@@ -1,7 +1,7 @@
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_CAPS } from '../../../../src/domain/settings/defaults';
-import { checkCaps, exposure, localDayKey, spentToday } from '../../../../src/domain/snipe/caps';
+import { checkCaps, exposure, localDayKey, spentToday, typoCheck } from '../../../../src/domain/snipe/caps';
 import type { CheckCaps, Snipe } from '../../../../src/domain/snipe/types';
 import type { ItemDetail } from '../../../../src/domain/types';
 
@@ -122,32 +122,14 @@ describe('checkCaps', () => {
     expect(checkCaps(snipe({ maxBid: 5000 }), others, 0, caps).ok).toBe(true);
   });
 
-  it('typo guard: above 3x current price blocks', () => {
-    const d = detail({ currentPrice: 500, minimumBid: 600 });
-    expect(checkCaps(snipe({ maxBid: 1500 }), [], 0, CAPS, d).ok).toBe(true);
-    expect(has(checkCaps(snipe({ maxBid: 1501 }), [], 0, CAPS, d), 'typo')).toBe(true);
-  });
-
-  it('typo guard: above the absolute threshold blocks, with or without detail', () => {
-    const caps = {
-      ...CAPS,
-      perItemMax: 100000,
-      perDayMax: 100000,
-      openExposureMax: 100000,
-    };
-    expect(checkCaps(snipe({ maxBid: 2500 }), [], 0, caps).ok).toBe(true);
-    expect(has(checkCaps(snipe({ maxBid: 2501 }), [], 0, caps), 'typo')).toBe(true);
-    const d = detail({ currentPrice: 2400, minimumBid: 2500 });
-    expect(has(checkCaps(snipe({ maxBid: 2501 }), [], 0, caps, d), 'typo')).toBe(true);
-  });
-
-  it('with no bids yet only the absolute threshold applies', () => {
-    const d = detail({ currentPrice: 0, numBids: 0, minimumBid: 100 });
-    expect(checkCaps(snipe({ maxBid: 2000 }), [], 0, CAPS, d).ok).toBe(true);
-  });
-
-  it('propagates RangeError from exceedsTypo on a bad absolute (guard is never silently off)', () => {
-    expect(() => checkCaps(snipe(), [], 0, { ...CAPS, typoAbsolute: -1 })).toThrow(RangeError);
+  it('never reports typo, however large the max versus the price', () => {
+    const caps = { ...CAPS, perItemMax: 10_000_000, perDayMax: 10_000_000, openExposureMax: 10_000_000 };
+    const d = detail({ currentPrice: 100, minimumBid: 200 });
+    const r = checkCaps(snipe({ maxBid: 5000 }), [], 0, caps, d);
+    expect(r).toEqual({ ok: true, violations: [] });
+    expect(checkCaps(snipe({ maxBid: 9_000_000 }), [], 0, caps).violations.some((v) => v.startsWith('typo'))).toBe(
+      false,
+    );
   });
 
   it('reports several violations at once', () => {
@@ -179,6 +161,49 @@ describe('checkCaps', () => {
         if (rHi.ok) expect(rLo.ok).toBe(true);
       }),
       { numRuns: 500 },
+    );
+  });
+});
+
+describe('typoCheck', () => {
+  it('3x current: at 3x passes, one cent over needs confirmation', () => {
+    const d = detail({ currentPrice: 500, minimumBid: 600 });
+    expect(typoCheck(1500, d, CAPS)).toEqual({ needsConfirmation: false });
+    const r = typoCheck(1501, d, CAPS);
+    expect(r.needsConfirmation).toBe(true);
+    expect(r.reason).toBeTruthy();
+  });
+
+  it('absolute threshold: at it passes, one cent over needs confirmation, with or without detail', () => {
+    expect(typoCheck(2500, undefined, CAPS).needsConfirmation).toBe(false);
+    expect(typoCheck(2501, undefined, CAPS).needsConfirmation).toBe(true);
+    const d = detail({ currentPrice: 2400, minimumBid: 2500 });
+    expect(typoCheck(2501, d, CAPS).needsConfirmation).toBe(true);
+  });
+
+  it('with no bids yet only the absolute threshold applies', () => {
+    const d = detail({ currentPrice: 0, numBids: 0, minimumBid: 100 });
+    expect(typoCheck(2000, d, CAPS).needsConfirmation).toBe(false);
+  });
+
+  it('propagates RangeError on a bad absolute or multiplier', () => {
+    expect(() => typoCheck(100, undefined, { ...CAPS, typoAbsolute: -1 })).toThrow(RangeError);
+    expect(() => typoCheck(100, undefined, { ...CAPS, typoMultiplier: 0 as unknown as 3 })).toThrow(RangeError);
+  });
+
+  it('property: monotone in maxBid', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 100000 }),
+        fc.integer({ min: 0, max: 100000 }),
+        fc.integer({ min: 0, max: 20000 }),
+        (a, b, cur) => {
+          const d = detail({ currentPrice: cur });
+          const lo = Math.min(a, b);
+          const hi = Math.max(a, b);
+          if (typoCheck(lo, d, CAPS).needsConfirmation) expect(typoCheck(hi, d, CAPS).needsConfirmation).toBe(true);
+        },
+      ),
     );
   });
 });

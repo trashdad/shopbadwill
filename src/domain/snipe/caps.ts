@@ -1,8 +1,8 @@
 // T-82: spending guards for the snipe engine. Pure domain code, integer cents.
 // `checkCaps` implements the frozen `CheckCaps` type (it only adds an optional
 // trailing `detail`), `exposure` totals the open commitments, and `spentToday`
-// is the only per-day accumulation (T-103 reuses it). The typo guard is
-// money.ts `exceedsTypo`; it is not re-implemented here.
+// is the only per-day accumulation (T-103 reuses it). `typoCheck` wraps
+// money.ts `exceedsTypo` (not re-implemented here).
 import { exceedsTypo, formatMoney } from '../money';
 import type { Cents, ItemDetail } from '../types';
 import type { CapsCheck, CapsResult, Snipe } from './types';
@@ -63,14 +63,12 @@ export function exposure(snipes: readonly Snipe[]): Exposure {
 
 /**
  * Checks one snipe against the caps. Violations are strings starting with the
- * kind: `per-item`, `per-day`, `exposure` or `typo`. The result never throws on
- * a violation, but a malformed cap (e.g. a negative `typoAbsolute`) throws
- * `RangeError` from `exceedsTypo` rather than silently disabling a guard.
+ * kind: `per-item`, `per-day` or `exposure`. The typo guard is NOT a cap: see
+ * `typoCheck`.
  *
  * `detail` (optional) is the latest ItemDetail: its `minimumBid` is the next
  * acceptable bid (the search row's `startingMinimumBid` is never used) and its
- * `currentPrice` feeds the typo guard. Without it only the absolute typo
- * threshold applies. Monotone in `maxBid`: raising it never removes a violation.
+ * Monotone in `maxBid`: raising it never removes a violation.
  */
 export function checkCaps(
   s: Snipe,
@@ -103,13 +101,30 @@ export function checkCaps(
     );
   }
 
-  if (exceedsTypo(s.maxBid, detail?.currentPrice ?? 0, caps.typoMultiplier, caps.typoAbsolute)) {
-    violations.push(
-      `typo: ${formatMoney(s.maxBid)} is above the typo guard (3x the current price or ${formatMoney(caps.typoAbsolute)})`,
-    );
-  }
-
   return { ok: violations.length === 0, violations };
+}
+
+/**
+ * Typo guard: a confirmation step at ARMING time, not a cap (controller ruling).
+ * Contract for the arming handler (T-84/T-85): when `needsConfirmation` is true,
+ * `snipe.arm` must carry `typedConfirmation` equal to the formatted max
+ * (`formatCents(maxBid)`); otherwise it refuses. `checkCaps` (run again at fire
+ * time) never reports typo, so a confirmed snipe is not blocked later.
+ * `detail.currentPrice` feeds the 3x rule; without detail only the absolute
+ * threshold applies. Throws RangeError on a malformed multiplier/absolute.
+ */
+export function typoCheck(
+  maxBid: Cents,
+  detail: ItemDetail | undefined,
+  caps: Pick<CapsCheck, 'typoMultiplier' | 'typoAbsolute'>,
+): { needsConfirmation: boolean; reason?: string } {
+  if (!exceedsTypo(maxBid, detail?.currentPrice ?? 0, caps.typoMultiplier, caps.typoAbsolute)) {
+    return { needsConfirmation: false };
+  }
+  return {
+    needsConfirmation: true,
+    reason: `${formatMoney(maxBid)} is above ${String(caps.typoMultiplier)}x the current price or the ${formatMoney(caps.typoAbsolute)} threshold`,
+  };
 }
 
 // ── Spent today ─────────────────────────────────────────────────────────────
