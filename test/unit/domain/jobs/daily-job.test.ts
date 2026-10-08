@@ -847,6 +847,141 @@ describe('Controller round: stop paging a watch (concern 4)', () => {
   });
 });
 
+// ── Fix round 1 ────────────────────────────────────────────────────────────
+
+describe('Fix round 1: attribution and calendar gating (M1, M2)', () => {
+  it('a watch that rejects the item on its own row is not attributed, even if the detail would satisfy it', () => {
+    const cat12 = rule('r-cat', [kw('pyrex'), { kind: 'category', categoryIds: [12], includeChildren: false }]);
+    const a = watch('a', { favoriteMode: 'local', calendar: true });
+    const b = watch('b', { favoriteMode: 'sgw', ruleIds: ['r-cat'] });
+    const { job, run } = setup({ watches: [a, b], rules: [PYREX, cat12], settings: settingsWith({ calendar: true }) });
+    const done = drive(
+      job,
+      run,
+      responder({ search: { 'a:1': [listing(1)], 'b:1': [listing(1, { categoryId: 99 })] }, details: { 1: { categoryId: 12 } } }),
+    );
+    expect(candidate(done, 1)?.watchIds).toEqual(['a']);
+    expect(stepsOf(done, 'favorite')).toEqual([]);
+    expect(stepsOf(done, 'calendarUpsert')).toEqual([{ kind: 'calendarUpsert', itemId: 1 }]);
+    expect(seenUpdates(done)).toEqual({ a: [1] });
+  });
+
+  it('an sgw watch with watch.calendar but settings.calendar off: exactly one favorite, no calendarUpsert', () => {
+    const { job, run } = setup({ watches: [watch('w1', { calendar: true })], settings: settingsWith({ calendar: false }) });
+    const done = drive(job, run, responder({ search: { 'w1:1': [listing(1)] } }));
+    expect(stepsOf(done, 'favorite')).toEqual([{ kind: 'favorite', itemId: 1, watchId: 'w1' }]);
+    expect(stepsOf(done, 'calendarUpsert')).toEqual([]);
+  });
+});
+
+describe('Fix round 1: budget fairness (R8 decision 3 changed)', () => {
+  const soon = listing(500, { endTime: endIn(1) });
+  const page1 = (): Listing[] => [
+    ...Array.from({ length: 20 }, (_, i) => listing(101 + i, { endTime: endIn(10 + i) })), // 10–29 h
+    ...Array.from({ length: 20 }, (_, i) => listing(201 + i, { title: 'Teapot' })), // full page
+  ];
+
+  it('details: a page-2 item ending in 1 h beats page-1 items ending in 10–29 h', () => {
+    const { job, run } = setup({ watches: [watch('w1', { maxPages: 2 })] });
+    const r1 = job.apply(run, at(run.steps, 0), { kind: 'search', items: page1(), total: 41 });
+    expect(stepsOf(r1, 'detail')).toEqual([]); // nothing planned before every search ran
+    const r2 = job.apply(r1, at(r1.steps, 1), { kind: 'search', items: [soon], total: 41 });
+    const planned = stepsOf(r2, 'detail').map((s) => s.itemId);
+    expect(planned).toHaveLength(MAX_DETAIL_STEPS_PER_RUN);
+    expect(planned[0]).toBe(500);
+    expect(planned).not.toContain(120); // the 29 h item is the overflow
+    expect(candidate(r2, 120)?.status).toBe('skipped-budget');
+    expect(r2.results.errors).toEqual([
+      { step: 1, message: 'budget: 1 candidate(s) skipped (max 20 detail steps per run); retried next run' },
+    ]);
+  });
+
+  it('details: a later watch’s item ending in 1 h beats an earlier watch’s items', () => {
+    const { job, run } = setup({ watches: [watch('a'), watch('b')] });
+    const done = drive(job, run, responder({ search: { 'a:1': page1().slice(0, 20), 'b:1': [soon] } }));
+    const planned = stepsOf(done, 'detail').map((s) => s.itemId);
+    expect(planned[0]).toBe(500);
+    expect(planned).not.toContain(120);
+    expect(stepsOf(done, 'favorite').map((s) => s.itemId)).toContain(500);
+  });
+
+  it('quotes: planned once every detail is in, over all candidates soonest-ending first (quote after its detail)', () => {
+    const lc = rule('r-lc', [kw('pyrex'), { kind: 'landedCost', max: 5000 }]);
+    // Watch a (local) needs no details; watch b (sgw) needs one for its 1 h item.
+    const a = watch('a', { ruleIds: ['r-lc'], favoriteMode: 'local' });
+    const b = watch('b', { ruleIds: ['r-lc'] });
+    const { job, run } = setup({ watches: [a, b], rules: [lc], settings: settingsWith(QUOTES_ON) });
+    const r = drive(job, run, responder({ search: { 'a:1': page1().slice(0, 20), 'b:1': [soon] } }));
+    const quotes = stepsOf(r, 'quote').map((s) => s.itemId);
+    expect(quotes).toHaveLength(MAX_QUOTE_STEPS_PER_RUN);
+    expect(quotes[0]).toBe(500);
+    expect(quotes).not.toContain(120);
+    const idx = (k: string, id: number): number => r.steps.findIndex((s) => s.kind === k && 'itemId' in s && s.itemId === id);
+    expect(idx('quote', 500)).toBeGreaterThan(idx('detail', 500));
+  });
+
+  it('records a quote-budget error against the step that was applied', () => {
+    const lc = rule('r-lc', [kw('pyrex'), { kind: 'landedCost', max: 5000 }]);
+    const rows = Array.from({ length: 25 }, (_, i) => listing(i + 1, { endTime: endIn(i + 1) }));
+    const { job, run } = setup({ watches: [watch('w1', { ruleIds: ['r-lc'], favoriteMode: 'local' })], rules: [lc], settings: settingsWith(QUOTES_ON) });
+    const after = job.apply(run, at(run.steps, 0), { kind: 'search', items: rows, total: 25 });
+    expect(after.results.errors).toEqual([
+      { step: 0, message: 'budget: 5 candidate(s) skipped (max 20 quote steps per run); retried next run' },
+    ]);
+  });
+});
+
+describe('Fix round 1: sgw-late and edited watches (M3, minors)', () => {
+  it('two sgw-late watches (N = 12 and N = 6): notBefore = end − 6 h (inside both windows)', () => {
+    const end = NOW + 50 * HOUR;
+    const a = watch('a', { favoriteMode: 'sgw-late', favoriteWithinHours: 12 });
+    const b = watch('b', { favoriteMode: 'sgw-late', favoriteWithinHours: 6 });
+    for (const ws of [
+      [a, b],
+      [b, a],
+    ]) {
+      const { job, run } = setup({ watches: ws });
+      const row = listing(1, { endTime: iso(end) });
+      const done = drive(job, run, responder({ search: { 'a:1': [row], 'b:1': [row] } }));
+      expect(stepsOf(done, 'favorite')).toEqual([{ kind: 'favorite', itemId: 1, watchId: 'b', notBefore: end - 6 * HOUR }]);
+    }
+  });
+
+  it('a notBefore already in the past is still planned (the favorite is due now)', () => {
+    const end = NOW + 2 * HOUR;
+    const { job, run } = setup({ watches: [watch('w1', { favoriteMode: 'sgw-late', favoriteWithinHours: 6 })] });
+    const done = drive(job, run, responder({ search: { 'w1:1': [listing(1, { endTime: iso(end) })] } }));
+    expect(stepsOf(done, 'favorite')).toEqual([{ kind: 'favorite', itemId: 1, watchId: 'w1', notBefore: NOW - 4 * HOUR }]);
+  });
+
+  it('a write or calendar watch without a detail (edited mid-run) fails the item, so the next run retries it', () => {
+    const lc = rule('r-lc', [kw('pyrex'), { kind: 'landedCost', max: 5000 }]);
+    const local = watch('w1', { ruleIds: ['r-lc'], favoriteMode: 'local' });
+    const first = setup({ watches: [local], rules: [lc], settings: settingsWith(QUOTES_ON) });
+    const r1 = first.job.apply(first.run, at(first.run.steps, 0), { kind: 'search', items: [listing(1)], total: 1 });
+    expect(stepsOf(r1, 'quote')).toEqual([{ kind: 'quote', itemId: 1 }]); // no detail needed while local
+    for (const edited of [watch('w1', { ruleIds: ['r-lc'] }), watch('w1', { ruleIds: ['r-lc'], favoriteMode: 'local', calendar: true })]) {
+      const job2 = createDailyJob({
+        evaluateBatch,
+        validateQuery: invalidSearchParams,
+        searchPageSize: () => SGW_PAGE_SIZE,
+        watches: [edited],
+        rules: [lc],
+        settings: settingsWith({ ...QUOTES_ON, calendar: true }),
+        now: () => NOW,
+      });
+      const done = drive(job2, r1, responder({ search: { 'w1:1': [listing(1)] } }));
+      expect(stepsOf(done, 'detail')).toEqual([]);
+      expect(stepsOf(done, 'favorite')).toEqual([]);
+      expect(stepsOf(done, 'calendarUpsert')).toEqual([]);
+      expect(candidate(done, 1)).toMatchObject({ status: 'failed' });
+      expect(candidate(done, 1)?.note).toMatch(/detail/);
+      expect(done.results.newMatches).toEqual([]);
+      expect(seenUpdates(done)).toEqual({});
+    }
+  });
+});
+
 // ── property ───────────────────────────────────────────────────────────────
 
 /** mulberry32: a tiny seeded PRNG so each fast-check case replays exactly. */
@@ -978,6 +1113,13 @@ describe('property', () => {
           const digests = run.steps.flatMap((s, i) => (s.kind === 'notifyDigest' ? [i] : []));
           expect(digests.length).toBeLessThanOrEqual(1);
           if (digests.length === 1) expect(digests[0]).toBe(run.steps.length - 1);
+          // Details are planned once at the searches-done barrier, quotes after every detail ran.
+          const lastSearch = run.steps.map((s) => s.kind).lastIndexOf('search');
+          const lastDetail = run.steps.map((s) => s.kind).lastIndexOf('detail');
+          run.steps.forEach((s, i) => {
+            if (s.kind === 'detail') expect(i).toBeGreaterThan(lastSearch);
+            if (s.kind === 'quote') expect(i).toBeGreaterThan(lastDetail);
+          });
           const status = new Map(run.candidates?.map((c) => [c.itemId, c.status]));
           for (const s of run.steps) {
             if (s.kind === 'favorite' || s.kind === 'calendarUpsert') expect(status.get(s.itemId)).toBe('matched');

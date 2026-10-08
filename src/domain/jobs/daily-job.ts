@@ -5,18 +5,20 @@
 // and persists the returned run. Everything a restarted worker needs lives in
 // the run: `steps`, `cursor`, `results` and `candidates` (R5).
 //
-// Per watch:
-//   search pages 1..maxPages (R2) → de-dup by `seenItemIds` → optimistic pass
-//   (R1.1, watch rules relaxed for what the row cannot answer) → candidates →
-//   `detail` when a deferred condition, favoriting or the calendar needs it
-//   (R1.2, R7) → `quote` only once every other condition holds → strict pass
-//   with the full rules (R1.3) → `favorite` per `favoriteMode` and
-//   `calendarUpsert`, only on a strict `watch` grounded in known conditions
-//   (R1.4) → `notifyDigest` last (R8).
+// Flow:
+//   search pages 1..maxPages per watch (R2; a short or last page stops the
+//   watch's paging) → de-dup by `seenItemIds` → optimistic pass (R1.1, watch
+//   rules relaxed for what the row cannot answer) → candidates, one per item,
+//   attributed only to watches that selected it →
+//   once every search ran: `detail` where a deferred condition, favoriting or
+//   the calendar needs it (R1.2, R7), all candidates soonest-ending first,
+//   capped (R3) →
+//   once every detail ran: `quote` only where every other condition holds,
+//   soonest-ending first, capped → strict pass with the full rules (R1.3) →
+//   `favorite` per `favoriteMode` and `calendarUpsert`, only on a strict watch
+//   match grounded in known conditions (R1.4) → `notifyDigest` last (R8).
 //
-// Steps are append-only and every append happens in `apply`. Searches are
-// planned first, so all candidates are selected before any detail is fetched,
-// and an item returned by several watches gets one candidate and one detail.
+// Steps are append-only and every append happens in `apply`.
 import { DEFAULT_FAVORITE_WITHIN_HOURS } from '../settings/defaults';
 import type { Settings } from '../settings/schema';
 import type { Condition, EvaluateBatch, MatchContext, MatchResult, Rule } from '../rules/schema';
@@ -250,8 +252,9 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
     return selected;
   };
 
-  const errorAt = (run: JobRun, message: string): void => {
-    run.results.errors.push({ step: run.cursor, message });
+  /** Records against `at`, by default the step at the cursor (the one being applied). */
+  const errorAt = (run: JobRun, message: string, at: number = run.cursor): void => {
+    run.results.errors.push({ step: at, message });
   };
 
   const close = (c: JobCandidate, status: JobCandidate['status'], note?: string): void => {
@@ -285,32 +288,28 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
       }
     }
 
+    // Selection only: detail and quote steps are planned in `settle` once every
+    // search ran, over all candidates (fix round 1, budget fairness).
     const candidates = (run.candidates ??= []);
-    let skipped = 0;
     for (const row of rows.filter((r) => picked.has(r.itemId)).sort(byEnd)) {
-      let c = candidates.find((x) => x.itemId === row.itemId);
-      if (c === undefined) {
-        c = { itemId: row.itemId, watchIds: [w.id], endTime: row.endTime, status: 'pending', row };
-        candidates.push(c);
-      } else if (!c.watchIds.includes(w.id)) {
-        c.watchIds.push(w.id);
-      }
-      if (c.status !== 'pending') continue;
-      const reason = detailNeed(w, availability(row));
-      if (reason === null || run.steps.some((s) => s.kind === 'detail' && s.itemId === row.itemId)) continue;
-      if (countKind(run, 'detail') < MAX_DETAIL_STEPS_PER_RUN) {
-        run.steps.push({ kind: 'detail', itemId: row.itemId, reason });
-      } else {
-        close(c, 'skipped-budget', 'detail budget');
-        skipped++;
-      }
+      const c = candidates.find((x) => x.itemId === row.itemId);
+      if (c === undefined) candidates.push({ itemId: row.itemId, watchIds: [w.id], endTime: row.endTime, status: 'pending', row });
+      else if (!c.watchIds.includes(w.id)) c.watchIds.push(w.id);
     }
-    if (skipped > 0) {
-      errorAt(
-        run,
-        `budget: ${String(skipped)} candidate(s) skipped (max ${String(MAX_DETAIL_STEPS_PER_RUN)} detail steps per run); retried next run`,
-      );
-    }
+  };
+
+  /** R1.2/R7: why the item needs its detail for any selecting watch, or null. */
+  const detailReason = (c: JobCandidate): 'new-match' | 'calendar' | null => {
+    if (c.row === undefined) return null;
+    const a = availability(c.row);
+    const reasons = c.watchIds.map((id) => watchById.get(id)).map((w) => (w === undefined ? null : detailNeed(w, a)));
+    if (reasons.includes('new-match')) return 'new-match';
+    return reasons.includes('calendar') ? 'calendar' : null;
+  };
+
+  const budgetNote = (run: JobRun, at: number, skipped: number, kind: 'detail' | 'quote', max: number): void => {
+    if (skipped === 0) return;
+    errorAt(run, `budget: ${String(skipped)} candidate(s) skipped (max ${String(max)} ${kind} steps per run); retried next run`, at);
   };
 
   /** R1.3/R1.4: the strict pass for every selecting watch; plans the writes. */
@@ -327,36 +326,41 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
       close(c, 'rejected', notes.join('; '));
       return;
     }
-    if (!run.results.newMatches.includes(c.itemId)) run.results.newMatches.push(c.itemId);
-    // Writes rest on the detail (R1.2); without one, none is planned.
-    if (c.detail !== undefined) {
-      const writers = matched.filter((w) => w.favoriteMode !== 'local');
-      const now = writers.find((w) => w.favoriteMode === 'sgw');
-      if (now !== undefined) {
-        run.steps.push({ kind: 'favorite', itemId: c.itemId, watchId: now.id });
-      } else if (writers.length > 0) {
-        // sgw-late: within every late watch's window = the latest notBefore.
-        const late = writers
-          .map((w) => ({ w, at: endMs(l.endTime) - (w.favoriteWithinHours ?? DEFAULT_FAVORITE_WITHIN_HOURS) * HOUR_MS }))
-          .reduce((a, b) => (b.at > a.at ? b : a));
-        if (Number.isFinite(late.at)) {
-          run.steps.push({ kind: 'favorite', itemId: c.itemId, watchId: late.w.id, notBefore: Math.max(0, late.at) });
-        } else {
-          notes.push(`${late.w.id}: no end time; favorite withheld`);
-        }
-      }
-      if (matched.some(calendarOn)) run.steps.push({ kind: 'calendarUpsert', itemId: c.itemId });
+    // Writes rest on the detail (R1.2). A write or calendar watch without one
+    // (its mode or calendar was edited mid-run) fails the item: not seen, so
+    // the next run retries it.
+    if (c.detail === undefined && matched.some((w) => w.favoriteMode !== 'local' || calendarOn(w))) {
+      close(c, 'failed', 'no detail for a write or calendar watch (edited mid-run); retried next run');
+      return;
     }
+    if (!run.results.newMatches.includes(c.itemId)) run.results.newMatches.push(c.itemId);
+    const writers = matched.filter((w) => w.favoriteMode !== 'local');
+    const immediate = writers.find((w) => w.favoriteMode === 'sgw');
+    if (immediate !== undefined) {
+      run.steps.push({ kind: 'favorite', itemId: c.itemId, watchId: immediate.id });
+    } else if (writers.length > 0) {
+      // sgw-late: within every late watch's window = the latest notBefore. It
+      // may already be past (a soon-ending item): the favorite is then due now.
+      const late = writers
+        .map((w) => ({ w, at: endMs(l.endTime) - (w.favoriteWithinHours ?? DEFAULT_FAVORITE_WITHIN_HOURS) * HOUR_MS }))
+        .reduce((a, b) => (b.at > a.at ? b : a));
+      if (Number.isFinite(late.at)) {
+        run.steps.push({ kind: 'favorite', itemId: c.itemId, watchId: late.w.id, notBefore: Math.max(0, late.at) });
+      } else {
+        notes.push(`${late.w.id}: no end time; favorite withheld`);
+      }
+    }
+    if (matched.some(calendarOn)) run.steps.push({ kind: 'calendarUpsert', itemId: c.itemId });
     close(c, 'matched', notes.join('; '));
   };
 
   /**
-   * Moves one pending candidate on once nothing is queued for it: a quote if a
-   * landed-cost rule needs one and every other condition holds, else the
-   * strict pass. Returns true when it was skipped for the quote budget.
+   * Moves one pending candidate on once its detail (if any) is in and no quote
+   * is queued: a quote if a landed-cost rule needs one and every other
+   * condition holds, else the strict pass. Returns true when it was skipped
+   * for the quote budget.
    */
-  const progress = (run: JobRun, c: JobCandidate, queued: Set<string>): boolean => {
-    if (queued.has(`detail:${String(c.itemId)}`) || queued.has(`quote:${String(c.itemId)}`)) return false;
+  const progress = (run: JobRun, c: JobCandidate): boolean => {
     const watches = c.watchIds.map((id) => watchById.get(id)).filter((w): w is Watch => w !== undefined);
     const l = enrich(c);
     if (watches.length === 0 || l === undefined) {
@@ -381,7 +385,6 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
           return true;
         }
         run.steps.push({ kind: 'quote', itemId: c.itemId });
-        queued.add(`quote:${String(c.itemId)}`);
         return false;
       }
     }
@@ -389,21 +392,41 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
     return false;
   };
 
-  /** After every apply: once all searches ran, move pending candidates on (soonest-ending first). */
-  const settle = (run: JobRun): void => {
-    const rest = run.steps.slice(run.cursor);
-    if (rest.some((s) => s.kind === 'search')) return;
-    const queued = new Set(rest.flatMap((s) => ('itemId' in s ? [`${s.kind}:${String(s.itemId)}`] : [])));
+  /**
+   * After every apply (budget fairness, fix round 1). Each barrier takes ALL
+   * pending candidates across watches, soonest-ending first, then the cap;
+   * the overflow is `skipped-budget` (not seen, retried next run, R3).
+   * 1. Once every search ran: detail steps.
+   * 2. Once every detail ran too: quote steps (so each comes after its item's
+   *    detail and every quote need is known), then the strict pass.
+   * Budget notes are recorded against `appliedAt`, the step just applied.
+   */
+  const settle = (run: JobRun, appliedAt: number): void => {
+    if (run.steps.slice(run.cursor).some((s) => s.kind === 'search')) return;
+    const pending = (): JobCandidate[] => (run.candidates ?? []).filter((x) => x.status === 'pending').sort(byEnd);
+    const planned = (kind: 'detail' | 'quote', id: ItemId): boolean => run.steps.some((s) => s.kind === kind && s.itemId === id);
+
     let skipped = 0;
-    for (const c of (run.candidates ?? []).filter((x) => x.status === 'pending').sort(byEnd)) {
-      if (progress(run, c, queued)) skipped++;
+    for (const c of pending()) {
+      // Never a detail after a quote was planned (R1.2 order); see `decide` for the mid-run edit case.
+      if (c.detail !== undefined || c.quote !== undefined || planned('detail', c.itemId) || planned('quote', c.itemId)) continue;
+      const reason = detailReason(c);
+      if (reason === null) continue;
+      if (countKind(run, 'detail') < MAX_DETAIL_STEPS_PER_RUN) {
+        run.steps.push({ kind: 'detail', itemId: c.itemId, reason });
+      } else {
+        close(c, 'skipped-budget', 'detail budget');
+        skipped++;
+      }
     }
-    if (skipped > 0) {
-      errorAt(
-        run,
-        `budget: ${String(skipped)} candidate(s) skipped (max ${String(MAX_QUOTE_STEPS_PER_RUN)} quote steps per run); retried next run`,
-      );
-    }
+    budgetNote(run, appliedAt, skipped, 'detail', MAX_DETAIL_STEPS_PER_RUN);
+
+    const rest = run.steps.slice(run.cursor);
+    if (rest.some((s) => s.kind === 'detail')) return;
+    const queuedQuotes = new Set(rest.flatMap((s) => (s.kind === 'quote' ? [s.itemId] : [])));
+    skipped = 0;
+    for (const c of pending()) if (!queuedQuotes.has(c.itemId) && progress(run, c)) skipped++;
+    budgetNote(run, appliedAt, skipped, 'quote', MAX_QUOTE_STEPS_PER_RUN);
   };
 
   const failStep = (run: JobRun, step: JobStep, why: string): void => {
@@ -462,8 +485,9 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
    * when the queue drains (only if wanted); else finish.
    */
   const advance = (run: JobRun, skip = 0): void => {
+    const appliedAt = run.cursor;
     run.cursor += 1 + skip;
-    settle(run);
+    settle(run, appliedAt);
     if (run.cursor < run.steps.length) return;
     const wantsDigest = run.steps.some((s) => s.kind === 'search' && watchById.get(s.watchId)?.notify === true);
     if (wantsDigest && !run.steps.some((s) => s.kind === 'notifyDigest')) {
