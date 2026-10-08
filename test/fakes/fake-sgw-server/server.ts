@@ -3,6 +3,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { BiddingPatchSchema, createBidding } from './bidding';
 import { epochToPacificNaive, pacificNaiveToEpoch } from './clock';
 import {
   applyPatch,
@@ -18,7 +19,6 @@ import {
   CalculateShippingRequestSchema,
   FavoriteSaveRequestSchema,
   ItemListingRequestSchema,
-  PlaceBidRequestSchema,
   RefreshTokenRequestSchema,
 } from './shapes';
 
@@ -105,9 +105,21 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise((r) => {
-    setTimeout(r, ms);
+/** Resolves true after ms, or false if the response closed first (client gone or server closing). */
+const sleep = (ms: number, res?: ServerResponse): Promise<boolean> =>
+  new Promise((resolve) => {
+    const done = (v: boolean): void => {
+      clearTimeout(timer);
+      res?.off('close', cancel);
+      resolve(v);
+    };
+    const cancel = (): void => {
+      done(false);
+    };
+    const timer = setTimeout(() => {
+      done(true);
+    }, ms);
+    res?.once('close', cancel);
   });
 
 function parseJson(text: string): unknown {
@@ -150,9 +162,12 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
     }
   };
 
-  const itemEnd = (it: SeedItem): number =>
+  const baseEnd = (it: SeedItem): number =>
     it.endTime === undefined ? loadedAt + (it.endsInMs ?? 0) : pacificNaiveToEpoch(it.endTime);
-  const itemEndRaw = (it: SeedItem): string => it.endTime ?? epochToPacificNaive(itemEnd(it), true);
+  const bidding = createBidding({ items: seed.items, baseEndMs: baseEnd, now: serverNow });
+  const itemEnd = (it: SeedItem): number => bidding.endMs(it);
+  const itemEndRaw = (it: SeedItem): string =>
+    it.endTime !== undefined && itemEnd(it) === baseEnd(it) ? it.endTime : epochToPacificNaive(itemEnd(it), true);
   const byId = new Map(seed.items.map((i) => [i.itemId, i]));
   const isFav = (id: number): boolean => favs.some((f) => f.itemId === id);
 
@@ -170,7 +185,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
   };
 
   type Ctx = { req: IncomingMessage; url: URL; body: string; bearer: string | null };
-  type Result = { status: number; body?: unknown; headers?: Record<string, string> };
+  type Result = { status: number; body?: unknown; headers?: Record<string, string>; delayMs?: number };
   interface Route {
     name: string;
     auth?: boolean;
@@ -181,12 +196,14 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
   const ack = (message = ''): Result => ok({ status: true, message });
   const bad = (status: number, message: string): Result => ({ status, body: { message } });
 
-  const searchRow = (it: SeedItem, authed: boolean): Record<string, unknown> => ({
+  const searchRow = (it: SeedItem, authed: boolean): Record<string, unknown> => {
+    const bv = bidding.view(it, authed);
+    return {
     itemId: it.itemId,
     title: it.title,
-    currentPrice: it.currentPrice,
+    currentPrice: bv.currentPrice,
     minimumBid: it.minimumBid,
-    numBids: it.numBids,
+    numBids: bv.numBids,
     endTime: itemEndRaw(it),
     sellerId: it.sellerId,
     sellerName: it.sellerName,
@@ -194,7 +211,8 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
     isFavorite: authed && isFav(it.itemId),
     shippingPrice: it.shippingPrice,
     imageURL: it.imageURL,
-  });
+    };
+  };
 
   const routes = new Map<string, Route>();
   const add = (method: string, pattern: string, r: Route): void => {
@@ -250,15 +268,16 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
       const it = byId.get(Number(m[1]));
       if (!it) return bad(404, 'Item not found');
       const now = serverNow();
-      const minimumBid = it.detailMinimumBid ?? (it.numBids > 0 ? it.currentPrice + it.bidIncrement : it.minimumBid);
+      const v = bidding.view(it, bearer !== null);
       return ok({
         itemId: it.itemId,
         title: it.title,
         description: it.description,
-        currentPrice: it.currentPrice,
-        minimumBid,
+        currentPrice: v.currentPrice,
+        minimumBid: v.minimumBid,
         bidIncrement: it.bidIncrement,
-        numBids: it.numBids,
+        numBids: v.numBids,
+        isHighBidder: v.isHighBidder,
         endTime: itemEndRaw(it),
         serverTime: epochToPacificNaive(now, true),
         sellerId: it.sellerId,
@@ -268,7 +287,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
         shippingPrice: it.shippingPrice,
         isClosed: itemEnd(it) <= now,
         inWatchlist: bearer === null ? null : isFav(it.itemId),
-        bidHistory: it.bidHistory,
+        bidHistory: [...v.bidHistory, ...it.bidHistory],
       });
     },
   });
@@ -355,16 +374,14 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
     handler: () => ok(seed.savedSearches),
   });
 
-  // Bidding endpoints are stubs until T-88: closed-auction responses only.
+  // Bidding: proxy-bid state and faults live in ./bidding. The Bid cookie 403 stays here.
   const bidCookie = /(?:^|;\s*)Bid=/;
   add('GET', '/api/ItemBid/ShowBidModal', {
     name: 'ItemBid/ShowBidModal',
     auth: true,
     handler: ({ req, url }) => {
       if (bidCookie.test(req.headers.cookie ?? '')) return bad(403, 'Forbidden');
-      const it = byId.get(Number(url.searchParams.get('itemId')));
-      if (!it) return bad(404, 'Item not found');
-      return ok({ sellerId: it.sellerId, minimumBid: it.detailMinimumBid ?? it.minimumBid });
+      return bidding.showBidModal(Number(url.searchParams.get('itemId')));
     },
   });
   add('POST', '/api/ItemBid/PlaceBid', {
@@ -372,11 +389,8 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
     auth: true,
     handler: ({ req, body }) => {
       if (bidCookie.test(req.headers.cookie ?? '')) return bad(403, 'Forbidden');
-      if (!PlaceBidRequestSchema.safeParse(parseJson(body)).success) return bad(400, 'Bad request');
-      return ok(
-        { status: false, result: -3, message: '<p>This auction is closed.</p>' },
-        scenario.bidSetsCookie ? { 'set-cookie': 'Bid=1; Path=/' } : undefined,
-      );
+      const r = bidding.placeBid(parseJson(body));
+      return r.status === 200 && scenario.bidSetsCookie ? { ...r, headers: { 'set-cookie': 'Bid=1; Path=/' } } : r;
     },
   });
 
@@ -427,15 +441,33 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
     else if (p === '/__log' && method === 'DELETE') {
       log.length = 0;
       send(res, 200, { entries: [] });
-    } else if (p === '/__scenario' && method === 'GET') send(res, 200, { scenario, known: Object.keys(NAMED_SCENARIOS) });
+    } else if (p === '/__scenario' && method === 'GET') {
+      send(res, 200, { scenario, known: Object.keys(NAMED_SCENARIOS), bidding: bidding.snapshot() });
+    }
     else if (p === '/__scenario' && method === 'POST') {
-      const parsed = ScenarioPatchSchema.safeParse(parseJson(body));
+      const raw = parseJson(body);
+      const parsed = ScenarioPatchSchema.safeParse(raw);
+      const bidPatch = BiddingPatchSchema.safeParse((raw as { bidding?: unknown } | undefined)?.bidding ?? {});
       if (!parsed.success) send(res, 400, { message: parsed.error.message });
+      else if (!bidPatch.success) send(res, 400, { message: bidPatch.error.message });
       else {
+        const savedScenario = scenario;
+        const savedAnchor = anchor;
+        const savedCounts = new Map(errorCounts);
+        const restoreBidding = bidding.checkpoint();
         try {
           setScenario(parsed.data);
-          send(res, 200, { scenario });
+          // A top-level preset or reset also clears bidding state; then apply the bidding patch.
+          if (parsed.data.reset === true || parsed.data.name !== undefined) bidding.applyPatch({ reset: true });
+          bidding.applyPatch(bidPatch.data);
+          send(res, 200, { scenario, bidding: bidding.snapshot() });
         } catch (e) {
+          // Roll back so a rejected patch leaves nothing half-applied.
+          scenario = savedScenario;
+          anchor = savedAnchor;
+          errorCounts.clear();
+          for (const [k, v] of savedCounts) errorCounts.set(k, v);
+          restoreBidding();
           send(res, 400, { message: e instanceof Error ? e.message : String(e) });
         }
       }
@@ -487,7 +519,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
       else if (hit === 'method') result = bad(405, 'Method not allowed');
       else {
         const lat = findSpec(scenario.latencyMs, endpoint);
-        if (lat && lat[1] > 0) await sleep(lat[1]);
+        if (lat && lat[1] > 0 && !(await sleep(lat[1], res))) return;
         const err = findSpec<ErrorSpec>(scenario.errors, endpoint);
         let forced: ErrorSpec | null = null;
         if (err) {
@@ -525,6 +557,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
         hasBearer: bearer !== null,
         body,
       });
+      if (result.delayMs !== undefined && result.delayMs > 0 && !(await sleep(result.delayMs, res))) return;
       send(res, result.status, result.body, result.headers);
     })().catch((e: unknown) => {
       // Never leave a request hanging or raise an unhandled rejection.

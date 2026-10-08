@@ -21,7 +21,7 @@ Raw request/response shapes are in `shapes.ts` (zod). T-24 owns the real adapter
 | `GET Favorite/AddToFavorite?itemId=`, `GET Favorite/RemoveItemFromFavoriteList?itemId=` | bearer | |
 | `POST Favorite/GetAllFavoriteItemsByType?Type=open\|close\|all`, `POST Favorite/Save {notes, watchlistId}` | bearer | |
 | `POST SaveSearches/GetSaveSearches` | bearer | |
-| `GET ItemBid/ShowBidModal?itemId=`, `POST ItemBid/PlaceBid` | bearer | Stubs until T-88: PlaceBid returns `{status:false, result:-3, message}`. A request carrying a `Bid` cookie gets 403. |
+| `GET ItemBid/ShowBidModal?itemId=`, `POST ItemBid/PlaceBid` | bearer | Proxy bidding (see Bidding). A request carrying a `Bid` cookie gets 403; PlaceBid sets the cookie when `bidSetsCookie` is on. |
 | `POST SignIn/RefreshToken`, `POST SignIn/RevokeToken` | none / bearer | RefreshToken mints a token with `tokenLifetimeMs`; refresh token `"revoked"` gives 401. |
 
 Bearer tokens are HS256 JWTs (claims `BuyerId`, `IpAddress`, `Browser`, `iat`, `exp`). Missing, bad-signature or expired (against the server clock, skew included) is 401. There is no login endpoint; mint tokens with `POST /__token` or `sgw.mintToken()`.
@@ -48,6 +48,24 @@ Unknown path is 404, wrong method 405. CORS reflects the request origin.
 | `bid-cookie` | PlaceBid sets `Bid=1`; sending it back gets 403. |
 
 Primitives: `skewMs`; `serverNowMs` (pin the server clock, it then ticks); `latencyMs: {"<endpoint>|*": ms}`; `errors: {"<endpoint>|*": {status, times?, retryAfterSec?}}` (`times` fails N requests, then recovers); `tokenLifetimeMs`; `bidSetsCookie`.
+
+## Bidding (`bidding/`)
+
+Per-item proxy-bid state starts from the seed (an item with bids has a hidden competitor leading at max = `currentPrice`). A bid is a hidden max: leader price = `min(leaderMax, runnerUpMax + bidIncrement)`, ties go to the earlier bidder, first bid on an unbid item lands at the starting minimum. Raising your own max leaves price and `numBids` alone. Detail, search rows and `ShowBidModal.minimumBid` all read this state; detail also gains `isHighBidder` (null when anonymous) and prepends placed bids to `bidHistory`. Result codes are in `bidding/result-codes.ts`; only `-3` is verified, the rest are placeholders until T-100.
+
+Configure with a `bidding` object inside the `POST /__scenario` body (a top-level `reset` or `name` clears bidding state first):
+
+| Field | Effect |
+| --- | --- |
+| `preset` | `soft-close` (bid in last 10 min moves end to now+10 min; unverified), `stalled-place-bid` (25 s), `auth-failure`, `auth-failure-http`. Implies a bidding reset. |
+| `items: {"<id>": {currentPrice, numBids, bidIncrement, competitorMax, myMax, endsAtMs, closed}}` | Seed an item's state. `competitorMax`/`myMax` set who leads and their hidden max. |
+| `competitorBids: [{itemId, maxBid}]` | Place competitor bids now (server clock); can outbid you and trigger soft close. |
+| `softClose: {windowMs, extensionMs}` or `null` | Extension rule. |
+| `authFailure: "result" \| "http" \| null` | PlaceBid answers 200 `result -110`, or 401 (also ShowBidModal). |
+| `stallMs` | PlaceBid response is held this long; the bid is evaluated on arrival. |
+| `tokenExpiresAtMs` | From this server-clock instant the bid endpoints return 401 whatever the bearer says (token expiry mid-window). |
+
+Responses: `-3` closed, `-4` below minimum, `-5` not above your own max, `-110` auth, `0` accepted and leading, `1` accepted but outbid at once. `GET /__scenario` also returns a `bidding` snapshot.
 
 ## Seed data
 

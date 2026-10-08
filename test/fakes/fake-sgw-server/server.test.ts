@@ -125,8 +125,9 @@ describe('endpoint responses validate against the local shapes', () => {
     expect(favs.some((f) => f.itemId === 279250102)).toBe(false);
     await parse(await post('/api/SaveSearches/GetSaveSearches', {}, h), SavedSearchesResponseSchema);
   });
-  it('bidding endpoints are stubs returning result -3', async () => {
+  it('bidding endpoints validate against the local shapes (closed auction gives -3)', async () => {
     const h = auth();
+    await post('/__scenario', { bidding: { items: { 279250057: { closed: true } } } });
     await parse(await get('/api/ItemBid/ShowBidModal?itemId=279250057', h), ShowBidModalResponseSchema);
     const r = await parse(
       await post('/api/ItemBid/PlaceBid', { itemId: 279250057, bidAmount: '20.00', sellerId: 31, quantity: 1 }, h),
