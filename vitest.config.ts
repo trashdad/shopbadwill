@@ -16,7 +16,7 @@ export default defineConfig({
     // Every suite has at least one test; a filter that matches nothing fails.
     passWithNoTests: false,
     // T-03 owns `setupFiles` (fakeBrowser reset, MSW server).
-    setupFiles: [],
+    setupFiles: ['test/setup/vitest.setup.ts'],
     // Node 25's built-in localStorage warns when touched without a backing file
     // (MSW probes it). Tests never need it; happy-dom brings its own.
     execArgv: ['--no-experimental-webstorage'],
