@@ -1,0 +1,31 @@
+{
+  "v": 1,
+  "reqId": "r-19",
+  "type": "watches.save",
+  "payload": {
+    "id": "w-pyrex",
+    "name": "Pyrex",
+    "enabled": true,
+    "query": {
+      "searchText": "pyrex",
+      "categoryIds": [],
+      "sellerIds": [],
+      "page": 1
+    },
+    "ruleIds": [
+      "r-pyrex"
+    ],
+    "maxPages": 2,
+    "favoriteMode": "sgw-late",
+    "favoriteWithinHours": 6,
+    "calendar": true,
+    "notify": true,
+    "lastRunAt": 1791313600000,
+    "nextRunAt": 1791443200000,
+    "lastError": "search page 2: HTTP 429",
+    "seenItemIds": [
+      279250057,
+      279250058
+    ]
+  }
+}

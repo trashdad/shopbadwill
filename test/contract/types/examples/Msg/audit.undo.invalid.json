@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "seq is a number",
+  "path": [
+    "payload",
+    "seq"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-39",
+    "type": "audit.undo",
+    "payload": {
+      "seq": "41"
+    }
+  }
+}

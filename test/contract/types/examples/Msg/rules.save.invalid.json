@@ -1,0 +1,54 @@
+{
+  "invalidBecause": "rule actions are highlight, hide and watch",
+  "path": [
+    "payload",
+    "action"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-15",
+    "type": "rules.save",
+    "payload": {
+      "id": "r-pyrex",
+      "name": "Pyrex under $40",
+      "enabled": true,
+      "action": "delete",
+      "tone": "green",
+      "all": [
+        {
+          "kind": "keyword",
+          "mode": "any",
+          "terms": [
+            "pyrex",
+            "fire-king"
+          ],
+          "wholeWord": true,
+          "regex": false,
+          "fields": [
+            "title"
+          ]
+        },
+        {
+          "kind": "price",
+          "max": 4000
+        }
+      ],
+      "any": [
+        {
+          "kind": "pickupOnly",
+          "value": false
+        },
+        {
+          "kind": "location",
+          "mode": "include",
+          "states": [
+            "OH",
+            "PA"
+          ]
+        }
+      ],
+      "createdAt": 1790795200000,
+      "updatedAt": 1791313600000
+    }
+  }
+}

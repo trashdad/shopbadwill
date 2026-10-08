@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "on is a boolean",
+  "path": [
+    "payload",
+    "on"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-36",
+    "type": "kill.set",
+    "payload": {
+      "on": "true"
+    }
+  }
+}

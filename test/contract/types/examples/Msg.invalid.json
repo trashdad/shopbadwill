@@ -1,0 +1,13 @@
+{
+  "invalidBecause": "item ids are numbers",
+  "path": [
+    "payload",
+    "itemId"
+  ],
+  "value": {
+    "type": "quick.track",
+    "payload": {
+      "itemId": "279250057"
+    }
+  }
+}

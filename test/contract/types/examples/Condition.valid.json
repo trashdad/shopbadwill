@@ -1,0 +1,13 @@
+{
+  "kind": "keyword",
+  "mode": "any",
+  "terms": [
+    "pyrex",
+    "fire-king"
+  ],
+  "wholeWord": true,
+  "regex": false,
+  "fields": [
+    "title"
+  ]
+}

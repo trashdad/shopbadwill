@@ -1,0 +1,13 @@
+{
+  "invalidBecause": "typoMultiplier is fixed at 3",
+  "path": [
+    "typoMultiplier"
+  ],
+  "value": {
+    "perItemMax": 5000,
+    "perDayMax": 10000,
+    "openExposureMax": 20000,
+    "typoMultiplier": 2,
+    "typoAbsolute": 2500
+  }
+}

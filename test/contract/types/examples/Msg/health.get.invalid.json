@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "every message carries a reqId",
+  "path": [
+    "reqId"
+  ],
+  "value": {
+    "v": 1,
+    "type": "health.get"
+  }
+}

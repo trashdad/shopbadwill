@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "a cached quote is a cent amount",
+  "path": [
+    "cents"
+  ],
+  "value": {
+    "cents": null,
+    "expiresAt": 1791486400000
+  }
+}

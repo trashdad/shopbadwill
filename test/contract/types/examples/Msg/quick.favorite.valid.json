@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-10",
+  "type": "quick.favorite",
+  "payload": {
+    "itemId": 279250057
+  }
+}

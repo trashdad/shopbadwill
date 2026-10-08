@@ -1,0 +1,11 @@
+{
+  "invalidBecause": "this build reads storage schema version 1",
+  "path": [
+    "schemaVersion"
+  ],
+  "value": {
+    "schemaVersion": 2,
+    "installedAt": 1791400000000,
+    "lastMigrationAt": 1791400000000
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "invalidBecause": "tokens come from the tap or webRequest",
+  "path": [
+    "source"
+  ],
+  "value": {
+    "bearer": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTE0NDAwMDAsInN1YiI6ImJ1eWVyLTAwMDEifQ.ZXhhbXBsZS1zaWduYXR1cmU",
+    "capturedAt": 1791400000000,
+    "expiresAt": 1791440000000,
+    "buyerId": "buyer-0001",
+    "source": "cookie",
+    "refreshToken": "example-refresh-token"
+  }
+}
