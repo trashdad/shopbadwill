@@ -3,9 +3,10 @@
 // zone America/Los_Angeles through Intl.DateTimeFormat, never with the built-in
 // string parser (ESLint bans it). No dependencies.
 
+import { formatter, wallParts, zonedWallToInstant } from './zoned';
+
 const PACIFIC = 'America/Los_Angeles';
 const NAIVE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/;
-const HOUR_MS = 3_600_000;
 
 export interface PacificParse {
   /** Epoch milliseconds of the resolved instant. */
@@ -14,62 +15,6 @@ export interface PacificParse {
   ambiguous: boolean;
   /** The wall time never happens (spring forward); resolved with the pre-transition offset. */
   nonexistent: boolean;
-}
-
-interface Wall {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-}
-
-const formatters = new Map<string, Intl.DateTimeFormat>();
-function formatter(timeZone: string, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
-  const key = `${timeZone}|${JSON.stringify(options)}`;
-  let f = formatters.get(key);
-  if (f === undefined) {
-    f = new Intl.DateTimeFormat('en-US', { timeZone, ...options });
-    formatters.set(key, f);
-  }
-  return f;
-}
-
-function wallParts(ms: number, timeZone: string): Wall {
-  const parts = formatter(timeZone, {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(ms);
-  const get = (type: Intl.DateTimeFormatPartTypes): number => {
-    const p = parts.find((x) => x.type === type);
-    return p === undefined ? Number.NaN : Number(p.value);
-  };
-  return {
-    year: get('year'),
-    month: get('month'),
-    day: get('day'),
-    hour: get('hour'),
-    minute: get('minute'),
-    second: get('second'),
-  };
-}
-
-/** Wall clock of `ms` in `timeZone`, expressed as if it were UTC (whole seconds). */
-function wallAsUtc(ms: number, timeZone: string): number {
-  const w = wallParts(ms, timeZone);
-  return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second);
-}
-
-/** UTC offset (ms, east positive) of `timeZone` at instant `ms`. */
-function offsetAt(ms: number, timeZone: string): number {
-  const whole = Math.floor(ms / 1000) * 1000;
-  return wallAsUtc(whole, timeZone) - whole;
 }
 
 function bad(raw: string): RangeError {
@@ -107,20 +52,8 @@ export function parsePacificDetailed(raw: string): PacificParse {
     throw bad(raw);
   }
 
-  // Offsets in force a day either side of the wall time bracket any single transition.
-  const before = offsetAt(asUtc - 24 * HOUR_MS, PACIFIC);
-  const after = offsetAt(asUtc + 24 * HOUR_MS, PACIFIC);
-  const candidates = [...new Set([before, after])]
-    .map((off) => asUtc - off)
-    .filter((instant) => wallAsUtc(instant, PACIFIC) === asUtc)
-    .sort((a, b) => a - b);
-
-  const first = candidates[0];
-  if (first === undefined) {
-    // Spring-forward gap: reuse the pre-transition offset (02:30 PST -> 03:30 PDT).
-    return { ms: asUtc - before + millis, ambiguous: false, nonexistent: true };
-  }
-  return { ms: first + millis, ambiguous: candidates.length > 1, nonexistent: false };
+  const r = zonedWallToInstant(asUtc, PACIFIC);
+  return { ms: r.ms + millis, ambiguous: r.ambiguous, nonexistent: r.nonexistent };
 }
 
 /** Epoch milliseconds for SGW naive Pacific time. See `parsePacificDetailed`. */

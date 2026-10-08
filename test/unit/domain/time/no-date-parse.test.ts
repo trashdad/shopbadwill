@@ -26,9 +26,10 @@ describe('Date.parse is banned in the time module', () => {
     expect(code).not.toMatch(/Date\s*\.\s*parse/);
   }, 60_000);
 
-  it('uses the America/Los_Angeles zone and has no imports', () => {
+  it('uses the America/Los_Angeles zone and has no third-party imports', () => {
     const src = readFileSync(MODULE, 'utf8');
     expect(src).toContain('America/Los_Angeles');
-    expect(src).not.toMatch(/^import\s/m);
+    // Sibling modules (./zoned) are fine; packages are not.
+    expect(src).not.toMatch(/^import\s[^;]*from\s+'(?!\.\/)/m);
   });
 });

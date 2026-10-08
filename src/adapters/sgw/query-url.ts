@@ -5,12 +5,15 @@
 // URL order, so a round trip never loses what the user searched for.
 import { formatCents, parseCents } from '../../domain/money';
 import type { Cents, SearchQuery } from '../../domain/types';
-import { SGW_ORIGIN, SGW_SEARCH_URL_PARAMS } from './config';
+import { SGW_ORIGIN, SGW_PAGE_PATTERNS, SGW_SEARCH_URL_PARAMS } from './config';
 
 type UrlParam = keyof typeof SGW_SEARCH_URL_PARAMS;
 
-const SEARCH_PATH = '/categories/listing';
-const HOSTS = new Set(['shopgoodwill.com', 'www.shopgoodwill.com']);
+// Path and host come from config.ts (SGW_PAGE_PATTERNS.search is '^/categories/listing$').
+const SEARCH_PATTERN = new RegExp(SGW_PAGE_PATTERNS.search);
+const SEARCH_PATH = SGW_PAGE_PATTERNS.search.replace(/^\^/, '').replace(/\$$/, '');
+const SGW_HOST = new URL(SGW_ORIGIN).hostname;
+const HOSTS = new Set([SGW_HOST, `www.${SGW_HOST}`]);
 
 /** Parameters mapped to SearchQuery fields, in the order they are emitted. */
 const NAMED: readonly UrlParam[] = ['st', 'c', 's', 'lp', 'hp', 'spo', 'snpo', 'socs', 'sd', 'sca', 'col', 'p', 'desc', 'layout'];
@@ -46,9 +49,22 @@ function priceText(cents: Cents): string {
   return t.endsWith('.00') ? t.slice(0, -3) : t.endsWith('0') ? t.slice(0, -1) : t;
 }
 
+/** Keys of `q.extra` that are also named params: their URL value did not parse (`lp=cheap`, `c=abc`). */
+export function invalidSearchParams(q: SearchQuery): string[] {
+  const named = new Set<string>(NAMED);
+  return Object.keys(q.extra ?? {}).filter((k) => named.has(k));
+}
+
 /**
  * Parses a shopgoodwill.com search page URL. Returns null for anything that is
  * not one (bad URL, other host, other path).
+ *
+ * WARNING for body builders (T-26): `extra` is preserved for the URL round trip
+ * only. NEVER forward an `extra` key that is also a named param (see
+ * `invalidSearchParams`): its value failed to parse and would, for example, make
+ * buyerapi answer 400 (non-numeric price) or silently drop a filter.
+ * A repeated unmapped key keeps only its last value (`extra` is string-valued).
+ * `extra` has a null prototype so a `__proto__` param stays a plain entry.
  */
 export function searchQueryFromUrl(url: string): SearchQuery | null {
   let u: URL;
@@ -58,10 +74,10 @@ export function searchQueryFromUrl(url: string): SearchQuery | null {
     return null;
   }
   if (!HOSTS.has(u.hostname.toLowerCase())) return null;
-  if (u.pathname.replace(/\/+$/, '') !== SEARCH_PATH) return null;
+  if (!SEARCH_PATTERN.test(u.pathname.replace(/\/+$/, ''))) return null;
 
   const q: SearchQuery = { searchText: '', categoryIds: [], sellerIds: [], page: 1 };
-  const extra: Record<string, string> = {};
+  const extra: Record<string, string> = Object.create(null) as Record<string, string>;
   const named = new Set<string>(NAMED);
 
   for (const [key, value] of u.searchParams) {

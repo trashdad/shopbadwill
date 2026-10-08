@@ -1,7 +1,7 @@
 // T-50: SGW search URL <-> SearchQuery. Param names live only in the adapter (I-26).
 import { describe, expect, it } from 'vitest';
 
-import { searchQueryFromUrl, searchQueryToUrl } from '../../../../src/adapters/sgw/query-url';
+import { invalidSearchParams, searchQueryFromUrl, searchQueryToUrl } from '../../../../src/adapters/sgw/query-url';
 import { SearchQuerySchema, type SearchQuery } from '../../../../src/domain/types';
 
 // Built in the exact format of SGW's buildSearchQueryString (S-1 section 4, config.ts).
@@ -115,5 +115,37 @@ describe('searchQueryToUrl', () => {
     const p = new URL(url).searchParams;
     expect(p.getAll('p')).toEqual(['2']);
     expect(p.get('zzz')).toBe('1');
+  });
+});
+
+describe('invalidSearchParams', () => {
+  it('lists extra keys that are also named params (unparseable values)', () => {
+    const q = parse('https://shopgoodwill.com/categories/listing?c=abc&lp=cheap&zzz=1&ps=40');
+    expect(invalidSearchParams(q)).toEqual(['c', 'lp']);
+  });
+
+  it('is empty for a clean query and when extra is absent', () => {
+    expect(invalidSearchParams(parse(OBSERVED_URL))).toEqual([]);
+    expect(invalidSearchParams({ searchText: '', categoryIds: [], sellerIds: [], page: 1 })).toEqual([]);
+  });
+});
+
+describe('edge cases', () => {
+  it('round-trips special characters in st', () => {
+    const text = 'c++ & caf\u00e9 100%';
+    const url = searchQueryToUrl({ searchText: text, categoryIds: [], sellerIds: [], page: 1 });
+    expect(parse(url).searchText).toBe(text);
+    expect(url).toContain('st=c%2B%2B%20%26%20caf%C3%A9%20100%25');
+  });
+
+  it('keeps a __proto__ param as an own extra entry without touching the prototype', () => {
+    const q = parse('https://shopgoodwill.com/categories/listing?__proto__=x&a=1');
+    expect(Object.keys(q.extra ?? {})).toEqual(['__proto__', 'a']);
+    expect(Object.getPrototypeOf(q.extra)).toBeNull();
+    expect(searchQueryToUrl(q)).toContain('__proto__=x');
+  });
+
+  it('a repeated unmapped key keeps only the last value', () => {
+    expect(parse('https://shopgoodwill.com/categories/listing?z=1&z=2').extra).toEqual({ z: '2' });
   });
 });

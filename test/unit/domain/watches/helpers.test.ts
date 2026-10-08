@@ -55,6 +55,16 @@ describe('nextRunAtFor', () => {
     expect(iso(nextRunAtFor(s, utc(2026, 11, 1), NY))).toBe('2026-11-01T05:30:00.000Z');
   });
 
+  it('on the spring-forward day itself, 10:59:59Z is before the run and 11:00:00Z is at it', () => {
+    expect(iso(nextRunAtFor(settings, Date.UTC(2026, 2, 8, 10, 59, 59), NY))).toBe('2026-03-08T11:00:00.000Z');
+    expect(iso(nextRunAtFor(settings, Date.UTC(2026, 2, 8, 11, 0, 0), NY))).toBe('2026-03-09T11:00:00.000Z');
+  });
+
+  it('on the fall-back day itself, 11:59:59Z is before the run and 12:00:00Z is at it', () => {
+    expect(iso(nextRunAtFor(settings, Date.UTC(2026, 10, 1, 11, 59, 59), NY))).toBe('2026-11-01T12:00:00.000Z');
+    expect(iso(nextRunAtFor(settings, Date.UTC(2026, 10, 1, 12, 0, 0), NY))).toBe('2026-11-02T12:00:00.000Z');
+  });
+
   it('works for Pacific and for zones east of UTC', () => {
     expect(iso(nextRunAtFor(settings, utc(2026, 7, 15), 'America/Los_Angeles'))).toBe('2026-07-15T14:00:00.000Z');
     expect(iso(nextRunAtFor(settings, utc(2026, 7, 15), 'Europe/Berlin'))).toBe('2026-07-15T05:00:00.000Z');
@@ -73,6 +83,11 @@ describe('seen ring', () => {
   it('evicts the oldest beyond the cap', () => {
     expect(recordSeen([4, 3, 2, 1], [5], 4)).toEqual([5, 4, 3, 2]);
     expect(recordSeen([], [1, 2, 3, 4, 5], 3)).toEqual([1, 2, 3]);
+  });
+
+  it('a cap of zero or less keeps nothing', () => {
+    expect(recordSeen([1], [2], 0)).toEqual([]);
+    expect(recordSeen([1], [2], -1)).toEqual([]);
   });
 
   it('defaults to WATCH_SEEN_RING_SIZE', () => {
