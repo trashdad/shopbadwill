@@ -63,11 +63,15 @@ export function allInToBid(allIn: Cents, shipping?: Cents | null, handling?: Cen
 /**
  * Typo guard (the only implementation; T-82 reuses it). True when `max` is
  * strictly above `multiplier` x `current`, or strictly above the `absolute`
- * threshold. With no bids yet (current 0) only the absolute threshold applies.
+ * threshold. Throws RangeError on a bad multiplier (NaN, infinite, <= 0) or
+ * absolute rather than silently disabling the guard. With no bids yet (current 0) only the absolute threshold applies.
  */
 export function exceedsTypo(max: Cents, current: Cents, multiplier: number, absolute: Cents): boolean {
   assertCents(max, 'max');
   assertCents(current, 'current');
   assertCents(absolute, 'absolute');
+  if (!Number.isFinite(multiplier) || multiplier <= 0) {
+    throw new RangeError(`multiplier must be a finite number > 0, got ${String(multiplier)}`);
+  }
   return max > absolute || (current > 0 && max > current * multiplier);
 }

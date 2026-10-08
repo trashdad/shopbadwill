@@ -158,11 +158,19 @@ function zoneLabel(ms: number, timeZone: string): string {
 /**
  * Dual display, "7:18 PM PT · 10:18 PM ET". Labels are always the generic
  * "PT"/"ET" (I-09), never PDT/EDT. A user on Pacific time sees a single time.
+ * When the user's calendar date differs from Pacific's, " (+1 day)" / " (-1 day)" is appended.
  */
 export function formatDual(ms: number, userTz: string): string {
   const pt = `${clock(ms, PACIFIC)} ${zoneLabel(ms, PACIFIC)}`;
   if (userTz === PACIFIC) return pt;
-  return `${pt} · ${clock(ms, userTz)} ${zoneLabel(ms, userTz)}`;
+  const user = `${clock(ms, userTz)} ${zoneLabel(ms, userTz)}`;
+  const p = wallParts(ms, PACIFIC);
+  const u = wallParts(ms, userTz);
+  const dayDiff = Math.round(
+    (Date.UTC(u.year, u.month - 1, u.day) - Date.UTC(p.year, p.month - 1, p.day)) / 86_400_000,
+  );
+  const marker = dayDiff === 0 ? '' : ` (${dayDiff > 0 ? '+' : '-'}${String(Math.abs(dayDiff))} day${Math.abs(dayDiff) === 1 ? '' : 's'})`;
+  return `${pt} · ${user}${marker}`;
 }
 
 /** "in 2h 5m", "45s ago", "now" (within a second). Two most significant units. */

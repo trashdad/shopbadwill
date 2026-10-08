@@ -111,6 +111,29 @@ describe('formatDual', () => {
   it('labels other zones with their generic initials', () => {
     expect(formatDual(parsePacific('2026-10-07T19:18:30'), 'America/Chicago')).toBe('7:18 PM PT · 9:18 PM CT');
   });
+  describe('next-day marker', () => {
+    it('+1 day when the user date is later (9:30 PM PT -> 12:30 AM ET)', () => {
+      expect(formatDual(parsePacific('2026-10-07T21:30:00'), 'America/New_York')).toBe(
+        '9:30 PM PT · 12:30 AM ET (+1 day)',
+      );
+    });
+    it('no marker on the same date', () => {
+      expect(formatDual(parsePacific('2026-10-07T12:00:00'), 'America/New_York')).toBe('12:00 PM PT · 3:00 PM ET');
+    });
+    it('-1 day when the user date is earlier (Pacific/Honolulu)', () => {
+      expect(formatDual(parsePacific('2026-10-07T01:30:00'), 'Pacific/Honolulu')).toBe(
+        '1:30 AM PT · 10:30 PM HST (-1 day)',
+      );
+    });
+    it('crosses a month/year boundary (Dec 31 PT -> Jan 1 ET)', () => {
+      expect(formatDual(parsePacific('2026-12-31T21:30:00'), 'America/New_York')).toBe(
+        '9:30 PM PT · 12:30 AM ET (+1 day)',
+      );
+    });
+    it('Pacific user collapse has no marker', () => {
+      expect(formatDual(parsePacific('2026-10-07T23:59:00'), 'America/Los_Angeles')).toBe('11:59 PM PT');
+    });
+  });
   it('midnight and noon use 12', () => {
     expect(formatDual(parsePacific('2026-10-07T00:05:00'), 'America/New_York')).toBe('12:05 AM PT · 3:05 AM ET');
   });

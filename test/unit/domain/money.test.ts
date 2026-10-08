@@ -158,6 +158,12 @@ describe('exceedsTypo(max, current, multiplier, absolute)', () => {
     expect(exceedsTypo(2000, 0, 3, abs)).toBe(false);
     expect(exceedsTypo(2501, 0, 3, abs)).toBe(true);
   });
+  it.each([Number.NaN, 0, -3, Number.POSITIVE_INFINITY])('throws on bad multiplier %d instead of disabling the guard', (m) => {
+    expect(() => exceedsTypo(100, 100, m, abs)).toThrow(RangeError);
+  });
+  it.each([Number.NaN, -1, Number.POSITIVE_INFINITY, 1.5])('throws on bad absolute %d', (a) => {
+    expect(() => exceedsTypo(100, 100, 3, a)).toThrow(RangeError);
+  });
   it('is monotone in max (property)', () => {
     fc.assert(
       fc.property(
