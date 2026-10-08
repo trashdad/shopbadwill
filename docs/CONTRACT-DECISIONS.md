@@ -314,3 +314,9 @@ The frozen `JobRun` had no field for any of this. `Repo.set` parses before writi
   - the property test asserts `JobRunSchema.parse(run)` equals `run` for every finished run.
 
 **Follow-up for the next PLAN edit.** Add `candidates?` to PLAN §3.6 `JobRun` and to contracts.md.
+
+## T-53 contract change: FavoritesReconciler.desired takes the favorites list
+
+`desired(tracked, watches, now, favorites)` gains a required fourth parameter, `favorites: readonly Favorite[]` (the `sbw:favoritesCache` items). Without it the "not in favoritesCache" rule in PLAN §3.7 cannot be evaluated by a pure function. `test/contract/types/spec-shapes.test.ts` asserts the new signature.
+
+**Follow-up for the next PLAN edit.** Add the parameter to PLAN §3.7 and contracts.md.

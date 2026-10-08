@@ -585,6 +585,7 @@ describe('§3 shapes (type level)', () => {
         tracked: SpecTrackedItem[],
         watches: SpecWatch[],
         now: EpochMs,
+        favorites: readonly SpecFavorite[],
       ) => Array<{ itemId: ItemId; action: 'add' | 'none'; reason: string }>
     >();
   });

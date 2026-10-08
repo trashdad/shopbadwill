@@ -18,6 +18,7 @@ import {
   ListingSchema,
   SearchQuerySchema,
   type EpochMs,
+  type Favorite,
   type ItemId,
   type TrackedItem,
 } from '../types';
@@ -143,11 +144,13 @@ export interface Scheduler {
 export interface FavoritesReconciler {
   /**
    * Idempotent: 'add' only when favoriteState is 'none' or 'failed' AND the
-   * item is not in favoritesCache AND the watch mode permits it now.
+   * item is not in `favorites` (the favoritesCache list) AND the watch mode
+   * permits it now.
    */
   desired(
     tracked: TrackedItem[],
     watches: Watch[],
     now: EpochMs,
+    favorites: readonly Favorite[],
   ): Array<{ itemId: ItemId; action: 'add' | 'none'; reason: string }>;
 }
