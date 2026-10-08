@@ -262,3 +262,15 @@ It could keep calling SGW after SGW had asked it to stop. The user's "considerat
 - `test/contract/types/spec-shapes.test.ts`: `SpecSchedulerStats` gains `paused?`.
 
 **Follow-up for the next PLAN edit.** Add `sbw:requestSchedulerState` to PLAN §2.3's table, and `paused?` to §3.4's `stats()` return type.
+
+## Contract change: Listing.pickupOnly optional (T-24)
+
+`Listing.pickupOnly` becomes `boolean | undefined` (`src/domain/types.ts`); undefined means unknown. `ItemDetail` still requires it (its schema overrides the field).
+
+**Why.** SGW search rows carry no pickup flag, so the adapter had to invent `false`. The rules matcher then showed items that a "hide pickup-only" rule should hide, and matched `pickupOnly: false` conditions it could not know, which can lead to SGW favorite writes.
+
+**Changes.**
+- `matcher.ts`: the `pickupOnly` condition returns UNKNOWN when `listing.pickupOnly` is undefined (same pattern as `location`).
+- `normalizeSearch` sets `pickupOnly` from the query filter only: `pickupOnly: true` gives true, `excludePickupOnly: true` gives false, neither leaves it unset.
+- `test/contract/types/spec-shapes.test.ts`: `SpecListing.pickupOnly` is optional, `SpecItemDetail` requires it.
+- Tests: two matcher cases (unknown for both condition values); `test/fakes/ports/fake-shared.test.ts` detail builder now sets `pickupOnly` explicitly.

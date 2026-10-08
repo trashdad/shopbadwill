@@ -139,15 +139,15 @@ export const ItemDetailResponseSchema = z.looseObject({
   currentPrice: Dollars,
   /** The NEXT acceptable bid. */
   minimumBid: Dollars,
-  startingPrice: Dollars.optional(),
+  startingPrice: Dollars,
   bidIncrement: Dollars,
   numberOfBids: Id.nonnegative(),
   endTime: Pacific,
   serverTime: Pacific,
   sellerId: Id,
   sellerCompanyName: z.string().nullable().optional(),
-  /** The seller's state ("IL"); Listing.sellerState. */
-  pickupState: z.string().nullable().optional(),
+  /** The seller's state ("IL"); Listing.sellerState. The key is required, the value may be null. */
+  pickupState: z.string().nullable(),
   pickupOnly: z.boolean(),
   categoryId: Id.optional(),
   /** "427|Travel/Luggage|428|Suitcases" */
@@ -255,7 +255,7 @@ export type ShowBidModalResponse = z.infer<typeof ShowBidModalResponseSchema>;
 
 // provisional: evidence=bundle
 // MONEY. Never captured. `status` and `result` are SGW's own codes
-// (BidResult.rawStatus / rawResult; -3 = closed is the one verified code);
+// (BidResult.rawStatus / rawResult). PLAN lists -3 = closed as a placeholder, not a verified code;
 // `message` is HTML. T-100 maps these to BidResult.kind. Both `status` shapes
 // are accepted because the real type is unknown.
 export const PlaceBidResponseSchema = z.looseObject({
@@ -264,6 +264,14 @@ export const PlaceBidResponseSchema = z.looseObject({
   message: z.string().nullable().optional(),
   isHighBidder: z.boolean().nullable().optional(),
   isUnauthorized: z.boolean().optional(),
+  /** If the reply is enveloped, `result` and `isHighBidder` live here. */
+  data: z
+    .looseObject({
+      result: z.number().int().nullable().optional(),
+      isHighBidder: z.boolean().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
 });
 export type PlaceBidResponse = z.infer<typeof PlaceBidResponseSchema>;
 

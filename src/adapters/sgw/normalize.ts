@@ -7,10 +7,17 @@
 //  - HTML (`message`) -> plain text
 // Each function takes the RAW response, validates it (SgwApiError 'schema' with
 // the failing path) and then maps it.
-import { parseCents } from '../../domain/money';
-import { parsePacific } from '../../domain/time/pacific';
-import type { Cents, EpochMs, Favorite, ItemDetail, ItemId, Listing, SearchQuery } from '../../domain/types';
-import { SgwApiError } from '../../ports/errors';
+import { parseCents } from "../../domain/money";
+import { parsePacific, parsePacificDetailed } from "../../domain/time/pacific";
+import type {
+  Cents,
+  EpochMs,
+  Favorite,
+  ItemDetail,
+  Listing,
+  SearchQuery,
+} from "../../domain/types";
+import { SgwApiError } from "../../ports/errors";
 import {
   CurrentTimeResponseSchema,
   FavoritesResponseSchema,
@@ -18,18 +25,24 @@ import {
   PlaceBidResponseSchema,
   SavedSearchesResponseSchema,
   SearchResponseSchema,
+  SearchRowSchema,
+  SgwEnvelopeHeadSchema,
   SellerInfoResponseSchema,
   ShippingQuoteResponseSchema,
   ShowBidModalResponseSchema,
   parseSgw,
-} from './schemas';
+} from "./schemas";
 
 // ── Scalars ─────────────────────────────────────────────────────────────────
 
 /** 67.01 -> 6701. Goes through the two-decimal string so no float error survives. */
-export function dollarsToCents(dollars: number, label = 'amount'): Cents {
+export function dollarsToCents(dollars: number, label = "amount"): Cents {
   const cents = parseCents(dollars.toFixed(2));
-  if (cents === null) throw new SgwApiError('schema', `${label}: not a money amount: ${String(dollars)}`);
+  if (cents === null)
+    throw new SgwApiError(
+      "schema",
+      `${label}: not a money amount: ${String(dollars)}`,
+    );
   return cents;
 }
 
@@ -37,47 +50,86 @@ function pacificToMs(raw: string, label: string): number {
   try {
     return parsePacific(raw);
   } catch (e) {
-    throw new SgwApiError('schema', `${label}: not a Pacific time: ${raw}`, { cause: e });
+    throw new SgwApiError("schema", `${label}: not a Pacific time: ${raw}`, {
+      cause: e,
+    });
   }
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
 const NAMED_ENTITIES: Record<string, string> = {
-  amp: '&',
-  lt: '<',
-  gt: '>',
+  amp: "&",
+  lt: "<",
+  gt: ">",
   quot: '"',
   apos: "'",
-  nbsp: ' ',
+  nbsp: " ",
+  rsquo: "’",
+  lsquo: "‘",
+  rdquo: "”",
+  ldquo: "“",
+  sbquo: "‚",
+  bdquo: "„",
+  copy: "©",
+  reg: "®",
+  trade: "™",
+  hellip: "…",
+  mdash: "—",
+  ndash: "–",
+  bull: "•",
+  middot: "·",
+  deg: "°",
+  cent: "¢",
+  pound: "£",
+  euro: "€",
+  frac12: "½",
+  frac14: "¼",
+  frac34: "¾",
+  times: "×",
+  eacute: "é",
 };
 
 function decodeEntities(s: string): string {
-  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body: string) => {
-    if (body.startsWith('#')) {
-      const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
-      return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
-    }
-    return NAMED_ENTITIES[body.toLowerCase()] ?? whole;
-  });
+  return s.replace(
+    /&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi,
+    (whole, body: string) => {
+      if (body.startsWith("#")) {
+        const code =
+          body[1] === "x" || body[1] === "X"
+            ? parseInt(body.slice(2), 16)
+            : parseInt(body.slice(1), 10);
+        return Number.isInteger(code) && code > 0 && code <= 0x10ffff
+          ? String.fromCodePoint(code)
+          : whole;
+      }
+      return (
+        NAMED_ENTITIES[body] ?? NAMED_ENTITIES[body.toLowerCase()] ?? whole
+      );
+    },
+  );
 }
 
 /**
  * HTML -> plain text, for SGW's `message` fields. Block tags become line
- * breaks, other tags vanish, entities are decoded, whitespace is collapsed.
- * Tags are removed before entities are decoded, so `&lt;b&gt;` stays the
- * literal text "<b>". The result is for text rendering only, never innerHTML.
+ * breaks, real tags (`<` followed by a letter, `/` or `!`) vanish, entities are
+ * decoded, whitespace is collapsed. A bare `<` or `>` in prose is kept. An
+ * unclosed `<script>`/`<style>` drops everything after it. Tags are removed
+ * before entities are decoded, so `&lt;b&gt;` stays the literal text "<b>".
+ * The result is for text rendering only, never innerHTML.
  */
 export function htmlToText(html: string): string {
   const noBlocks = html
-    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<br\b[^>]*>|<\/(p|div|li|tr|h[1-6]|ul|ol|table)\s*>/gi, '\n');
-  const text = decodeEntities(noBlocks.replace(/<[^>]*>/g, ''));
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<(script|style)\b[\s\S]*$/i, " ")
+    .replace(/<!--[\s\S]*?(-->|$)/g, "")
+    .replace(/<br\b[^>]*>|<\/(p|div|li|tr|h[1-6]|ul|ol|table)\s*>/gi, "\n");
+  const text = decodeEntities(noBlocks.replace(/<[a-zA-Z/!][^>]*>/g, ""));
   return text
-    .split('\n')
-    .map((line) => line.replace(/\s+/g, ' ').trim())
-    .filter((line) => line !== '')
-    .join('\n');
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line !== "")
+    .join("\n");
 }
 
 // ── Context ─────────────────────────────────────────────────────────────────
@@ -92,16 +144,52 @@ export interface NormalizeContext {
   authenticated: boolean;
 }
 
+/** The part of the request that decides what a search row implies. */
+export interface SearchNormalizeContext extends NormalizeContext {
+  query: Pick<SearchQuery, "page" | "pickupOnly" | "excludePickupOnly">;
+}
+
+/**
+ * Shared first step for enveloped replies (`{status, message, isUnauthorized,
+ * data}`): `isUnauthorized` is an `auth` error and `status: false` a `server`
+ * error, BEFORE `data` is looked at, so a failure is never read as an empty
+ * list or reported as a schema error. Replies of unconfirmed wrapping
+ * (`flat: true`) are only unwrapped when they look enveloped.
+ */
+function checkEnvelope(raw: unknown, label: string, flat = false): void {
+  if (flat) {
+    const looksEnveloped =
+      typeof raw === "object" &&
+      raw !== null &&
+      "status" in raw &&
+      ("data" in raw || "isUnauthorized" in raw);
+    if (!looksEnveloped) return;
+  }
+  const head = parseSgw(SgwEnvelopeHeadSchema, raw, label);
+  if (head.isUnauthorized === true)
+    throw new SgwApiError("auth", `${label}: SGW says unauthorized`);
+  if (!head.status)
+    throw new SgwApiError(
+      "server",
+      `${label}: status false${head.message ? `: ${head.message}` : ""}`,
+    );
+}
+
 // ── Search ──────────────────────────────────────────────────────────────────
 
 /**
  * Search rows carry no seller name, state or pickup flag: `sellerState` stays
- * unset and `pickupOnly` is false until ItemDetail / GetSellerInfo says
- * otherwise. `shippingPrice` 0 means "calculated" (the site shows 0 for nearly
+ * unset, and `pickupOnly` is only known from the query's own filter
+ * (`pickupOnly: true` -> true, `excludePickupOnly: true` -> false), else left
+ * unset (unknown) until ItemDetail says otherwise. `shippingPrice` 0 means "calculated" (the site shows 0 for nearly
  * every row), so it maps to null; 0.01 is a real one-cent price.
  */
-export function normalizeSearchRow(row: unknown, ctx: NormalizeContext, label = 'search.row'): Listing {
-  const r = parseSgw(SearchResponseSchema.shape.searchResults.shape.items.element, row, label);
+export function normalizeSearchRow(
+  row: unknown,
+  ctx: SearchNormalizeContext,
+  label = "search.row",
+): Listing {
+  const r = parseSgw(SearchRowSchema, row, label);
   const endTimeMs = pacificToMs(r.endTime, `${label}.endTime`);
   const listing: Listing = {
     itemId: r.itemId,
@@ -112,21 +200,30 @@ export function normalizeSearchRow(row: unknown, ctx: NormalizeContext, label = 
     endTime: iso(endTimeMs),
     endTimeRaw: r.endTime,
     sellerId: r.sellerId,
-    pickupOnly: false,
-    source: 'api',
+    source: "api",
     observedAt: ctx.observedAt,
   };
+  if (ctx.query.pickupOnly === true) listing.pickupOnly = true;
+  else if (ctx.query.excludePickupOnly === true) listing.pickupOnly = false;
   if (r.categoryId !== undefined) listing.categoryId = r.categoryId;
   if (r.catFullName) listing.categoryPath = r.catFullName;
   if (r.shippingPrice !== undefined) {
-    listing.shippingPrice = r.shippingPrice === null || r.shippingPrice === 0 ? null : dollarsToCents(r.shippingPrice);
+    listing.shippingPrice =
+      r.shippingPrice === null || r.shippingPrice === 0
+        ? null
+        : dollarsToCents(r.shippingPrice);
   }
   if (r.buyNowPrice !== undefined) {
-    listing.buyNowPrice = r.buyNowPrice === null || r.buyNowPrice === 0 ? null : dollarsToCents(r.buyNowPrice);
+    listing.buyNowPrice =
+      r.buyNowPrice === null || r.buyNowPrice === 0
+        ? null
+        : dollarsToCents(r.buyNowPrice);
   }
   if (r.imageURL) listing.imageUrl = r.imageURL;
-  if (ctx.authenticated && r.isFavorite !== undefined) listing.isFavorite = r.isFavorite;
-  if (r.relistId !== undefined) listing.relistId = r.relistId === 0 ? null : r.relistId;
+  if (ctx.authenticated && r.isFavorite !== undefined)
+    listing.isFavorite = r.isFavorite;
+  if (r.relistId !== undefined)
+    listing.relistId = r.relistId === 0 ? null : r.relistId;
   return listing;
 }
 
@@ -136,17 +233,25 @@ export interface NormalizedSearch {
   page: number;
 }
 
-/** `page` is the request's page (the response does not echo it). */
-export function normalizeSearch(raw: unknown, page: number, ctx: NormalizeContext): NormalizedSearch {
-  const r = parseSgw(SearchResponseSchema, raw, 'search');
+/** `ctx.query.page` is echoed back (the response does not carry it). */
+export function normalizeSearch(
+  raw: unknown,
+  ctx: SearchNormalizeContext,
+): NormalizedSearch {
+  const r = parseSgw(SearchResponseSchema, raw, "search");
   if (r.categoryListModel === null) {
     // A 200 with a null categoryListModel marks a server-side error, not an empty result.
-    throw new SgwApiError('server', 'search: categoryListModel is null (server-side error)');
+    throw new SgwApiError(
+      "server",
+      "search: categoryListModel is null (server-side error)",
+    );
   }
   return {
-    items: r.searchResults.items.map((row, i) => normalizeSearchRow(row, ctx, `search.searchResults.items[${String(i)}]`)),
+    items: r.searchResults.items.map((row, i) =>
+      normalizeSearchRow(row, ctx, `search.searchResults.items[${String(i)}]`),
+    ),
     total: r.searchResults.itemCount,
-    page,
+    page: ctx.query.page,
   };
 }
 
@@ -154,37 +259,77 @@ export function normalizeSearch(raw: unknown, page: number, ctx: NormalizeContex
 
 /** "427|Travel/Luggage|428|Suitcases" -> "Travel/Luggage > Suitcases" (id|name pairs). */
 function categoryPathOf(list: string): string | undefined {
-  const parts = list.split('|');
-  const names = parts.filter((_, i) => i % 2 === 1).filter((n) => n !== '');
-  return names.length > 0 ? names.join(' > ') : undefined;
+  const parts = list.split("|");
+  const names = parts.filter((_, i) => i % 2 === 1).filter((n) => n !== "");
+  return names.length > 0 ? names.join(" > ") : undefined;
 }
 
 /** imageServer + the first `;`-separated path of imageUrlString (backslash separators). */
-function imageUrlOf(server: string | null | undefined, paths: string | null | undefined): string | undefined {
-  const first = paths?.split(';').find((p) => p.trim() !== '');
+function imageUrlOf(
+  server: string | null | undefined,
+  paths: string | null | undefined,
+): string | undefined {
+  const first = paths?.split(";").find((p) => p.trim() !== "");
   if (first === undefined) return undefined;
-  const rel = first.trim().replaceAll('\\', '/').replace(/^\/+/, '');
+  const rel = first.trim().replaceAll("\\", "/").replace(/^\/+/, "");
   if (/^https?:\/\//i.test(rel)) return rel;
   if (!server) return undefined;
-  return `${server.endsWith('/') ? server : `${server}/`}${rel}`;
+  return `${server.endsWith("/") ? server : `${server}/`}${rel}`;
 }
 
 const UsStateRe = /^[A-Z]{2}$/;
 
 /**
+ * ItemDetail `serverTime` has no offset. In the fall-back hour the wall time
+ * happens twice; `parsePacific` picks the earlier instant, so choose whichever
+ * of the two candidates is nearest `nearMs` (when we received the reply).
+ */
+function serverTimeMs(raw: string, nearMs: number): number {
+  let parsed;
+  try {
+    parsed = parsePacificDetailed(raw);
+  } catch (e) {
+    throw new SgwApiError(
+      "schema",
+      `itemDetail.serverTime: not a Pacific time: ${raw}`,
+      { cause: e },
+    );
+  }
+  if (!parsed.ambiguous) return parsed.ms;
+  const later = parsed.ms + 3_600_000;
+  return Math.abs(later - nearMs) < Math.abs(parsed.ms - nearMs)
+    ? later
+    : parsed.ms;
+}
+
+/**
  * `bidHistory` is the per-bid log (`bidHistory.bidComplete`), retracted bids
- * dropped, newest first. `minimumBid` is the NEXT acceptable bid.
+ * dropped, newest first. Its `bidAmount` is the bidder's OWN bid (their max);
+ * `itemPrice` (not read) is the resulting price. While the auction is open the
+ * leader's `bidAmount` is masked to the current price (the open fixture shows
+ * 67.01 where the closed one shows 71 for the same bid), so amounts are only
+ * exact once closed. `numBids > bidHistory.length` signals dropped (retracted)
+ * bids. `minimumBid` is the NEXT acceptable bid.
  * `pickupState` (the seller's state) becomes `sellerState`, the field the
  * rules engine's `location` condition reads. `shippingPrice` 0 with
  * `allowShippingCalculation` is "calculated" -> null.
  */
-export function normalizeItemDetail(raw: unknown, ctx: NormalizeContext): ItemDetail {
-  const d = parseSgw(ItemDetailResponseSchema, raw, 'itemDetail');
-  const endMs = pacificToMs(d.endTime, 'itemDetail.endTime');
-  const serverMs = pacificToMs(d.serverTime, 'itemDetail.serverTime');
+export function normalizeItemDetail(
+  raw: unknown,
+  ctx: NormalizeContext,
+): ItemDetail {
+  const d = parseSgw(ItemDetailResponseSchema, raw, "itemDetail");
+  const endMs = pacificToMs(d.endTime, "itemDetail.endTime");
+  const serverMs = serverTimeMs(d.serverTime, ctx.observedAt);
 
   const bidHistory = d.bidHistory.bidComplete
-    .map((b, i) => ({ b, ms: pacificToMs(b.bidTime, `itemDetail.bidHistory.bidComplete[${String(i)}].bidTime`) }))
+    .map((b, i) => ({
+      b,
+      ms: pacificToMs(
+        b.bidTime,
+        `itemDetail.bidHistory.bidComplete[${String(i)}].bidTime`,
+      ),
+    }))
     .filter(({ b }) => b.retracted !== true)
     .sort((x, y) => y.ms - x.ms)
     .map(({ b, ms }) => ({
@@ -197,17 +342,20 @@ export function normalizeItemDetail(raw: unknown, ctx: NormalizeContext): ItemDe
   const detail: ItemDetail = {
     itemId: d.itemId,
     title: d.title,
-    currentPrice: dollarsToCents(d.currentPrice, 'itemDetail.currentPrice'),
-    startingMinimumBid: dollarsToCents(d.startingPrice ?? d.currentPrice, 'itemDetail.startingPrice'),
+    currentPrice: dollarsToCents(d.currentPrice, "itemDetail.currentPrice"),
+    startingMinimumBid: dollarsToCents(
+      d.startingPrice,
+      "itemDetail.startingPrice",
+    ),
     numBids: d.numberOfBids,
     endTime: iso(endMs),
     endTimeRaw: d.endTime,
     sellerId: d.sellerId,
     pickupOnly: d.pickupOnly,
-    source: 'api',
+    source: "api",
     observedAt: ctx.observedAt,
-    minimumBid: dollarsToCents(d.minimumBid, 'itemDetail.minimumBid'),
-    bidIncrement: dollarsToCents(d.bidIncrement, 'itemDetail.bidIncrement'),
+    minimumBid: dollarsToCents(d.minimumBid, "itemDetail.minimumBid"),
+    bidIncrement: dollarsToCents(d.bidIncrement, "itemDetail.bidIncrement"),
     serverTime: iso(serverMs),
     serverTimeRaw: d.serverTime,
     isClosed: d.bidHistory.auctionClosed || d.isItemEndTimeExpire,
@@ -216,18 +364,25 @@ export function normalizeItemDetail(raw: unknown, ctx: NormalizeContext): ItemDe
     bidHistory,
   };
   if (d.sellerCompanyName) detail.sellerName = d.sellerCompanyName;
-  if (d.pickupState && UsStateRe.test(d.pickupState)) detail.sellerState = d.pickupState;
+  if (d.pickupState && UsStateRe.test(d.pickupState))
+    detail.sellerState = d.pickupState;
   if (d.categoryId !== undefined) detail.categoryId = d.categoryId;
   if (d.categoryParentList) {
     const path = categoryPathOf(d.categoryParentList);
     if (path !== undefined) detail.categoryPath = path;
   }
   detail.shippingPrice =
-    d.shippingPrice === null || (d.shippingPrice === 0 && d.allowShippingCalculation === true)
+    d.shippingPrice === null ||
+    (d.shippingPrice === 0 && d.allowShippingCalculation === true)
       ? null
-      : dollarsToCents(d.shippingPrice, 'itemDetail.shippingPrice');
-  if (d.handlingPrice !== undefined && d.handlingPrice !== null) detail.handlingPrice = dollarsToCents(d.handlingPrice);
-  if (d.buyNowPrice !== undefined) detail.buyNowPrice = d.buyNowPrice === null || d.buyNowPrice === 0 ? null : dollarsToCents(d.buyNowPrice);
+      : dollarsToCents(d.shippingPrice, "itemDetail.shippingPrice");
+  if (d.handlingPrice !== undefined && d.handlingPrice !== null)
+    detail.handlingPrice = dollarsToCents(d.handlingPrice);
+  if (d.buyNowPrice !== undefined)
+    detail.buyNowPrice =
+      d.buyNowPrice === null || d.buyNowPrice === 0
+        ? null
+        : dollarsToCents(d.buyNowPrice);
   const image = imageUrlOf(d.imageServer, d.imageUrlString);
   if (image !== undefined) detail.imageUrl = image;
   return detail;
@@ -237,17 +392,29 @@ export function normalizeItemDetail(raw: unknown, ctx: NormalizeContext): ItemDe
 
 /** "10/07/2026 20:09:15" (Pacific) -> epoch ms. 1 s resolution. */
 export function normalizeCurrentTime(raw: unknown): EpochMs {
-  const r = parseSgw(CurrentTimeResponseSchema, raw, 'currentTime');
+  checkEnvelope(raw, "currentTime");
+  const r = parseSgw(CurrentTimeResponseSchema, raw, "currentTime");
   const m = /^(\d{2})\/(\d{2})\/(\d{4}) (\d{2}:\d{2}:\d{2})$/.exec(r.data);
-  if (m === null) throw new SgwApiError('schema', `currentTime.data: unreadable: ${r.data}`);
-  return pacificToMs(`${m[3] ?? ''}-${m[1] ?? ''}-${m[2] ?? ''}T${m[4] ?? ''}`, 'currentTime.data');
+  if (m === null)
+    throw new SgwApiError("schema", `currentTime.data: unreadable: ${r.data}`);
+  return pacificToMs(
+    `${m[3] ?? ""}-${m[1] ?? ""}-${m[2] ?? ""}T${m[4] ?? ""}`,
+    "currentTime.data",
+  );
 }
 
 // ── Seller ──────────────────────────────────────────────────────────────────
 
-export function normalizeSellerInfo(raw: unknown): { sellerId: number; name: string; state?: string } {
-  const s = parseSgw(SellerInfoResponseSchema, raw, 'sellerInfo');
-  const out: { sellerId: number; name: string; state?: string } = { sellerId: s.sellerId, name: s.companyName };
+export function normalizeSellerInfo(raw: unknown): {
+  sellerId: number;
+  name: string;
+  state?: string;
+} {
+  const s = parseSgw(SellerInfoResponseSchema, raw, "sellerInfo");
+  const out: { sellerId: number; name: string; state?: string } = {
+    sellerId: s.sellerId,
+    name: s.companyName,
+  };
   if (s.state && UsStateRe.test(s.state)) out.state = s.state;
   return out;
 }
@@ -256,38 +423,47 @@ export function normalizeSellerInfo(raw: unknown): { sellerId: number; name: str
 
 /** `nowMs` decides open/closed per row: the response carries no status. */
 export function normalizeFavorites(raw: unknown, nowMs: EpochMs): Favorite[] {
-  const r = parseSgw(FavoritesResponseSchema, raw, 'favorites');
+  checkEnvelope(raw, "favorites");
+  const r = parseSgw(FavoritesResponseSchema, raw, "favorites");
   return r.data.map((f, i) => {
-    const endMs = pacificToMs(f.endTime, `favorites.data[${String(i)}].endTime`);
+    const endMs = pacificToMs(
+      f.endTime,
+      `favorites.data[${String(i)}].endTime`,
+    );
     return {
       itemId: f.itemId,
       watchlistId: f.watchlistId,
-      notes: f.notes ?? '',
+      notes: f.notes ?? "",
       endTime: iso(endMs),
       sellerId: f.sellerId,
-      status: endMs <= nowMs ? 'closed' : 'open',
+      status: endMs <= nowMs ? "closed" : "open",
     };
   });
 }
 
 function idList(csv: string | null | undefined): number[] {
-  return (csv ?? '')
-    .split(',')
+  return (csv ?? "")
+    .split(",")
     .map((s) => s.trim())
     .filter((s) => /^\d+$/.test(s))
     .map(Number);
 }
 
 function priceCents(v: string | number | null | undefined): Cents | undefined {
-  if (v === null || v === undefined || v === '') return undefined;
-  return typeof v === 'number' ? dollarsToCents(v) : (parseCents(v) ?? undefined);
+  if (v === null || v === undefined || v === "") return undefined;
+  return typeof v === "number"
+    ? dollarsToCents(v)
+    : (parseCents(v) ?? undefined);
 }
 
-export function normalizeSavedSearches(raw: unknown): Array<{ id: number; name: string; query: SearchQuery }> {
-  const r = parseSgw(SavedSearchesResponseSchema, raw, 'savedSearches');
+export function normalizeSavedSearches(
+  raw: unknown,
+): Array<{ id: number; name: string; query: SearchQuery }> {
+  checkEnvelope(raw, "savedSearches");
+  const r = parseSgw(SavedSearchesResponseSchema, raw, "savedSearches");
   return r.data.map((s) => {
     const query: SearchQuery = {
-      searchText: s.searchText ?? '',
+      searchText: s.searchText ?? "",
       categoryIds: idList(s.selectedCategoryIds),
       sellerIds: idList(s.selectedSellerIds),
       page: 1,
@@ -301,34 +477,58 @@ export function normalizeSavedSearches(raw: unknown): Array<{ id: number; name: 
 }
 
 /** `null` when SGW returned no quote (neither amount present). */
-export function normalizeShippingQuote(raw: unknown): { shipping: Cents; handling: Cents } | null {
-  const q = parseSgw(ShippingQuoteResponseSchema, raw, 'shippingQuote');
-  if (q.shippingPrice == null && q.handlingPrice == null) return null;
-  return { shipping: dollarsToCents(q.shippingPrice ?? 0), handling: dollarsToCents(q.handlingPrice ?? 0) };
+export function normalizeShippingQuote(
+  raw: unknown,
+): { shipping: Cents; handling: Cents } | null {
+  checkEnvelope(raw, "shippingQuote", true);
+  const q = parseSgw(ShippingQuoteResponseSchema, raw, "shippingQuote");
+  // No shipping amount means no quote, even if a handling fee is present.
+  if (q.shippingPrice == null) return null;
+  return {
+    shipping: dollarsToCents(q.shippingPrice),
+    handling: dollarsToCents(q.handlingPrice ?? 0),
+  };
 }
 
-export function normalizeShowBidModal(raw: unknown): { sellerId: number; minimumBid: Cents } {
-  const m = parseSgw(ShowBidModalResponseSchema, raw, 'showBidModal');
-  return { sellerId: m.sellerId, minimumBid: dollarsToCents(m.minimumBid, 'showBidModal.minimumBid') };
+export function normalizeShowBidModal(raw: unknown): {
+  sellerId: number;
+  minimumBid: Cents;
+} {
+  checkEnvelope(raw, "showBidModal", true);
+  const m = parseSgw(ShowBidModalResponseSchema, raw, "showBidModal");
+  return {
+    sellerId: m.sellerId,
+    minimumBid: dollarsToCents(m.minimumBid, "showBidModal.minimumBid"),
+  };
 }
 
 /**
- * The raw half of a BidResult: SGW's codes and the message as text. T-100 maps
- * these to `BidResult.kind`. `rawStatus` is null unless SGW sent a number.
+ * The raw half of a BidResult: SGW's own signals, with the message as text.
+ * T-100 maps these to `BidResult.kind`.
+ *
+ * `statusFlag` is the boolean `status` (null if SGW sent a number, which goes to
+ * `rawStatus`). `status: true` ALONE IS NEVER SUCCESS: SGW has answered
+ * rejections with HTTP 200. The outcome is decided only by an explicit success
+ * `result` code or a post-read of the item, never by `statusFlag`. `result` and
+ * `isHighBidder` are read from `data` when the reply is enveloped.
+ * `isUnauthorized` is reported, not thrown, so the caller can treat it as an
+ * auth outcome of the bid.
  */
 export function normalizePlaceBidRaw(raw: unknown): {
+  statusFlag: boolean | null;
   rawStatus: number | null;
   rawResult: number | null;
   messageText: string;
   isHighBidder: boolean | null;
+  isUnauthorized: boolean;
 } {
-  const p = parseSgw(PlaceBidResponseSchema, raw, 'placeBid');
+  const p = parseSgw(PlaceBidResponseSchema, raw, "placeBid");
   return {
-    rawStatus: typeof p.status === 'number' ? p.status : null,
-    rawResult: p.result ?? null,
-    messageText: htmlToText(p.message ?? ''),
-    isHighBidder: p.isHighBidder ?? null,
+    statusFlag: typeof p.status === "boolean" ? p.status : null,
+    rawStatus: typeof p.status === "number" ? p.status : null,
+    rawResult: p.result ?? p.data?.result ?? null,
+    messageText: htmlToText(p.message ?? ""),
+    isHighBidder: p.isHighBidder ?? p.data?.isHighBidder ?? null,
+    isUnauthorized: p.isUnauthorized === true,
   };
 }
-
-export type { ItemId };

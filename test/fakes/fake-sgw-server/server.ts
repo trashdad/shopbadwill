@@ -322,7 +322,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
         sellerId: it.sellerId,
         sellerCompanyName: it.sellerName,
         sellerName: it.sellerName,
-        pickupState: 'WA',
+        pickupState: it.sellerState ?? null,
         categoryId: it.categoryId,
         categoryParentList: `${String(it.categoryId)}|Category ${String(it.categoryId)}`,
         pickupOnly: it.pickupOnly,

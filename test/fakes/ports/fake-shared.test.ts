@@ -28,6 +28,7 @@ const listing = (itemId: number): Listing => ({
 });
 const detail = (itemId: number): ItemDetail => ({
   ...listing(itemId),
+  pickupOnly: false,
   minimumBid: 150,
   bidIncrement: 50,
   serverTime: '2026-10-07T00:00:00.000Z',

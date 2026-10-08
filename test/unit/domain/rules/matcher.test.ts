@@ -129,6 +129,8 @@ const cases: Case[] = [
   { name: 'bidCount zero only', cond: { kind: 'bidCount', max: 0 }, match: false },
   { name: 'pickupOnly true listing', cond: { kind: 'pickupOnly', value: true }, l: { pickupOnly: true }, match: true, reason: { field: 'pickup', detail: 'pickup only' } },
   { name: 'pickupOnly mismatch', cond: { kind: 'pickupOnly', value: true }, match: false },
+  { name: 'pickupOnly true on unknown pickup is unknown', cond: { kind: 'pickupOnly', value: true }, l: { pickupOnly: undefined }, match: false, unknown: 1 },
+  { name: 'pickupOnly false on unknown pickup is unknown, not a match', cond: { kind: 'pickupOnly', value: false }, l: { pickupOnly: undefined }, match: false, unknown: 1 },
 ];
 
 describe('evaluate: every condition kind', () => {
