@@ -37,6 +37,9 @@ from cryptography.x509.oid import NameOID
 SGW_HOST = "shopgoodwill.com"
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "sgw"
 SOCKET_TIMEOUT_S = 30
+# In the body of every 403 the proxy sends, so the sandbox canary can tell the
+# proxy's refusal from a page served by anything else.
+REFUSAL_MARKER = "sbw-e2e-proxy-refused"
 
 
 @dataclass(frozen=True)
@@ -153,8 +156,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def do_CONNECT(self) -> None:  # noqa: N802 (http.server naming)
         host, _, port = self.path.partition(":")
         if host != self.site.host or port not in ("", "443"):
-            self.site._refuse(self.path)
-            self.send_error(403, "Only the fixture SGW site is reachable in E2E tests")
+            self._forbid(self.path)
             return
         self.send_response(200, "Connection Established")
         self.end_headers()
@@ -166,8 +168,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         _FixtureHandler(tls, self.client_address, self.server, self.site)
 
     def _refuse_plain(self) -> None:
-        self.site._refuse(f"{self.command} {self.path}")
-        self.send_error(403, "Only the fixture SGW site is reachable in E2E tests")
+        self._forbid(f"{self.command} {self.path}")
+
+    def _forbid(self, target: str) -> None:
+        self.site._refuse(target)
+        self.send_error(
+            403,
+            "Forbidden by the E2E sandbox",
+            f"{REFUSAL_MARKER}: only the fixture SGW site ({self.site.host}) is reachable in E2E tests",
+        )
 
     do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _refuse_plain
 

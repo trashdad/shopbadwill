@@ -2,6 +2,8 @@
 
 * ``sgw_site``: the fixture SGW site behind the hostname override (one per run).
 * ``firefox``: a WebDriver with the test build installed (one fresh profile per spec file).
+  Each new browser first passes the sandbox canary (harness/firefox.py:check_sandbox);
+  if it fails, the whole run stops with exit code 3.
 * ``extension``: the installed build: ``url(path)``, ``call_hook(name, payload)``.
 
 On failure, a screenshot and the page source go to ``test-results/firefox/``.
@@ -52,6 +54,11 @@ def _session(sgw_site: SgwSite) -> Iterator[Extension]:
         caps = driver.capabilities
         _versions["Firefox"] = str(caps.get("browserVersion"))
         _versions["geckodriver"] = str(caps.get("moz:geckodriverVersion"))
+        # Before any test navigation: prove the browser cannot go around the proxy.
+        try:
+            firefox_launcher.check_sandbox(driver, sgw_site)
+        except firefox_launcher.SandboxError as error:
+            pytest.exit(f"Firefox E2E sandbox check failed, aborting the run: {error}", returncode=3)
         yield firefox_launcher.install(driver)
     finally:
         driver.quit()

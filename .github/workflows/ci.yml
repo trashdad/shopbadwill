@@ -158,10 +158,16 @@ jobs:
         with:
           python-version: '3.14'
           cache: pip
-          cache-dependency-path: test/e2e/firefox/requirements.txt
+          cache-dependency-path: |
+            test/e2e/firefox/requirements.txt
+            test/e2e/firefox/constraints.txt
       - run: pnpm install --frozen-lockfile
-      - name: Install the Firefox harness (Selenium, pytest)
-        run: python -m pip install -r test/e2e/firefox/requirements.txt
+      # Direct pins in requirements.txt, every transitive one in constraints.txt;
+      # check_pins.py fails if anything in the closure is unpinned or off-pin.
+      - name: Install the Firefox harness (Selenium, pytest), pinned
+        run: |
+          python -m pip install -r test/e2e/firefox/requirements.txt -c test/e2e/firefox/constraints.txt
+          python test/e2e/firefox/check_pins.py
       # ubuntu-latest ships Firefox stable and geckodriver (GECKOWEBDRIVER); the
       # harness uses both (test/e2e/firefox/harness/firefox.py). geckodriver
       # must be >= 0.36 for --allow-system-access.

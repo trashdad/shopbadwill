@@ -4,8 +4,9 @@
 // 1. Builds the Firefox test extension (`pnpm build:test -b firefox --mv3`,
 //    output .output/firefox-mv3-test), unless --no-build is given.
 // 2. Runs pytest in test/e2e/firefox. The specs install that build temporarily
-//    in Firefox through Selenium/geckodriver. One-time setup:
-//      python -m pip install -r test/e2e/firefox/requirements.txt
+//    in Firefox through Selenium/geckodriver. One-time setup (a venv is best;
+//    SBW_PYTHON points at its python):
+//      python -m pip install -r test/e2e/firefox/requirements.txt -c test/e2e/firefox/constraints.txt
 //
 // Other arguments go to pytest, which runs in test/e2e/firefox, for example
 // `pnpm test:e2e:firefox -k badge` or `pnpm test:e2e:firefox smoke_test.py`.
@@ -57,7 +58,8 @@ const deps = spawnSync(python, [...pythonPrefix, '-c', 'import selenium, pytest,
 if (deps.status !== 0) {
   console.error(
     'test:e2e:firefox: the Python harness dependencies are missing. Install them with\n' +
-      `  ${[python, ...pythonPrefix].join(' ')} -m pip install -r test/e2e/firefox/requirements.txt\n` +
+      `  ${[python, ...pythonPrefix].join(' ')} -m pip install -r test/e2e/firefox/requirements.txt` +
+      ' -c test/e2e/firefox/constraints.txt\n' +
       deps.stderr.trim(),
   );
   process.exit(1);

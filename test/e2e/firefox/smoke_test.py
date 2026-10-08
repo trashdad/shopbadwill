@@ -19,10 +19,18 @@ from selenium.webdriver.firefox.webdriver import WebDriver
 from selenium.webdriver.support.ui import WebDriverWait
 
 from harness.extension import Extension, background_contains
+from harness.firefox import CANARIES
 from harness.sgw_site import SGW_HOST, SgwSite
 
 HOOKS_WIRED = background_contains("sbw:test:state")
 RECONCILE_BUILT = background_contains("sbw:tick")
+
+
+def test_sandbox_canary_was_refused_by_the_proxy(firefox: WebDriver, sgw_site: SgwSite) -> None:
+    # The session fixture ran check_sandbox() on this browser before any test.
+    for _url, log_entry in CANARIES:
+        assert log_entry in sgw_site.refused
+    assert not any(SGW_HOST in entry for entry in sgw_site.refused)
 
 
 def test_badge_shadow_dom_on_fixture_page(firefox: WebDriver, sgw_site: SgwSite) -> None:
