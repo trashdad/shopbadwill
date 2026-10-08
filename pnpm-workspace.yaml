@@ -1,0 +1,7 @@
+# pnpm settings (single package; no workspace packages).
+
+# Dependency build scripts are blocked unless listed here.
+allowBuilds:
+  # Only a fallback that downloads a native binding when the prebuilt optional
+  # dependency is missing; the prebuilt binding is installed normally.
+  unrs-resolver: false
