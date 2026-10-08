@@ -7,9 +7,12 @@ import {
   BACKOFF_CAP_MS,
   BLOCK_PAUSE_MS,
   BLOCKED_BACKOFF_MS,
+  MAX_RESTORED_WAIT_MS,
   PAUSE_NOTIFICATION_ID,
+  STATE_READ_RETRY_MS,
   SgwRequestScheduler,
   localDay,
+  parseRetryAfter,
   type SchedulerEvent,
 } from '../../../../src/adapters/sgw/request-scheduler';
 import {
@@ -999,5 +1002,317 @@ describe('RequestScheduler: persisted state (sbw:requestSchedulerState)', () => 
     expect(Object.keys(dump).sort()).toEqual([STORAGE_KEYS.requestBudget, STORAGE_KEYS.requestSchedulerState].sort());
     expect(RequestBudgetSchema.safeParse(dump[STORAGE_KEYS.requestBudget]).success).toBe(true);
     expect(RequestSchedulerStateSchema.safeParse(dump[STORAGE_KEYS.requestSchedulerState]).success).toBe(true);
+  });
+});
+
+// ── Review fix round 1: nothing may erase a block or the day's budget ────────
+
+describe('RequestScheduler: hardening (review fix round 1)', () => {
+  const KEY = STORAGE_KEYS.requestSchedulerState;
+  const BUDGET = STORAGE_KEYS.requestBudget;
+  const BLOCK = { cause: 'blocked' as const, reason: 'SGW is refusing requests; automation paused', until: T0 + 6 * HOUR };
+  const state = (over: Partial<RequestSchedulerState> = {}): RequestSchedulerState => ({
+    version: 1,
+    pause: null,
+    consecutive403: 0,
+    consecutive429: 0,
+    lanes: {},
+    ...over,
+  });
+  const stored = (storage: FakeStorage): RequestSchedulerState => RequestSchedulerStateSchema.parse(storage.dump()[KEY]);
+  const failingGet = (): Promise<never> => Promise.reject(new Error('storage I/O error'));
+
+  // 1. Storage read failures fail closed.
+  it('a storage read failure fails closed: nothing is sent, nothing is written, the read is retried', async () => {
+    const storage = new FakeStorage();
+    storage.seed({ [KEY]: state({ pause: BLOCK }), [BUDGET]: { day: '2026-10-07', used: { canary: 3 } } });
+    const before = storage.dump();
+    const realGet = storage.get.bind(storage);
+    storage.get = failingGet;
+
+    const h = setup({ storage });
+    expect(await h.sched.load()).toBe(false);
+    const err = await failure(h.sched.run(req('canary')));
+    expect(err.kind).toBe('paused');
+    expect(err.retryAfterMs).toBe(STATE_READ_RETRY_MS);
+    expect(h.sent).toHaveLength(0);
+    expect(h.events).toContainEqual({ type: 'state-read-failed', error: 'storage I/O error' });
+    await h.sched.flush();
+    expect(storage.dump()).toEqual(before);
+
+    // Storage recovers: the next request re-reads it, and the saved block holds.
+    storage.get = realGet;
+    const blocked = await failure(h.sched.run(req('canary')));
+    expect(blocked.kind).toBe('paused');
+    expect(blocked.retryAfterMs).toBe(6 * HOUR);
+    expect(h.sched.stats().lanes.canary.usedToday).toBe(3);
+    expect(h.sent).toHaveLength(0);
+    await h.sched.flush();
+    expect(storage.dump()).toEqual(before);
+  });
+
+  it('a pause set while storage is unreadable is saved once it can be read', async () => {
+    const storage = new FakeStorage();
+    const realGet = storage.get.bind(storage);
+    storage.get = failingGet;
+    const h = setup({ storage });
+    h.sched.pause('health check failed');
+    await h.sched.flush();
+    expect(storage.dump()).toEqual({});
+
+    storage.get = realGet;
+    expect(await h.sched.load()).toBe(true);
+    await h.sched.flush();
+    expect(stored(storage).pause).toEqual({ cause: 'manual', reason: 'health check failed', until: null });
+  });
+
+  it('a failed write is reported as state-write-failed', async () => {
+    const h = setup();
+    await h.sched.load();
+    h.storage.set = () => Promise.reject(new Error('QUOTA_BYTES quota exceeded'));
+    await expect(h.sched.run(req('interactive'))).resolves.toBe('ok');
+    await h.sched.flush();
+    expect(h.events).toContainEqual({ type: 'state-write-failed', error: 'QUOTA_BYTES quota exceeded' });
+  });
+
+  // 2. resume() on a cold worker.
+  it('resume() on a cold worker wins over the saved pause, clears it and emits `resumed`', async () => {
+    const storage = new FakeStorage();
+    storage.seed({
+      [KEY]: state({
+        pause: BLOCK,
+        consecutive403: 2,
+        lanes: { interactive: { gapJitterMs: 0, backoffUntil: T0 + HOUR, backoffKind: 'blocked', failures: 0 } },
+      }),
+    });
+    const h = setup({ storage });
+    h.sched.resume(); // before the saved state has been read
+    expect(await h.sched.load()).toBe(true);
+    expect(h.sched.stats().paused).toBeUndefined();
+    expect(h.events.filter((e) => e.type === 'resumed')).toHaveLength(1);
+    await h.sched.flush();
+    expect(stored(storage).pause).toBeNull();
+    expect(stored(storage).consecutive403).toBe(0);
+
+    await expect(h.sched.run(req('canary'))).resolves.toBe('ok');
+    // The per-lane backoff SGW asked for still holds.
+    expect((await failure(h.sched.run(req('interactive')))).kind).toBe('blocked');
+  });
+
+  // 3. Two instances on one storage.
+  it('a second instance adopts the first one’s pause, and its own writes keep it', async () => {
+    const storage = new FakeStorage();
+    const clock = new FakeClock(T0);
+    const a = setup({ storage, clock });
+    const b = setup({ storage, clock });
+    await Promise.all([a.sched.load(), b.sched.load()]);
+
+    b.reply({ status: 200, bodyText: 'slow', latencyMs: 5 * S });
+    const inFlight = track(b.sched.run(req('interactive')));
+    await flush();
+
+    a.reply({ status: 403 });
+    for (const lane of ['interactive', 'background', 'snipe'] as const) await a.sched.run(req(lane)).catch(() => undefined);
+    await a.sched.flush();
+    expect(stored(storage).pause).toEqual(BLOCK);
+
+    // B follows A's write and refuses.
+    expect(b.sched.stats().paused).toEqual({ reason: BLOCK.reason, until: BLOCK.until });
+    expect((await failure(b.sched.run(req('canary')))).kind).toBe('paused');
+
+    // B's in-flight request settles and B writes its state: A's pause survives.
+    await b.advance(5 * S);
+    expect(inFlight.value).toBe('slow');
+    await b.sched.flush();
+    expect(stored(storage).pause).toEqual(BLOCK);
+  });
+
+  it('its own late onChanged echoes do not undo a resume()', async () => {
+    /** Delivers change events only when told to, as chrome.storage may deliver them late. */
+    class LateEventsStorage extends FakeStorage {
+      readonly queued: Array<() => void> = [];
+      override onChanged(cb: (changes: Record<string, { oldValue?: unknown; newValue?: unknown }>) => void): () => void {
+        return super.onChanged((changes) => {
+          this.queued.push(() => {
+            cb(changes);
+          });
+        });
+      }
+      deliver(): void {
+        for (const fn of this.queued.splice(0)) fn();
+      }
+    }
+    const storage = new LateEventsStorage();
+    const h = setup({ storage });
+    await h.sched.load();
+    h.reply({ status: 403 });
+    for (const lane of ['interactive', 'background', 'snipe'] as const) await h.sched.run(req(lane)).catch(() => undefined);
+    await h.sched.flush();
+    expect(stored(storage).pause).toEqual(BLOCK);
+
+    h.sched.resume();
+    await h.sched.flush();
+    storage.deliver(); // the echoes of the paused snapshots arrive after the resume
+    expect(h.sched.stats().paused).toBeUndefined();
+    await h.sched.flush();
+    expect(stored(storage).pause).toBeNull();
+  });
+
+  it('two instances add up the day’s budget instead of overwriting it', async () => {
+    const storage = new FakeStorage();
+    const clock = new FakeClock(T0);
+    const a = setup({ storage, clock });
+    const b = setup({ storage, clock });
+    await Promise.all([a.sched.load(), b.sched.load()]);
+    await a.sched.run(req('canary'));
+    await a.advance(120 * S);
+    await b.sched.run(req('canary'));
+    await b.advance(120 * S);
+    await a.sched.run(req('canary'));
+    await Promise.all([a.sched.flush(), b.sched.flush()]);
+    expect(storage.dump()[BUDGET]).toEqual({ day: '2026-10-07', used: { canary: 3 } });
+    expect(a.sched.stats().lanes.canary.usedToday).toBe(3);
+    expect(b.sched.stats().lanes.canary.usedToday).toBe(3);
+  });
+
+  it('a second instance respects the first one’s lane gap', async () => {
+    const storage = new FakeStorage();
+    const clock = new FakeClock(T0);
+    const a = setup({ storage, clock });
+    const b = setup({ storage, clock });
+    await Promise.all([a.sched.load(), b.sched.load()]);
+    await a.sched.run(req('background'));
+    await a.sched.flush();
+    const next = track(b.sched.run(req('background')));
+    await flush();
+    expect(b.sent).toHaveLength(0);
+    await b.advance(120 * S - 1);
+    expect(next.done).toBe(false);
+    await b.advance(1);
+    expect(next.value).toBe('ok');
+  });
+
+  // 4. The wall clock moving backwards.
+  it('the budget day never goes backwards: spent at 00:30, clock back to 23:00 the day before → still refused', async () => {
+    const h = setup({ start: new Date(2026, 9, 8, 0, 30, 0).getTime() });
+    for (let i = 0; i < 4; i++) {
+      await h.sched.run(req('canary'));
+      await h.advance(120 * S);
+    }
+    await h.sched.flush();
+    const spent = h.storage.dump()[BUDGET];
+    expect(spent).toEqual({ day: '2026-10-08', used: { canary: 4 } });
+
+    const back = new Date(2026, 9, 7, 23, 0, 0).getTime();
+    h.clock.set(back);
+    const err = await failure(h.sched.run(req('canary')));
+    expect(err.kind).toBe('budget');
+    expect(err.retryAfterMs).toBe(new Date(2026, 9, 9, 0, 0, 0).getTime() - back);
+    expect(h.sched.stats().lanes.canary.usedToday).toBe(4);
+    await h.sched.flush();
+    expect(h.storage.dump()[BUDGET]).toEqual(spent);
+
+    // Other lanes keep counting against the later day.
+    await h.sched.run(req('interactive'));
+    await h.sched.flush();
+    expect(h.storage.dump()[BUDGET]).toEqual({ day: '2026-10-08', used: { canary: 4, interactive: 1 } });
+  });
+
+  it('a 1 h backward jump does not stall the snipe lane (live or after a restart)', async () => {
+    const storage = new FakeStorage();
+    const clock = new FakeClock(T0);
+    const a = setup({ storage, clock });
+    await a.sched.run(req('snipe'));
+    await a.sched.flush();
+
+    clock.set(T0 - HOUR);
+    const live = track(a.sched.run(req('snipe')));
+    await flush();
+    expect(live.done).toBe(false);
+    await a.advance(S);
+    expect(live.value).toBe('ok');
+    await a.sched.flush();
+    a.sched.dispose();
+
+    const b = setup({ storage, clock });
+    const restarted = track(b.sched.run(req('snipe')));
+    await flush();
+    await b.advance(S);
+    expect(restarted.value).toBe('ok');
+  });
+
+  // 5. Restored values are clamped.
+  it('clamps restored times to the policy maximums', async () => {
+    const YEAR = 365 * 24 * HOUR;
+    const storage = new FakeStorage();
+    storage.seed({
+      [KEY]: state({
+        pause: { cause: 'manual', reason: 'far future', until: T0 + YEAR },
+        lanes: {
+          interactive: { gapJitterMs: 0, backoffUntil: T0 + YEAR, backoffKind: 'blocked', failures: 1000 },
+          background: { lastEndAt: T0 + YEAR, gapJitterMs: 999_999_999, failures: 0 },
+        },
+      }),
+    });
+    const h = setup({ storage });
+    await h.sched.load();
+    expect(MAX_RESTORED_WAIT_MS).toBe(24 * HOUR);
+    expect(h.sched.stats().paused).toEqual({ reason: 'far future', until: T0 + 24 * HOUR });
+    expect(h.sched.stats().lanes.interactive.backoffUntil).toBe(T0 + 24 * HOUR);
+
+    h.sched.resume();
+    const bg = track(h.sched.run(req('background')));
+    await flush();
+    await h.advance(135 * S, S);
+    expect(bg.value).toBe('ok');
+    expect(h.sent[0]?.at).toBeLessThanOrEqual(T0 + 135 * S);
+  });
+
+  // 6. Retry-After date forms.
+  const RETRY_AFTER_CAP = 24 * HOUR; // '-70' is only 44 years ahead of 2026: 2070, capped
+  it('parses Retry-After as IMF-fixdate, RFC 850 and asctime (RFC 9110 examples)', () => {
+    const now = Date.UTC(1994, 10, 6, 8, 49, 0);
+    for (const value of ['Sun, 06 Nov 1994 08:49:37 GMT', 'Sunday, 06-Nov-94 08:49:37 GMT', 'Sun Nov  6 08:49:37 1994']) {
+      expect(parseRetryAfter({ 'Retry-After': value }, now), value).toBe(37 * S);
+    }
+    // A two-digit year more than 50 years ahead belongs to the previous century.
+    expect(parseRetryAfter({ 'retry-after': 'Saturday, 01-Jan-94 00:00:00 GMT' }, Date.UTC(2026, 0, 1))).toBe(0);
+    expect(parseRetryAfter({ 'retry-after': 'Monday, 01-Jan-70 00:00:00 GMT' }, Date.UTC(2026, 0, 1))).toBe(RETRY_AFTER_CAP);
+    expect(parseRetryAfter({ 'retry-after': 'Friday, 01-Jan-27 00:00:00 GMT' }, Date.UTC(2026, 11, 31, 23, 59, 0))).toBe(60 * S);
+    expect(parseRetryAfter({ 'retry-after': 'Sun Nov 6 08:49:37 1994' }, now)).toBeUndefined();
+  });
+
+  // 7. 401s.
+  it('a 401 refuses the requests queued on its lane with `auth` instead of sending each', async () => {
+    const h = setup();
+    h.reply({ status: 401 }, { status: 200, bodyText: 'ok' });
+    const all = Array.from({ length: 3 }, () => track(h.sched.run(req('interactive'))));
+    await flush();
+    await h.advance(5 * S, S);
+    expect(h.sent).toHaveLength(1);
+    expect(all.map((t) => (t.error as SgwApiError).kind)).toEqual(['auth', 'auth', 'auth']);
+    expect(all.map((t) => (t.error as SgwApiError).status)).toEqual([401, 401, 401]);
+    await expect(h.sched.run(req('interactive'))).resolves.toBe('ok');
+  });
+
+  // 8. budget-exhausted on every crossing.
+  it('emits budget-exhausted when switching to tight crosses the budget mid-day', async () => {
+    const h = setup();
+    for (let i = 0; i < 3; i++) {
+      await h.sched.run(req('canary'));
+      await h.advance(120 * S);
+    }
+    const exhausted = (): SchedulerEvent[] => h.events.filter((e) => e.type === 'budget-exhausted');
+    expect(exhausted()).toHaveLength(0);
+
+    h.sched.setConsiderateMode('tight');
+    expect(exhausted()).toEqual([{ type: 'budget-exhausted', lane: 'canary', day: '2026-10-07', budget: 2 }]);
+    h.sched.setConsiderateMode('normal');
+    expect(exhausted()).toHaveLength(1);
+    await h.sched.run(req('canary'));
+    expect(exhausted()).toEqual([
+      { type: 'budget-exhausted', lane: 'canary', day: '2026-10-07', budget: 2 },
+      { type: 'budget-exhausted', lane: 'canary', day: '2026-10-07', budget: 4 },
+    ]);
   });
 });
