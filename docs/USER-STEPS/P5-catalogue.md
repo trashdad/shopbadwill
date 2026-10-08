@@ -45,7 +45,7 @@ S-1 step 0.5 set up DevTools **request blocking** with four patterns. One of the
 
 4. On the item's tab, press F12 to open DevTools. Press Ctrl+Shift+P, type `blocking`, and open **Network request blocking** (newer Chrome calls it **Request conditions**).
 5. Look at the list:
-   - If `*ItemBid/PlaceBid*` is there, remove **only that one pattern**: select it and delete it. Leave `*Favorite/Save*`, `*AddToFavorite*` and `*RemoveItemFromFavoriteList*`, and the **Enable** tick, exactly as they are. You put it back in step 16.
+   - If `*ItemBid/PlaceBid*` is there, remove **only that one pattern**: hover over it and click the **×** at its right, or right-click it and choose **Remove**. Leave `*Favorite/Save*`, `*AddToFavorite*` and `*RemoveItemFromFavoriteList*`, and the **Enable** tick, exactly as they are. You put it back in step 16.
    - If the list is empty (you cleaned up in S-1 step 13), there is nothing to remove.
 
    Note which case it was, for `notes-p5.txt`.
@@ -59,6 +59,7 @@ S-1 step 0.5 set up DevTools **request blocking** with four patterns. One of the
 10. **Your bid.** In the popup, type your amount: one you are happy to pay, at or above the minimum shown. Click the popup's own **Place Bid** button, and confirm if the site asks. If the site shows a reCAPTCHA or another check, complete it as you normally would and note what you saw.
 11. A `PlaceBid` row appears:
     - If its **Status** column says `(blocked:devtools)` or anything with "blocked", your bid was **not sent**. Go back to step 5, remove the pattern, and then repeat steps 7 to 11.
+    - If its **Status** shows `(failed)` or `(canceled)`, or the row has no response, **do NOT bid again**: the bid may still have reached SGW. Check the item page instead: reload it and look at the bid history and whether it says you are the high bidder. Write down the Status and what the page shows in `notes-p5.txt`, and skip to step 15.
     - Otherwise, note the Status value (for example `200`). Right-click the row and choose **Copy → Copy response**. Then run `Save-Clip placebid-1.json`.
 12. Copy, word for word, what the page tells you after the bid (for example "You are the high bidder" or "You have been outbid"). It goes in `notes-p5.txt`. If you were outbid at once, that is a useful catalogue entry too. **Don't bid again just for this.**
 

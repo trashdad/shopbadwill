@@ -41,6 +41,22 @@
 //   lapses between the modal read and the bid ('auth'), or a lane refusal
 //   other than `paused`/`budget`, is never claimed as "not sent". The cost of
 //   that is one extra post-read; the opposite error could double a bid.
+//
+// Caller contract (T-101's SendStrategy):
+// - Persist the idempotency key and dispatch `sent` BEFORE calling placeBid,
+//   so a restarted worker treats the attempt as sent.
+// - A BidNotSentError means the bid provably never arrived, so the
+//   single-retry path is allowed.
+// - Any other rejection: dispatch `ambiguous`, which leads to a post-read.
+//   Resend only if that post-read meets §3.9's proof.
+// - A resolved BidResult is SGW's answer. A resolved 'rejected-unknown' is
+//   NOT proof that the bid did not arrive or register (its code is not in the
+//   catalogue), so NEVER resend after one.
+//
+// Stage 2 (P5 catalogue): if the real 200 ShowBidModal reply carries a field
+// that says the auction is closed or the account is restricted, step 2 must
+// refuse the bid on it, sending nothing. Stage 1 reads only sellerId and
+// minimumBid, because the modal schema is still provisional.
 import { bidAmount } from '../../domain/money';
 import type { BidResult, BidResultKind, EpochMs } from '../../domain/types';
 import { HttpNetworkError, SgwApiError } from '../../ports/errors';
