@@ -9,6 +9,10 @@ Nothing in the extension runs while the browser is closed or the PC is asleep (a
 - Sleep states: S3 standby and hibernate. **No Modern Standby (S0 Low Power Idle)**, no hybrid sleep (hypervisor present), Fast Startup disabled by policy.
 - Power plan Balanced: Sleep after = Never (AC and battery). Hibernate after = 3 h. **Allow wake timers: Enable on AC, Disable on battery.**
 
+**Battery caveat:** Allow wake timers is Disabled on battery (DC), so an unplugged laptop will not wake for a snipe. Keep it plugged in at auction close.
+
+Provisional recommendation (full test deferred until before T-110): keep Sleep-after = Never on AC and Allow wake timers = Enabled on AC.
+
 ## Recommended settings (draft)
 
 | Setting | Recommendation | Why |
