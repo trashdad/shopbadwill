@@ -12,9 +12,11 @@
 // - `conditionIndex` in a reason indexes `all` first, then `any` continues at
 //   `all.length`.
 // - Precedence of `decision`: hide > highlight > watch > none.
-// - `include` / `exclude` modes on seller and location both match listings whose
-//   seller is in the list; `exclude` only changes the wording of the reason
-//   ("(excluded)"). The rule's action decides what happens to them.
+// - seller / location: `include` matches when the seller or state IS in the list,
+//   `exclude` when it is NOT (like keyword mode 'none'). A missing seller name
+//   (with name lists) or missing sellerState makes the condition unknown.
+// - category.includeChildren is treated as exact-id matching: a Listing has no
+//   category tree to resolve children from.
 import { formatMoney } from '../money';
 import type { Cents, Listing } from '../types';
 
@@ -138,18 +140,24 @@ function evalCondition(c: Condition, l: Listing, ctx: MatchContext, entry: Compi
       const name = l.sellerName?.trim().toLowerCase();
       const byId = c.sellerIds.includes(l.sellerId);
       const byName = name !== undefined && c.sellerNames.some((n) => n.trim().toLowerCase() === name);
-      if (!byId && !byName) return NO;
-      const who = l.sellerName ?? `#${String(l.sellerId)}`;
-      return yes('seller', `seller is ${who}${c.mode === 'exclude' ? ' (excluded)' : ''}`);
+      const listed = byId || byName;
+      // Without a seller name we cannot rule out a name-list hit.
+      if (!listed && name === undefined && c.sellerNames.length > 0) return UNKNOWN;
+      if (c.mode === 'exclude') return listed ? NO : yes('seller', 'seller is not in excluded list');
+      if (!listed) return NO;
+      return yes('seller', `seller is ${l.sellerName ?? `#${String(l.sellerId)}`} (included)`);
     }
     case 'location': {
       if (l.sellerState === undefined) return UNKNOWN;
-      if (!c.states.includes(l.sellerState)) return NO;
-      return yes('seller location', `seller location is ${l.sellerState}${c.mode === 'exclude' ? ' (excluded)' : ''}`);
+      const listed = c.states.includes(l.sellerState);
+      if (c.mode === 'exclude') {
+        return listed ? NO : yes('seller location', `location ${l.sellerState} is not in excluded states`);
+      }
+      return listed ? yes('seller location', `seller location is ${l.sellerState} (included)`) : NO;
     }
     case 'category': {
       if (l.categoryId === undefined) return UNKNOWN;
-      // Listings carry no category tree, so `includeChildren` cannot be resolved here; ids match exactly.
+      // No category tree on a Listing: `includeChildren` true or false both match the exact id.
       if (!c.categoryIds.includes(l.categoryId)) return NO;
       return yes('category', `category is ${l.categoryPath ?? `#${String(l.categoryId)}`}`);
     }
