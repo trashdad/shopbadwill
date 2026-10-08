@@ -22,5 +22,9 @@
       "nextAllowedAt": 1791400120000
     }
   },
-  "cacheHits": 7
+  "cacheHits": 7,
+  "paused": {
+    "until": 1791421600000,
+    "reason": "SGW is refusing requests; automation paused"
+  }
 }

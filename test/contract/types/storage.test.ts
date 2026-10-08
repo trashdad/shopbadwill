@@ -10,7 +10,9 @@ import {
   CalendarStateSchema,
   QUARANTINE_KEY_PREFIX,
   QuarantineRecordSchema,
+  REQUEST_SCHEDULER_STATE_VERSION,
   RequestBudgetSchema,
+  RequestSchedulerStateSchema,
   STORAGE_KEYS,
   STORAGE_LIMITS,
   STORAGE_RECORDS,
@@ -42,6 +44,7 @@ const LOCAL_KEYS = [
   'sbw:sgwSession',
   'sbw:google',
   'sbw:requestBudget',
+  'sbw:requestSchedulerState',
   'sbw:awake',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
@@ -64,6 +67,7 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:sgwSession': example('SgwSessionRecord'),
   'sbw:google': example('GoogleCredentials'),
   'sbw:requestBudget': example('RequestBudget'),
+  'sbw:requestSchedulerState': example('RequestSchedulerState'),
   'sbw:awake': [1791400000000, 1791400300000],
   'sbw:clock': [example('ClockSample')],
   'sbw:googleAccess': example('GoogleAccess'),
@@ -114,6 +118,19 @@ describe('storage schema v1', () => {
     expect(RequestBudgetSchema.parse(full)).toEqual(full);
     expect(RequestBudgetSchema.safeParse({ day, used: { bulk: 1 } }).success).toBe(false);
     expectTypeOf<RequestBudget['used']>().toEqualTypeOf<Partial<Record<Lane, number>>>();
+  });
+
+  it('versions the request scheduler state and keeps it minimal (T-25 contract change)', () => {
+    const valid = example('RequestSchedulerState') as Record<string, unknown>;
+    expect(REQUEST_SCHEDULER_STATE_VERSION).toBe(1);
+    expect(RequestSchedulerStateSchema.safeParse({ ...valid, version: 2 }).success).toBe(false);
+    const empty = { version: 1, pause: null, consecutive403: 0, consecutive429: 0, lanes: {} };
+    expect(RequestSchedulerStateSchema.parse(empty)).toEqual(empty);
+    const manual = { ...empty, pause: { cause: 'manual', reason: 'health check failed', until: null } };
+    expect(RequestSchedulerStateSchema.parse(manual)).toEqual(manual);
+    expect(RequestSchedulerStateSchema.safeParse({ ...empty, lanes: { bulk: { gapJitterMs: 0, failures: 0 } } }).success).toBe(
+      false,
+    );
   });
 
   it('keeps calendarId in one place: sbw:calendar, not the Google credentials', () => {

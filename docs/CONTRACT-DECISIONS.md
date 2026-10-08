@@ -216,3 +216,49 @@ $ eslint . --max-warnings=0
   - `GoogleCredentials` no longer has `calendarId`. This differs from §3.11, so PLAN §3.11 and §2.3 should be updated in the next contract-change PR, along with the other decisions.
 - **Concern 1** (`typoAbsolute`): resolved by your ruling.
 - **Concern 6** (adapter zone): resolved by this round.
+
+## Contract change: request scheduler state (T-25)
+
+Approved by the controller on 2026-10-07 and made in `task/T-25`.
+
+**Why.** An MV3 background worker is killed after about 30 s idle. The daily job sends one request per 2-minute alarm tick, so each tick usually runs on a fresh `RequestScheduler`. Before this change only the budget (`sbw:requestBudget`) was persisted. A restarted worker therefore forgot:
+- the 6 h pause after three 403s;
+- the 1 h 403 backoff;
+- the 429/5xx backoffs, including any `Retry-After`;
+- the consecutive-403/429 counters;
+- the 120 s gap.
+
+It could keep calling SGW after SGW had asked it to stop. The user's "considerate guest" rule requires that a restarted worker never forgets a pause or backoff SGW asked for.
+
+### Changes
+
+1. **New storage key `sbw:requestSchedulerState`** (`STORAGE_KEYS.requestSchedulerState`, area `local`), validated by the new `RequestSchedulerStateSchema` in `src/domain/storage/schema.ts`. It is registered in `STORAGE_RECORDS`, so the T-33 `Repo` validates it, lists it and quarantines it like every other record.
+   - `version: 1`: the literal `REQUEST_SCHEDULER_STATE_VERSION`. A reader rejects any other version, which is handled as an invalid record.
+   - `pause: { cause: 'manual' | 'blocked' | 'rate-limited', reason, until: EpochMs | null } | null`: the all-lane pause. `until: null` means until `resume()`.
+   - `consecutive403` and `consecutive429`: the burst counters, counted across lanes.
+   - `lanes`: a partial `Lane` record. A lane that has nothing a restart needs has no entry. Each entry is `{ lastEndAt?, gapJitterMs, backoffUntil?, backoffKind?: 'rate-limited' | 'blocked' | 'server', failures }`, which holds the lane gap, the lane backoff and the exponent n of min(2^n × 30 s, 30 min).
+2. **Scheduler behaviour (`src/adapters/sgw/request-scheduler.ts`).**
+   - It writes the record on every change: after each request settles, and on `pause()` and `resume()`.
+   - It reads the record at construction.
+   - On read, a pause or backoff that has already expired is ignored. A live one is merged, keeping whichever is stricter, so refusals carry the correct `retryAfterMs`.
+   - A missing record means no pause.
+   - An invalid record also means no pause. It is quarantined as a `QuarantineRecord` at `sbw:quarantine:sbw:requestSchedulerState` (generation 0; the record is copied first, then removed, as the Repo does) and flagged with a `{ type: 'state-invalid', key, error }` scheduler event. `sbw:requestBudget` is handled the same way.
+   - Persistence is always on; there is no opt-out.
+3. **`RequestSchedulerStatsSchema` gains `paused?: { until: EpochMs | null, reason: string }`** (`src/domain/types.ts`).
+   - It is present only while every lane is paused. `null` means open-ended: a manual or health pause.
+   - A lane's `backoffUntil` now reports only that lane's backoff. A timed pause still raises every lane's `nextAllowedAt`.
+   - The `pauseState()` method drafted in T-25 is gone.
+   - `health.get`'s `budget` reply (`ReturnType<RequestScheduler['stats']>`) inherits the field.
+4. **No migration.** This is a new key with nothing stored under it before, and `sbw:meta.schemaVersion` stays 1 (§2.3: adding a key or an optional field is not a migration).
+
+### Tests and fixtures updated
+
+- `test/contract/types/examples/RequestSchedulerState.{valid,invalid}.json`: new. The invalid example is rejected at `["version"]`.
+- `test/contract/types/examples/RequestSchedulerStats.valid.json`: now includes `paused`.
+- `test/contract/types/examples.test.ts`: `RequestSchedulerState` added to the locked schema list for `src/domain/storage/schema.ts`.
+- `test/contract/types/storage.test.ts`:
+  - the new key is in the local-key list and the per-key sample values;
+  - a new test checks versioning, the empty and open-ended-pause shapes, and that unknown lanes are rejected.
+- `test/contract/types/spec-shapes.test.ts`: `SpecSchedulerStats` gains `paused?`.
+
+**Follow-up for the next PLAN edit.** Add `sbw:requestSchedulerState` to PLAN §2.3's table, and `paused?` to §3.4's `stats()` return type.

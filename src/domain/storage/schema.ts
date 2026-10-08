@@ -49,6 +49,7 @@ export const STORAGE_KEYS = {
   sgwSession: 'sbw:sgwSession',
   google: 'sbw:google',
   requestBudget: 'sbw:requestBudget',
+  requestSchedulerState: 'sbw:requestSchedulerState',
   awake: 'sbw:awake',
   clock: 'sbw:clock',
   googleAccess: 'sbw:googleAccess',
@@ -144,6 +145,48 @@ export const RequestBudgetSchema = z.object({
 });
 export type RequestBudget = z.infer<typeof RequestBudgetSchema>;
 
+/** Version of the `sbw:requestSchedulerState` record; a reader rejects any other. */
+export const REQUEST_SCHEDULER_STATE_VERSION = 1;
+
+/**
+ * `sbw:requestSchedulerState` (contract change, T-25): what a restarted worker
+ * needs so it never forgets a pause or backoff SGW asked for. The scheduler
+ * writes it on every change and reads it at construction; a pause or backoff
+ * that has already expired is ignored, and a missing or invalid record means
+ * no pause (an invalid one is quarantined and flagged).
+ */
+export const RequestSchedulerStateSchema = z.object({
+  version: z.literal(REQUEST_SCHEDULER_STATE_VERSION),
+  /** The all-lane pause, or null. `until: null` = until resume() (manual / health). */
+  pause: z
+    .object({
+      cause: z.enum(['manual', 'blocked', 'rate-limited']),
+      reason: z.string(),
+      until: EpochMsSchema.nullable(),
+    })
+    .nullable(),
+  /** Consecutive 403 answers on any lane (three pause every lane 6 h). */
+  consecutive403: z.number().int().nonnegative(),
+  /** Consecutive 429 answers on any lane (three pause every lane until the backoff ends). */
+  consecutive429: z.number().int().nonnegative(),
+  /** Per lane; a lane that never sent has no entry. */
+  lanes: z.partialRecord(
+    LaneSchema,
+    z.object({
+      /** When the last request settled; the next one waits out the lane gap from here. */
+      lastEndAt: EpochMsSchema.optional(),
+      /** Jitter drawn for that gap. */
+      gapJitterMs: z.number().int().nonnegative(),
+      backoffUntil: EpochMsSchema.optional(),
+      /** The error kind a request refused during the backoff gets. */
+      backoffKind: z.enum(['rate-limited', 'blocked', 'server']).optional(),
+      /** Consecutive 429/5xx on this lane: the n in min(2^n × 30 s, 30 min). */
+      failures: z.number().int().nonnegative(),
+    }),
+  ),
+});
+export type RequestSchedulerState = z.infer<typeof RequestSchedulerStateSchema>;
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -173,6 +216,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },
   [STORAGE_KEYS.google]: { area: 'local', schema: GoogleCredentialsSchema },
   [STORAGE_KEYS.requestBudget]: { area: 'local', schema: RequestBudgetSchema },
+  [STORAGE_KEYS.requestSchedulerState]: { area: 'local', schema: RequestSchedulerStateSchema },
   [STORAGE_KEYS.awake]: { area: 'local', schema: z.array(EpochMsSchema) },
   [STORAGE_KEYS.clock]: { area: 'session', schema: z.array(ClockSampleSchema) },
   [STORAGE_KEYS.googleAccess]: { area: 'session', schema: GoogleAccessSchema },
