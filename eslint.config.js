@@ -106,7 +106,9 @@ export default defineConfig(
     },
   },
   {
-    files: ['src/entrypoints/**/*.{ts,tsx}'],
+    // Entrypoints may import anything but the layer-violating paths; tests may
+    // also import entrypoints (only the "nothing imports entrypoints" rule is relaxed).
+    files: ['src/entrypoints/**/*.{ts,tsx}', 'test/**/*.{ts,tsx}'],
     rules: {
       'import/no-restricted-paths': ['error', { basePath: root, zones: LAYER_ZONES }],
     },
