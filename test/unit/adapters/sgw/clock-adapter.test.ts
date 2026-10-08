@@ -2,7 +2,6 @@
 import { describe, expect, it } from 'vitest';
 
 import { SAMPLE_TTL_MS, SgwClockAdapter } from '../../../../src/adapters/sgw/clock-adapter';
-import { parsePacific, parsePacificDetailed } from '../../../../src/domain/time/pacific';
 import type { ClockSample } from '../../../../src/domain/types';
 import { FakeClock } from '../../../fakes/ports/fake-clock';
 
@@ -27,7 +26,7 @@ function off(a: SgwClockAdapter) {
 
 function make() {
   const clock = new FakeClock(T0 + 1000);
-  return { clock, adapter: new SgwClockAdapter({ parsePacific, parsePacificDetailed }, clock) };
+  return { clock, adapter: new SgwClockAdapter(clock) };
 }
 
 describe('SgwClockAdapter', () => {

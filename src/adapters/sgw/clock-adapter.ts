@@ -4,6 +4,7 @@
 import type { Clock } from '../../ports/clock';
 import type { SgwClock } from '../../ports/sgw-clock';
 import type { ClockSample, EpochMs, PacificNaiveRaw } from '../../domain/types';
+import { parsePacific, parsePacificDetailed } from '../../domain/time/pacific';
 
 /** Samples older than this (by receivedAt) are dropped from every calculation. */
 export const SAMPLE_TTL_MS = 30 * 60 * 1000;
@@ -30,30 +31,17 @@ function beats(a: ClockSample, b: ClockSample): boolean {
   return a.receivedAt > b.receivedAt;
 }
 
-/**
- * T-20's Pacific parser, injected because the layer rule (PLAN §2.1) forbids
- * src/adapters from importing src/domain/time. The composition root passes
- * `{ parsePacific, parsePacificDetailed }` from `domain/time/pacific`.
- */
-export interface PacificParser {
-  parsePacific(raw: string): number;
-  parsePacificDetailed(raw: string): { ms: number; ambiguous: boolean; nonexistent: boolean };
-}
-
 export class SgwClockAdapter implements SgwClock {
   private samples: ClockSample[] = [];
 
-  constructor(
-    private readonly pacific: PacificParser,
-    private readonly clock: Pick<Clock, 'now'> = { now: () => Date.now() },
-  ) {}
+  constructor(private readonly clock: Pick<Clock, 'now'> = { now: () => Date.now() }) {}
 
   parsePacific(raw: PacificNaiveRaw): EpochMs {
-    return this.pacific.parsePacific(raw);
+    return parsePacific(raw);
   }
 
   parsePacificDetailed(raw: string): { ms: EpochMs; ambiguous: boolean; nonexistent: boolean } {
-    return this.pacific.parsePacificDetailed(raw);
+    return parsePacificDetailed(raw);
   }
 
   addSample(s: ClockSample): void {
@@ -97,7 +85,7 @@ export class SgwClockAdapter implements SgwClock {
   sampleFromServerTime(raw: string, sentAt: EpochMs, receivedAt: EpochMs): ClockSample | null {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw)) return null;
     return {
-      serverMs: this.pacific.parsePacific(raw),
+      serverMs: parsePacific(raw),
       sentAt,
       receivedAt,
       rttMs: Math.max(0, receivedAt - sentAt),
@@ -114,7 +102,7 @@ export class SgwClockAdapter implements SgwClock {
     if (!m) return null;
     const [mm, dd, yyyy, hms] = [m[1] ?? '', m[2] ?? '', m[3] ?? '', m[4] ?? ''];
     return {
-      serverMs: this.pacific.parsePacific(`${yyyy}-${mm}-${dd}T${hms}`),
+      serverMs: parsePacific(`${yyyy}-${mm}-${dd}T${hms}`),
       sentAt,
       receivedAt,
       rttMs: Math.max(0, receivedAt - sentAt),
