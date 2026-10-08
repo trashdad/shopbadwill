@@ -1,0 +1,13 @@
+{
+  "invalidBecause": "the snipe id is required",
+  "path": [
+    "payload",
+    "id"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-34",
+    "type": "snipe.disarm",
+    "payload": {}
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "invalidBecause": "money is integer cents",
+  "path": [],
+  "value": 12.99
+}

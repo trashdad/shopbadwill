@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "a completed favorite step reports done: true",
+  "path": [
+    "done"
+  ],
+  "value": {
+    "kind": "favorite",
+    "done": false
+  }
+}

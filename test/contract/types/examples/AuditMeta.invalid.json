@@ -1,0 +1,11 @@
+{
+  "invalidBecause": "sequence numbers are non-negative",
+  "path": [
+    "nextSeq"
+  ],
+  "value": {
+    "nextSeq": -1,
+    "head": 0,
+    "tail": 0
+  }
+}

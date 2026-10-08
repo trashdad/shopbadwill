@@ -1,0 +1,5 @@
+{
+  "invalidBecause": "'armed' is a state, not an outcome",
+  "path": [],
+  "value": "armed"
+}

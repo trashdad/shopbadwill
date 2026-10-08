@@ -1,0 +1,12 @@
+{
+  "connected": true,
+  "provider": "pkce",
+  "account": "user@example.com",
+  "grantedScopes": [
+    "https://www.googleapis.com/auth/calendar.app.created"
+  ],
+  "refreshTokenAgeDays": 3,
+  "lastError": "rate_limited",
+  "needsInteraction": false,
+  "configured": true
+}

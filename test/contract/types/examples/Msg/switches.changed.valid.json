@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "reqId": "r-41",
+  "type": "switches.changed",
+  "payload": {
+    "killSwitch": false,
+    "writesAllowed": {
+      "favorites": false,
+      "calendar": false,
+      "bidding": false
+    }
+  }
+}
