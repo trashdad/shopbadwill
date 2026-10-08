@@ -1,0 +1,14 @@
+{
+  "errors": {
+    "lowPrice": [
+      "Could not convert string to decimal: abc. Path 'lowPrice', line 1, position 222."
+    ],
+    "highPrice": [
+      "Could not convert string to decimal: xyz. Path 'highPrice', line 1, position 240."
+    ]
+  },
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+  "title": "One or more validation errors occurred.",
+  "status": 400,
+  "traceId": "00-04578f683eff0f616243edb071932dc6-b310eeb407d0c033-00"
+}

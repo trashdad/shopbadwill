@@ -1,0 +1,511 @@
+[
+  {
+    "seq": 1,
+    "stepId": "robots",
+    "kind": "text",
+    "method": "GET",
+    "url": "https://shopgoodwill.com/robots.txt",
+    "sentAtMs": 1791428301954,
+    "endedAtMs": 1791428302040,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "pages\\robots"
+    ],
+    "note": "Confirm Crawl-delay and Disallow rules (S-1 evidence).",
+    "pageInitiated": {
+      "sgwFirstParty": 0,
+      "buyerapi": [],
+      "blockedByType": {},
+      "blockedThirdPartyHosts": {},
+      "corsPreflights": 0
+    },
+    "observations": {}
+  },
+  {
+    "seq": 2,
+    "stepId": "home",
+    "kind": "render",
+    "method": "GET",
+    "url": "https://shopgoodwill.com/",
+    "sentAtMs": 1791428423071,
+    "endedAtMs": 1791428424207,
+    "status": 200,
+    "error": "page.evaluate: ReferenceError: __name is not defined\n    at eval (eval at evaluate (:311:30), <anonymous>:1:342)\n    at new t (https://shopgoodwill.com/polyfills.d5aa3e735d7bfd35.js:1:24753)\n    at eval (eval at evaluate (:311:30), <anonymous>:1:5)\n    at UtilityScript.evaluate (<anonymous>:313:16)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)",
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "pages\\home"
+    ],
+    "note": "Logged-out home page DOM (home product cards), app bundles for endpoint/field discovery, footer help link, reCAPTCHA observation.",
+    "pageInitiated": {
+      "sgwFirstParty": 10,
+      "buyerapi": [
+        {
+          "method": "POST",
+          "path": "/api/Dashboard/GetCurrentTime",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/Dashboard/GetNewBanner",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/Category/GetAllCategoriesByPageType?PageType=0",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/Dashboard/GetGalleryItems",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/Dashboard/GetMyStoryNew",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/Category/GetAllCategoriesByPageType?PageType=1",
+          "status": 200
+        }
+      ],
+      "blockedByType": {
+        "image": 4,
+        "font": 3
+      },
+      "blockedThirdPartyHosts": {
+        "shopgoodwillimages.azureedge.net": 42,
+        "www.googletagmanager.com": 1,
+        "cdn.scarabresearch.com": 1,
+        "apps.rokt-api.com": 1,
+        "fonts.gstatic.com": 2,
+        "assets.adobedtm.com": 1,
+        "cdn.intergient.com": 1
+      },
+      "corsPreflights": 0
+    },
+    "observations": {
+      "title": "Online Thrift Store For Unique & Vintage Finds | ShopGoodwill.com",
+      "challengeFrames": 0,
+      "hydrated": true
+    }
+  },
+  {
+    "seq": 3,
+    "stepId": "search-grid",
+    "kind": "api",
+    "method": "POST",
+    "url": "https://buyerapi.shopgoodwill.com/api/Search/ItemListing",
+    "sentAtMs": 1791428711785,
+    "endedAtMs": 1791428712242,
+    "status": 200,
+    "sent": {
+      "origin": "chrome-extension://bojepjeicaifliociipnjaahbmnglbdn",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/search-grid-p1.json"
+    ],
+    "note": "Keyword search, ending soonest, layout grid (fixture search-grid-p1).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 136841,
+      "dateHeader": "Thu, 08 Oct 2026 03:05:12 GMT"
+    }
+  },
+  {
+    "seq": 4,
+    "stepId": "search-list",
+    "kind": "api",
+    "method": "POST",
+    "url": "https://buyerapi.shopgoodwill.com/api/Search/ItemListing",
+    "sentAtMs": 1791428833253,
+    "endedAtMs": 1791428833739,
+    "status": 200,
+    "sent": {
+      "origin": "chrome-extension://bojepjeicaifliociipnjaahbmnglbdn",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/search-list-p1.json"
+    ],
+    "note": "Second keyword search, layout list (fixture search-list-p1).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 136978,
+      "dateHeader": "Thu, 08 Oct 2026 03:07:13 GMT"
+    }
+  },
+  {
+    "seq": 5,
+    "stepId": "item-open",
+    "kind": "render",
+    "method": "GET",
+    "url": "https://shopgoodwill.com/item/702801256",
+    "sentAtMs": 1791428954785,
+    "endedAtMs": 1791428958068,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "pages/item-open"
+    ],
+    "note": "Logged-out item page DOM of an open item with bids; the page's own ItemDetail XHR becomes item-detail-open; item-page chunks for CalculateShipping/bid/reCAPTCHA discovery.",
+    "pageInitiated": {
+      "sgwFirstParty": 16,
+      "buyerapi": [
+        {
+          "method": "POST",
+          "path": "/api/Dashboard/GetCurrentTime",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/ItemDetail/GetItemDetailModelByItemId/702801256",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/Seller/GetSellerInfo/135",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/Home/GetSellerItems?sellerId=135&categoryId=0",
+          "status": 200
+        }
+      ],
+      "blockedByType": {
+        "image": 3,
+        "font": 3
+      },
+      "blockedThirdPartyHosts": {
+        "shopgoodwillimages.azureedge.net": 46,
+        "www.googletagmanager.com": 1,
+        "cdn.scarabresearch.com": 1,
+        "apps.rokt-api.com": 1,
+        "fonts.gstatic.com": 1,
+        "assets.adobedtm.com": 1,
+        "cdn.intergient.com": 1,
+        "connect.facebook.net": 1,
+        "www.paypal.com": 1
+      },
+      "corsPreflights": 0
+    },
+    "observations": {
+      "title": "Ut ipsum laboris in reprehenderit dolor veniam incidid | ShopGoodwill.com",
+      "challengeFrames": 0,
+      "apiSeen": true,
+      "hydrated": true,
+      "recaptchaInDom": {
+        "scripts": [],
+        "iframes": 0,
+        "badge": 0
+      }
+    }
+  },
+  {
+    "seq": 6,
+    "stepId": "search-empty",
+    "kind": "api",
+    "method": "POST",
+    "url": "https://buyerapi.shopgoodwill.com/api/Search/ItemListing",
+    "sentAtMs": 1791429079072,
+    "endedAtMs": 1791429079260,
+    "status": 200,
+    "sent": {
+      "origin": "chrome-extension://bojepjeicaifliociipnjaahbmnglbdn",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/search-empty.json"
+    ],
+    "note": "Search that matches nothing (fixture search-empty).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 100831,
+      "dateHeader": "Thu, 08 Oct 2026 03:11:19 GMT"
+    }
+  },
+  {
+    "seq": 7,
+    "stepId": "search-malformed",
+    "kind": "api",
+    "method": "POST",
+    "url": "https://buyerapi.shopgoodwill.com/api/Search/ItemListing",
+    "sentAtMs": 1791429200269,
+    "endedAtMs": 1791429200682,
+    "status": 400,
+    "sent": {
+      "origin": "chrome-extension://bojepjeicaifliociipnjaahbmnglbdn",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/search-malformed.json"
+    ],
+    "note": "Valid body shape with non-numeric lowPrice/highPrice (fixture search-malformed-200 or -500).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 397,
+      "dateHeader": "Thu, 08 Oct 2026 03:13:20 GMT"
+    }
+  },
+  {
+    "seq": 8,
+    "stepId": "search-pickup",
+    "kind": "api",
+    "method": "POST",
+    "url": "https://buyerapi.shopgoodwill.com/api/Search/ItemListing",
+    "sentAtMs": 1791429321697,
+    "endedAtMs": 1791429322194,
+    "status": 200,
+    "sent": {
+      "origin": "chrome-extension://bojepjeicaifliociipnjaahbmnglbdn",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/search-pickup-only.json"
+    ],
+    "note": "Pickup-only search to find a pickup item for item-detail-pickup (fixture search-pickup-only).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 136650,
+      "dateHeader": "Thu, 08 Oct 2026 03:15:22 GMT"
+    }
+  },
+  {
+    "seq": 9,
+    "stepId": "help",
+    "kind": "render",
+    "method": "GET",
+    "url": "https://shopgoodwill.com/help",
+    "sentAtMs": 1791429443221,
+    "endedAtMs": 1791429446389,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "pages/help"
+    ],
+    "note": "Read SGW's own help center once: is the Goodwill Canada 'last-second bids may not be processed' warning present? (S-1 verdict)",
+    "pageInitiated": {
+      "sgwFirstParty": 11,
+      "buyerapi": [
+        {
+          "method": "POST",
+          "path": "/api/Dashboard/GetCurrentTime",
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/HelpCenter/GetList",
+          "status": 200
+        }
+      ],
+      "blockedByType": {
+        "image": 3,
+        "font": 3
+      },
+      "blockedThirdPartyHosts": {
+        "shopgoodwillimages.azureedge.net": 20,
+        "www.googletagmanager.com": 1,
+        "cdn.scarabresearch.com": 1,
+        "apps.rokt-api.com": 1,
+        "fonts.gstatic.com": 1,
+        "assets.adobedtm.com": 1,
+        "cdn.intergient.com": 1
+      },
+      "corsPreflights": 0
+    },
+    "observations": {
+      "title": "Help Center | ShopGoodwill.com",
+      "challengeFrames": 0,
+      "apiSeen": true,
+      "recaptchaInDom": {
+        "scripts": [],
+        "iframes": 0,
+        "badge": 0
+      }
+    }
+  },
+  {
+    "seq": 10,
+    "stepId": "search-malformed-cat",
+    "kind": "api",
+    "method": "POST",
+    "url": "https://buyerapi.shopgoodwill.com/api/Search/ItemListing",
+    "sentAtMs": 1791429567406,
+    "endedAtMs": 1791429567891,
+    "status": 200,
+    "sent": {
+      "origin": "chrome-extension://bojepjeicaifliociipnjaahbmnglbdn",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/search-malformed-cat.json"
+    ],
+    "note": "Type-valid but unparseable selectedCategoryIds, looking for the documented 200-with-error reply (categoryListModel null).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 136935,
+      "dateHeader": "Thu, 08 Oct 2026 03:19:27 GMT"
+    }
+  },
+  {
+    "seq": 11,
+    "stepId": "item-detail-pickup",
+    "kind": "api",
+    "method": "GET",
+    "url": "https://buyerapi.shopgoodwill.com/api/ItemDetail/GetItemDetailModelByItemId/372176454",
+    "sentAtMs": 1791429688900,
+    "endedAtMs": 1791429689282,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/item-detail-pickup.json"
+    ],
+    "note": "ItemDetail of an open pickup-only auction with bids (fixture item-detail-pickup).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 14482,
+      "dateHeader": "Thu, 08 Oct 2026 03:21:29 GMT"
+    }
+  },
+  {
+    "seq": 12,
+    "stepId": "item-detail-closed",
+    "kind": "api",
+    "method": "GET",
+    "url": "https://buyerapi.shopgoodwill.com/api/ItemDetail/GetItemDetailModelByItemId/702801256",
+    "sentAtMs": 1791443275310,
+    "endedAtMs": 1791443275500,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/item-detail-closed.json"
+    ],
+    "note": "ItemDetail of the item-detail-open auction (22 bids), read about 3.5 h after its endTime (fixture item-detail-closed). No search was needed to find a closed id.",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 20989,
+      "dateHeader": "Thu, 08 Oct 2026 07:07:55 GMT"
+    }
+  },
+  {
+    "seq": 13,
+    "stepId": "help-last-second",
+    "kind": "api",
+    "method": "GET",
+    "url": "https://buyerapi.shopgoodwill.com/api/HelpCenter/GetQuestionAnswer?q=i-tried-bidding-on-an-item-in-the-last-second",
+    "sentAtMs": 1791443396512,
+    "endedAtMs": 1791443396687,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/help-answer-last-second-bids.json"
+    ],
+    "note": "SGW's own help answer 'Why was my bid in the last seconds of an auction not accepted?' (slug from HelpCenter/GetList, request #9): S-1 verdict on the Goodwill Canada last-second-bids warning.",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 9698,
+      "dateHeader": "Thu, 08 Oct 2026 07:09:56 GMT"
+    }
+  },
+  {
+    "seq": 14,
+    "stepId": "help-15-items",
+    "kind": "api",
+    "method": "GET",
+    "url": "https://buyerapi.shopgoodwill.com/api/HelpCenter/GetQuestionAnswer?q=why-cant-i-bid-on-more-than-15-items-as-a-new",
+    "sentAtMs": 1791443517690,
+    "endedAtMs": 1791443518192,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/help-answer-new-account-15-items.json"
+    ],
+    "note": "SGW's own help answer 'Why can't I bid on more than 15 Items?': settles the third-party new-account cap claim (fable-prompt ⚠).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 10178,
+      "dateHeader": "Thu, 08 Oct 2026 07:11:58 GMT"
+    }
+  },
+  {
+    "seq": 15,
+    "stepId": "help-end-early",
+    "kind": "api",
+    "method": "GET",
+    "url": "https://buyerapi.shopgoodwill.com/api/HelpCenter/GetQuestionAnswer?q=why-did-the-auction-i-was-bidding-on-end-early",
+    "sentAtMs": 1791443639207,
+    "endedAtMs": 1791443639582,
+    "status": 200,
+    "sent": {
+      "origin": null,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36",
+      "hadCookieHeader": false,
+      "hadAuthorizationHeader": false
+    },
+    "outFiles": [
+      "api/help-answer-ended-early.json"
+    ],
+    "note": "SGW's own help answer 'Why did the auction I was bidding on end early?': early-end and soft-close evidence (fable-prompt ⚠).",
+    "observations": {
+      "corsPreflights": 0,
+      "bytes": 9885,
+      "dateHeader": "Thu, 08 Oct 2026 07:13:59 GMT"
+    }
+  }
+]
