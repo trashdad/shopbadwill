@@ -320,7 +320,7 @@ export interface Listing {
   categoryId?: number;
   categoryPath?: string;                // "Collectibles > Glass"
   shippingPrice?: Cents | null;         // null = calculated, unknown until quoted
-  pickupOnly: boolean;
+  pickupOnly?: boolean;                 // undefined = unknown: search rows lack it unless the query filtered on pickup (T-24 change); required on ItemDetail
   buyNowPrice?: Cents | null;
   imageUrl?: string;
   isFavorite?: boolean;                 // only meaningful when the request was authenticated
@@ -581,7 +581,8 @@ export type StepOutcome =                             // one variant per step ki
   | { kind: 'error'; message: string; retryable: boolean };
 export interface JobRun { id: string; trigger: 'scheduled' | 'catch-up' | 'manual'; startedAt: EpochMs; finishedAt?: EpochMs;
   status: 'running' | 'done' | 'failed' | 'paused'; steps: JobStep[]; cursor: number;
-  results: { newMatches: ItemId[]; favorited: ItemId[]; calendarUpserts: ItemId[]; errors: Array<{ step: number; message: string }> }; }
+  results: { newMatches: ItemId[]; favorited: ItemId[]; calendarUpserts: ItemId[]; errors: Array<{ step: number; message: string }> };
+  candidates?: JobCandidate[]; }   // T-51 change: per-item two-pass working state (watchIds, status, row/detail/quote until decided)
 export interface DailyJob {        // pure state machine; the runner feeds it one step at a time
   plan(watches: Watch[], now: EpochMs): JobRun;
   next(run: JobRun): JobStep | null;
@@ -595,8 +596,8 @@ Manual "Run now" uses lane `interactive` (1 req/s); scheduled and catch-up runs 
 
 ```ts
 export interface FavoritesReconciler {
-  desired(tracked: TrackedItem[], watches: Watch[], now: EpochMs): Array<{ itemId: ItemId; action: 'add' | 'none'; reason: string }>;
-  // idempotent: 'add' only when favoriteState==='none'|'failed' AND the item is not in favoritesCache AND the watch mode permits now
+  desired(tracked: TrackedItem[], watches: Watch[], now: EpochMs, favorites: readonly Favorite[]): Array<{ itemId: ItemId; action: 'add' | 'none'; reason: string }>;   // T-53 change: favorites list required
+  // 'favorited' is never downgraded by sync (the user owns it after that); idempotent: 'add' only when favoriteState==='none'|'failed' AND the item is not in favoritesCache AND the watch mode permits now
 }
 ```
 Removal is never automatic (the user may have favorited manually); undo of an extension-made favorite is an explicit audit-log undo.
@@ -1546,7 +1547,7 @@ Justified exception to the 120 s rule: the snipe window (≤ 6 reads for one ite
 | R12 | `background` permission ineffective under MV3 | M | M | S-8 measures; T1 falls back to power-plan guidance; T2 wake-and-launch | T-14, T-91 |
 | R13 | Favoriting attracts rival bidders (anecdotal) | ? | L | per-watch mode incl. `local` and `sgw-late` | T-51, T-55 |
 | R14 | Soft close exists (snipe fires into an extension) | L | M | S-3 verdict; `extended` detection and re-arm proposal | T-09, T-80 |
-| R15 | New-account 15-auction cap ⚠ / restricted auctions | L | L | `restricted` BidResultKind; warning copy in arming UI | T-100, T-85 |
+| R15 | New-account 15-auction cap (confirmed by SGW help, S-1) / suspension at 15 unpaid items / restricted auctions | L | L | `restricted` BidResultKind; warning copy in arming UI | T-100, T-85 |
 | R16 | Fixture sanitization leaks personal data | L | M | sanitizer tests; raw dir git-ignored; review step | T-07 |
 
 ---
@@ -1667,3 +1668,15 @@ The interface contract is frozen as **code**: `src/ports/**`, `src/domain/**/typ
 - `GcalEventSchema` is the normalized form; T-64 parses raw Google responses leniently.
 - Defaults: caps 5000/10000/20000, `requiredDryRuns` 5, `Watch.favoriteMode` `'sgw'`, `typoAbsolute` 2500, `features.landedCost` false (onboarding offers it), `snipe.keepAlive` true; `defaultSettings()` returns a mutable clone of the deep-frozen `DEFAULT_SETTINGS`.
 - T-35 defines the message reply/error envelope (not in §3).
+
+## 18. Contract changes after the freeze (2026-10-08)
+
+Each is recorded with its reason in `docs/CONTRACT-DECISIONS.md`; the code is authoritative.
+
+| Change | Card | Why |
+|---|---|---|
+| `Listing.pickupOnly` optional (undefined = unknown); `ItemDetail.pickupOnly` stays required; matcher `pickupOnly` → unknown when undefined | T-24 | S-1: search rows carry no pickup flag; a fabricated `false` mis-matched rules |
+| `JobRun.candidates?: JobCandidate[]` | T-51 | per-item, per-watch two-pass state must survive service-worker death between ticks |
+| `FavoritesReconciler.desired(…, favorites)` required | T-53 | the already-favorited check needs the list; an optional argument would silently drop it |
+| `config.ts` endpoint auth gains `'optional'` (itemDetail: bearer on the snipe lane only) | T-26 | `isHighBidder` is only meaningful on an authenticated read |
+| Audit `disableRule` undo ref = rule id | T-58 | no writer existed; the first writer must follow it |
