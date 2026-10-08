@@ -36,6 +36,7 @@
   },
   "dependencies": {
     "preact": "10.29.8",
+    "re2js": "2.8.6",
     "zod": "4.6.5"
   },
   "devDependencies": {
