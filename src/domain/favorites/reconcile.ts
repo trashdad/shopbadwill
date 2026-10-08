@@ -2,10 +2,11 @@
 //
 // 'add' only when ALL hold (idempotent; removal is never automatic):
 //   - favoriteState is 'none' or 'failed' ('queued' and 'favorited' are 'none');
-//   - the item is not in the favorites list cache;
+//   - the item is not in the favorites list;
 //   - the auction has not ended;
-//   - some enabled watch that tracks the item permits a favorite now:
-//     'sgw' always, 'sgw-late' from `endTime - favoriteWithinHours`, 'local' never.
+//   - the enabled watches that track the item permit a favorite now, as T-51
+//     plans it: any 'sgw' watch, else every 'sgw-late' watch's window is open
+//     (the latest notBefore has passed); 'local' never.
 import { DEFAULT_FAVORITE_WITHIN_HOURS } from '../settings/defaults';
 import type { EpochMs, Favorite, ItemId, TrackedItem } from '../types';
 import type { Watch } from '../watches/schema';
@@ -18,7 +19,7 @@ export interface DesiredFavorite {
   reason: string;
 }
 
-/** Whether watch `w` permits favoriting an item ending at `endMs`, as of `now`; `opensAt` is set for a closed sgw-late window. */
+/** Whether one watch permits favoriting an item ending at `endMs`, as of `now`; `opensAt` is set for a closed sgw-late window. */
 export function watchPermits(w: Watch, endMs: number, now: EpochMs): { ok: boolean; reason: string; opensAt?: number } {
   if (!w.enabled) return { ok: false, reason: `watch ${w.id} is disabled` };
   if (w.favoriteMode === 'local') return { ok: false, reason: `watch ${w.id} is local-only` };
@@ -33,10 +34,10 @@ export function desired(
   tracked: readonly TrackedItem[],
   watches: readonly Watch[],
   now: EpochMs,
-  /** The favorites list cache (`sbw:favoritesCache`.items). */
-  cached: ReadonlyArray<Pick<Favorite, 'itemId'>> = [],
+  /** The favorites list (`sbw:favoritesCache`.items). */
+  favorites: readonly Pick<Favorite, 'itemId'>[],
 ): DesiredFavorite[] {
-  const inList = new Set(cached.map((f) => f.itemId));
+  const inList = new Set(favorites.map((f) => f.itemId));
   const byId = new Map(watches.map((w) => [w.id, w]));
   return tracked.map((t): DesiredFavorite => {
     const none = (reason: string): DesiredFavorite => ({ itemId: t.itemId, action: 'none', reason });
@@ -46,16 +47,23 @@ export function desired(
     if (Number.isNaN(endMs)) return none('end time unknown');
     if (endMs <= now) return none('auction ended');
     const reasons: string[] = [];
+    let sgw: Watch | undefined;
+    const late: Watch[] = [];
     for (const r of t.reasons) {
       if (r.kind !== 'watch' || r.id === undefined) continue;
       const w = byId.get(r.id);
-      if (w === undefined) {
-        reasons.push(`watch ${r.id} not found`);
-        continue;
-      }
-      const p = watchPermits(w, endMs, now);
-      if (p.ok) return { itemId: t.itemId, action: 'add', reason: p.reason };
-      reasons.push(p.reason);
+      if (w === undefined) reasons.push(`watch ${r.id} not found`);
+      else if (!w.enabled) reasons.push(`watch ${w.id} is disabled`);
+      else if (w.favoriteMode === 'local') reasons.push(`watch ${w.id} is local-only`);
+      else if (w.favoriteMode === 'sgw') sgw ??= w;
+      else late.push(w);
+    }
+    if (sgw !== undefined) return { itemId: t.itemId, action: 'add', reason: `watch ${sgw.id}: sgw` };
+    if (late.length > 0) {
+      const opensAt = Math.max(...late.map((w) => endMs - (w.favoriteWithinHours ?? DEFAULT_FAVORITE_WITHIN_HOURS) * HOUR_MS));
+      return now >= opensAt
+        ? { itemId: t.itemId, action: 'add', reason: 'sgw-late: every window is open' }
+        : none(`sgw-late window opens at ${String(opensAt)}`);
     }
     return none(reasons.length > 0 ? reasons.join('; ') : 'no watch asks for a favorite');
   });

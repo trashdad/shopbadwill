@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { createFavoritesHandlers } from '../../../../src/background/handlers/favorites';
-import favoriteStep, { executeFavoriteStep, type FavoriteStepDeps } from '../../../../src/background/jobs/steps/favorite';
+import favoriteStep, {
+  FAVORITE_SKIP_PREFIX,
+  executeFavoriteStep,
+  parseUnfavoriteRef,
+  unfavoriteRef,
+  type FavoriteStepDeps,
+} from '../../../../src/background/jobs/steps/favorite';
 import { createAuditLog } from '../../../../src/domain/audit/log';
+import { desired } from '../../../../src/domain/favorites/reconcile';
 import { defaultSettings } from '../../../../src/domain/settings/defaults';
 import { Repo } from '../../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../../src/domain/storage/schema';
@@ -64,7 +71,7 @@ beforeEach(async () => {
   switches = new FakeSwitches();
   api = new FakeSgwApi({ clock, switches });
   audit = createAuditLog(repo);
-  deps = { api, switches, audit, repo, now: () => clock.now() };
+  deps = { api, switches, audit, repo };
   await repo.set(STORAGE_KEYS.watches, [watch()]);
   await repo.set(STORAGE_KEYS.tracked, { 101: tracked() });
   await setDryRun(false);
@@ -118,23 +125,85 @@ describe('executeFavoriteStep', () => {
     expect(await state()).toBe('none');
   });
 
-  it('auth/server errors mark failed and retry once per run', async () => {
+  it('an addFavorite failure marks failed, audits, and is not retryable; desired() re-adds it', async () => {
     api.failNext('addFavorite', 'server');
-    api.failNext('addFavorite', 'auth');
-    const first = await executeFavoriteStep(step, deps);
-    expect(first).toMatchObject({ kind: 'error', retryable: true });
+    const out = await executeFavoriteStep(step, deps);
+    expect(out).toMatchObject({ kind: 'error', retryable: false });
+    expect((out as Extract<StepOutcome, { kind: 'error' }>).message.startsWith(FAVORITE_SKIP_PREFIX)).toBe(false);
     expect(await state()).toBe('failed');
-    const second = await executeFavoriteStep(step, deps);
-    expect(second).toMatchObject({ kind: 'error', retryable: false });
-    expect(await state()).toBe('failed');
-    expect(addCalls()).toBe(2);
+    expect((await audit.list({ limit: 5, kinds: ['favorite.failed'] })).length).toBe(1);
+    const t = Object.values(await repo.get(STORAGE_KEYS.tracked));
+    expect(desired(t, [watch()], NOW, [])[0]?.action).toBe('add');
   });
 
-  it('a retry that succeeds ends favorited', async () => {
+  it('a later run that succeeds ends favorited', async () => {
     api.failNext('addFavorite', 'network');
     await executeFavoriteStep(step, deps);
     expect(await executeFavoriteStep(step, deps)).toEqual({ kind: 'favorite', done: true });
     expect(await state()).toBe('favorited');
+  });
+
+  it('kill switch: favorite.skipped audit, never a dry-run entry, no call', async () => {
+    await setDryRun(true);
+    const s = await repo.get(STORAGE_KEYS.settings);
+    await repo.set(STORAGE_KEYS.settings, { ...s, killSwitch: true });
+    const out = await executeFavoriteStep(step, deps);
+    expect(out).toMatchObject({ kind: 'error', retryable: false });
+    expect(api.calls).toEqual([]);
+    const all = await audit.list({ limit: 10 });
+    expect(all.map((e) => e.kind)).toEqual(['favorite.skipped']);
+    expect(all[0]?.dryRun).toBeUndefined();
+  });
+
+  it('switches.killAll refuses without a call or a dry-run entry', async () => {
+    switches.killAll('kill switch');
+    const out = await executeFavoriteStep(step, deps);
+    expect(out).toMatchObject({ kind: 'error', retryable: false });
+    expect(addCalls()).toBe(0);
+    expect((await audit.list({ limit: 10 })).some((e) => e.dryRun === true)).toBe(false);
+  });
+
+  it('every policy skip starts with FAVORITE_SKIP_PREFIX', async () => {
+    const msgs: string[] = [];
+    const msg = (o: StepOutcome): string => (o.kind === 'error' ? o.message : '');
+    await setDryRun(true);
+    msgs.push(msg(await executeFavoriteStep(step, deps)));
+    await setDryRun(false);
+    switches.block('favorites', 'x');
+    msgs.push(msg(await executeFavoriteStep(step, deps)));
+    switches.reset();
+    api.failNext('addFavorite', 'paused');
+    msgs.push(msg(await executeFavoriteStep(step, deps)));
+    await repo.set(STORAGE_KEYS.watches, [watch({ favoriteMode: 'local' })]);
+    msgs.push(msg(await executeFavoriteStep(step, deps)));
+    await repo.set(STORAGE_KEYS.watches, [watch({ enabled: false })]);
+    msgs.push(msg(await executeFavoriteStep(step, deps)));
+    expect(msgs).toHaveLength(5);
+    for (const m of msgs) expect(m.startsWith(FAVORITE_SKIP_PREFIX)).toBe(true);
+  });
+
+  it('a watch disabled mid-run is refused', async () => {
+    await repo.set(STORAGE_KEYS.watches, [watch({ enabled: false })]);
+    expect(await executeFavoriteStep(step, deps)).toMatchObject({ kind: 'error', retryable: false });
+    expect(api.calls).toEqual([]);
+  });
+
+  it('an item that already ended is refused', async () => {
+    await repo.set(STORAGE_KEYS.tracked, { 101: tracked({ endTime: new Date(NOW - 1000).toISOString() }) });
+    expect(await executeFavoriteStep(step, deps)).toMatchObject({ kind: 'error', retryable: false });
+    expect(api.calls).toEqual([]);
+  });
+
+  it('a favorited item is done with no call (the user owns it now)', async () => {
+    await repo.set(STORAGE_KEYS.tracked, { 101: tracked({ favoriteState: 'favorited' }) });
+    expect(await executeFavoriteStep(step, deps)).toEqual({ kind: 'favorite', done: true });
+    expect(api.calls).toEqual([]);
+  });
+
+  it('undo refs round trip', () => {
+    expect(parseUnfavoriteRef(unfavoriteRef(101))).toBe(101);
+    expect(parseUnfavoriteRef('nope')).toBeUndefined();
+    expect(parseUnfavoriteRef('removeFavorite:abc')).toBeUndefined();
   });
 
   it('local mode never favorites', async () => {
@@ -184,6 +253,20 @@ describe('favorites.sync handler', () => {
     expect(reads[0]?.args).toEqual(['all', 'interactive']);
     expect((await repo.get(STORAGE_KEYS.favoritesCache)).items.map((f) => f.itemId)).toEqual([101]);
     const t = await repo.get(STORAGE_KEYS.tracked);
-    expect([t[101]?.favoriteState, t[102]?.favoriteState, t[103]?.favoriteState]).toEqual(['favorited', 'none', 'failed']);
+    expect([t[101]?.favoriteState, t[102]?.favoriteState, t[103]?.favoriteState]).toEqual(['favorited', 'favorited', 'failed']);
+  });
+
+  it('user removed X on SGW: sync keeps favorited, desired() is none, a second watch makes no call', async () => {
+    await repo.set(STORAGE_KEYS.tracked, { 101: tracked({ favoriteState: 'favorited', reasons: [{ kind: 'watch', id: 'w1' }, { kind: 'watch', id: 'w2' }] }) });
+    await repo.set(STORAGE_KEYS.watches, [watch(), watch({ id: 'w2' })]);
+    api.favoriteList = [];
+    const h = createFavoritesHandlers({ api, repo });
+    await h['favorites.sync'](undefined, { sender: {}, senderClass: 'ui' });
+    const t = await repo.get(STORAGE_KEYS.tracked);
+    expect(t[101]?.favoriteState).toBe('favorited');
+    const cache = await repo.get(STORAGE_KEYS.favoritesCache);
+    expect(desired(Object.values(t), await repo.get(STORAGE_KEYS.watches), NOW, cache.items)[0]?.action).toBe('none');
+    expect(await executeFavoriteStep({ kind: 'favorite', itemId: 101, watchId: 'w2' }, deps)).toEqual({ kind: 'favorite', done: true });
+    expect(addCalls()).toBe(0);
   });
 });
