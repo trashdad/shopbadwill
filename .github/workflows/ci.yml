@@ -144,7 +144,8 @@ jobs:
     needs: e2e-chromium
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Allowed to fail until S-6 lands; then remove this line to make it required.
+    # Allowed to fail until the harness (T-12) has run green on GitHub's Linux
+    # runner; then remove this line to make the job required (S-6).
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4.2.2
@@ -153,14 +154,29 @@ jobs:
         with:
           node-version: 25
           cache: pnpm
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: |
+            test/e2e/firefox/requirements.txt
+            test/e2e/firefox/constraints.txt
       - run: pnpm install --frozen-lockfile
-      # ubuntu-latest ships Firefox and geckodriver (GECKOWEBDRIVER); show them.
+      # Direct pins in requirements.txt, every transitive one in constraints.txt;
+      # check_pins.py fails if anything in the closure is unpinned or off-pin.
+      - name: Install the Firefox harness (Selenium, pytest), pinned
+        run: |
+          python -m pip install -r test/e2e/firefox/requirements.txt -c test/e2e/firefox/constraints.txt
+          python test/e2e/firefox/check_pins.py
+      # ubuntu-latest ships Firefox stable and geckodriver (GECKOWEBDRIVER); the
+      # harness uses both (test/e2e/firefox/harness/firefox.py). geckodriver
+      # must be >= 0.36 for --allow-system-access.
       - name: Firefox and geckodriver versions
         run: |
           firefox --version
           "${GECKOWEBDRIVER}/geckodriver" --version
-      - name: Build the Firefox test extension
-        run: pnpm build:test -b firefox --mv3
+      # The harness serves its own fixture page (https://shopgoodwill.com/ via a
+      # local proxy). The fake servers are for specs that call buyerapi/Google.
       - name: Start the fake servers and wait for them
         run: |
           pnpm fake:sgw > fake-sgw.log 2>&1 &
@@ -179,5 +195,19 @@ jobs:
               sleep 1
             done
           done
-      # Passes with zero specs until T-12 lands (test/e2e/firefox/run.ts).
-      - run: pnpm test:e2e:firefox
+      # Builds the Firefox test extension (.output/firefox-mv3-test), then runs
+      # pytest in test/e2e/firefox: temporary install via Selenium/geckodriver,
+      # headless Firefox.
+      - name: Firefox E2E (build:test + pytest)
+        run: pnpm test:e2e:firefox
+      - name: Upload Firefox E2E artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: firefox-e2e
+          path: |
+            test-results/firefox/
+            fake-sgw.log
+            fake-google.log
+          if-no-files-found: ignore
+          retention-days: 7
