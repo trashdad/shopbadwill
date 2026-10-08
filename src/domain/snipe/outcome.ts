@@ -137,7 +137,10 @@ export function classifyOutcome(
   const price = post?.currentPrice;
   const priceKnown = closed && price !== undefined;
   const firedAfterEnd = timing.firedBeforeEndMs !== undefined && timing.firedBeforeEndMs < 0;
-  const extended = post !== null && !post.isClosed && isoMs(post.endTime) > armedEndMs;
+  // Extension is judged against the end at arm time: the runner may have refreshed
+  // `snipe.endTime` at T-60 and that refresh could itself hide a soft close.
+  // Lateness uses `snipe.endTime` (latest known end): that is the end the fire aimed at.
+  const extended = post !== null && !post.isClosed && isoMs(post.endTime) > isoMs(snipe.endTimeAtArm);
 
   let outcome: SnipeOutcome;
   let heading: string;
@@ -208,8 +211,8 @@ export function classifyOutcome(
     final = false;
     showEnd = false;
     newEndTime = post.endTime;
-    message = `Auction was extended to ${formatDual(isoMs(post.endTime), tz)} (was ${endedAt}). This snipe is spent; re-arm to bid again (your max ${max}).`;
-    detail = `Soft close: end moved from ${snipe.endTime} to ${post.endTime}.`;
+    message = `Auction was extended to ${formatDual(isoMs(post.endTime), tz)} (was ${formatDual(isoMs(snipe.endTimeAtArm), tz)}). This snipe is spent; re-arm to bid again (your max ${max}).`;
+    detail = `Soft close: end moved from ${snipe.endTimeAtArm} to ${post.endTime}.`;
   } else if (bidResult?.kind === 'closed' || (bidResult === null && firedAfterEnd)) {
     if (firedAfterEnd) {
       outcome = 'late';

@@ -127,6 +127,15 @@ describe('extended', () => {
     expect(r.stamp).toBeNull();
     expect(r.notify.message).toContain('re-arm');
   });
+  it('detects an extension even when snipe.endTime was refreshed to the new end', () => {
+    const r = classifyOutcome(
+      snipe({ endTime: later }),
+      bid('accepted', { isHighBidder: true }),
+      detail({ isClosed: false, endTime: later, serverTime: new Date(END_MS - 1000).toISOString() }),
+    );
+    expect(r.outcome).toBe('extended');
+    expect(r.report.detail).toContain(END);
+  });
   it('is not extended when the endTime is unchanged', () => {
     const r = classifyOutcome(snipe(), bid('accepted', { isHighBidder: true }), detail({ isHighBidder: true }));
     expect(r.outcome).toBe('won');
