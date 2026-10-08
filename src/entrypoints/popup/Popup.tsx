@@ -28,11 +28,13 @@ const DRY_RUN_LABELS = { favorites: 'Favorites', calendar: 'Calendar', bidding: 
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
+class TimeoutError extends Error {}
+
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(new Error(`${what} timed out (the background is not responding)`));
+      reject(new TimeoutError(`${what} timed out (the background is not responding)`));
     }, ms);
   });
   return Promise.race([p, timeout]).finally(() => {
@@ -128,17 +130,29 @@ export function Popup({ messaging, actions, now, sections, timeoutMs = DEFAULT_T
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const keepRef = useRef<HTMLButtonElement>(null);
+  // Sequence counters: a load result is dropped if a newer load started, and
+  // its kill value is dropped if a broadcast arrived while it was in flight.
+  const loadSeq = useRef(0);
+  const broadcastSeq = useRef(0);
 
   const load = useCallback(async (resync = false) => {
     setLoadError(null);
+    const myLoad = ++loadSeq.current;
+    const broadcastAtStart = broadcastSeq.current;
     const [s, h] = await Promise.allSettled([
       withTimeout(messaging.send('settings.get', undefined), timeoutMs, 'settings.get'),
       withTimeout(messaging.send('health.get', undefined), timeoutMs, 'health.get'),
     ]);
+    if (myLoad !== loadSeq.current) return; // a newer load superseded this one
     if (s.status === 'fulfilled') {
       setSettings(s.value);
-      // On first load a broadcast that arrived first is newer; Retry re-syncs from the background.
-      setKill((k) => (resync ? s.value.killSwitch : (k ?? s.value.killSwitch)));
+      // A broadcast is newer than any read that started before it. Otherwise
+      // Retry re-syncs from the background, and the first load only fills an unknown state.
+      const broadcastSince = broadcastSeq.current !== broadcastAtStart;
+      if (!broadcastSince) {
+        setKill((k) => (resync ? s.value.killSwitch : (k ?? s.value.killSwitch)));
+        if (resync) setActionError(null);
+      }
     } else {
       setLoadError(`Cannot reach the background: ${errorText(s.reason)}`);
     }
@@ -148,7 +162,9 @@ export function Popup({ messaging, actions, now, sections, timeoutMs = DEFAULT_T
   useEffect(() => {
     // Subscribe before loading, so no change is missed in between.
     const off = messaging.onBroadcast('switches.changed', (p) => {
+      broadcastSeq.current += 1;
       setKill(p.killSwitch);
+      setActionError(null);
       if (!p.killSwitch) setConfirming(false);
     });
     void load();
@@ -165,7 +181,15 @@ export function Popup({ messaging, actions, now, sections, timeoutMs = DEFAULT_T
       setKill(on);
       setConfirming(false);
     } catch (e) {
-      setActionError(`Could not change the kill switch: ${errorText(e)}`);
+      if (e instanceof TimeoutError) {
+        // The change may have happened after we gave up: the state is unknown, not unchanged.
+        setKill(null);
+        setConfirming(false);
+        setActionError('Unconfirmed: the background did not reply. The state may have changed — checking…');
+        void load(true);
+      } else {
+        setActionError(`Could not change the kill switch: ${errorText(e)}`);
+      }
     } finally {
       setBusy(false);
     }

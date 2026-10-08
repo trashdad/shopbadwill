@@ -155,6 +155,95 @@ describe('popup kill switch', () => {
     });
   });
 
+  function timeoutSetup(initialKill: boolean, afterKill: () => Settings | Promise<Settings>) {
+    const m = new FakeMessaging();
+    let calls = 0;
+    m.handle('settings.get', () => {
+      calls += 1;
+      return calls === 1 ? { ...DEFAULT_SETTINGS, killSwitch: initialKill } : afterKill();
+    });
+    m.handle('health.get', () => health());
+    m.handle('kill.set', () => new Promise<never>(() => undefined));
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [], timeoutMs: 40 }));
+    return m;
+  }
+
+  it('kill.set timeout on stop: unknown, then re-synced', async () => {
+    timeoutSetup(false, () => ({ ...DEFAULT_SETTINGS, killSwitch: true }));
+    const btn = await screen.findByRole('button', { name: /kill switch/i });
+    await waitFor(() => {
+      expect(screen.getByTestId('kill-state').textContent).toMatch(/automation on/i);
+    });
+    fireEvent.click(btn);
+    expect((await screen.findByRole('alert')).textContent).toMatch(/unconfirmed/i);
+    await waitFor(() => {
+      expect(screen.getByTestId('kill-state').textContent).toMatch(/stopped/i);
+    });
+  });
+
+  it('kill.set timeout on resume: never shows STOPPED as certain; failed re-sync stays unknown', async () => {
+    const m = new FakeMessaging();
+    let calls = 0;
+    m.handle('settings.get', () => {
+      calls += 1;
+      if (calls > 1) throw new Error('down');
+      return { ...DEFAULT_SETTINGS, killSwitch: true };
+    });
+    m.handle('health.get', () => health());
+    m.handle('kill.set', () => new Promise<never>(() => undefined));
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [], timeoutMs: 40 }));
+    const btn = await screen.findByRole('button', { name: /kill switch/i });
+    await waitFor(() => {
+      expect(btn.getAttribute('aria-pressed')).toBe('true');
+    });
+    fireEvent.click(btn);
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('kill-state').textContent).toMatch(/unknown/i);
+    });
+    expect(screen.getByTestId('kill-state').textContent).not.toMatch(/STOPPED/);
+    expect(screen.queryByText(/resume/i)).toBeNull();
+    expect(screen.getByText('Stop all automation')).toBeTruthy();
+    expect(document.body.textContent).toMatch(/unconfirmed/i);
+  });
+
+  it('kill.set timeout on resume that re-syncs shows the true state', async () => {
+    timeoutSetup(true, () => ({ ...DEFAULT_SETTINGS, killSwitch: false }));
+    const btn = await screen.findByRole('button', { name: /kill switch/i });
+    await waitFor(() => {
+      expect(btn.getAttribute('aria-pressed')).toBe('true');
+    });
+    fireEvent.click(btn);
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('kill-state').textContent).toMatch(/automation on/i);
+    });
+  });
+
+  it('a broadcast during a reload is not overwritten by the stale read', async () => {
+    const m = new FakeMessaging();
+    let calls = 0;
+    let release: (s: Settings) => void = () => undefined;
+    m.handle('settings.get', () => {
+      calls += 1;
+      if (calls === 1) throw new Error('down');
+      return new Promise<Settings>((resolve) => {
+        release = resolve;
+      });
+    });
+    m.handle('health.get', () => health());
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [] }));
+    await screen.findByRole('alert');
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    await waitFor(() => {
+      expect(calls).toBe(2);
+    });
+    m.broadcast('switches.changed', { killSwitch: true, writesAllowed: {} });
+    release({ ...DEFAULT_SETTINGS, killSwitch: false }); // read taken before the broadcast
+    await screen.findByTestId('budget'); // the reload has finished
+    expect(screen.getByTestId('kill-state').textContent).toMatch(/stopped/i);
+  });
+
   it('an unresponsive background times out with Retry', async () => {
     const m = new FakeMessaging();
     m.handle('settings.get', () => new Promise<never>(() => undefined));
