@@ -1,15 +1,16 @@
 name: Release
 
-# Tag push (vX.Y.Z) -> build, lint, package, optionally sign Firefox, publish a GitHub release.
-# Manual run (workflow_dispatch) with `draft` left at true -> same pipeline, but the release is
-# a DRAFT and no tag is created (a draft release does not create its tag until it is published).
+# Tag push (vX.Y.Z) -> build, lint, package, optionally sign Firefox, create a GitHub release.
+# EVERY release is created as a DRAFT; the maintainer publishes it manually.
+# Manual run (workflow_dispatch) with `draft` left at true -> same pipeline on a branch, and no tag
+# is created (a draft release does not create its tag until it is published).
 on:
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
     inputs:
       draft:
-        description: 'Draft only: create a draft release and no tag. Required unless run on a tag.'
+        description: 'Run from a branch: draft release, no tag created. Must stay true unless run on a tag.'
         type: boolean
         default: true
 
@@ -124,12 +125,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${{ inputs.draft }}" != "true" ]; then
-            gh release create "${GITHUB_REF_NAME}" dist/* \
-              --title "ShopBadwill ${VERSION}" --notes-file dist-notes.md --verify-tag
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # The tag already exists (it triggered this run); the release stays a draft.
+            gh release create "${GITHUB_REF_NAME}" dist/* --draft --verify-tag \n              --title "ShopBadwill ${VERSION}" --notes-file dist-notes.md
           else
-            # Draft: no tag is created. The name is unique per run so reruns never collide.
-            gh release create "v${VERSION}-draft.${GITHUB_RUN_ID}" dist/* \
-              --draft --target "${GITHUB_SHA}" \
-              --title "ShopBadwill ${VERSION} (draft)" --notes-file dist-notes.md
+            # Branch dispatch: no tag is created. The name is unique per run so reruns never collide.
+            gh release create "v${VERSION}-draft.${GITHUB_RUN_ID}" dist/* \n              --draft --target "${GITHUB_SHA}" \n              --title "ShopBadwill ${VERSION} (draft)" --notes-file dist-notes.md
           fi
