@@ -13,13 +13,18 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type * as BidModule from '../../../../src/adapters/sgw/bid';
 
-/** The BidContext the adapter hands bid.ts, captured so tests can drive ctx.sendWrite (I2). */
-const bidCapture = vi.hoisted((): { ctx: unknown } => ({ ctx: undefined }));
+/**
+ * The BidContext the adapter hands bid.ts, captured so tests can drive
+ * ctx.sendWrite (I2). With `captureOnly`, bid.ts is not run: the call rejects
+ * `paused` and sends nothing, as T-26's stub did. Otherwise T-100's live path runs.
+ */
+const bidCapture = vi.hoisted((): { ctx: unknown; captureOnly: boolean } => ({ ctx: undefined, captureOnly: false }));
 vi.mock('../../../../src/adapters/sgw/bid', async (importOriginal) => {
   const real = await importOriginal<typeof BidModule>();
   const placeBid: typeof real.placeBid = (ctx, req, opts) => {
     bidCapture.ctx = ctx;
-    return real.placeBid(ctx, req, opts); // the stub's own behaviour: always paused
+    if (bidCapture.captureOnly) return Promise.reject(new real.BidNotSentError('paused', 'captured by the test; nothing was sent'));
+    return real.placeBid(ctx, req, opts);
   };
   return { ...real, placeBid };
 });
@@ -484,14 +489,17 @@ describe("R3: credentials 'omit' on every request, bearer only on auth endpoints
     }
   });
 
-  it('placeBid sends nothing at all (stub)', async () => {
+  it("placeBid (T-100): ShowBidModal then PlaceBid, both credentials 'omit', no cookie, with the bearer", async () => {
     const t = setup();
     scriptAll(t.http);
-    await rejectsWith(
-      t.api.placeBid({ itemId: ITEM, sellerId: 12, bidAmount: 7000, quantity: 1 }, { idempotencyKey: 'k1', timeoutMs: 20 * S }),
-      'paused',
-    );
-    expect(t.http.requests).toHaveLength(0);
+    t.http.on(`${BASE}ItemBid/PlaceBid`, json({ status: false, result: -999, message: 'x' }));
+    await t.api.placeBid({ itemId: ITEM, sellerId: 12, bidAmount: 7000, quantity: 1 }, { idempotencyKey: 'k1', timeoutMs: 20 * S });
+    expect(t.http.requests.map((r) => r.url.split('?')[0])).toEqual([`${BASE}ItemBid/ShowBidModal`, `${BASE}ItemBid/PlaceBid`]);
+    for (const r of t.http.requests) {
+      expect(r.credentials).toBe('omit');
+      expect(header(r, 'cookie')).toBeUndefined();
+      expect(header(r, 'authorization')).toBe(`Bearer ${BEARER}`);
+    }
   });
 
   const AUTH_CALLS = READ_AND_WRITE_CALLS.filter(([, , auth]) => auth);
@@ -790,16 +798,14 @@ describe('R4/C1: every write asks GlobalSwitches.writesAllowed; a refusal is aud
     await rejectsWith(t.api.removeFavorite(ITEM), 'auth');
   });
 
-  it('placeBid with every switch open still throws paused (T-100 stub) and sends nothing', async () => {
+  it('placeBid (T-100) with every switch open: writesAllowed asked by placeBid, then by sendWrite; one PlaceBid sent', async () => {
     const t = setup();
     scriptAll(t.http);
-    const err = await rejectsWith(
-      t.api.placeBid({ itemId: ITEM, sellerId: 12, bidAmount: 7000, quantity: 1 }, { idempotencyKey: 'k', timeoutMs: 20 * S }),
-      'paused',
-    );
-    expect(err.message).toContain('T-100');
-    expect(t.switches.checks).toEqual(['bidding']);
-    expect(t.http.requests).toHaveLength(0);
+    t.http.on(`${BASE}ItemBid/PlaceBid`, json({ status: false, result: -999, message: 'x' }));
+    const r = await t.api.placeBid({ itemId: ITEM, sellerId: 12, bidAmount: 7000, quantity: 1 }, { idempotencyKey: 'k', timeoutMs: 20 * S });
+    expect(r.kind).toBe('rejected-unknown');
+    expect(t.switches.checks).toEqual(['bidding', 'bidding']);
+    expect(t.http.requests.filter((q) => q.url === `${BASE}ItemBid/PlaceBid`)).toHaveLength(1);
   });
 });
 
@@ -809,13 +815,18 @@ describe('I2: ctx.sendWrite is the same guarded send, on the snipe lane, for bid
   const PLACE_BID = `${BASE}ItemBid/PlaceBid`;
   const BID_BODY = { itemId: ITEM, bidAmount: '70.00', sellerId: 12, quantity: 1 };
 
-  /** Calls placeBid (the stub rejects paused) and returns the BidContext it was handed. */
+  /** Calls placeBid in capture-only mode (it rejects paused, sends nothing) and returns the BidContext it was handed. */
   async function stubContext(t: Setup): Promise<BidContext> {
     bidCapture.ctx = undefined;
-    await rejectsWith(
-      t.api.placeBid({ itemId: ITEM, sellerId: 12, bidAmount: 7000, quantity: 1 }, { idempotencyKey: 'k', timeoutMs: 20 * S }),
-      'paused',
-    );
+    bidCapture.captureOnly = true;
+    try {
+      await rejectsWith(
+        t.api.placeBid({ itemId: ITEM, sellerId: 12, bidAmount: 7000, quantity: 1 }, { idempotencyKey: 'k', timeoutMs: 20 * S }),
+        'paused',
+      );
+    } finally {
+      bidCapture.captureOnly = false;
+    }
     expect(bidCapture.ctx).toBeDefined();
     return bidCapture.ctx as BidContext;
   }

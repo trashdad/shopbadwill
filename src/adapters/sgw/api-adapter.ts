@@ -199,10 +199,15 @@ export interface SgwRequestInit {
   lane?: Lane;
 }
 
-/** What the PlaceBid path (bid.ts, T-100) gets from the adapter. */
+/**
+ * What the PlaceBid path (bid.ts, T-100) gets from the adapter. It has no
+ * scheduler: the only way to send the bid is `sendWrite`, so the write gate
+ * cannot be bypassed.
+ */
 export interface BidContext {
-  readonly scheduler: RequestScheduler;
   readonly clock: Clock;
+  /** The adapter's own ShowBidModal read (snipe lane, bearer), made just before the bid. */
+  showBidModal(itemId: ItemId): Promise<{ sellerId: number; minimumBid: Cents }>;
   /**
    * Builds a request the way every adapter request is built (`credentials:
    * 'omit'`, the bearer only for auth endpoints). Rejects with
@@ -432,8 +437,8 @@ export class SgwApiAdapter implements SgwApi {
 
   /**
    * Asks writesAllowed('bidding') here, then hands bid.ts a BidContext whose
-   * `sendWrite` is the guarded send for this bid. bid.ts is a stub that
-   * throws `paused` until T-100.
+   * `sendWrite` is the guarded send for this bid. bid.ts (T-100) reads
+   * ShowBidModal, then sends PlaceBid through `sendWrite`.
    */
   async placeBid(
     req: { itemId: ItemId; sellerId: number; bidAmount: Cents; quantity: 1 },
@@ -444,8 +449,8 @@ export class SgwApiAdapter implements SgwApi {
     const verdict = await this.ask('bidding');
     if (!verdict.ok) throw await this.refuse('bid.place', target, verdict.why);
     const ctx: BidContext = {
-      scheduler: this.deps.scheduler,
       clock: this.deps.clock,
+      showBidModal: (itemId) => this.showBidModal(itemId),
       prepare: (endpoint, init) => this.prepare(endpoint, init),
       sendWrite: (endpoint, init, parse) => this.guardedRun('bidding', 'bid.place', target, endpoint, 'snipe', init, parse),
       flagSchemaFailure: (endpoint, error) => {
