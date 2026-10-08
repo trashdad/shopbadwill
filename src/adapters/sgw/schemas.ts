@@ -264,14 +264,11 @@ export const PlaceBidResponseSchema = z.looseObject({
   message: z.string().nullable().optional(),
   isHighBidder: z.boolean().nullable().optional(),
   isUnauthorized: z.boolean().optional(),
-  /** If the reply is enveloped, `result` and `isHighBidder` live here. */
-  data: z
-    .looseObject({
-      result: z.number().int().nullable().optional(),
-      isHighBidder: z.boolean().nullable().optional(),
-    })
-    .nullable()
-    .optional(),
+  /**
+   * If the reply is enveloped, `result` and `isHighBidder` live here. Any shape is accepted
+   * (a failure may send `[]` or text); normalize.ts reads it only when it is a plain object.
+   */
+  data: z.unknown().optional(),
 });
 export type PlaceBidResponse = z.infer<typeof PlaceBidResponseSchema>;
 

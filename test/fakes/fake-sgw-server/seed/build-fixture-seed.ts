@@ -93,11 +93,9 @@ export function buildFixtureSeed(dir: string = FIXTURE_JSON_DIR): SeedItem[] {
       pickupOnly: d.pickupOnly,
       shippingPrice: d.shippingPrice === 0 && d.allowShippingCalculation ? null : d.shippingPrice,
       imageURL: d.imageServer + d.imageUrlString,
-      bidHistory: [...d.bidHistory.bidComplete].reverse().map((b) => ({
-        bidAmount: b.bidAmount,
-        bidTime: b.bidTime,
-        bidderName: b.bidderName,
-      })),
+      bidHistory: [...d.bidHistory.bidComplete]
+        .reverse()
+        .map((b) => ({ bidAmount: b.bidAmount, bidTime: b.bidTime, bidderName: b.bidderName })),
     });
   }
   return [...items.values()].sort((a, b) => a.itemId - b.itemId);
