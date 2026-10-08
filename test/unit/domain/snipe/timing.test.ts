@@ -55,6 +55,14 @@ describe('toLocalFireAt', () => {
   });
 });
 
+describe('end to end', () => {
+  it('server fire time converted to the local clock', () => {
+    const server = computeFireAt(END, 8000, 150);
+    expect(toLocalFireAt(server, 2000)).toBe(END - 10150);
+    expect(toLocalFireAt(server, -2000)).toBe(END - 6150);
+  });
+});
+
 describe('planClockSamples', () => {
   it('is 3 samples 20 s apart starting at wake', () => {
     expect(CLOCK_SAMPLE_COUNT).toBe(3);
@@ -81,6 +89,8 @@ describe('clockSanity', () => {
   });
   it('aborts on non-finite offset', () => {
     expect(clockSanity({ offsetMs: Number.NaN })).toEqual({ ok: false, reason: 'clock-skew' });
+    expect(clockSanity({ offsetMs: Infinity })).toEqual({ ok: false, reason: 'clock-skew' });
+    expect(clockSanity({ offsetMs: -Infinity })).toEqual({ ok: false, reason: 'clock-skew' });
   });
 });
 
@@ -92,7 +102,13 @@ describe('assessClock', () => {
   it('rtt: exactly 2000 allowed, above aborts', () => {
     expect(MAX_RTT_MS).toBe(2000);
     expect(assessClock(ok({ rttMs: 2000 }))).toEqual({ ok: true, offsetMs: 0, rttMs: 2000, oneWayMs: 1000 });
-    expect(assessClock(ok({ rttMs: 2001 }))).toEqual({ ok: false, reason: 'rtt-too-high' });
+    expect(assessClock(ok({ rttMs: 2001 }))).toEqual({ ok: false, reason: 'bad-rtt' });
+  });
+  it('bad rtt (NaN, negative, +-Infinity) aborts as bad-rtt; NaN offset as clock-skew', () => {
+    for (const rttMs of [Number.NaN, -1, -Infinity, Infinity]) {
+      expect(assessClock(ok({ rttMs }))).toEqual({ ok: false, reason: 'bad-rtt' });
+    }
+    expect(assessClock(ok({ offsetMs: Number.NaN }))).toEqual({ ok: false, reason: 'clock-skew' });
   });
   it('clock skew aborts', () => {
     expect(assessClock(ok({ offsetMs: 300_001 }))).toEqual({ ok: false, reason: 'clock-skew' });

@@ -36,7 +36,7 @@ export function planClockSamples(wakeAtMs: EpochMs): EpochMs[] {
   return Array.from({ length: CLOCK_SAMPLE_COUNT }, (_, i) => wakeAtMs + i * CLOCK_SAMPLE_SPACING_MS);
 }
 
-export type ClockAbortReason = 'no-offset' | 'rtt-too-high' | 'clock-skew';
+export type ClockAbortReason = 'no-offset' | 'bad-rtt' | 'clock-skew';
 export type ClockSanityResult = { ok: true } | { ok: false; reason: 'clock-skew' };
 
 /** Abort if |offset| > 5 min (exactly 5 min is allowed). Non-finite offsets abort. */
@@ -57,7 +57,7 @@ export type ClockAssessment =
 /** Gate on SgwClock.offset(): null or confidence none, rtt > 2 s, or insane skew abort. */
 export function assessClock(offset: ClockOffsetInput | null): ClockAssessment {
   if (offset === null || offset.confidence === 'none') return { ok: false, reason: 'no-offset' };
-  if (!(offset.rttMs <= MAX_RTT_MS)) return { ok: false, reason: 'rtt-too-high' };
+  if (!(offset.rttMs >= 0 && offset.rttMs <= MAX_RTT_MS)) return { ok: false, reason: 'bad-rtt' };
   const sane = clockSanity(offset);
   if (!sane.ok) return sane;
   return { ok: true, offsetMs: offset.offsetMs, rttMs: offset.rttMs, oneWayMs: offset.rttMs / 2 };
