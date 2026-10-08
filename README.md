@@ -41,3 +41,19 @@ A filter is a substring of the test file path (`pnpm test:unit -- domain/time` r
 - Firefox: `about:debugging#/runtime/this-firefox` → Load Temporary Add-on → `.output/firefox-mv3/manifest.json`.
 
 `pnpm exec tsx scripts/badge-check.ts` (after `pnpm build`) loads the Chromium build in Playwright, opens the shopgoodwill.com home page once, checks the "ShopBadwill ready" Shadow DOM badge and saves `test-results/t01-badge.png`.
+
+## Reproducible build
+
+The Firefox add-on is distributed as an unlisted, self-signed `.xpi`. Mozilla (AMO) receives the source with each signing upload; this is how to rebuild it from that source (or from a release tag):
+
+- Node 25 (`.nvmrc`; `engines` requires `>=25`)
+- pnpm 12.9.1 (the `packageManager` field in `package.json`; `corepack enable` selects it)
+
+```sh
+pnpm install --frozen-lockfile
+pnpm build:firefox
+```
+
+The unpacked Firefox extension lands in `.output/firefox-mv3/` (`manifest.json` plus bundled assets). `pnpm build` writes the Chrome build to `.output/chrome-mv3/`. Leave `SBW_TEST` and `SBW_GOOGLE_CLIENT_ID` unset to match the Firefox build; the release workflow's source zip (`shopbadwill-<version>-sources.zip`, produced by `git archive`) contains exactly the tracked files of the tagged commit.
+
+Release checksums are in `SHA256SUMS` on each GitHub release.
