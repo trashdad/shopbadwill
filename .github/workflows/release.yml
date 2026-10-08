@@ -127,8 +127,11 @@ jobs:
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             # The tag already exists (it triggered this run); the release stays a draft.
-            gh release create "${GITHUB_REF_NAME}" dist/* --draft --verify-tag \n              --title "ShopBadwill ${VERSION}" --notes-file dist-notes.md
+            gh release create "${GITHUB_REF_NAME}" dist/* --draft --verify-tag \
+              --title "ShopBadwill ${VERSION}" --notes-file dist-notes.md
           else
             # Branch dispatch: no tag is created. The name is unique per run so reruns never collide.
-            gh release create "v${VERSION}-draft.${GITHUB_RUN_ID}" dist/* \n              --draft --target "${GITHUB_SHA}" \n              --title "ShopBadwill ${VERSION} (draft)" --notes-file dist-notes.md
+            gh release create "v${VERSION}-draft.${GITHUB_RUN_ID}" dist/* \
+              --draft --target "${GITHUB_SHA}" \
+              --title "ShopBadwill ${VERSION} (draft)" --notes-file dist-notes.md
           fi
