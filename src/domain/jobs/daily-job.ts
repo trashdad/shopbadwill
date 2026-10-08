@@ -36,6 +36,14 @@ export interface DailyJobDeps {
   evaluateBatch: EvaluateBatch;
   /** R2: names the query's invalid params (T-52 passes the adapter's `invalidSearchParams`). */
   validateQuery: (query: SearchQuery) => string[];
+  /**
+   * Rows per page the search request for this query actually asks for.
+   * `SearchQuery` has no page-size field; S-1 fixes ItemListing at 40
+   * (`SGW_SEARCH_BODY_DEFAULTS.pageSize`), so T-52 passes the body builder's
+   * value. Used only to stop paging early; a non-positive or non-integer
+   * size never stops it.
+   */
+  searchPageSize: (query: SearchQuery) => number;
   /** Watches and rules as stored at this tick (`apply` takes no watches). */
   watches: readonly Watch[];
   rules: readonly Rule[];
@@ -45,7 +53,15 @@ export interface DailyJobDeps {
 }
 
 type Kind = JobStep['kind'];
-type Decision = MatchResult['decision'];
+
+/**
+ * Controller ruling (concern 2): a watch match ignores display precedence.
+ * Some matched rule of the watch has action `watch` and none has `hide` (a
+ * hide vetoes); highlight never matters. Uses `matched`, not `decision`.
+ */
+function isWatchMatch(res: MatchResult): boolean {
+  return res.matched.some((m) => m.action === 'watch') && !res.matched.some((m) => m.action === 'hide');
+}
 
 /** What the row has, for the data a detail can supply. */
 interface Availability {
@@ -180,19 +196,22 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
   };
 
   /**
-   * R1.4: the strict decision for one watch, and whether a write may rest on
-   * it: some matched `watch` rule has every condition known, and no hide or
-   * highlight rule has an unknown condition (one could flip the decision).
+   * R1.3/R1.4: the strict match for one watch, and whether a write may rest on
+   * it: some matched `watch` rule has every condition known, and no hide rule
+   * has an unknown condition (one could veto the match). Highlight rules never
+   * affect a watch match (controller ruling, concern 2).
    */
-  const judge = (w: Watch, l: Listing, ctx: MatchContext): { decision: Decision; confident: boolean } => {
+  const judge = (w: Watch, l: Listing, ctx: MatchContext): { match: boolean; confident: boolean; why: string } => {
     const rules = rulesOf(w);
     const res = evaluateOne(l, rules, ctx);
-    if (res.decision !== 'watch') return { decision: res.decision, confident: false };
-    if (res.unknownConditions === 0) return { decision: 'watch', confident: true };
+    if (!isWatchMatch(res)) {
+      return { match: false, confident: false, why: res.matched.some((m) => m.action === 'hide') ? 'hidden' : 'no rule matched' };
+    }
+    if (res.unknownConditions === 0) return { match: true, confident: true, why: '' };
     const known = (r: Rule | undefined): boolean => r !== undefined && evaluateOne(l, [r], ctx).unknownConditions === 0;
     const ruleKnown = res.matched.some((m) => m.action === 'watch' && known(rules.find((r) => r.id === m.ruleId)));
-    const othersKnown = rules.filter((r) => r.action !== 'watch').every(known);
-    return { decision: 'watch', confident: ruleKnown && othersKnown };
+    const hidesKnown = rules.filter((r) => r.action === 'hide').every(known);
+    return { match: true, confident: ruleKnown && hidesKnown, why: 'unknown conditions; write withheld' };
   };
 
   const ctxFor = (c: JobCandidate, l: Listing): MatchContext => ({
@@ -210,7 +229,7 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
     return calendarOn(w) ? 'calendar' : null;
   };
 
-  /** R1.1: rows the relaxed watch rules select (decision `watch`). */
+  /** R1.1: rows the relaxed watch rules select (a watch match, concern 2). */
   const optimistic = (rows: Listing[], rules: Rule[], deferLandedCost: boolean): Set<ItemId> => {
     const groups = new Map<string, { a: Availability; rows: Listing[] }>();
     for (const row of rows) {
@@ -225,7 +244,7 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
       const deferred = (c: Condition): boolean => (c.kind === 'landedCost' && deferLandedCost) || deferredByDetail(c, a);
       const relaxed = rules.map((r) => relax(r, deferred));
       for (const res of deps.evaluateBatch(group, relaxed, { now: deps.now() })) {
-        if (res.decision === 'watch') selected.add(res.itemId);
+        if (isWatchMatch(res)) selected.add(res.itemId);
       }
     }
     return selected;
@@ -301,9 +320,8 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
     const notes: string[] = [];
     for (const w of watches) {
       const j = judge(w, l, ctx);
-      if (j.decision !== 'watch') notes.push(`${w.id}: ${j.decision === 'none' ? 'no rule matched' : j.decision}`);
-      else if (!j.confident) notes.push(`${w.id}: unknown conditions; write withheld`);
-      else matched.push(w);
+      if (j.match && j.confident) matched.push(w);
+      else notes.push(`${w.id}: ${j.why}`);
     }
     if (matched.length === 0) {
       close(c, 'rejected', notes.join('; '));
@@ -355,7 +373,7 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
         const rules = rulesOf(w);
         if (!rules.some(usesLandedCost) || judge(w, l, ctx).confident) return false;
         const relaxed = rules.map((r) => relax(r, (x) => x.kind === 'landedCost'));
-        return evaluateOne(l, relaxed, ctx).decision === 'watch';
+        return isWatchMatch(evaluateOne(l, relaxed, ctx));
       });
       if (wantsQuote) {
         if (countKind(run, 'quote') >= MAX_QUOTE_STEPS_PER_RUN) {
@@ -416,9 +434,35 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
     // favorite once its window opens (R8, decision 7). notifyDigest, postEnd: nothing.
   };
 
-  /** Advance; append the digest when the queue drains (only if wanted); else finish. */
-  const advance = (run: JobRun): void => {
-    run.cursor += 1;
+  /**
+   * Controller ruling (concern 4): this page was the watch's last one, being
+   * short (fewer rows than the page size) or reaching `total`
+   * (page × pageSize ≥ total).
+   */
+  const lastPage = (step: Extract<JobStep, { kind: 'search' }>, rows: number, total: number): boolean => {
+    const w = watchById.get(step.watchId);
+    if (w === undefined) return false;
+    const size = deps.searchPageSize(w.query);
+    if (!Number.isInteger(size) || size <= 0) return false;
+    return rows < size || step.page * size >= total;
+  };
+
+  /** The same watch's later search pages right after the cursor (`plan` keeps a watch's pages together). */
+  const laterPages = (run: JobRun, step: Extract<JobStep, { kind: 'search' }>): number => {
+    let n = 0;
+    for (let s = run.steps[run.cursor + 1]; s?.kind === 'search' && s.watchId === step.watchId && s.page > step.page; ) {
+      n++;
+      s = run.steps[run.cursor + 1 + n];
+    }
+    return n;
+  };
+
+  /**
+   * Advance past the step (and `skip` unexecuted pages); append the digest
+   * when the queue drains (only if wanted); else finish.
+   */
+  const advance = (run: JobRun, skip = 0): void => {
+    run.cursor += 1 + skip;
     settle(run);
     if (run.cursor < run.steps.length) return;
     const wantsDigest = run.steps.some((s) => s.kind === 'search' && watchById.get(s.watchId)?.notify === true);
@@ -472,6 +516,7 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
       if (current === undefined || !sameStep(current, step)) return run;
 
       const next = structuredClone(run);
+      let skip = 0;
       if (outcome.kind === 'error') {
         errorAt(next, `${step.kind}: ${outcome.message}`);
         const prefix = `${step.kind}: `;
@@ -486,8 +531,12 @@ export function createDailyJob(deps: DailyJobDeps): DailyJob {
         failStep(next, step, 'unexpected outcome');
       } else {
         record(next, step, outcome);
+        // Stop paging (concern 4): skip the watch's remaining pages; not an error.
+        if (step.kind === 'search' && outcome.kind === 'search' && lastPage(step, outcome.items.length, outcome.total)) {
+          skip = laterPages(next, step);
+        }
       }
-      advance(next);
+      advance(next, skip);
       return next;
     },
   };

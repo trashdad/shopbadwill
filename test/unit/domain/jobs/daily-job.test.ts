@@ -124,12 +124,17 @@ interface Setup {
   rules?: Rule[];
   settings?: Settings;
   validateQuery?: DailyJobDeps['validateQuery'];
+  searchPageSize?: DailyJobDeps['searchPageSize'];
 }
+
+/** S-1: ItemListing always asks for 40 rows (SGW_SEARCH_BODY_DEFAULTS.pageSize); T-52 injects it. */
+const SGW_PAGE_SIZE = 40;
 
 function setup(s: Setup): { job: DailyJob; run: JobRun } {
   const job = createDailyJob({
     evaluateBatch,
     validateQuery: s.validateQuery ?? invalidSearchParams,
+    searchPageSize: s.searchPageSize ?? (() => SGW_PAGE_SIZE),
     watches: s.watches,
     rules: s.rules ?? [PYREX],
     settings: s.settings ?? settingsWith(),
@@ -141,6 +146,8 @@ function setup(s: Setup): { job: DailyJob; run: JobRun } {
 interface Script {
   /** Rows per `${watchId}:${page}`. */
   search?: Record<string, Listing[]>;
+  /** `total` per `${watchId}:${page}`; default: the page's row count. */
+  totals?: Record<string, number>;
   /** Overrides on the detail built from the item's search row. */
   details?: Record<number, Partial<ItemDetail>>;
   quotes?: Record<number, { shipping: number; handling: number } | null>;
@@ -153,8 +160,9 @@ function responder(script: Script): (step: JobStep) => StepOutcome {
   return (step) => {
     switch (step.kind) {
       case 'search': {
-        const items = script.search?.[`${step.watchId}:${String(step.page)}`] ?? [];
-        return { kind: 'search', items, total: items.length };
+        const key = `${step.watchId}:${String(step.page)}`;
+        const items = script.search?.[key] ?? [];
+        return { kind: 'search', items, total: script.totals?.[key] ?? items.length };
       }
       case 'favoritesList':
         return { kind: 'favoritesList', items: [] };
@@ -457,13 +465,21 @@ describe('R1 two-pass evaluation', () => {
       expect(candidate(done, 1)?.note).toMatch(/unknown/);
     });
 
-    it('an unknown hide (or highlight) rule withholds the write: it could flip the decision', () => {
+    it('an unknown hide rule withholds the write: it could veto the match', () => {
       const hide = rule('h', [loc(['CA'])], { action: 'hide' });
       const w = watch('w1', { ruleIds: ['r-pyrex', 'h'] });
       const { job, run } = setup({ watches: [w], rules: [PYREX, hide] });
       const done = drive(job, run, responder({ search: { 'w1:1': [listing(1)] }, details: { 1: { sellerState: undefined } } }));
       expect(stepsOf(done, 'favorite')).toEqual([]);
       expect(candidate(done, 1)?.note).toMatch(/unknown/);
+    });
+
+    it('an unknown highlight rule does not withhold the write: highlight never affects a watch match', () => {
+      const hl = rule('hl', [loc(['CA'])], { action: 'highlight' });
+      const w = watch('w1', { ruleIds: ['r-pyrex', 'hl'] });
+      const { job, run } = setup({ watches: [w], rules: [PYREX, hl] });
+      const done = drive(job, run, responder({ search: { 'w1:1': [listing(1)] }, details: { 1: { sellerState: undefined } } }));
+      expect(stepsOf(done, 'favorite').map((s) => s.itemId)).toEqual([1]);
     });
 
     it('a strictly unmatched location (still unknown after the detail) is rejected, not written', () => {
@@ -556,10 +572,13 @@ describe('R3 budget', () => {
 
   it('counts the budget across the whole run, not per search page', () => {
     const w = watch('w1', { maxPages: 2 });
-    const page1 = rows.slice(0, 15);
+    // A full page 1 (15 matches + 25 non-matching rows), so paging continues.
+    const teapots = Array.from({ length: 25 }, (_, i) => listing(101 + i, { title: 'Teapot' }));
+    const page1 = rows.slice(0, 15).concat(teapots);
     const page2 = rows.slice(15).concat([listing(30, { endTime: endIn(0.5) })]);
     const { job, run } = setup({ watches: [w] });
-    const done = drive(job, run, responder({ search: { 'w1:1': page1, 'w1:2': page2 } }));
+    const done = drive(job, run, responder({ search: { 'w1:1': page1, 'w1:2': page2 }, totals: { 'w1:1': 51 } }));
+    expect(stepsOf(done, 'detail').map((s) => s.itemId)).toContain(30); // page 2 ran
     expect(stepsOf(done, 'detail')).toHaveLength(MAX_DETAIL_STEPS_PER_RUN);
     expect(done.candidates?.filter((c) => c.status === 'skipped-budget')).toHaveLength(6);
   });
@@ -746,6 +765,88 @@ describe('R8 decisions', () => {
   });
 });
 
+// ── Controller ruling round (concerns 2 and 4) ─────────────────────────────
+
+describe('Controller round: a watch match ignores display precedence (concern 2)', () => {
+  it('highlight + watch is a match, in the optimistic and the strict pass', () => {
+    const hl = rule('hl', [kw('bowl')], { action: 'highlight' });
+    const { job, run } = setup({ watches: [watch('w1', { ruleIds: ['r-pyrex', 'hl'] })], rules: [PYREX, hl] });
+    const after = job.apply(run, at(run.steps, 0), { kind: 'search', items: [listing(1)], total: 1 });
+    expect(stepsOf(after, 'detail').map((s) => s.itemId)).toEqual([1]);
+    const done = drive(job, after, responder({ search: { 'w1:1': [listing(1)] } }));
+    expect(stepsOf(done, 'favorite').map((s) => s.itemId)).toEqual([1]);
+    expect(done.results.newMatches).toEqual([1]);
+  });
+
+  it('hide + watch is not a match: a matched hide rule vetoes, on the row and on the detail', () => {
+    const hideRow = rule('h', [kw('bowl')], { action: 'hide' });
+    const a = setup({ watches: [watch('w1', { ruleIds: ['r-pyrex', 'h'] })], rules: [PYREX, hideRow] });
+    const afterA = a.job.apply(a.run, at(a.run.steps, 0), { kind: 'search', items: [listing(1)], total: 1 });
+    expect(afterA.candidates).toEqual([]);
+    expect(stepsOf(afterA, 'detail')).toEqual([]);
+
+    const hideDetail = rule('h', [{ kind: 'category', categoryIds: [12], includeChildren: false }], { action: 'hide' });
+    const b = setup({ watches: [watch('w1', { ruleIds: ['r-pyrex', 'h'] })], rules: [PYREX, hideDetail] });
+    const done = drive(b.job, b.run, responder({ search: { 'w1:1': [listing(1)] }, details: { 1: { categoryId: 12 } } }));
+    expect(stepsOf(done, 'detail')).toHaveLength(1);
+    expect(stepsOf(done, 'favorite')).toEqual([]);
+    expect(candidate(done, 1)).toMatchObject({ status: 'rejected', note: 'w1: hidden' });
+  });
+
+  it('a highlight-only match is not a watch match', () => {
+    const hl = rule('hl', [kw('pyrex')], { action: 'highlight' });
+    const { job, run } = setup({ watches: [watch('w1', { ruleIds: ['hl'] })], rules: [hl] });
+    const after = job.apply(run, at(run.steps, 0), { kind: 'search', items: [listing(1)], total: 1 });
+    expect(after.candidates).toEqual([]);
+  });
+});
+
+describe('Controller round: stop paging a watch (concern 4)', () => {
+  const teapots = (from: number, n = SGW_PAGE_SIZE): Listing[] =>
+    Array.from({ length: n }, (_, i) => listing(from + i, { title: 'Teapot' }));
+
+  it('a short page skips the watch’s remaining pages without an error; other watches still page', () => {
+    const { job, run } = setup({ watches: [watch('a', { maxPages: 3 }), watch('b', { maxPages: 2 })] });
+    const r1 = job.apply(run, at(run.steps, 0), { kind: 'search', items: [listing(1)], total: 500 });
+    expect(r1.cursor).toBe(3); // past a:2 and a:3
+    expect(job.next(r1)).toEqual({ kind: 'search', watchId: 'b', page: 1 });
+    expect(r1.results.errors).toEqual([]);
+    const r2 = job.apply(r1, at(r1.steps, 3), { kind: 'search', items: teapots(100), total: 500 });
+    expect(job.next(r2)).toEqual({ kind: 'search', watchId: 'b', page: 2 }); // full page, more to come
+    // A skipped page is never executed: applying it is a stale no-op.
+    expect(job.apply(r2, at(r2.steps, 1), { kind: 'search', items: [], total: 0 })).toBe(r2);
+  });
+
+  it('a full page that reaches `total` (page × pageSize ≥ total) stops too', () => {
+    const { job, run } = setup({ watches: [watch('a', { maxPages: 3 })] });
+    const r1 = job.apply(run, at(run.steps, 0), { kind: 'search', items: teapots(100), total: SGW_PAGE_SIZE });
+    expect(r1.cursor).toBe(3);
+    expect(job.next(r1)).toEqual({ kind: 'favoritesList' });
+  });
+
+  it('uses the injected page size for the watch’s query; an invalid size never stops early', () => {
+    const go = (size: number, total: number): number => {
+      const { job, run } = setup({ watches: [watch('a', { maxPages: 2 })], searchPageSize: () => size });
+      return job.apply(run, at(run.steps, 0), { kind: 'search', items: teapots(100), total }).cursor;
+    };
+    expect(go(60, 500)).toBe(2); // 40 rows < 60: short page
+    expect(go(20, 500)).toBe(1); // 40 rows ≥ 20 and 1 × 20 < 500: keep paging
+    expect(go(0, 0)).toBe(1); // fail-safe
+    expect(go(Number.NaN, 0)).toBe(1);
+    const seen: unknown[] = [];
+    const q = { searchText: 'x', categoryIds: [], sellerIds: [], page: 1, extra: { ps: '20' } };
+    const { job, run } = setup({ watches: [watch('a', { maxPages: 2, query: q })], searchPageSize: (query) => (seen.push(query), 40) });
+    job.apply(run, at(run.steps, 0), { kind: 'search', items: [], total: 0 });
+    expect(seen).toEqual([q]);
+  });
+
+  it('an errored page does not stop paging', () => {
+    const { job, run } = setup({ watches: [watch('a', { maxPages: 2 })] });
+    const r1 = job.apply(run, at(run.steps, 0), { kind: 'error', message: 'HTTP 500', retryable: false });
+    expect(job.next(r1)).toEqual({ kind: 'search', watchId: 'a', page: 2 });
+  });
+});
+
 // ── property ───────────────────────────────────────────────────────────────
 
 /** mulberry32: a tiny seeded PRNG so each fast-check case replays exactly. */
@@ -794,6 +895,7 @@ describe('property', () => {
           const job = createDailyJob({
             evaluateBatch,
             validateQuery: invalidSearchParams,
+            searchPageSize: () => SGW_PAGE_SIZE,
             watches,
             rules: PROP_RULES,
             settings: settingsWith({ landedCost: quotes, homeZip: '43004', calendar: cal }),
@@ -814,8 +916,10 @@ describe('property', () => {
             if (roll < 0.1) return { kind: 'notifyDigest', done: true }; // wrong kind for most steps
             switch (step.kind) {
               case 'search': {
-                const items = Array.from({ length: Math.floor(rand() * 45) }, () => row(1 + Math.floor(rand() * 60)));
-                return { kind: 'search', items, total: items.length };
+                // Mostly full pages (so later pages run), sometimes short; total sometimes says "more".
+                const n = rand() < 0.6 ? SGW_PAGE_SIZE : Math.floor(rand() * SGW_PAGE_SIZE);
+                const items = Array.from({ length: n }, () => row(1 + Math.floor(rand() * 60)));
+                return { kind: 'search', items, total: rand() < 0.5 ? items.length : items.length + 200 };
               }
               case 'favoritesList':
                 return { kind: 'favoritesList', items: [] };
@@ -855,7 +959,16 @@ describe('property', () => {
             run = job.apply(run, step, outcomeFor(step));
             expect(run.steps.slice(0, before.steps.length)).toEqual(before.steps); // append-only
             expect(run.cursor - before.cursor).toBeGreaterThanOrEqual(0);
-            expect(run.cursor - before.cursor).toBeLessThanOrEqual(1);
+            // The cursor moves by one, except past the same watch's later search pages (stop paging).
+            for (let k = before.cursor + 1; k < run.cursor; k++) {
+              const skipped = at(run.steps, k);
+              expect(step.kind).toBe('search');
+              expect(skipped.kind).toBe('search');
+              if (skipped.kind === 'search' && step.kind === 'search') {
+                expect(skipped.watchId).toBe(step.watchId);
+                expect(skipped.page).toBeGreaterThan(step.page);
+              }
+            }
           }
           expect(run.status).toBe('done');
           expect(run.cursor).toBe(run.steps.length);
