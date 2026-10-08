@@ -57,11 +57,52 @@ describe('SgwClockAdapter', () => {
     }
   });
 
-  it('a lower-RTT seconds-only sample still wins over a slower ms sample', () => {
+  it('an ms sample at rtt 100 beats a seconds-only sample at rtt 50', () => {
     const { adapter } = make();
     adapter.addSample(sample({ rttMs: 50, source: 'dateHeader', serverMs: T0 + 2000 }));
     adapter.addSample(sample({ rttMs: 100, serverMs: T0 + 5000 }));
-    expect(off(adapter).rttMs).toBe(50);
+    expect(off(adapter).rttMs).toBe(100);
+  });
+
+  it('a seconds-only sample wins only when its rtt is more than 1000 lower', () => {
+    const { adapter } = make();
+    adapter.addSample(sample({ rttMs: 1500, serverMs: T0 + 5000 }));
+    adapter.addSample(sample({ rttMs: 500, source: 'getCurrentTime', serverMs: T0 + 2000 }));
+    expect(off(adapter).rttMs).toBe(1500); // effective 1500 vs 1500: ms wins the tie
+    adapter.addSample(sample({ rttMs: 499, source: 'getCurrentTime', serverMs: T0 + 2000 }));
+    expect(off(adapter).rttMs).toBe(499);
+  });
+
+  it('a seconds-only winner is corrected by +500 ms for truncation', () => {
+    const { adapter } = make();
+    adapter.addSample(sample({ rttMs: 100, source: 'getCurrentTime', serverMs: T0 + 2000 }));
+    expect(off(adapter).offsetMs).toBe(T0 + 2000 + 500 - (T0 + 50));
+  });
+
+  it('a seconds-only winner never reports high confidence', () => {
+    const { adapter } = make();
+    for (const r of [10, 20, 30]) adapter.addSample(sample({ rttMs: r, source: 'getCurrentTime' }));
+    const o = off(adapter);
+    expect(o.samples).toBe(3);
+    expect(o.confidence).toBe('low');
+  });
+
+  it('newest receivedAt wins a full tie, and sentAt is honoured per sample', () => {
+    const { adapter } = make();
+    adapter.addSample(sample({ rttMs: 100, sentAt: T0, serverMs: T0 + 5050 }));
+    adapter.addSample(sample({ rttMs: 100, sentAt: T0 + 400, serverMs: T0 + 9000 }));
+    expect(off(adapter).offsetMs).toBe(T0 + 9000 - (T0 + 400 + 50));
+  });
+
+  it('ignores non-finite samples', () => {
+    const { adapter } = make();
+    adapter.addSample(sample({ rttMs: Number.NaN }));
+    adapter.addSample(sample({ rttMs: 100, serverMs: Number.POSITIVE_INFINITY }));
+    adapter.addSample(sample({ rttMs: 100, sentAt: Number.NaN, receivedAt: T0 + 100 }));
+    adapter.addSample(sample({ rttMs: 100, receivedAt: Number.NaN }));
+    expect(adapter.offset()).toBeNull();
+    adapter.addSample(sample({ rttMs: 100 }));
+    expect(off(adapter).rttMs).toBe(100);
   });
 
   it('samples older than 30 min expire, including from the count', () => {
@@ -77,6 +118,15 @@ describe('SgwClockAdapter', () => {
     clock.advance(SAMPLE_TTL_MS);
     expect(adapter.offset()).toBeNull();
     expect(adapter.serverNow()).toBeNull();
+  });
+
+  it('keeps a sample exactly 30:00 old, drops it a millisecond later', () => {
+    const { adapter, clock } = make();
+    adapter.addSample(sample({ rttMs: 100, sentAt: clock.now() - 100 }));
+    clock.advance(SAMPLE_TTL_MS);
+    expect(adapter.offset()?.samples).toBe(1);
+    clock.advance(1);
+    expect(adapter.offset()).toBeNull();
   });
 
   it('confidence: high needs >=3 live samples and winning rtt <= 400', () => {
@@ -133,6 +183,26 @@ describe('serverTime helpers (S-1 verdict)', () => {
     expect(s?.serverMs).toBe(Date.UTC(2026, 9, 8, 3, 9, 15));
     expect(s?.source).toBe('getCurrentTime');
     expect(s?.rttMs).toBe(80);
+  });
+
+  it('rejects ambiguous (fall-back) and nonexistent (spring-forward) times', () => {
+    const a = make().adapter;
+    expect(a.sampleFromServerTime('2026-11-01T01:30:00.000', T0, T0 + 1)).toBeNull();
+    expect(a.sampleFromServerTime('2026-03-08T02:30:00.000', T0, T0 + 1)).toBeNull();
+    expect(a.sampleFromGetCurrentTime('11/01/2026 01:30:00', T0, T0 + 1)).toBeNull();
+    expect(a.sampleFromGetCurrentTime('03/08/2026 02:30:00', T0, T0 + 1)).toBeNull();
+  });
+
+  it('returns null when receivedAt precedes sentAt', () => {
+    const a = make().adapter;
+    expect(a.sampleFromServerTime('2026-10-07T20:09:15.967', T0, T0 - 1)).toBeNull();
+    expect(a.sampleFromGetCurrentTime('10/07/2026 20:09:15', T0, T0 - 1)).toBeNull();
+  });
+
+  it('returns null instead of throwing on impossible dates', () => {
+    const a = make().adapter;
+    expect(a.sampleFromServerTime('2026-13-45T20:09:15.967', T0, T0 + 1)).toBeNull();
+    expect(a.sampleFromGetCurrentTime('13/45/2026 20:09:15', T0, T0 + 1)).toBeNull();
   });
 
   it('rejects malformed input', () => {
