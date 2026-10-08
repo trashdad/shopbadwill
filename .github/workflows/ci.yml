@@ -1,0 +1,183 @@
+name: CI
+
+# Runs on every push to dev and on pull requests into main (PR #1: dev -> main).
+# Job chain: static -> unit -> contract -> integration -> e2e-chromium -> e2e-firefox.
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: 'true'
+  # Dummy value so the production manifest has its `oauth2` block, which the
+  # permission snapshot covers (the id itself is never snapshotted).
+  SBW_GOOGLE_CLIENT_ID: ci-dummy.apps.googleusercontent.com
+
+jobs:
+  static:
+    name: static (lint, types, builds, permissions, bundle, web-ext)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: pnpm/action-setup@v4.1.0 # version comes from package.json "packageManager"
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm build:firefox
+      - run: pnpm check:permissions
+      - run: pnpm check:prod-bundle
+      - run: pnpm lint:webext
+
+  unit:
+    name: unit (Vitest unit + dom)
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: pnpm/action-setup@v4.1.0
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:unit
+      - run: pnpm test:dom
+
+  contract:
+    name: contract
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: pnpm/action-setup@v4.1.0
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:contract
+
+  integration:
+    name: integration
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: pnpm/action-setup@v4.1.0
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:integration
+
+  e2e-chromium:
+    name: e2e-chromium (headless chromium channel)
+    needs: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: pnpm/action-setup@v4.1.0
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Build the test extension (SBW_TEST=1, mode "test")
+        run: pnpm build:test
+      - name: Start the fake servers and wait for them
+        run: |
+          pnpm fake:sgw > fake-sgw.log 2>&1 &
+          pnpm fake:google > fake-google.log 2>&1 &
+          for port in 8787 8788; do
+            for i in $(seq 1 60); do
+              if curl -s -o /dev/null "http://127.0.0.1:${port}/"; then
+                echo "port ${port} is up"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "fake server on ${port} did not start" >&2
+                cat fake-sgw.log fake-google.log >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+      # Passes with zero specs until T-39 lands (scripts/run-playwright.ts).
+      # Chromium has no display on the runner; the `chromium` channel runs headless.
+      - run: pnpm test:e2e:chromium
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+            fake-sgw.log
+            fake-google.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  e2e-firefox:
+    name: e2e-firefox (geckodriver)
+    needs: e2e-chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Allowed to fail until S-6 lands; then remove this line to make it required.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: pnpm/action-setup@v4.1.0
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # ubuntu-latest ships Firefox and geckodriver (GECKOWEBDRIVER); show them.
+      - name: Firefox and geckodriver versions
+        run: |
+          firefox --version
+          "${GECKOWEBDRIVER}/geckodriver" --version
+      - name: Build the Firefox test extension
+        run: pnpm build:test -b firefox --mv3
+      - name: Start the fake servers and wait for them
+        run: |
+          pnpm fake:sgw > fake-sgw.log 2>&1 &
+          pnpm fake:google > fake-google.log 2>&1 &
+          for port in 8787 8788; do
+            for i in $(seq 1 60); do
+              if curl -s -o /dev/null "http://127.0.0.1:${port}/"; then
+                echo "port ${port} is up"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "fake server on ${port} did not start" >&2
+                cat fake-sgw.log fake-google.log >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+      # Passes with zero specs until T-12 lands (test/e2e/firefox/run.ts).
+      - run: pnpm test:e2e:firefox
