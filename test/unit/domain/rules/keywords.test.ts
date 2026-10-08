@@ -111,44 +111,51 @@ describe('regex', () => {
     expect(k.test('women')).toBe(false);
     expect(k.test('men')).toBe(true);
   });
-  it.each(['(a+)+$', '(a*)*b', '(a|aa)+$', '(.*a){10,}', '(\\d+)*x', '((a+)b)+', '(a+){2,5}'])(
-    'rejects catastrophic pattern %s at compile',
+  it.each(['(a+)+$', '(a|a){26}b', '(a?){30}a{30}', '(a|a?){30}', 'a*a*a*a*a*b', '.*.*.*.*x', String.raw`\d+\d+\d+\d+x`])(
+    'runs hostile pattern %s in linear time on a hostile 4096-char input',
     (p) => {
-      expect(() => compileKeyword(rx([p]))).toThrow(KeywordCompileError);
-      const r = tryCompileKeyword(rx([p]));
-      expect(r.ok).toBe(false);
+      for (const mode of ['any', 'none'] as const) {
+        const k = compileKeyword(rx([p], { mode }));
+        const hostile = 'a1'.repeat(2048);
+        const start = performance.now();
+        k.test(hostile);
+        k.test('a'.repeat(4096));
+        expect(performance.now() - start).toBeLessThan(50);
+      }
     },
   );
-  it('rejects backreferences, bad syntax and over-long patterns', () => {
-    for (const p of ['(a)\\1', '(?<n>a)\\k<n>', '(', '[', 'a{2,1}', 'a'.repeat(MAX_REGEX_LENGTH + 1)]) {
+  it('regex terms in none mode still exclude', () => {
+    const k = compileKeyword(rx([String.raw`(a+)+$|broken\s+lid`], { mode: 'none' }));
+    expect(k.test('Pyrex Broken   lid')).toBe(false);
+    expect(k.test('Pyrex bowl')).toBe(true);
+  });
+  it('rejects backreferences, bad syntax and over-long patterns at compile', () => {
+    for (const p of [String.raw`(a)\1`, String.raw`(?<n>a)\k<n>`, '(', '[', 'a{2,1}', 'a'.repeat(MAX_REGEX_LENGTH + 1)]) {
+      expect(() => compileKeyword(rx([p]))).toThrow(KeywordCompileError);
       const r = tryCompileKeyword(rx([p]));
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBeTruthy();
     }
   });
-  it('accepts safe quantified groups and escaped/class lookalikes', () => {
-    for (const p of ['(ab)+', '(\\d{3}-?){2}', '\\(a+\\)+', '[(a+)+]', '(?:ab|cd)?x', 'a+b*c?']) {
+  it('rejects lookarounds at compile', () => {
+    for (const p of ['(?=a)b', '(?!a)b', '(?<=a)b', '(?<!a)b']) expect(tryCompileKeyword(rx([p])).ok).toBe(false);
+  });
+  it('accepts ordinary patterns', () => {
+    for (const p of ['(ab)+', String.raw`(\d{3}-?){2}`, String.raw`\(a+\)+`, '[(a+)+]', '(?:ab|cd)?x', 'a+b*c?', '(foo|bar)+']) {
       expect(tryCompileKeyword(rx([p])).ok).toBe(true);
     }
   });
-  it('a failing term in none-mode is a compile error, never a match-time throw', () => {
-    expect(tryCompileKeyword(rx(['(a+)+$'], { mode: 'none' })).ok).toBe(false);
+  it('whole-word regex uses Unicode word characters', () => {
+    const k = compileKeyword(rx(['caf.'], { wholeWord: true }));
+    expect(k.test('un café noir')).toBe(true);
+    expect(k.test('cafés')).toBe(false);
   });
-  it('watchdog: a regex that exceeds the 5 ms budget is disabled (fail closed)', () => {
-    let t = 0;
-    const clock = () => (t += 10); // every test appears to take 10 ms
-    const r = tryCompileKeyword(rx(['pyrex']), { now: clock });
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    expect(r.matcher.test('pyrex')).toBe(true); // the slow call still returns its result
-    expect(r.matcher.tripped).toBe(true);
-    expect(r.matcher.test('pyrex')).toBe(false); // then the pattern is disabled
-  });
-  it('does not trip when fast', () => {
-    const r = tryCompileKeyword(rx(['pyrex']));
-    if (!r.ok) throw new Error('unexpected');
-    r.matcher.test('pyrex');
-    expect(r.matcher.tripped).toBe(false);
+});
+
+describe('input caps', () => {
+  it('zero-width padding cannot push a negative term out of view', () => {
+    const k = compileKeyword(kw(['broken'], { mode: 'none' }));
+    expect(k.test('​'.repeat(8000) + 'broken')).toBe(false);
   });
 });
 
