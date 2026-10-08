@@ -142,6 +142,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
   };
   const setScenario = (patch: ScenarioPatch): void => {
     scenario = applyPatch(scenario, patch);
+    for (const k of Object.keys(patch.errors ?? {})) errorCounts.delete(k);
     if (patch.serverNowMs !== undefined) anchor = patch.serverNowMs === null ? null : { fake: patch.serverNowMs, real: Date.now() };
     if (patch.name !== undefined || patch.reset === true) {
       errorCounts.clear();
@@ -446,6 +447,8 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
   };
 
   const server: Server = createServer((req, res) => {
+    const started = Date.now();
+    let logged = false;
     void (async () => {
       const receivedAtMs = Date.now();
       const url = new URL(req.url ?? '/', 'http://fake');
@@ -508,6 +511,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
       }
 
       const fakeNowMs = parseFakeNow([req.headers['x-sbw-fake-now']].flat()[0]);
+      logged = true;
       log.push({
         seq: ++seq,
         method,
@@ -522,7 +526,28 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
         body,
       });
       send(res, result.status, result.body, result.headers);
-    })();
+    })().catch((e: unknown) => {
+      // Never leave a request hanging or raise an unhandled rejection.
+      if (!logged) {
+        log.push({
+          seq: ++seq,
+          method: req.method ?? 'GET',
+          path: req.url ?? '',
+          query: '',
+          endpoint: req.url ?? '',
+          status: 500,
+          receivedAtMs: started,
+          fakeNowMs: null,
+          requestTimeMs: started,
+          hasBearer: false,
+          body: '',
+        });
+      }
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ message: e instanceof Error ? e.message : 'Internal error' }));
+      } else res.end();
+    });
   });
 
   if (opts.scenario !== undefined) setScenario(typeof opts.scenario === 'string' ? { name: opts.scenario } : opts.scenario);

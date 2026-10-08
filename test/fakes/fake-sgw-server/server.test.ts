@@ -231,6 +231,28 @@ describe('scenario toggles', () => {
   });
 });
 
+describe('robustness and re-patching', () => {
+  it('re-patching a times-limited error resets its counter', async () => {
+    const spec = { errors: { 'Dashboard/GetCurrentTime': { status: 503, times: 2 } } };
+    await post('/__scenario', spec);
+    expect((await post('/api/Dashboard/GetCurrentTime')).status).toBe(503);
+    expect((await post('/api/Dashboard/GetCurrentTime')).status).toBe(503);
+    expect((await post('/api/Dashboard/GetCurrentTime')).status).toBe(200);
+    await post('/__scenario', spec);
+    expect((await post('/api/Dashboard/GetCurrentTime')).status).toBe(503);
+    expect((await post('/api/Dashboard/GetCurrentTime')).status).toBe(503);
+    expect((await post('/api/Dashboard/GetCurrentTime')).status).toBe(200);
+  });
+  it('a handler throw yields 500 JSON, is logged, and the server keeps working', async () => {
+    const res = await fetch(`${sgw.url}//`, { signal: AbortSignal.timeout(3000) });
+    expect(res.status).toBe(500);
+    await parse(res, ErrorBodySchema);
+    const log = await parse(await get('/__log'), LogResponseSchema);
+    expect(log.entries.some((e) => e.status === 500)).toBe(true);
+    expect((await post('/api/Dashboard/GetCurrentTime')).status).toBe(200);
+  });
+});
+
 describe('request log', () => {
   it('stamps requests with the client-declared fake time', async () => {
     const fake = Date.parse('2026-10-08T19:18:00.000Z');
