@@ -104,9 +104,21 @@ function evalKeyword(c: KeywordCondition, l: Listing, entry: CompiledEntry | und
   const present = c.fields
     .map((f) => ({ f, text: fieldText(l, f) }))
     .filter((x): x is { f: KeywordField; text: string } => x.text !== undefined);
-  if (present.length === 0) return NO;
+  if (present.length === 0) return UNKNOWN; // none of the selected fields has text
+  // `holds` is the matcher's own verdict (for mode 'none' it means no term was found).
   // Joined so that mode 'none' means none of the fields and 'all' may span fields.
-  if (!entry.matcher.test(present.map((x) => x.text).join(' \n '))) return NO;
+  const holds = entry.matcher.test(present.map((x) => x.text).join(' | '));
+  // Some selected fields may be absent. A verdict is final only if more text
+  // cannot change it: 'any' / 'all' are monotone (extra text only adds hits), so
+  // a hit stands but a miss might flip; for 'none' a hit stands but a clean
+  // result might flip. Otherwise the condition is unknown.
+  const partial = present.length < c.fields.length;
+  if (c.mode === 'none') {
+    if (!holds) return NO;
+    if (partial) return UNKNOWN;
+  } else if (!holds) {
+    return partial ? UNKNOWN : NO;
+  }
 
   const shown = (t: string): string => (c.regex ? `/${t}/` : `"${t}"`);
   const suffix = c.wholeWord ? ' (whole word)' : '';
@@ -143,7 +155,7 @@ function evalCondition(c: Condition, l: Listing, ctx: MatchContext, entry: Compi
       const listed = byId || byName;
       // Without a seller name we cannot rule out a name-list hit.
       if (!listed && name === undefined && c.sellerNames.length > 0) return UNKNOWN;
-      if (c.mode === 'exclude') return listed ? NO : yes('seller', 'seller is not in excluded list');
+      if (c.mode === 'exclude') return listed ? NO : yes('seller', `seller ${l.sellerName ?? `#${String(l.sellerId)}`} is not in excluded list`);
       if (!listed) return NO;
       return yes('seller', `seller is ${l.sellerName ?? `#${String(l.sellerId)}`} (included)`);
     }
