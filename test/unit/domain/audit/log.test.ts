@@ -208,3 +208,14 @@ describe('AuditLog escaped quotes (raw storage dump)', () => {
     });
   }
 });
+
+describe('AuditLog backslash-newline in quoted values (raw storage dump)', () => {
+  const dump = () => JSON.stringify(areas.local.dump());
+  it('redacts across a backslash-newline in quoted authorization and password values', async () => {
+    const bsnl = String.fromCharCode(92, 10);
+    const a = '{"authorization":"Basic a' + bsnl + 'NLSEC1 tail"}';
+    const p = "password='x" + bsnl + "NLSEC2 tail'";
+    await log.append({ ...base, details: { a, p } });
+    expect(dump()).not.toMatch(/NLSEC1|NLSEC2/);
+  });
+});
