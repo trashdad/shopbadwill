@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 
 import type { Settings } from '../../domain/settings/schema';
 import type { SgwSessionState } from '../../domain/types';
@@ -20,9 +20,25 @@ export interface PopupProps {
   actions: PopupActions;
   now: () => number;
   sections: readonly PopupSection[];
+  /** How long to wait for the background before giving up (default 5000). */
+  timeoutMs?: number;
 }
 
 const DRY_RUN_LABELS = { favorites: 'Favorites', calendar: 'Calendar', bidding: 'Bidding' } as const;
+
+const DEFAULT_TIMEOUT_MS = 5000;
+
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${what} timed out (the background is not responding)`));
+    }, ms);
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+}
 
 function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -103,52 +119,67 @@ function HealthRow({ health }: { health: Health | null | 'error' }) {
   );
 }
 
-export function Popup({ messaging, actions, now, sections }: PopupProps): JSX.Element {
+export function Popup({ messaging, actions, now, sections, timeoutMs = DEFAULT_TIMEOUT_MS }: PopupProps): JSX.Element {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [kill, setKill] = useState<boolean | null>(null);
   const [health, setHealth] = useState<Health | null | 'error'>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const keepRef = useRef<HTMLButtonElement>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (resync = false) => {
     setLoadError(null);
     const [s, h] = await Promise.allSettled([
-      messaging.send('settings.get', undefined),
-      messaging.send('health.get', undefined),
+      withTimeout(messaging.send('settings.get', undefined), timeoutMs, 'settings.get'),
+      withTimeout(messaging.send('health.get', undefined), timeoutMs, 'health.get'),
     ]);
     if (s.status === 'fulfilled') {
       setSettings(s.value);
-      // A broadcast that arrived first is newer than the loaded value.
-      setKill((k) => k ?? s.value.killSwitch);
+      // On first load a broadcast that arrived first is newer; Retry re-syncs from the background.
+      setKill((k) => (resync ? s.value.killSwitch : (k ?? s.value.killSwitch)));
     } else {
       setLoadError(`Cannot reach the background: ${errorText(s.reason)}`);
     }
     setHealth(h.status === 'fulfilled' ? h.value : 'error');
-  }, [messaging]);
+  }, [messaging, timeoutMs]);
 
   useEffect(() => {
     // Subscribe before loading, so no change is missed in between.
     const off = messaging.onBroadcast('switches.changed', (p) => {
       setKill(p.killSwitch);
+      if (!p.killSwitch) setConfirming(false);
     });
     void load();
     return off;
   }, [messaging, load]);
 
-  const toggleKill = async (): Promise<void> => {
-    const on = !(kill ?? false);
+  // Stopping is one click. Resuming needs a second, deliberate step, and is
+  // never offered while the state is unknown (kill === null).
+  const sendKill = async (on: boolean): Promise<void> => {
     setActionError(null);
     setBusy(true);
     try {
-      await messaging.send('kill.set', { on });
+      await withTimeout(messaging.send('kill.set', { on }), timeoutMs, 'kill.set');
       setKill(on);
+      setConfirming(false);
     } catch (e) {
       setActionError(`Could not change the kill switch: ${errorText(e)}`);
     } finally {
       setBusy(false);
     }
   };
+
+  const onKillClick = (): void => {
+    if (busy) return;
+    if (kill === true) setConfirming(true);
+    else void sendKill(true);
+  };
+
+  useEffect(() => {
+    if (confirming) keepRef.current?.focus();
+  }, [confirming]);
 
   const toggleOverlay = async (enabled: boolean): Promise<void> => {
     if (settings === null) return;
@@ -181,21 +212,48 @@ export function Popup({ messaging, actions, now, sections }: PopupProps): JSX.El
       </header>
 
       <section aria-label="Kill switch section" class="kill">
-        <button
-          type="button"
-          class={stopped ? 'kill-button on' : 'kill-button'}
-          aria-pressed={stopped}
-          disabled={busy}
-          onClick={() => void toggleKill()}
-        >
-          <span class="kill-title">Kill switch</span>
-          <span class="kill-action">{stopped ? 'Resume automation' : 'Stop all automation'}</span>
-        </button>
+        {stopped && confirming ? (
+          <div class="kill-confirm" role="group" aria-label="Confirm resume">
+            <p class="kill-title">Resume automation?</p>
+            <div class="buttons">
+              <button
+                type="button"
+                ref={keepRef}
+                class="keep"
+                onClick={() => {
+                  setConfirming(false);
+                }}
+              >
+                Keep stopped
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  if (!busy) void sendKill(false);
+                }}
+              >
+                Resume
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            type="button"
+            class={stopped ? 'kill-button on' : 'kill-button'}
+            aria-pressed={stopped}
+            disabled={busy}
+            onClick={onKillClick}
+          >
+            <span class="kill-title">Kill switch</span>
+            <span class="kill-action">{stopped ? 'Resume automation…' : 'Stop all automation'}</span>
+          </button>
+        )}
         <p class="kill-state" data-testid="kill-state" role="status">
           <span class="symbol" aria-hidden="true">
             {stopped ? '■' : '●'}
           </span>{' '}
-          {kill === null ? 'Checking…' : stopped ? 'STOPPED: all automated writes are off' : 'Automation on'}
+          {kill === null ? (loadError === null ? 'Checking…' : 'State unknown: stopping is still available') : stopped ? 'STOPPED: all automated writes are off' : 'Automation on'}
         </p>
         <p class="hint">
           Shortcut: <kbd>Alt+Shift+K</kbd>
@@ -205,7 +263,7 @@ export function Popup({ messaging, actions, now, sections }: PopupProps): JSX.El
       {loadError !== null && (
         <div class="error" role="alert">
           <p>{loadError}</p>
-          <button type="button" onClick={() => void load()}>
+          <button type="button" onClick={() => void load(true)}>
             Retry
           </button>
         </div>

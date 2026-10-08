@@ -6,6 +6,7 @@
   --border: #b8c0c8;
   --accent: #0b5cad;
   --danger: #a1181f;
+  --on-danger: #ffffff; /* 7.9:1 on --danger */
   --danger-bg: #fdecec;
   --ok-bg: #e8f3ec;
   --warn-bg: #fff4d6;
@@ -18,6 +19,7 @@
     --border: #4a525b;
     --accent: #6cb2ff;
     --danger: #ff8d92;
+    --on-danger: #1c1f23; /* 7.4:1 on --danger */
     --danger-bg: #3d1a1c;
     --ok-bg: #1b3325;
     --warn-bg: #3b3115;
@@ -97,7 +99,7 @@ kbd {
 .kill-button.on {
   background: var(--danger);
   border-style: double;
-  color: #fff;
+  color: var(--on-danger);
 }
 .kill-state {
   font-weight: 700;
@@ -198,4 +200,19 @@ kbd {
 .extra {
   border-top: 1px solid var(--border);
   padding-top: 10px;
+}
+.kill-confirm {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  text-align: center;
+  border: 3px double var(--danger);
+  border-radius: 10px;
+}
+.kill-confirm .buttons button {
+  padding: 12px 8px;
+  font-weight: 700;
+}
+.kill-confirm .keep {
+  border: 2px solid var(--accent);
 }

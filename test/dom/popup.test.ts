@@ -73,13 +73,95 @@ describe('popup kill switch', () => {
     await waitFor(() => { expect(screen.getByTestId('kill-state').textContent).toMatch(/automation on/i); });
   });
 
-  it('turning it off sends on:false, and the shortcut is shown', async () => {
+  it('resuming needs the inline confirm; the shortcut is shown', async () => {
     const { m } = setup({ settings: { ...DEFAULT_SETTINGS, killSwitch: true } });
     const btn = await screen.findByRole('button', { name: /kill switch/i });
-    await waitFor(() => { expect(btn.getAttribute('aria-pressed')).toBe('true'); });
+    await waitFor(() => {
+      expect(btn.getAttribute('aria-pressed')).toBe('true');
+    });
     fireEvent.click(btn);
-    await waitFor(() => { expect(m.sent.at(-1)).toEqual({ type: 'kill.set', payload: { on: false } }); });
+    expect(m.sent.filter((s) => s.type === 'kill.set')).toEqual([]);
+    expect(screen.getByText(/resume automation\?/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
+    await waitFor(() => {
+      expect(m.sent.at(-1)).toEqual({ type: 'kill.set', payload: { on: false } });
+    });
     expect(document.body.textContent).toContain('Alt+Shift+K');
+  });
+
+  it('a double activation while stopped does not resume, and focus lands on Keep stopped', async () => {
+    const { m } = setup({ settings: { ...DEFAULT_SETTINGS, killSwitch: true } });
+    const btn = await screen.findByRole('button', { name: /kill switch/i });
+    await waitFor(() => {
+      expect(btn.getAttribute('aria-pressed')).toBe('true');
+    });
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+    const keep = await screen.findByRole('button', { name: 'Keep stopped' });
+    expect(document.activeElement).toBe(keep);
+    expect(m.sent.filter((s) => s.type === 'kill.set')).toEqual([]);
+    fireEvent.click(keep);
+    expect(screen.getByTestId('kill-state').textContent).toMatch(/stopped/i);
+    expect(screen.queryByText(/resume automation\?/i)).toBeNull();
+    expect(m.sent.filter((s) => s.type === 'kill.set')).toEqual([]);
+  });
+
+  it('a broadcast that turns it off closes the confirm', async () => {
+    const { m } = setup({ settings: { ...DEFAULT_SETTINGS, killSwitch: true } });
+    const btn = await screen.findByRole('button', { name: /kill switch/i });
+    await waitFor(() => {
+      expect(btn.getAttribute('aria-pressed')).toBe('true');
+    });
+    fireEvent.click(btn);
+    m.broadcast('switches.changed', { killSwitch: false, writesAllowed: {} });
+    await waitFor(() => {
+      expect(screen.queryByText(/resume automation\?/i)).toBeNull();
+    });
+  });
+
+  it('unknown state: offers only Stop (sends on:true), never resume; Retry re-syncs', async () => {
+    const m = new FakeMessaging();
+    let fail = true;
+    m.handle('settings.get', () => {
+      if (fail) throw new Error('down');
+      return { ...DEFAULT_SETTINGS, killSwitch: true };
+    });
+    m.handle('health.get', () => health());
+    m.handle('kill.set', () => undefined);
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [] }));
+    await screen.findByRole('alert');
+    expect(screen.getByTestId('kill-state').textContent).toMatch(/unknown/i);
+    expect(screen.getByText('Stop all automation')).toBeTruthy();
+    expect(screen.queryByText(/resume/i)).toBeNull();
+    fail = false;
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId('kill-state').textContent).toMatch(/stopped/i);
+    });
+  });
+
+  it('unknown state: clicking sends kill.set on:true', async () => {
+    const m = new FakeMessaging();
+    m.handle('settings.get', () => {
+      throw new Error('down');
+    });
+    m.handle('health.get', () => health());
+    m.handle('kill.set', () => undefined);
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [] }));
+    await screen.findByRole('alert');
+    fireEvent.click(screen.getByRole('button', { name: /kill switch/i }));
+    await waitFor(() => {
+      expect(m.sent.filter((s) => s.type === 'kill.set')).toEqual([{ type: 'kill.set', payload: { on: true } }]);
+    });
+  });
+
+  it('an unresponsive background times out with Retry', async () => {
+    const m = new FakeMessaging();
+    m.handle('settings.get', () => new Promise<never>(() => undefined));
+    m.handle('health.get', () => new Promise<never>(() => undefined));
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [], timeoutMs: 30 }));
+    expect((await screen.findByRole('alert')).textContent).toMatch(/not responding/i);
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
   });
 
   it('shows an error when kill.set fails', async () => {
