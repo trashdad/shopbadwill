@@ -244,6 +244,55 @@ describe('popup kill switch', () => {
     expect(screen.getByTestId('kill-state').textContent).toMatch(/stopped/i);
   });
 
+  it('a successful kill.set invalidates an older in-flight load', async () => {
+    const m = new FakeMessaging();
+    let calls = 0;
+    let release: (s: Settings) => void = () => undefined;
+    m.handle('settings.get', () => {
+      calls += 1;
+      if (calls === 1) throw new Error('down');
+      return new Promise<Settings>((resolve) => {
+        release = resolve;
+      });
+    });
+    m.handle('health.get', () => health());
+    m.handle('kill.set', () => undefined);
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [] }));
+    await screen.findByRole('alert');
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    await waitFor(() => {
+      expect(calls).toBe(2);
+    });
+    fireEvent.click(screen.getByRole('button', { name: /kill switch/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId('kill-state').textContent).toMatch(/stopped/i);
+    });
+    release({ ...DEFAULT_SETTINGS, killSwitch: false }); // stale read, no broadcast
+    await screen.findByTestId('budget');
+    expect(screen.getByTestId('kill-state').textContent).toMatch(/stopped/i);
+  });
+
+  it('a failed re-sync after a timeout replaces the checking message', async () => {
+    const m = new FakeMessaging();
+    let calls = 0;
+    m.handle('settings.get', () => {
+      calls += 1;
+      if (calls > 1) throw new Error('down');
+      return DEFAULT_SETTINGS;
+    });
+    m.handle('health.get', () => health());
+    m.handle('kill.set', () => new Promise<never>(() => undefined));
+    render(h(Popup, { messaging: m, actions: actionsMock(), now: () => NOW, sections: [], timeoutMs: 40 }));
+    await waitFor(() => {
+      expect(screen.getByTestId('kill-state').textContent).toMatch(/automation on/i);
+    });
+    fireEvent.click(screen.getByRole('button', { name: /kill switch/i }));
+    await waitFor(() => {
+      expect(document.body.textContent).toMatch(/still can't reach the background/i);
+    });
+    expect(document.body.textContent).not.toContain('The state may have changed — checking');
+  });
+
   it('an unresponsive background times out with Retry', async () => {
     const m = new FakeMessaging();
     m.handle('settings.get', () => new Promise<never>(() => undefined));

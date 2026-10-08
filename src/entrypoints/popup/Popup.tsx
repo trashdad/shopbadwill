@@ -155,6 +155,10 @@ export function Popup({ messaging, actions, now, sections, timeoutMs = DEFAULT_T
       }
     } else {
       setLoadError(`Cannot reach the background: ${errorText(s.reason)}`);
+      // The check that the Unconfirmed message promised has ended.
+      setActionError((m) =>
+        m?.startsWith('Unconfirmed') === true ? "Unconfirmed: still can't reach the background. Stopping is still available." : m,
+      );
     }
     setHealth(h.status === 'fulfilled' ? h.value : 'error');
   }, [messaging, timeoutMs]);
@@ -178,6 +182,8 @@ export function Popup({ messaging, actions, now, sections, timeoutMs = DEFAULT_T
     setBusy(true);
     try {
       await withTimeout(messaging.send('kill.set', { on }), timeoutMs, 'kill.set');
+      // A confirmed write is newer than any read that started before it.
+      broadcastSeq.current += 1;
       setKill(on);
       setConfirming(false);
     } catch (e) {
