@@ -39,7 +39,7 @@ param(
   [string]$ChromeUserDataDir = '',
   [string]$ChromeProfile = 'Default',
   # Hosts that must resolve AND accept a TCP connection before "network up".
-  [string[]]$Hosts = @('www.shopgoodwill.com', 'one.one.one.one'),
+  [string[]]$Hosts = @('one.one.one.one', 'www.msftconnecttest.com'),
   [int]$HostPort = 443,
   [int]$NetworkTimeoutSec = 300,
   [string]$LogDir = (Join-Path $env:LOCALAPPDATA 'ShopBadwill\probe'),
@@ -216,7 +216,10 @@ function Invoke-Schedule {
     $cfg | ConvertTo-Json | Set-Content -LiteralPath $cfgPath -Encoding UTF8
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArgs
     $trigger = New-ScheduledTaskTrigger -Once -At $due.LocalDateTime
+    # Orphan safety: the trigger expires 1 h after due and the task then deletes itself.
+    $trigger.EndBoundary = $due.LocalDateTime.AddHours(1).ToString('yyyy-MM-dd\THH:mm:ss')
     $settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+    $settings.DeleteExpiredTaskAfter = 'PT10M'
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
     $t = Get-ScheduledTask -TaskName $taskName
@@ -230,10 +233,13 @@ function Invoke-Schedule {
   }
 }
 
-function Invoke-Fire {
-  if (-not $ConfigFile) { throw '-ConfigFile required in Fire mode.' }
-  $cfg = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json
-  $script:LogPath = $cfg.logPath
+function Remove-ProbeTask($cfg) {
+  if ($cfg.dryRun) { return }
+  try { Unregister-ScheduledTask -TaskName $cfg.taskName -Confirm:$false -ErrorAction Stop; Write-ProbeLog 'TASK_REMOVED' @{ taskName = $cfg.taskName } }
+  catch { Write-ProbeLog 'TASK_REMOVE_FAILED' @{ error = $_.Exception.Message; hint = 'run -Mode Cleanup' } }
+}
+
+function Invoke-FireBody($cfg) {
   $firedAt = [datetimeoffset]::UtcNow
   $up = [int]((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalSeconds
   Write-ProbeLog 'FIRED' @{ label = $cfg.label; uptimeSec = $up }
@@ -269,12 +275,24 @@ function Invoke-Fire {
     }
   }
 
-  if (-not $cfg.dryRun) {
-    try { Unregister-ScheduledTask -TaskName $cfg.taskName -Confirm:$false; Write-ProbeLog 'TASK_REMOVED' @{ taskName = $cfg.taskName } }
-    catch { Write-ProbeLog 'TASK_REMOVE_FAILED' @{ error = $_.Exception.Message; hint = 'run -Mode Cleanup' } }
+}
+
+function Invoke-Fire {
+  if (-not $ConfigFile) { throw '-ConfigFile required in Fire mode.' }
+  $cfg = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json
+  $script:LogPath = $cfg.logPath
+  try {
+    Invoke-FireBody $cfg
+  } catch {
+    Write-ProbeLog 'FIRE_ERROR' @{ error = $_.Exception.Message }
+    throw
+  } finally {
+    Remove-ProbeTask $cfg
+    try {
+      $ev = @(Get-Content -LiteralPath $script:LogPath | ForEach-Object { ConvertFrom-ProbeLine $_ } | Where-Object { $_ })
+      Write-ProbeLog 'SUMMARY' @{ json = ((Get-WakeSummary -Events $ev) | ConvertTo-Json -Compress) }
+    } catch { }
   }
-  $ev = @(Get-Content -LiteralPath $script:LogPath | ForEach-Object { ConvertFrom-ProbeLine $_ } | Where-Object { $_ })
-  Write-ProbeLog 'SUMMARY' @{ json = ((Get-WakeSummary -Events $ev) | ConvertTo-Json -Compress) }
 }
 
 function Invoke-Summarize {

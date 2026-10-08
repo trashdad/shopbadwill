@@ -43,3 +43,26 @@ Describe 'Get-WakeSummary' {
     $s.WakeToNetworkUpSec | Should BeNullOrEmpty
   }
 }
+
+Describe 'Invoke-Fire cleanup' {
+  It 'unregisters its own task even when the Fire body throws' {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("sbwprobe-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    $cfgFile = Join-Path $tmp 'run.json'
+    @{ taskName = 'ShopBadwillWakeProbe-test'; logPath = (Join-Path $tmp 'x.log'); dryRun = $false } | ConvertTo-Json | Set-Content $cfgFile
+    $script:ConfigFile = $cfgFile
+    Mock Invoke-FireBody { throw 'boom' }
+    Mock Unregister-ScheduledTask { }
+    $threw = $false
+    try { Invoke-Fire } catch { $threw = $true }
+    Remove-Item $tmp -Recurse -Force
+    $threw | Should Be $true
+    Assert-MockCalled Unregister-ScheduledTask -Exactly 1 -ParameterFilter { $TaskName -eq 'ShopBadwillWakeProbe-test' }
+  }
+  It 'does not unregister in dry-run mode' {
+    $cfg = [pscustomobject]@{ taskName = 't'; dryRun = $true }
+    Mock Unregister-ScheduledTask { }
+    Remove-ProbeTask $cfg
+    Assert-MockCalled Unregister-ScheduledTask -Exactly 0 -ParameterFilter { $TaskName -eq 't' }
+  }
+}
