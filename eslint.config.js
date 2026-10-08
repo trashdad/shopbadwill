@@ -32,7 +32,8 @@ const LAYER_ZONES = [
       './domain/money.ts',
       './domain/time/pacific.ts',
     ],
-    message: 'src/adapters may import only src/adapters, src/ports, domain types and the pure money/time modules (PLAN §2.1).',
+    message:
+      'src/adapters may import only src/adapters, src/ports, domain types and the pure money/time modules (PLAN §2.1).',
   },
 ];
 const NOTHING_IMPORTS_ENTRYPOINTS = {
