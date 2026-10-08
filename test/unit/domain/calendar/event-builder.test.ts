@@ -85,3 +85,18 @@ describe('hashDesired', () => {
     expect(hashes.size).toBe(7);
   });
 });
+
+describe('fix round 1', () => {
+  it('derives the description time from startUtc, ignoring endTimeRaw', () => {
+    const e = buildDesiredEvent(tracked, { ...listing, endTimeRaw: 'garbage' }, settings);
+    expect(e.startUtc).toBe(listing.endTime);
+    expect(e.description).toContain('9:30 PM PT · 12:30 AM ET (+1 day)');
+    const later = buildDesiredEvent(tracked, { ...listing, endTime: '2026-10-08T05:00:00.000Z', endTimeRaw: 'x' }, settings);
+    expect(later.description).toContain('10:00 PM PT');
+  });
+  it('replaces lone surrogates in titles', () => {
+    const t = buildDesiredEvent(tracked, { ...listing, title: 'a\ud800b' }, settings).title;
+    expect(t).toBe('a�b');
+    expect(t.isWellFormed()).toBe(true);
+  });
+});

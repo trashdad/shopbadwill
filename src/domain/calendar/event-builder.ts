@@ -2,7 +2,7 @@
 // only from the inputs. Titles are untrusted text and stay plain text.
 import { formatMoney } from '../money';
 import type { Settings } from '../settings/schema';
-import { formatDual, parsePacific } from '../time/pacific';
+import { formatDual } from '../time/pacific';
 import type { Cents, ItemDetail, Listing, TrackedItem } from '../types';
 import type { DesiredEvent } from './types';
 
@@ -26,8 +26,8 @@ export function sanitizeTitle(raw: string): string {
     .join('')
     .replace(/\s+/g, ' ')
     .trim();
-  const points = Array.from(flat);
-  if (points.length <= MAX_TITLE_CHARS) return flat;
+  const points = Array.from(flat.toWellFormed());
+  if (points.length <= MAX_TITLE_CHARS) return points.join('');
   return `${points.slice(0, MAX_TITLE_CHARS - 1).join('')}…`;
 }
 
@@ -59,7 +59,7 @@ export function buildDesiredEvent(
 
   const url = itemUrl(item.itemId);
   const lines = [
-    `Ends: ${formatDual(parsePacific(item.endTimeRaw), settings.locale.timeZone)}`,
+    `Ends: ${formatDual(new Date(item.endTime).getTime(), settings.locale.timeZone)}`,
     `Current price: ${formatMoney(item.currentPrice)}`,
   ];
   if (options.maxBid !== undefined) lines.push(`Your max bid: ${formatMoney(options.maxBid)}`);
