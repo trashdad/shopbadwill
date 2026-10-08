@@ -320,3 +320,7 @@ The frozen `JobRun` had no field for any of this. `Repo.set` parses before writi
 `desired(tracked, watches, now, favorites)` gains a required fourth parameter, `favorites: readonly Favorite[]` (the `sbw:favoritesCache` items). Without it the "not in favoritesCache" rule in PLAN §3.7 cannot be evaluated by a pure function. `test/contract/types/spec-shapes.test.ts` asserts the new signature.
 
 **Follow-up for the next PLAN edit.** Add the parameter to PLAN §3.7 and contracts.md.
+
+## T-58: disableRule undo ref = rule id
+
+An audit entry with `undo: { kind: 'disableRule', ref }` carries the disabled rule's id in `ref`. `createUndoExecutors` (`src/background/handlers/audit.ts`) re-enables that rule. No card writes such an entry yet; the writer must use this format. Audit entries cannot be updated in place, so an undo is recorded as a new `undo` entry (`details.undoneSeq`), and `audit.list` reports `undo.done` from those.

@@ -1,6 +1,9 @@
+import { createRouter } from '../../../src/background/router';
+import { createMessagingClient, type ClientRuntime } from '../../../src/messaging/client';
+import { UNDOABLE_KINDS } from '../../../src/ui/activity/undoable';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { createAuditHandlers, createUndoExecutors } from '../../../src/background/handlers/audit';
+import { createAuditHandlers, createUndoExecutors, SCAN_BATCH } from '../../../src/background/handlers/audit';
 import { unfavoriteRef } from '../../../src/background/jobs/steps/favorite';
 import { Repo } from '../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
@@ -107,6 +110,8 @@ describe('audit.undo', () => {
     const e = await audit.append({ actor: 'system', kind: 'rule.disabled', details: {}, undo: { kind: 'disableRule', ref: 'r1' } });
     await h['audit.undo']({ seq: e.seq }, CTX);
     expect((await repo.get(STORAGE_KEYS.rules))[0]?.enabled).toBe(true);
+    expect(audit.entries[1]).toMatchObject({ kind: 'undo', details: { undoneSeq: e.seq, undoKind: 'disableRule' } });
+    expect((await h['audit.list']({ limit: 10 }, CTX)).find((x) => x.seq === e.seq)?.undo?.done).toBe(true);
   });
 
   it('refuses kinds with no executor yet, and unknown or non-undoable entries', async () => {
@@ -125,5 +130,59 @@ describe('audit.list', () => {
     expect(p1.map((e) => e.seq)).toEqual([5, 4]);
     const p2 = await h['audit.list']({ limit: 2, before: 4 }, CTX);
     expect(p2.map((e) => e.seq)).toEqual([3, 2]);
+  });
+});
+
+describe('audit.list cost', () => {
+  it('scans only entries newer than the page, not the whole log', async () => {
+    for (let i = 0; i < 500; i++) await audit.append({ actor: 'user', kind: 'old', details: {}, undo: { kind: 'unfavorite', ref: unfavoriteRef(5) } });
+    let returned = 0;
+    const spy = {
+      append: audit.append.bind(audit),
+      exportJson: audit.exportJson.bind(audit),
+      list: async (q: Parameters<typeof audit.list>[0]) => {
+        const r = await audit.list(q);
+        returned += r.length;
+        return r;
+      },
+    };
+    const hh = createAuditHandlers({ audit: spy, executors: {} });
+    const page = await hh['audit.list']({ limit: 5 }, CTX);
+    expect(page).toHaveLength(5);
+    expect(returned).toBeLessThanOrEqual(5 + SCAN_BATCH);
+  });
+
+  it('still finds an undo entry newer than the page', async () => {
+    const e = await favEntry();
+    for (let i = 0; i < 250; i++) await audit.append({ actor: 'user', kind: 'x', details: {} });
+    await h['audit.undo']({ seq: e.seq }, CTX);
+    const page = await h['audit.list']({ limit: 5, before: e.seq + 1 }, CTX);
+    expect(page[0]?.undo?.done).toBe(true);
+  });
+});
+
+describe('undoable kinds', () => {
+  it('the UI list matches the wired executors', () => {
+    expect([...UNDOABLE_KINDS].sort()).toEqual(Object.keys(createUndoExecutors({ api, repo })).sort());
+  });
+});
+
+describe('error text on the real wire', () => {
+  it('"not now: <why>" reaches a UI client through router and messaging/client', async () => {
+    const router = createRouter({
+      runtimeId: 'ext-id',
+      getURL: (p) => `chrome-extension://ext-id/${p}`,
+      isQuickFavoriteEnabled: () => true,
+      log: () => undefined,
+    });
+    router.register('audit.undo', h['audit.undo']);
+    const sender = { id: 'ext-id', url: 'chrome-extension://ext-id/options.html' };
+    const client = createMessagingClient({ id: 'ext-id', sendMessage: (m: unknown) => router.handle(m, sender) } as unknown as ClientRuntime);
+    const e = await favEntry();
+    switches.block('favorites', 'kill switch is on');
+    await expect(client.send('audit.undo', { seq: e.seq })).rejects.toMatchObject({
+      code: 'handler_error',
+      message: expect.stringMatching(/^not now: .*kill switch is on/) as unknown,
+    });
   });
 });

@@ -23,7 +23,8 @@ export type UndoKind = NonNullable<AuditEntry['undo']>['kind'];
 export type UndoExecutor = (ref: string, entry: AuditEntry) => Promise<void>;
 
 export const UNDO_AUDIT_KIND = 'undo';
-const MAX_SCAN = 10_000;
+/** Entries per scan batch in `audit.list` / undo's done check. */
+export const SCAN_BATCH = 100;
 
 export interface AuditHandlerDeps {
   audit: AuditLog;
@@ -34,6 +35,8 @@ export interface AuditHandlerDeps {
 export function createUndoExecutors(deps: { api: Pick<SgwApi, 'removeFavorite'>; repo: Repo }): Partial<Record<UndoKind, UndoExecutor>> {
   return {
     // favoriteState stays 'favorited' on purpose (T-53): handled, the user owns it now.
+    // A worker restart mid-undo (after the write, before the `undo` audit append) leaves the
+    // entry not done; a retried removeFavorite on an item already removed is harmless.
     unfavorite: async (ref) => {
       const itemId = parseUnfavoriteRef(ref);
       if (itemId === undefined) throw new Error('This entry has no valid favorite to undo.');
@@ -44,17 +47,17 @@ export function createUndoExecutors(deps: { api: Pick<SgwApi, 'removeFavorite'>;
         throw e;
       }
     },
-    // `ref` is the rule id.
+    // undo.ref = the rule id (T-58 decision, docs/CONTRACT-DECISIONS.md); no writer exists yet.
     disableRule: async (ref) => {
-      const seen = { found: false };
+      const hits: string[] = [];
       await deps.repo.update(STORAGE_KEYS.rules, (rules) =>
         rules.map((r) => {
           if (r.id !== ref) return r;
-          seen.found = true;
+          hits.push(r.id);
           return { ...r, enabled: true, updatedAt: deps.repo.now() };
         }),
       );
-      if (!seen.found) throw new Error('That rule no longer exists.');
+      if (hits.length === 0) throw new Error('That rule no longer exists.');
     },
   };
 }
@@ -65,14 +68,25 @@ export function createAuditHandlers(deps: AuditHandlerDeps): {
 } {
   const inFlight = new Map<number, Promise<void>>();
 
-  const undoneSeqs = async (): Promise<Set<number>> => {
-    const done = await deps.audit.list({ limit: MAX_SCAN, kinds: [UNDO_AUDIT_KIND] });
+  /**
+   * Seqs undone by `undo` entries newer than `minSeq`. An undo entry is always newer
+   * than its original, so the scan walks newest-first in batches and stops as soon as
+   * it passes `minSeq`: the cost is the entries newer than the page, not the ring.
+   */
+  const undoneAfter = async (minSeq: number): Promise<Set<number>> => {
     const out = new Set<number>();
-    for (const e of done) {
-      const s = e.details['undoneSeq'];
-      if (typeof s === 'number') out.add(s);
+    let before: number | undefined;
+    for (;;) {
+      const batch = await deps.audit.list({ limit: SCAN_BATCH, ...(before === undefined ? {} : { before }) });
+      for (const e of batch) {
+        if (e.seq <= minSeq) return out;
+        const s = e.details['undoneSeq'];
+        if (e.kind === UNDO_AUDIT_KIND && typeof s === 'number') out.add(s);
+      }
+      const last = batch[batch.length - 1];
+      if (batch.length < SCAN_BATCH || !last) return out;
+      before = last.seq;
     }
-    return out;
   };
 
   const runUndo = async (seq: number): Promise<void> => {
@@ -81,7 +95,7 @@ export function createAuditHandlers(deps: AuditHandlerDeps): {
     const undo = entry.undo;
     if (!undo) throw new Error('That activity cannot be undone.');
     if (entry.dryRun === true) throw new Error('That was a dry run: nothing was done, so there is nothing to undo.');
-    if (undo.done === true || (await undoneSeqs()).has(seq)) return; // no-op
+    if (undo.done === true || (await undoneAfter(seq)).has(seq)) return; // no-op
     const exec = deps.executors[undo.kind];
     if (!exec) throw new Error('Undo not available yet for this kind of activity.');
     await exec(undo.ref, entry);
@@ -97,8 +111,9 @@ export function createAuditHandlers(deps: AuditHandlerDeps): {
   return {
     'audit.list': async (p) => {
       const page = await deps.audit.list({ limit: p.limit, ...(p.before === undefined ? {} : { before: p.before }) });
-      if (!page.some((e) => e.undo && e.undo.done !== true)) return page;
-      const done = await undoneSeqs();
+      const pending = page.filter((e) => e.undo && e.undo.done !== true).map((e) => e.seq);
+      if (pending.length === 0) return page;
+      const done = await undoneAfter(Math.min(...pending));
       return page.map((e) => (e.undo && done.has(e.seq) ? { ...e, undo: { ...e.undo, done: true } } : e));
     },
     'audit.undo': async (p) => {

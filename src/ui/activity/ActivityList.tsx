@@ -9,6 +9,7 @@ import type { MessagingClient } from '../../ports/messaging';
 import { describeError } from '../components/describeError';
 import { Status } from '../components/Status';
 import { PacificTime } from '../time';
+import { UNDOABLE_KINDS } from './undoable';
 
 export interface ActivityListProps {
   client: MessagingClient;
@@ -46,11 +47,11 @@ export function ActivityList(props: ActivityListProps): VNode {
   const [busy, setBusy] = useState<ReadonlySet<number>>(new Set());
   const inFlight = useRef(new Set<number>());
 
-  const load = (before?: number): void => {
-    client.send('audit.list', { limit: pageSize, ...(before === undefined ? {} : { before }) }).then(
+  const load = (before?: number, limit = pageSize): void => {
+    client.send('audit.list', { limit, ...(before === undefined ? {} : { before }) }).then(
       (page) => {
         setEntries((cur) => (before === undefined ? page : [...cur, ...page]));
-        setMore(page.length >= pageSize);
+        setMore(page.length >= limit);
         setLoaded(true);
       },
       (e: unknown) => {
@@ -72,6 +73,7 @@ export function ActivityList(props: ActivityListProps): VNode {
       () => {
         setEntries((cur) => cur.map((x) => (x.seq === e.seq && x.undo ? { ...x, undo: { ...x.undo, done: true } } : x)));
         setStatus({ message: `Undone: ${what(e)}.`, tone: 'ok' });
+        load(undefined, Math.max(pageSize, entries.length + 1)); // shows the new `undo` row
       },
       (err: unknown) => {
         setStatus({ message: `Could not undo. ${describeError(err)}`, tone: 'error' });
@@ -84,7 +86,13 @@ export function ActivityList(props: ActivityListProps): VNode {
 
   return (
     <div class="sbw-activity">
-      <Status message={status.message} tone={status.tone} />
+      <Status message={status.tone === 'ok' ? status.message : ''} tone="ok" />
+      {status.tone === 'error' ? (
+        <p class="sbw-status" role="alert" data-tone="error">
+          <strong>Problem: </strong>
+          {status.message}
+        </p>
+      ) : null}
       {loaded && entries.length === 0 ? <p>Nothing has happened yet.</p> : null}
       <ul class="sbw-activity-list" aria-label="Activity">
         {entries.map((e) => (
@@ -96,7 +104,11 @@ export function ActivityList(props: ActivityListProps): VNode {
             {e.dryRun === true ? <span class="sbw-activity-dry"> (dry run)</span> : null}{' '}
             <span class="sbw-activity-actor">by {e.actor}</span>
             <div class="sbw-activity-summary">{summary(e)}</div>
-            {e.undo ? (
+            {e.undo && !UNDOABLE_KINDS.has(e.undo.kind) ? (
+              <button type="button" disabled aria-label={`Undo not available yet: ${what(e)}, ${e.kind} #${String(e.seq)}`}>
+                Undo not available yet
+              </button>
+            ) : e.undo ? (
               <button
                 type="button"
                 disabled={e.undo.done === true || busy.has(e.seq)}

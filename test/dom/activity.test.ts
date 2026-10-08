@@ -42,14 +42,38 @@ describe('activity list', () => {
   });
 
   it('undo sends audit.undo and disables the button once done', async () => {
-    const fake = app([entry(1)]);
-    fake.handle('audit.undo', () => undefined);
+    const data = [entry(1)];
+    const fake = app(data);
+    fake.handle('audit.undo', ({ seq }) => {
+      const e = data.find((x) => x.seq === seq);
+      if (e?.undo) e.undo.done = true;
+      data.push(entry(2, { kind: 'undo', undo: undefined, details: { undoneSeq: seq } }));
+      return undefined;
+    });
     mount(fake);
     fireEvent.click(await screen.findByRole('button', { name: /Undo: Unfavorite for item 101/ }));
     await waitFor(() => {
       expect(screen.getByRole<HTMLButtonElement>('button', { name: /Undone: Unfavorite/ }).disabled).toBe(true);
     });
     expect(undos(fake)).toEqual([{ type: 'audit.undo', payload: { seq: 1 } }]);
+    // the list is refreshed, so the new `undo` row shows without a reload
+    await waitFor(() => {
+      expect(screen.getAllByRole('listitem')).toHaveLength(2);
+    });
+    expect(fake.sent.filter((m) => m.type === 'audit.list')).toHaveLength(2);
+  });
+
+  it('shows a disabled "Undo not available yet" button for kinds with no executor', async () => {
+    const fake = app([
+      entry(1, { undo: { kind: 'deleteEvent', ref: 'ev1' } }),
+      entry(2, { undo: { kind: 'disarm', ref: 's1' } }),
+    ]);
+    mount(fake);
+    const btns = await screen.findAllByRole<HTMLButtonElement>('button', { name: /Undo not available yet/ });
+    expect(btns).toHaveLength(2);
+    expect(btns.every((b) => b.disabled)).toBe(true);
+    fireEvent.click(btns[0] as HTMLButtonElement);
+    expect(undos(fake)).toHaveLength(0);
   });
 
   it('shows done entries disabled and leaves a failed undo retryable', async () => {
@@ -63,7 +87,7 @@ describe('activity list', () => {
     const btns = await screen.findAllByRole<HTMLButtonElement>('button', { name: /Undo/ });
     expect(btns.map((b) => b.disabled)).toEqual([false, true]);
     fireEvent.click(btns[0] as HTMLButtonElement);
-    await screen.findByText(/not now: kill switch is on/);
+    expect((await screen.findByRole('alert')).textContent).toMatch(/not now: kill switch is on/);
     const retry = screen.getByRole<HTMLButtonElement>('button', { name: /^Undo: Unfavorite for item 102/ });
     expect(retry.disabled).toBe(false);
     fail = false;
