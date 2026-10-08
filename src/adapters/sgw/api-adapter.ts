@@ -25,9 +25,9 @@
 //   That is false for the kill switch, dry-run, a failed health check and a
 //   bad session. A refusal sends nothing, records an audit intent (item,
 //   action, why) and rejects with SgwApiError('paused', why). Callers ask
-//   writesAllowed themselves first; this check is defense in depth. It runs
-//   when the write is called: a switch flipped while the write waits in its
-//   lane's queue is not seen again.
+//   writesAllowed themselves first; this check is defense in depth. It is
+//   asked again right before the send: a write that waited in its lane's
+//   queue is re-checked before it goes (see WRITE_GATE_MAX_AGE_MS).
 // - A reply that fails its schema throws SgwApiError('schema') and is
 //   reported to health (`flagSchemaFailure`), so writes can fail closed.
 import type { AuditLog } from '../../domain/audit/types';
@@ -104,6 +104,23 @@ export const DETAIL_CACHE_TTL_MS = 60_000;
 export const DETAIL_NO_CACHE_BEFORE_END_MS = 5 * 60_000;
 /** Bound on the in-memory detail cache; the oldest entry goes first. */
 export const DETAIL_CACHE_MAX_ENTRIES = 500;
+
+/**
+ * The writesAllowed verdict a write goes out under is never older than this.
+ * The frozen ScheduledRequest.build() is synchronous, so the async
+ * `writesAllowed` cannot run inside it. Instead build() compares the age of
+ * the last verdict against this limit (monotonic clock):
+ * - A write sent at once, with its lane free, goes under the check made when
+ *   it was requested, which happened just before.
+ * - A write that waited in its lane's queue is refused by build(). Nothing is
+ *   sent, and no budget or gap is charged. The adapter then asks
+ *   writesAllowed again and re-queues it; the lane is free by then, so it
+ *   leaves at once.
+ * - After WRITE_GATE_MAX_ATTEMPTS checks without getting a free lane, it
+ *   gives up with `paused`.
+ */
+export const WRITE_GATE_MAX_AGE_MS = 1000;
+export const WRITE_GATE_MAX_ATTEMPTS = 3;
 
 /** SgwApi.saveFavoriteNote: "≤ 256 chars enforced" (§3.3), counted in UTF-16 units like .NET. */
 export const FAVORITE_NOTE_MAX_CHARS = 256;
@@ -223,6 +240,13 @@ interface DetailRead {
 
 interface RunOptions {
   priority?: number;
+  /** Runs inside build(), right before the request leaves; may throw to stop it (nothing is sent). */
+  beforeSend?: () => void;
+}
+
+/** build() refused a write whose writesAllowed verdict went stale while it waited in its lane. Never escapes the adapter. */
+class StaleWriteGate extends Error {
+  override readonly name = 'StaleWriteGate';
 }
 
 const US_ZIP = /^\d{5}(-\d{4})?$/;
@@ -383,11 +407,38 @@ export class SgwApiAdapter implements SgwApi {
     endpoint: AckEndpoint,
     init: SgwRequestInit,
   ): Promise<void> {
-    await this.gate(feature, kind, target);
+    await this.gate(feature, kind, target); // when the write is requested
+    let checkedAt = this.deps.clock.monotonic();
     const request = await this.prepare(endpoint, init);
-    await this.run(endpoint, WRITE_LANE, request, (_res, raw) => {
-      ack(endpoint, raw);
-    });
+    for (let attempt = 1; ; attempt += 1) {
+      const verdictAt = checkedAt;
+      try {
+        await this.run(
+          endpoint,
+          WRITE_LANE,
+          request,
+          (_res, raw) => {
+            ack(endpoint, raw);
+          },
+          {
+            beforeSend: () => {
+              if (this.deps.clock.monotonic() - verdictAt > WRITE_GATE_MAX_AGE_MS) throw new StaleWriteGate();
+            },
+          },
+        );
+        return;
+      } catch (e) {
+        if (!(e instanceof StaleWriteGate)) throw e;
+        if (attempt >= WRITE_GATE_MAX_ATTEMPTS) {
+          throw new SgwApiError(
+            'paused',
+            `${kind}: the write lane stayed busy, so writesAllowed could not be re-checked right before sending; nothing was sent`,
+          );
+        }
+      }
+      await this.gate(feature, kind, target); // again, right after the queue wait, before anything is sent
+      checkedAt = this.deps.clock.monotonic();
+    }
   }
 
   /**
@@ -542,7 +593,10 @@ export class SgwApiAdapter implements SgwApi {
     const scheduled: ScheduledRequest<T> = {
       lane,
       endpoint,
-      build: () => ({ ...request, headers: { ...request.headers } }),
+      build: () => {
+        opts.beforeSend?.();
+        return { ...request, headers: { ...request.headers } };
+      },
       parse: (res) => parse(res, decode(endpoint, res)),
     };
     if (opts.priority !== undefined) scheduled.priority = opts.priority;

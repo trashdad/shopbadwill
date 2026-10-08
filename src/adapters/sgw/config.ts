@@ -14,7 +14,7 @@
 //
 // Data only: no logic, no imports.
 
-export const SGW_CONFIG_VERSION = '2026-10-08.1';
+export const SGW_CONFIG_VERSION = '2026-10-08.2';
 
 export const SGW_ORIGIN = 'https://shopgoodwill.com';
 /** Every endpoint path below is relative to this base (SGW's own `apiEndPoint`). */

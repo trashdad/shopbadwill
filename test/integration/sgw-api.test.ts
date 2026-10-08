@@ -49,14 +49,14 @@ afterEach(() => {
   started.length = 0;
 });
 
-function setup(start = T0) {
+function setup(start = T0, lanes: Record<Lane, LaneConfig> = FAST_LANES) {
   const clock = new FakeClock(start);
   const scheduler = new SgwRequestScheduler({
     clock,
     http: new BrowserHttp({ now: () => clock.now(), isOnline: () => true }),
     storage: new FakeStorage(),
     random: () => 0,
-    lanes: FAST_LANES,
+    lanes,
   });
   const audit = createAuditLog(new Repo({ local: new FakeStorage(), session: new FakeStorage() }, clock));
   const switches = new FakeSwitches();
@@ -212,6 +212,24 @@ describe('SgwApiAdapter over the real scheduler, fetch and MSW', () => {
       ['favorite.remove', ITEM, { action: 'remove', why: 'dry run' }],
       ['favorite.add', ITEM, { action: 'add', why: 'dry run' }],
     ]);
+  });
+
+  it('the kill switch flipped while a write waits in its lane: asked again before the send, and the write never reaches the network', async () => {
+    const gap: LaneConfig = { minIntervalMs: 120_000, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
+    const t = setup(T0, { ...FAST_LANES, background: gap });
+    serveAll(t);
+    await t.api.search({ searchText: 'pyrex', categoryIds: [], sellerIds: [], page: 1 }, 'background');
+    const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    expect(t.switches.checks).toEqual(['favorites']);
+    t.switches.killAll('kill switch');
+    t.clock.advance(120_000);
+    const err = await pending;
+    expect(err instanceof SgwApiError ? [err.kind, err.message] : err).toEqual(['paused', 'kill switch']);
+    expect(t.switches.checks).toEqual(['favorites', 'favorites']);
+    expect(started).toEqual([`POST ${BASE}Search/ItemListing`]);
+    const [entry] = await t.audit.list({ limit: 1 });
+    expect(entry).toMatchObject({ kind: 'favorite.add', itemId: ITEM, details: { action: 'add', why: 'kill switch' } });
   });
 
   it('a write refused for the kill switch (writesAllowed) records an audit intent and makes ZERO HTTP requests', async () => {

@@ -18,9 +18,12 @@ import {
   DETAIL_NO_CACHE_BEFORE_END_MS,
   FAVORITE_NOTE_MAX_CHARS,
   SgwApiAdapter,
+  WRITE_GATE_MAX_AGE_MS,
+  WRITE_GATE_MAX_ATTEMPTS,
   WRITE_LANE,
   type SchemaFailure,
 } from '../../../../src/adapters/sgw/api-adapter';
+import { SGW_CONFIG_VERSION, SGW_ENDPOINTS } from '../../../../src/adapters/sgw/config';
 import { SgwClockAdapter } from '../../../../src/adapters/sgw/clock-adapter';
 import { searchQueryFromUrl } from '../../../../src/adapters/sgw/query-url';
 import { SgwRequestScheduler } from '../../../../src/adapters/sgw/request-scheduler';
@@ -568,6 +571,98 @@ describe('R4/C1: every write asks GlobalSwitches.writesAllowed; a refusal is aud
     expect(t.http.requests).toHaveLength(0);
   });
 
+  // writesAllowed again right before the send: a write that waited in its lane is re-checked.
+  const GAP: LaneConfig = { minIntervalMs: 120 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
+
+  it.each([
+    ['the kill switch', (s: FakeSwitches) => {
+      s.killAll('kill switch');
+    }, 'kill switch'],
+    ['dry-run', (s: FakeSwitches) => {
+      s.block('favorites', 'dry run');
+    }, 'dry run'],
+  ])('%s turned on while the write waits in its lane: asked again before the send, audited, never reaches the network', async (_c, apply, why) => {
+    const t = setup({ lanes: { ...FAST_LANES, background: GAP } });
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'background'); // starts the 120 s gap on the write lane
+    const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
+    await flush();
+    expect(t.switches.checks).toEqual(['favorites']); // asked when requested; now queued behind the gap
+    apply(t.switches);
+    t.clock.advance(120 * S);
+    const err = await pending;
+    expect(err).toBeInstanceOf(SgwApiError);
+    expect((err as SgwApiError).kind).toBe('paused');
+    expect((err as SgwApiError).message).toBe(why);
+    expect(t.switches.checks).toEqual(['favorites', 'favorites']);
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`]);
+    expect(t.audit.entries).toEqual([
+      expect.objectContaining({ kind: 'favorite.add', itemId: ITEM, details: { action: 'add', why } }),
+    ]);
+    expect(t.inner.stats().lanes.background.usedToday).toBe(1); // the refused attempt cost no budget
+    expect(t.failures).toHaveLength(0);
+  });
+
+  it('a write that waited and is still allowed is re-checked, then sent exactly once', async () => {
+    const t = setup({ lanes: { ...FAST_LANES, background: GAP } });
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'background');
+    const pending = t.api.saveFavoriteNote(55, 'n');
+    await flush();
+    t.clock.advance(120 * S);
+    await pending;
+    expect(t.switches.checks).toEqual(['favorites', 'favorites']);
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`, `${BASE}Favorite/Save`]);
+    expect(t.inner.stats().lanes.background.usedToday).toBe(2);
+    expect(t.audit.entries).toHaveLength(0);
+  });
+
+  it(`a write whose lane never frees in time gives up after ${String(WRITE_GATE_MAX_ATTEMPTS)} checks, paused, without sending`, async () => {
+    const clock = new FakeClock(T0);
+    const switches = new FakeSwitches();
+    let sent = 0;
+    /** A scheduler whose lane is always busy: every build() happens after the verdict went stale. */
+    const busy: RequestScheduler = {
+      run: <T>(r: ScheduledRequest<T>): Promise<T> => {
+        clock.advance(WRITE_GATE_MAX_AGE_MS + 1);
+        try {
+          r.build();
+        } catch (e) {
+          return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+        }
+        sent += 1;
+        return Promise.reject(new Error('must not be sent'));
+      },
+      stats: () => {
+        throw new Error('unused');
+      },
+      pause: () => undefined,
+      resume: () => undefined,
+    };
+    const api = new SgwApiAdapter({
+      scheduler: busy,
+      clock,
+      session: { current: () => Promise.resolve({ bearer: BEARER, expiresAt: T0 + 60 * MIN, buyerId: '42' }) },
+      switches,
+      audit: new FakeAuditLog(clock),
+      health: { flagSchemaFailure: () => undefined },
+      sgwClock: new SgwClockAdapter(clock),
+    });
+    const err = await rejectsWith(api.addFavorite(ITEM), 'paused');
+    expect(err.message).toContain('re-check');
+    expect(sent).toBe(0);
+    expect(switches.checks).toHaveLength(WRITE_GATE_MAX_ATTEMPTS);
+  });
+
+  it('a write sent at once (free lane) is asked once: that check is the one right before the send', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    await t.api.removeFavorite(ITEM);
+    expect(t.switches.checks).toEqual(['favorites']);
+    expect(t.http.requests).toHaveLength(1);
+    expect(WRITE_GATE_MAX_AGE_MS).toBeLessThanOrEqual(1000);
+  });
+
   it('a note over 256 characters is refused before the gate and before any HTTP call', async () => {
     const t = setup();
     scriptAll(t.http);
@@ -1068,5 +1163,15 @@ describe('other reads', () => {
     scriptAll(t.http);
     for (const [, call] of READ_AND_WRITE_CALLS) await call(t.api);
     for (const r of t.http.requests) expect(r.timeoutMs).toBeGreaterThan(0);
+  });
+});
+
+// ── config.ts lines this card owns (rulings C6, I-29) ───────────────────────
+
+describe('config.ts (I-29)', () => {
+  it("itemDetail is auth 'optional', and SGW_CONFIG_VERSION moved past v1 for that change", () => {
+    expect(SGW_ENDPOINTS.itemDetail.auth).toBe('optional');
+    expect(SGW_CONFIG_VERSION).toMatch(/^\d{4}-\d{2}-\d{2}\.\d+$/);
+    expect(SGW_CONFIG_VERSION).not.toBe('2026-10-08.1');
   });
 });
