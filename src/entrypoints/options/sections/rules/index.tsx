@@ -2,6 +2,7 @@ import type { VNode } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 
 import type { Rule } from '../../../../domain/rules/schema';
+import { describeError } from '../../../../ui/components/describeError';
 import { Status } from '../../../../ui/components/Status';
 import type { SectionDef, SectionProps } from '../../registry';
 import { RuleEditor } from './RuleEditor';
@@ -15,10 +16,6 @@ export interface RulesSectionProps extends SectionProps {
 }
 
 type Editing = { rule: Rule | undefined } | null;
-
-function messageOf(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
 
 export function RulesSection(props: RulesSectionProps): VNode {
   const { client } = props;
@@ -36,7 +33,7 @@ export function RulesSection(props: RulesSectionProps): VNode {
       },
       (e: unknown) => {
         setRules((r) => r ?? []);
-        setStatus({ message: `Could not load your rules. ${messageOf(e)}`, tone: 'error' });
+        setStatus({ message: `Could not load your rules. ${describeError(e)}`, tone: 'error' });
       },
     );
   }, [client]);
@@ -60,7 +57,7 @@ export function RulesSection(props: RulesSectionProps): VNode {
         setStatus({ message: `${rule.name} is now ${enabled ? 'on' : 'off'}.`, tone: 'ok' });
       },
       (e: unknown) => {
-        setStatus({ message: `Could not change "${rule.name}". ${messageOf(e)}`, tone: 'error' });
+        setStatus({ message: `Could not change "${rule.name}". ${describeError(e)}`, tone: 'error' });
       },
     );
   };
@@ -73,7 +70,7 @@ export function RulesSection(props: RulesSectionProps): VNode {
         setStatus({ message: `Deleted "${rule.name}".`, tone: 'ok' });
       },
       (e: unknown) => {
-        setStatus({ message: `Could not delete "${rule.name}". ${messageOf(e)}`, tone: 'error' });
+        setStatus({ message: `Could not delete "${rule.name}". ${describeError(e)}`, tone: 'error' });
       },
     );
   };

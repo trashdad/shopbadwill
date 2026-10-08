@@ -8,6 +8,7 @@ import { RuleSchema, type Rule } from '../../src/domain/rules/schema';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { MessagingError } from '../../src/messaging/errors';
+import { describeError } from '../../src/ui/components/describeError';
 import { App } from '../../src/entrypoints/options/App';
 import { loadSections } from '../../src/entrypoints/options/registry';
 import { RulesSection, section as rulesSection } from '../../src/entrypoints/options/sections/rules';
@@ -288,7 +289,8 @@ describe('settings', () => {
     await waitFor(() => {
       expect(lastSent(fake, 'settings.set')).toMatchObject({ overlay: { hideStyle: 'dim', enabled: true } });
     });
-    expect(screen.getByText(/Controls how gently ShopBadwill spaces out its requests/)).toBeTruthy();
+    expect(screen.getByText(/halves ShopBadwill's daily request budgets and doubles the time between background requests/)).toBeTruthy();
+    expect(screen.getByText(/Normal: ShopBadwill's standard/)).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Tight'));
     await waitFor(() => {
       expect(lastSent(fake, 'settings.set')).toEqual({ considerateMode: 'tight' });
@@ -337,7 +339,55 @@ describe('shell and registry', () => {
     const fake = new FakeMessaging(); // no handlers: every send fails with no_handler
     render(h(App, { client: fake, sections: [settingsSection, rulesSection] }));
     expect(await screen.findByText(/Could not load your settings/)).toBeTruthy();
-    expect(MessagingError.name).toBe('MessagingError');
+  });
+});
+
+describe('focus management', () => {
+  it('focuses the new condition, and a neighbour or the Add button after Remove', async () => {
+    rulesApp();
+    await openNewRule();
+    const add = screen.getByRole('button', { name: 'Add condition' });
+    fireEvent.click(add);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole('combobox', { name: 'Match' }));
+    });
+    fireEvent.click(add);
+    const second = screen.getByRole('group', { name: /Condition 2/ });
+    await waitFor(() => {
+      expect(second.contains(document.activeElement)).toBe(true);
+    });
+    // Remove the second: focus goes to the previous one.
+    fireEvent.click(within(second).getByRole('button', { name: /Remove/ }));
+    const first = screen.getByRole('group', { name: /Condition 1/ });
+    await waitFor(() => {
+      expect(first.contains(document.activeElement)).toBe(true);
+    });
+    // Remove the last one: focus goes to the Add button.
+    fireEvent.click(within(first).getByRole('button', { name: /Remove/ }));
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Add condition' }));
+    });
+  });
+});
+
+describe('describeError', () => {
+  it('maps messaging codes to plain text', () => {
+    const e = (code: ConstructorParameters<typeof MessagingError>[0], m = 'raw') => describeError(new MessagingError(code, m));
+    expect(e('no_response')).toMatch(/background isn't responding/);
+    expect(e('transport')).toMatch(/reloading the extension/);
+    expect(e('forbidden')).toBe('Not allowed.');
+    expect(e('bad_sender')).toBe('Not allowed.');
+    expect(e('invalid_message')).toBe("That change wasn't valid.");
+    expect(e('disabled')).toBe('Turned off in settings.');
+    expect(e('handler_error', 'regex too complex')).toBe('regex too complex');
+    expect(e('no_handler')).toBe('Something went wrong.');
+    expect(describeError(new Error('boom'))).toBe('Something went wrong.');
+  });
+
+  it('shows plain text when the background is missing', async () => {
+    const fake = new FakeMessaging();
+    render(h(SettingsSection, { client: fake }));
+    expect(await screen.findByText(/Could not load your settings\. Something went wrong\./)).toBeTruthy();
   });
 });
 

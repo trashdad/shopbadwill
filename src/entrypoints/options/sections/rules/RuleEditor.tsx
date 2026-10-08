@@ -2,9 +2,9 @@ import type { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 
 import type { Rule } from '../../../../domain/rules/schema';
-import { MessagingError } from '../../../../messaging/errors';
 import type { MessagingClient } from '../../../../ports/messaging';
 import { Field } from '../../../../ui/components/Field';
+import { describeError } from '../../../../ui/components/describeError';
 import { Status } from '../../../../ui/components/Status';
 import { ConditionEditor } from './ConditionEditor';
 import {
@@ -41,10 +41,6 @@ type Preview =
   | { state: 'ready'; matched: number; total: number }
   | { state: 'failed'; message: string };
 
-function messageOf(e: unknown): string {
-  return e instanceof MessagingError || e instanceof Error ? e.message : String(e);
-}
-
 export function RuleEditor(props: RuleEditorProps): VNode {
   const { client } = props;
   const [draft, setDraft] = useState<RuleDraft>(() =>
@@ -57,6 +53,7 @@ export function RuleEditor(props: RuleEditorProps): VNode {
   const [addKind, setAddKind] = useState<ConditionKind>('keyword');
   const summaryRef = useRef<HTMLDivElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const pendingFocus = useRef<string | null>(null);
 
   const result = fromDraft(draft, props.now());
   const errors: readonly DraftError[] = result.ok ? [] : result.errors;
@@ -83,7 +80,7 @@ export function RuleEditor(props: RuleEditorProps): VNode {
           if (!cancelled) setPreview({ state: 'ready', matched: r.matched, total: r.total });
         },
         (e: unknown) => {
-          if (!cancelled) setPreview({ state: 'failed', message: messageOf(e) });
+          if (!cancelled) setPreview({ state: 'failed', message: describeError(e) });
         },
       );
     }, props.previewDelayMs);
@@ -94,6 +91,16 @@ export function RuleEditor(props: RuleEditorProps): VNode {
     // result is derived from draft; previewKey changes exactly when the rule content does.
   }, [previewKey, client, props.previewDelayMs]);
 
+  // Focus follows add/remove: the new condition's first control, a neighbour, or the Add button.
+  useEffect(() => {
+    const id = pendingFocus.current;
+    if (id === null) return;
+    pendingFocus.current = null;
+    const el = document.getElementById(id);
+    const target = el instanceof HTMLFieldSetElement ? el.querySelector<HTMLElement>('input, select, textarea') : el;
+    target?.focus();
+  }, [draft]);
+
   const patch = (p: Partial<RuleDraft>): void => {
     setDraft((d) => ({ ...d, ...p }));
   };
@@ -101,9 +108,15 @@ export function RuleEditor(props: RuleEditorProps): VNode {
     setDraft((d) => ({ ...d, [group]: d[group].map((c) => (c.key === key ? { ...c, ...p } : c)) }));
   };
   const addCondition = (group: DraftGroup): void => {
-    setDraft((d) => ({ ...d, [group]: [...d[group], newCondition(addKind, nextKey(d))] }));
+    const key = nextKey(draft);
+    pendingFocus.current = `cond-${group}-${String(key)}`;
+    setDraft((d) => ({ ...d, [group]: [...d[group], newCondition(addKind, key)] }));
   };
   const removeCondition = (group: DraftGroup, key: number): void => {
+    const list = draft[group];
+    const at = list.findIndex((c) => c.key === key);
+    const neighbour = list[at + 1] ?? list[at - 1];
+    pendingFocus.current = neighbour === undefined ? `add-${group}` : `cond-${group}-${String(neighbour.key)}`;
     setDraft((d) => ({ ...d, [group]: d[group].filter((c) => c.key !== key) }));
   };
 
@@ -124,7 +137,7 @@ export function RuleEditor(props: RuleEditorProps): VNode {
       },
       (err: unknown) => {
         setSaving(false);
-        setSaveError(`The rule was not saved. ${messageOf(err)}`);
+        setSaveError(`The rule was not saved. ${describeError(err)}`);
         queueMicrotask(() => summaryRef.current?.focus());
       },
     );
@@ -150,6 +163,7 @@ export function RuleEditor(props: RuleEditorProps): VNode {
         />
       ))}
       <button
+        id={`add-${group}`}
         type="button"
         class="sbw-secondary"
         onClick={() => {

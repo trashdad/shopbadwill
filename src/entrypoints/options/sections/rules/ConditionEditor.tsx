@@ -284,7 +284,7 @@ export function ConditionEditor(props: ConditionEditorProps): VNode {
   }
 
   return (
-    <fieldset class="sbw-condition">
+    <fieldset class="sbw-condition" id={base}>
       <legend>{title}</legend>
       {body}
       <button type="button" class="sbw-secondary" aria-label={`Remove ${title}`} onClick={props.onRemove}>

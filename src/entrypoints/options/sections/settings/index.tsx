@@ -3,14 +3,11 @@ import { useEffect, useState } from 'preact/hooks';
 
 import type { Settings } from '../../../../domain/settings/schema';
 import { Card, Field } from '../../../../ui/components/Field';
+import { describeError } from '../../../../ui/components/describeError';
 import { Status } from '../../../../ui/components/Status';
 import { Switch } from '../../../../ui/components/Switch';
 import { Money } from '../../../../ui/money';
 import type { SectionDef, SectionProps } from '../../registry';
-
-function messageOf(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
 
 const ZIP = /^\d{5}$/;
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -30,7 +27,7 @@ export function SettingsSection(props: SectionProps): VNode {
         setZip(s.homeZip ?? '');
       },
       (e: unknown) => {
-        setLoadError(`Could not load your settings. ${messageOf(e)}`);
+        setLoadError(`Could not load your settings. ${describeError(e)}`);
       },
     );
   }, [client]);
@@ -49,7 +46,7 @@ export function SettingsSection(props: SectionProps): VNode {
       },
       (e: unknown) => {
         setSettings((cur) => (cur === null ? cur : { ...cur, ...pick(previous, patch) }));
-        setStatus({ message: `Could not save ${what}. ${messageOf(e)}`, tone: 'error' });
+        setStatus({ message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' });
       },
     );
   };
@@ -236,7 +233,7 @@ export function SettingsSection(props: SectionProps): VNode {
         <fieldset class="sbw-inline-fieldset">
           <legend>Considerate mode</legend>
           <p class="sbw-hint" id="considerate-hint">
-            Controls how gently ShopBadwill spaces out its requests to ShopGoodwill; Tight is the most careful.
+            Normal: ShopBadwill's standard daily request budgets and spacing. Tight: halves ShopBadwill's daily request budgets and doubles the time between background requests to ShopGoodwill. Use it if you want the lightest possible footprint.
           </p>
           {(
             [
@@ -280,24 +277,6 @@ export function SettingsSection(props: SectionProps): VNode {
           checked={s.features.countdownRefresh}
           onChange={(countdownRefresh) => {
             save({ features: { ...s.features, countdownRefresh } }, 'countdown refresh');
-          }}
-        />
-        <Switch
-          id="set-comps"
-          label="Price comparisons (planned)"
-          hint="Not built yet. The switch is saved for when it arrives."
-          checked={s.features.comps}
-          onChange={(comps) => {
-            save({ features: { ...s.features, comps } }, 'price comparisons');
-          }}
-        />
-        <Switch
-          id="set-relist"
-          label="Relist detector (planned)"
-          hint="Not built yet. The switch is saved for when it arrives."
-          checked={s.features.relistDetector}
-          onChange={(relistDetector) => {
-            save({ features: { ...s.features, relistDetector } }, 'relist detector');
           }}
         />
       </Card>
