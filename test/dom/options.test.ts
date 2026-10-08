@@ -1,5 +1,4 @@
 // T-37: options page (rule editor + settings), driven through FakeMessaging.
-/* eslint-disable import/no-restricted-paths -- the options page lives in src/entrypoints; this suite is its test. */
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it } from 'vitest';

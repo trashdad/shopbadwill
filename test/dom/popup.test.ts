@@ -1,4 +1,3 @@
-/* eslint-disable import/no-restricted-paths -- the popup lives under src/entrypoints; its own test is the one importer */
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
