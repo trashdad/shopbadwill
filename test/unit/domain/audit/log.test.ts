@@ -164,3 +164,31 @@ describe('AuditLog leak paths (raw storage dump)', () => {
     expect(before >= 0xd800 && before <= 0xdbff).toBe(false);
   });
 });
+
+describe('AuditLog header-like and key-family leaks (raw storage dump)', () => {
+  const dump = () => JSON.stringify(areas.local.dump());
+  const cases: Array<[string, string, string]> = [
+    ['Authorization Basic', 'Authorization: Basic dXNlcjpwYXNzd29yZA==', 'dXNlcjpwYXNzd29yZA'],
+    ['Proxy-Authorization', 'Proxy-Authorization: Basic PROXYSECRET99 extra', 'PROXYSECRET99'],
+    ['multi-pair cookie', 'cookie: a=1; sid=COOKIE2; theme=dark', 'COOKIE2'],
+    ['Set-Cookie attrs', 'Set-Cookie: sid=SETCOOKIE3; Path=/; HttpOnly', 'SETCOOKIE3'],
+    ['x-api-key', 'x-api-key: APIKEYSECRET4', 'APIKEYSECRET4'],
+    ['api_key=', 'GET /x?api_key=APIKEYSECRET5&a=1', 'APIKEYSECRET5'],
+    ['percent-encoded', 'q=token%3DPCTSECRET6&z=1', 'PCTSECRET6'],
+    ['JSON authorization', '{"authorization":"Basic abc def JSONAUTH7"}', 'JSONAUTH7'],
+    ['auth key', 'auth=AUTHSECRET8', 'AUTHSECRET8'],
+    ['passphrase/pwd', 'pwd: PWDSECRET9 passphrase=PHRASE10', 'PWDSECRET9'],
+  ];
+  for (const [name, text, secret] of cases) {
+    it('redacts ' + name, async () => {
+      await log.append({ ...base, details: { t: text }, ref: text });
+      expect(dump()).not.toContain(secret);
+      expect(dump()).not.toContain('PHRASE10');
+    });
+  }
+
+  it('drops api_key/pwd/credentials keys and keeps author', async () => {
+    const e = await log.append({ ...base, details: { 'x-api-key': 'K1', apiKey: 'K2', pwd: 'K3', credentials: 'K4', author: 'bob' } });
+    expect(e.details).toEqual({ author: 'bob' });
+  });
+});
