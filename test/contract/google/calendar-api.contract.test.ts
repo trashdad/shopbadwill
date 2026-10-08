@@ -111,8 +111,6 @@ describe('GoogleCalendarApi against the fake Google server', () => {
       expect(LenientRawEventSchema.safeParse(raw).success).toBe(true);
       expect(GcalEventSchema.safeParse(normalizeEvent(raw)).success).toBe(true);
     }
-    const listRes = await fetch(`${fake.url}/__admin/state`);
-    expect(listRes.status).toBe(200);
     const listed = await api.eventsListByPrivateProp(calId, 'sbwItemId', '1');
     expect(listed.map((e) => e.id)).toEqual(['sbv1g0abc']);
     expect(FakeRawListSchema.safeParse({ kind: 'calendar#events', etag: 'e', summary: 's', timeZone: 'UTC', items: [...(state?.events.values() ?? [])] }).success).toBe(true);
@@ -172,17 +170,23 @@ describe('GoogleCalendarApi against the fake Google server', () => {
 
   it('rateLimitExceeded -> backoff honoring Retry-After: 1, then success', async () => {
     const { api, clock } = await makeApi(`${SCOPE}calendar`, { rateLimitNext: 2 });
-    const { id } = await api.calendarsInsert('c', 'UTC');
-    expect(id).toContain('@group.calendar.google.com');
+    expect(await api.calendarListGet('primary')).toEqual({ id: 'primary' });
     expect(clock.delays).toEqual([1000, 1000]);
     expect(fake.state.requests.filter((r) => r.status === 429)).toHaveLength(2);
   });
 
   it('rateLimitExceeded beyond the attempt cap -> rate-limited', async () => {
     const { api, clock } = await makeApi(`${SCOPE}calendar`, { rateLimitNext: 100 });
-    const e = await failure(api.calendarsInsert('c', 'UTC'));
+    const e = await failure(api.calendarListGet('primary'));
     expect(e).toMatchObject({ code: 'rate-limited', status: 429 });
     expect(clock.delays).toHaveLength(4); // 5 attempts, 4 sleeps
+  });
+
+  it('calendarsInsert is not retried on 429 (no duplicate calendar)', async () => {
+    const { api, clock } = await makeApi(`${SCOPE}calendar`, { rateLimitNext: 1 });
+    expect((await failure(api.calendarsInsert('c', 'UTC'))).code).toBe('rate-limited');
+    expect(clock.delays).toEqual([]);
+    expect(fake.state.calendars.size).toBe(1); // only 'primary'
   });
 
   it('an expired access token -> auth', async () => {

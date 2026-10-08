@@ -34,6 +34,8 @@ export interface GoogleCalendarApiOptions {
 const RETRYABLE_RATE_REASONS = new Set(['rateLimitExceeded', 'userRateLimitExceeded']);
 /** 403 reasons that are quota, not burst: reported as rate-limited but not retried. */
 const QUOTA_REASONS = new Set(['quotaExceeded', 'dailyLimitExceeded', 'dailyLimitExceededUnreg']);
+/** 403 reasons that mean the grant is not enough (the only ones that may prompt a reconnect). */
+const SCOPE_REASONS = new Set(['insufficientPermissions', 'forbidden', 'accessNotConfigured']);
 const MAX_LIST_PAGES = 20;
 
 interface Failure {
@@ -59,8 +61,9 @@ function classify(status: number, reasons: string[]): Failure {
   if (status === 403) {
     if (reasons.some((r) => RETRYABLE_RATE_REASONS.has(r))) return { code: 'rate-limited', retryable: true };
     if (reasons.some((r) => QUOTA_REASONS.has(r))) return { code: 'rate-limited', retryable: false };
-    // insufficientPermissions, forbidden and any other 403: the grant is not enough.
-    return { code: 'insufficient-scope', retryable: false };
+    if (reasons.some((r) => SCOPE_REASONS.has(r))) return { code: 'insufficient-scope', retryable: false };
+    // forbiddenForNonOrganizer, notACalendarUser, proxy/HTML 403s: reconnecting would not help.
+    return { code: 'other', retryable: false };
   }
   if (status === 404 || status === 410) return { code: 'not-found', retryable: false };
   if (status === 409) return { code: 'conflict', retryable: false };
@@ -114,8 +117,15 @@ export class GoogleCalendarApi implements CalendarApi {
     this.random = opts.random ?? Math.random;
   }
 
+  /**
+   * NOT idempotent: Google assigns the id, so a retry after a lost response
+   * would create a duplicate calendar. This call therefore never retries
+   * (5xx, 429 and timeouts surface as errors). The caller (T-67
+   * `ensureCalendar`) must reconcile possible duplicates by listing calendars
+   * before creating a new one.
+   */
   async calendarsInsert(summary: string, timeZone: string): Promise<{ id: string }> {
-    const res = await this.request('POST', '/calendars', { body: { summary, timeZone } });
+    const res = await this.request('POST', '/calendars', { body: { summary, timeZone }, noRetry: true });
     const parsed = RawCalendarSchema.safeParse(this.json(res));
     if (!parsed.success) throw new CalendarApiError('schema', 'calendars.insert: response has no id', { status: res.status });
     return { id: parsed.data.id };
@@ -134,6 +144,12 @@ export class GoogleCalendarApi implements CalendarApi {
     return this.event(res, 'events.insert');
   }
 
+  /**
+   * Returns a cancelled event with status 'cancelled' (the one read that can
+   * see one), or null for 404/410. A normalized event whose
+   * `extendedProperties.private.sbwItemId` is '' is NOT ours (a user event or
+   * one stripped by hand): callers must not patch or delete it.
+   */
   async eventsGet(calendarId: string, eventId: string): Promise<GcalEvent | null> {
     const res = await this.request('GET', this.eventsPath(calendarId, eventId), { notFoundOk: true });
     if (res.status === 404 || res.status === 410) return null;
@@ -149,7 +165,11 @@ export class GoogleCalendarApi implements CalendarApi {
     await this.request('DELETE', this.eventsPath(calendarId, eventId), { notFoundOk: true });
   }
 
-  /** Live events only (Google's default: cancelled events are not listed). Follows nextPageToken. */
+  /**
+   * Cancelled events are EXCLUDED from the list (Google's default; use
+   * `eventsGet` to see one). Follows nextPageToken. A result with
+   * `sbwItemId === ''` is NOT ours: callers must not patch or delete it.
+   */
   async eventsListByPrivateProp(calendarId: string, key: string, value: string): Promise<GcalEvent[]> {
     const out: GcalEvent[] = [];
     let pageToken: string | undefined;
@@ -210,7 +230,7 @@ export class GoogleCalendarApi implements CalendarApi {
   private async request(
     method: HttpRequest['method'],
     path: string,
-    opts: { body?: unknown; notFoundOk?: boolean } = {},
+    opts: { body?: unknown; notFoundOk?: boolean; noRetry?: boolean } = {},
   ): Promise<HttpResponse> {
     for (let attempt = 1; ; attempt++) {
       const token = await this.token();
@@ -244,7 +264,7 @@ export class GoogleCalendarApi implements CalendarApi {
         new CalendarApiError(failure.code, `${method} ${path} -> ${String(res.status)}${message === undefined ? '' : `: ${message}`}`, {
           status: res.status,
         });
-      if (!failure.retryable || attempt >= this.maxAttempts) throw fail();
+      if (!failure.retryable || opts.noRetry === true || attempt >= this.maxAttempts) throw fail();
 
       const retryAfter = parseRetryAfter(header(res, 'retry-after'), this.clock.now());
       if (retryAfter !== undefined && retryAfter > this.maxRetryAfterMs) throw fail();

@@ -207,7 +207,10 @@ describe('error mapping', () => {
     ['401 -> auth', gerr(401, 'authError'), 'auth'],
     ['403 insufficientPermissions -> insufficient-scope', gerr(403, 'insufficientPermissions'), 'insufficient-scope'],
     ['403 forbidden -> insufficient-scope', gerr(403, 'forbidden'), 'insufficient-scope'],
-    ['403 unparseable body -> insufficient-scope', { status: 403, bodyText: 'nope' }, 'insufficient-scope'],
+    ['403 accessNotConfigured -> insufficient-scope', gerr(403, 'accessNotConfigured'), 'insufficient-scope'],
+    ['403 forbiddenForNonOrganizer -> other', gerr(403, 'forbiddenForNonOrganizer'), 'other'],
+    ['403 notACalendarUser -> other', gerr(403, 'notACalendarUser'), 'other'],
+    ['403 HTML proxy body -> other', { status: 403, bodyText: '<html>blocked</html>' }, 'other'],
     ['403 dailyLimitExceeded -> rate-limited', gerr(403, 'dailyLimitExceeded'), 'rate-limited'],
     ['400 -> other', gerr(400, 'invalid'), 'other'],
   ];
@@ -246,6 +249,29 @@ describe('error mapping', () => {
       expect((await code(api.eventsGet('c', 'a'))).code).toBe(calCode);
     }
     expect(http.requests).toHaveLength(0);
+  });
+});
+
+describe('calendarsInsert is not retried (non-idempotent)', () => {
+  for (const [name, step] of [
+    ['503', gerr(503, 'backendError')],
+    ['429', gerr(429, 'rateLimitExceeded')],
+    ['timeout', { error: new HttpTimeoutError(1) }],
+  ] as const) {
+    it(name, async () => {
+      const { api, http, clock } = setup();
+      http.on(`${BASE}/calendars`, step);
+      await code(api.calendarsInsert('s', 'UTC'));
+      expect(http.requests).toHaveLength(1);
+      expect(clock.delays).toEqual([]);
+    });
+  }
+
+  it('keeps the status in the message of an unmapped 403', async () => {
+    const { api, http } = setup();
+    http.on(BASE, gerr(403, 'notACalendarUser'));
+    const e = await api.eventsGet('c', 'a').catch((x: unknown) => x);
+    expect(e).toMatchObject({ code: 'other', status: 403, message: expect.stringContaining('403') as string });
   });
 });
 
