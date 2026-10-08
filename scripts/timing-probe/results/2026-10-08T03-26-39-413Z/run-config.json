@@ -1,0 +1,164 @@
+{
+  "runId": "2026-10-08T03-26-39-413Z",
+  "pilot": false,
+  "startedAt": 1791429999429,
+  "skewMs": 1300,
+  "latencyMs": 150,
+  "placeBidStallMs": {
+    "main": 25000,
+    "long": 45000
+  },
+  "sgw": {
+    "main": "http://127.0.0.1:62305",
+    "long": "http://127.0.0.1:62306"
+  },
+  "collector": "http://127.0.0.1:62307",
+  "common": {
+    "holdLeadMs": 300000,
+    "verifyLeadMs": 60000,
+    "releaseAfterMs": 90000,
+    "gapMs": 90000,
+    "recoverAfterMs": 100000,
+    "hbIntervalMs": 20000,
+    "tickMs": 5000,
+    "leadMs": 8000,
+    "sampleGapMs": 20000,
+    "finalHopMs": 20,
+    "itemId": 279250057
+  },
+  "lanes": [
+    {
+      "lane": "chrome-main1",
+      "browser": "chrome",
+      "mode": "main",
+      "cycles": 7,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 60000
+    },
+    {
+      "lane": "firefox-main1",
+      "browser": "firefox",
+      "mode": "main",
+      "cycles": 7,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 97000
+    },
+    {
+      "lane": "chrome-main2",
+      "browser": "chrome",
+      "mode": "main",
+      "cycles": 7,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 134000
+    },
+    {
+      "lane": "firefox-main2",
+      "browser": "firefox",
+      "mode": "main",
+      "cycles": 7,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 171000
+    },
+    {
+      "lane": "chrome-main3",
+      "browser": "chrome",
+      "mode": "main",
+      "cycles": 7,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 208000
+    },
+    {
+      "lane": "firefox-main3",
+      "browser": "firefox",
+      "mode": "main",
+      "cycles": 7,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 245000
+    },
+    {
+      "lane": "chrome-longfetch",
+      "browser": "chrome",
+      "mode": "ctl-longfetch",
+      "cycles": 3,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 60000,
+      "sgwKey": "long",
+      "firstWakeDelayMs": 282000
+    },
+    {
+      "lane": "firefox-longfetch",
+      "browser": "firefox",
+      "mode": "ctl-longfetch",
+      "cycles": 3,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 60000,
+      "sgwKey": "long",
+      "firstWakeDelayMs": 319000
+    },
+    {
+      "lane": "chrome-hbstop",
+      "browser": "chrome",
+      "mode": "ctl-hbstop",
+      "cycles": 3,
+      "heartbeat": true,
+      "hbStopAtFire": true,
+      "abortMs": 60000,
+      "sgwKey": "long",
+      "firstWakeDelayMs": 356000
+    },
+    {
+      "lane": "firefox-hbstop",
+      "browser": "firefox",
+      "mode": "ctl-hbstop",
+      "cycles": 3,
+      "heartbeat": true,
+      "hbStopAtFire": true,
+      "abortMs": 60000,
+      "sgwKey": "long",
+      "firstWakeDelayMs": 393000
+    }
+  ],
+  "host": {
+    "platform": "Windows_NT 10.0.26200",
+    "cpus": 24,
+    "cpuModel": "Intel(R) Core(TM) Ultra 9 275HX",
+    "memGb": 31,
+    "node": "v25.7.0"
+  },
+  "chromium": "C:\\Users\\insan\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe",
+  "firefox": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+  "endedAt": 1791433534550,
+  "stopReason": "all lanes done",
+  "lanesDone": [
+    "chrome-longfetch",
+    "firefox-longfetch",
+    "chrome-hbstop",
+    "firefox-hbstop",
+    "chrome-main1",
+    "firefox-main1",
+    "chrome-main2",
+    "firefox-main2",
+    "chrome-main3",
+    "firefox-main3"
+  ]
+}
