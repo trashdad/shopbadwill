@@ -110,7 +110,8 @@ interface Verdict {
 function judgeAccepted(s: Snipe, bid: BidResult | null, post: ItemDetail | null): Verdict {
   const accepted = bid?.kind === 'accepted';
   if (bid?.kind === 'outbid') return { outcome: 'outbid', how: 'reported by SGW' };
-  const high = post?.isHighBidder ?? bid?.isHighBidder ?? null;
+  // An unrecognised reply's own flag is unverified: only the post-read may speak for it.
+  const high = bid?.kind === 'rejected-unknown' ? (post?.isHighBidder ?? null) : (post?.isHighBidder ?? bid?.isHighBidder ?? null);
   if (high === true) return { outcome: 'won', how: 'reported by SGW' };
   if (high === false) return { outcome: 'outbid', how: 'reported by SGW' };
   // No high-bidder flag (anonymous read): proxy bidding lets the price settle it, except at a tie.
@@ -257,11 +258,6 @@ export function classifyOutcome(
         ? 'Not bid: ShopGoodwill rejected your session. Sign in again.'
         : 'Not bid: ShopGoodwill says your account cannot bid on this item.';
     detail = `SGW ${bidResult.kind}: ${bidResult.messageText}`;
-  } else if (bidResult?.kind === 'rejected-unknown') {
-    outcome = 'network';
-    heading = 'Not bid';
-    message = 'Not bid: ShopGoodwill refused the bid for an unrecognised reason. Check the audit log.';
-    detail = `Unrecognised rejection (status ${String(bidResult.rawStatus)}, result ${String(bidResult.rawResult)}): ${bidResult.messageText}`;
   } else if (bidResult?.kind === 'below-minimum') {
     outcome = 'below-minimum';
     heading = 'Lost';
@@ -278,20 +274,29 @@ export function classifyOutcome(
     const v = judgeAccepted(snipe, bidResult, post);
     final = closed;
     finalPrice = price;
-    const via = bidResult === null ? ' The bid response was lost; this comes from re-reading the item.' : '';
+    const unknown = bidResult?.kind === 'rejected-unknown' ? bidResult : null;
+    const via =
+      bidResult === null
+        ? ' The bid response was lost; this comes from re-reading the item.'
+        : unknown
+          ? " ShopGoodwill's reply was not recognised; this comes from re-reading the item."
+          : '';
+    const rawNote = unknown
+      ? ` Unrecognised reply (status ${String(unknown.rawStatus)}, result ${String(unknown.rawResult)}): ${unknown.messageText}`
+      : '';
     const at = price !== undefined ? ` at ${formatMoney(price)}` : '';
     if (v.outcome === 'won') {
       outcome = 'won';
       heading = 'Won';
       message = `Won${final ? '' : ' (leading; auction still open)'}${at} (your max ${max}).${via}`;
-      detail = `Won; ${v.how}.`;
+      detail = `Won; ${v.how}.${rawNote}`;
       stampAs = final ? 'won' : null;
     } else if (v.outcome === 'outbid') {
       outcome = 'outbid';
       heading = final ? 'Lost' : 'Outbid';
       if (price !== undefined) marginCents = price > snipe.maxBid ? price - snipe.maxBid : 0;
       message = `${final ? 'Lost: outbid' : 'Currently outbid'}${at} (${final ? '' : 'auction still open; '}your max ${max})${marginCents ? `, short by ${formatMoney(marginCents)}` : ''}.${via}`;
-      detail = `Outbid; ${v.how}.`;
+      detail = `Outbid; ${v.how}.${rawNote}`;
       stampAs = final ? 'lost' : null;
     } else {
       outcome = 'network';
@@ -301,7 +306,7 @@ export function classifyOutcome(
       message = `Unconfirmed: the bid may have been placed but the result could not be read${
         price !== undefined ? ` (price ${formatMoney(price)}, your max ${max})` : ''
       }. Check ShopGoodwill.${via}`;
-      detail = v.how;
+      detail = `${v.how}.${rawNote}`;
     }
   }
 

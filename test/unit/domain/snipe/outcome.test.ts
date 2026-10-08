@@ -277,3 +277,50 @@ describe('fix round 1', () => {
   });
 });
 
+
+describe('T-87b rejected-unknown is settled by re-reading, never "Not bid"', () => {
+  const unk = (over: Partial<BidResult> = {}) =>
+    bid('rejected-unknown', { rawStatus: 200, rawResult: 77, messageText: 'weird reply', ...over });
+
+  it('post-read isHighBidder true is Won, text mentions the re-read', () => {
+    const r = classifyOutcome(snipe(), unk(), detail({ isHighBidder: true, currentPrice: 1800 }));
+    expect(r.outcome).toBe('won');
+    expect(r.notify.message).toContain('not recognised');
+    expect(r.notify.message).toContain('re-reading the item');
+    expect(r.notify.message).not.toContain('Not bid');
+    expect(r.detail).toContain('status 200');
+    expect(r.detail).toContain('result 77');
+    expect(r.detail).toContain('weird reply');
+  });
+  it('post-read price above max is Lost/Outbid', () => {
+    const r = classifyOutcome(snipe(), unk(), detail({ currentPrice: 2350 }));
+    expect(r.outcome).toBe('outbid');
+    expect(r.notify.title).toMatch(/^Lost:/);
+    expect(r.notify.message).toContain('re-reading the item');
+  });
+  it('no high-bidder flag and price below max is Unconfirmed, never Won', () => {
+    const r = classifyOutcome(snipe(), unk(), detail({ currentPrice: 1500 }));
+    expect(r.outcome).toBe('network');
+    expect(r.notify.message).toContain('Unconfirmed');
+    expect(r.notify.message).toContain('re-reading the item');
+    expect(r.stamp).toBeNull();
+  });
+  it('no post-read is Unconfirmed, never "Not bid"', () => {
+    const r = classifyOutcome(snipe(), unk(), null);
+    expect(r.outcome).toBe('network');
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).not.toContain('Not bid');
+    expect(r.notify.message).toContain('not recognised');
+    expect(r.detail).toContain('weird reply');
+    expect(r.stamp).toBeNull();
+  });
+  it('the reply\'s own isHighBidder alone does not prove a win', () => {
+    const r = classifyOutcome(snipe(), unk({ isHighBidder: true }), detail({ currentPrice: 1500, isHighBidder: null }));
+    expect(r.outcome).toBe('network');
+    expect(r.stamp).toBeNull();
+  });
+  it('the reply\'s own isHighBidder false does not prove a loss either', () => {
+    const r = classifyOutcome(snipe(), unk({ isHighBidder: false }), detail({ currentPrice: 1500, isHighBidder: null }));
+    expect(r.outcome).toBe('network');
+  });
+});
