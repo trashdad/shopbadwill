@@ -61,6 +61,7 @@ import type {
 import type {
   DailyJob,
   FavoritesReconciler,
+  JobCandidate,
   JobRun,
   JobStep,
   Scheduler,
@@ -294,6 +295,18 @@ interface SpecJobRun {
     calendarUpserts: ItemId[];
     errors: Array<{ step: number; message: string }>;
   };
+  /** T-51 contract change (R5): two-pass working state, persisted with the run. */
+  candidates?: SpecJobCandidate[];
+}
+interface SpecJobCandidate {
+  itemId: ItemId;
+  watchIds: string[];
+  endTime: IsoUtc;
+  status: 'pending' | 'matched' | 'rejected' | 'skipped-budget' | 'failed';
+  row?: SpecListing;
+  detail?: SpecItemDetail;
+  quote?: { shipping: Cents; handling: Cents } | null;
+  note?: string;
 }
 
 // ── §3.8 ────────────────────────────────────────────────────────────────────
@@ -560,6 +573,7 @@ describe('§3 shapes (type level)', () => {
     expectTypeOf<JobStep>().toEqualTypeOf<SpecJobStep>();
     expectTypeOf<StepOutcome>().toEqualTypeOf<SpecStepOutcome>();
     expectTypeOf<JobRun>().toEqualTypeOf<SpecJobRun>();
+    expectTypeOf<JobCandidate>().toEqualTypeOf<SpecJobCandidate>();
     expectTypeOf<DailyJob['plan']>().toEqualTypeOf<(watches: SpecWatch[], now: EpochMs) => SpecJobRun>();
     expectTypeOf<DailyJob['next']>().toEqualTypeOf<(run: SpecJobRun) => SpecJobStep | null>();
     expectTypeOf<DailyJob['apply']>().toEqualTypeOf<

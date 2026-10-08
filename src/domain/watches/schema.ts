@@ -1,6 +1,6 @@
 // Contract v1 (T-02): PLAN §3.6 watches and the daily job (with I-07's
-// `notBefore`, `quote` and `postEnd` steps and `StepOutcome`), and the §3.7
-// favorites reconciler. T-50 owns the watch helpers, T-51 the DailyJob, T-52
+// `notBefore`, `quote` and `postEnd` steps and `StepOutcome`; T-51 added the
+// optional `JobRun.candidates`), and the §3.7 favorites reconciler. T-50 owns the watch helpers, T-51 the DailyJob, T-52
 // the Scheduler and T-53 the FavoritesReconciler.
 //
 // Manual "Run now" uses lane `interactive`; scheduled and catch-up runs use
@@ -12,6 +12,7 @@ import {
   CentsSchema,
   EpochMsSchema,
   FavoriteSchema,
+  IsoUtcSchema,
   ItemDetailSchema,
   ItemIdSchema,
   ListingSchema,
@@ -83,6 +84,28 @@ export const StepOutcomeSchema = z.discriminatedUnion('kind', [
 ]);
 export type StepOutcome = z.infer<typeof StepOutcomeSchema>;
 
+/**
+ * T-51 contract change (rulings R5): one item the daily job's two-pass
+ * evaluation is working on. It lives in the run because the worker dies
+ * between ticks. Not exported as a schema (validated through `JobRunSchema`).
+ */
+const JobCandidateSchema = z.object({
+  itemId: ItemIdSchema,
+  /** Watches whose search returned the item and whose optimistic pass selected it. */
+  watchIds: z.array(z.string().min(1)).min(1),
+  endTime: IsoUtcSchema,
+  status: z.enum(['pending', 'matched', 'rejected', 'skipped-budget', 'failed']),
+  /** The search row, kept until the strict pass decides. */
+  row: ListingSchema.optional(),
+  /** The fetched detail, kept until the strict pass decides. */
+  detail: ItemDetailSchema.optional(),
+  /** undefined = not quoted; null = no quote available. */
+  quote: z.object({ shipping: CentsSchema, handling: CentsSchema }).nullable().optional(),
+  /** Why rejected, skipped or a write withheld. Never param values or tokens. */
+  note: z.string().optional(),
+});
+export type JobCandidate = z.infer<typeof JobCandidateSchema>;
+
 export const JobRunSchema = z.object({
   id: z.string().min(1),
   trigger: z.enum(['scheduled', 'catch-up', 'manual']),
@@ -97,6 +120,8 @@ export const JobRunSchema = z.object({
     calendarUpserts: z.array(ItemIdSchema),
     errors: z.array(z.object({ step: z.number().int().nonnegative(), message: z.string() })),
   }),
+  /** T-51 two-pass working state (R5); absent on runs written before it. */
+  candidates: z.array(JobCandidateSchema).optional(),
 });
 export type JobRun = z.infer<typeof JobRunSchema>;
 
