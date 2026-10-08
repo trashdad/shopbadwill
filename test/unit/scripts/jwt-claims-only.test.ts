@@ -89,6 +89,34 @@ describe('analyzeJwt', () => {
   });
 });
 
+describe('claim name hygiene', () => {
+  const longKey = 'k'.repeat(42);
+  const keys = ['jane.doe@example.test', longKey, 'a\r\nb', 'x\u202Ey', 'ok_Name'];
+  it('omits email-like, long, CR/LF and bidi names', () => {
+    const r = analyzeJwt(mk(Object.fromEntries(keys.map((k) => [k, 1]))));
+    expect(r.claimNames).toEqual([
+      '<name omitted, 21 chars>',
+      '<name omitted, 42 chars>',
+      '<name omitted, 4 chars>',
+      '<name omitted, 3 chars>',
+      'ok_Name',
+    ]);
+    const out = formatReport(r);
+    for (const k of keys.slice(0, 4)) expect(out).not.toContain(k);
+    expect(out).not.toMatch(/[\u202E\r]/);
+    expect(out.split('\n')).toHaveLength(7);
+  });
+  it('detects IP-like names by the raw name even when it is not printed', () => {
+    const r = analyzeJwt(mk({ 'client ip': 1 }));
+    expect(r.hasIpClaim).toBe(true);
+    expect(r.claimNames[0]).toBe('<name omitted, 9 chars>');
+  });
+  it('accepts a 41-char name and omits 42', () => {
+    expect(analyzeJwt(mk({ ['a'.repeat(41)]: 1 })).claimNames[0]).toBe('a'.repeat(41));
+    expect(analyzeJwt(mk({ ['a'.repeat(42)]: 1 })).claimNames[0]).toBe('<name omitted, 42 chars>');
+  });
+});
+
 describe('formatReport shape', () => {
   it('prints a fixed, pasteable block', () => {
     const lines = formatReport(analyzeJwt(mk(payload))).trimEnd().split('\n');

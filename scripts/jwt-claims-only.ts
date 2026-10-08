@@ -33,6 +33,10 @@ export interface ClaimsReport {
   hasBrowserClaim: boolean;
 }
 
+const SAFE_NAME = /^[A-Za-z_][A-Za-z0-9_:./-]{0,40}$/;
+/** A claim name is printed only if it looks like a normal identifier; anything else could be identifying data or control characters. */
+const printableName = (n: string): string => (SAFE_NAME.test(n) ? n : `<name omitted, ${String(n.length)} chars>`);
+
 const B64URL = /^[A-Za-z0-9_-]+$/;
 
 function decodeJsonPart(part: string, what: string): unknown {
@@ -70,7 +74,8 @@ export function analyzeJwt(input: string): ClaimsReport {
   const payload = decodeJsonPart(p, 'payload');
   if (!isPlainObject(payload)) throw new JwtRefusal('payload is not a JSON object');
 
-  const claimNames = Object.keys(payload);
+  const rawNames = Object.keys(payload);
+  const claimNames = rawNames.map(printableName);
   const iat = timeState(payload.iat);
   const exp = timeState(payload.exp);
   const lifetimeMs = iat.ms !== null && exp.ms !== null ? exp.ms - iat.ms : null;
@@ -82,8 +87,8 @@ export function analyzeJwt(input: string): ClaimsReport {
     expState: exp.state,
     lifetimeHours: lifetimeMs === null ? null : lifetimeMs / 3_600_000,
     lifetimeDays: lifetimeMs === null ? null : lifetimeMs / 86_400_000,
-    hasIpClaim: claimNames.some((n) => IP_NAME.test(n) || IP_CAMEL.test(n)),
-    hasBrowserClaim: claimNames.some((n) => UA_NAME.test(n)),
+    hasIpClaim: rawNames.some((n) => IP_NAME.test(n) || IP_CAMEL.test(n)),
+    hasBrowserClaim: rawNames.some((n) => UA_NAME.test(n)),
   };
 }
 
