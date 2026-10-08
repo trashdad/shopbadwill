@@ -106,18 +106,24 @@ export const DETAIL_NO_CACHE_BEFORE_END_MS = 5 * 60_000;
 export const DETAIL_CACHE_MAX_ENTRIES = 500;
 
 /**
- * The writesAllowed verdict a write goes out under is never older than this.
- * The frozen ScheduledRequest.build() is synchronous, so the async
- * `writesAllowed` cannot run inside it. Instead build() compares the age of
- * the last verdict against this limit (monotonic clock):
- * - A write sent at once, with its lane free, goes under the check made when
- *   it was requested, which happened just before.
- * - A write that waited in its lane's queue is refused by build(). Nothing is
- *   sent, and no budget or gap is charged. The adapter then asks
- *   writesAllowed again and re-queues it; the lane is free by then, so it
- *   leaves at once.
- * - After WRITE_GATE_MAX_ATTEMPTS checks without getting a free lane, it
- *   gives up with `paused`.
+ * The guarded send (`guardedRun`, every write; bids via `BidContext.sendWrite`).
+ * The writesAllowed verdict a write goes out under is never older than
+ * WRITE_GATE_MAX_AGE_MS (monotonic clock). The frozen ScheduledRequest.build()
+ * is synchronous, so the async `writesAllowed` cannot run inside it; instead:
+ * - `writesAllowed` is asked when the write is requested. While the write
+ *   waits in its lane's queue, it is asked again every
+ *   WRITE_GATE_MAX_AGE_MS / 2 on a clock timer. That is a local call: no
+ *   network. The timer is cleared when the write settles.
+ * - build() checks the latest verdict right before the send:
+ *   - `ok:false` refuses the write: it is audited with `why`, nothing is sent,
+ *     and it rejects `paused(why)`;
+ *   - a verdict older than WRITE_GATE_MAX_AGE_MS (only if the refreshes fell
+ *     behind) also refuses it, without sending, budget or gap. The adapter
+ *     then asks again, re-prepares the request (fresh bearer and expiry), and
+ *     re-queues it.
+ * - After WRITE_GATE_MAX_ATTEMPTS stale turns it gives up. It audits
+ *   `write.blocked` with reason `lane-busy` and rejects `paused`, with
+ *   `retryAfterMs` taken from the lane's `nextAllowedAt`. It is never silent.
  */
 export const WRITE_GATE_MAX_AGE_MS = 1000;
 export const WRITE_GATE_MAX_ATTEMPTS = 3;
@@ -203,7 +209,16 @@ export interface BidContext {
    * SgwApiError('auth'), sending nothing, without a usable session.
    */
   prepare(endpoint: SgwEndpointKey, init?: SgwRequestInit): Promise<HttpRequest>;
-  /** Reports a reply that failed its schema. */
+  /**
+   * THE way to send the bid (T-100): the adapter's guarded send with feature
+   * `'bidding'`, audit kind `bid.place` and lane `'snipe'`. It asks
+   * writesAllowed when called, keeps the verdict fresh while the bid is
+   * queued, re-checks it right before the send, and re-prepares the request
+   * on a retry (see WRITE_GATE_MAX_AGE_MS). A refusal is audited, sends
+   * nothing and rejects `paused`. Schema failures are flagged to health.
+   */
+  sendWrite<T>(endpoint: SgwEndpointKey, init: SgwRequestInit, parse: (res: HttpResponse, raw: unknown) => T): Promise<T>;
+  /** Reports a reply that failed its schema (sendWrite already does this for its own replies). */
   flagSchemaFailure(endpoint: SgwEndpointKey, error: SgwApiError): void;
 }
 
@@ -244,15 +259,28 @@ interface RunOptions {
   beforeSend?: () => void;
 }
 
-/** build() refused a write whose writesAllowed verdict went stale while it waited in its lane. Never escapes the adapter. */
+/** A writesAllowed answer and when it was asked (monotonic clock). */
+type Verdict = { ok: true; at: number } | { ok: false; why: string; at: number };
+
+/** build() refused a write whose latest verdict is stale (the refreshes fell behind). Never escapes the adapter. */
 class StaleWriteGate extends Error {
   override readonly name = 'StaleWriteGate';
+}
+
+/** build() refused a write whose latest verdict is ok:false. Never escapes the adapter. */
+class RefusedWrite extends Error {
+  override readonly name = 'RefusedWrite';
+  constructor(readonly why: string) {
+    super(why);
+  }
 }
 
 const US_ZIP = /^\d{5}(-\d{4})?$/;
 
 export class SgwApiAdapter implements SgwApi {
   private readonly details = new Map<ItemId, CachedDetail>();
+  /** M1: in-flight non-snipe itemDetail reads, keyed `${lane}:${itemId}`, so concurrent misses share one request. */
+  private readonly detailReads = new Map<string, Promise<DetailRead>>();
   /** The last item read while open: serverTimeSample prefers its ItemDetail serverTime. */
   private clockItem: { itemId: ItemId; endMs: EpochMs } | undefined;
 
@@ -277,15 +305,29 @@ export class SgwApiAdapter implements SgwApi {
    * real, and it bypasses the cache both ways. On every other lane it is
    * anonymous (those two fields come back null) and cached per
    * DETAIL_CACHE_TTL_MS.
+   *
+   * M1: concurrent misses on the same (lane, item) share one in-flight read.
+   * Each caller gets its own copy, and a failure rejects every one of them.
+   * The key includes the lane, so a read queued on the background lane never
+   * makes an interactive caller wait. Snipe reads are never shared.
    */
   async itemDetail(itemId: ItemId, lane: Lane, opts?: { maxAgeMs?: number }): Promise<ItemDetail> {
     assertItemId('itemDetail', itemId);
-    if (lane !== 'snipe') {
-      const cached = this.fromCache(itemId, opts?.maxAgeMs);
-      if (cached !== undefined) return cached;
+    if (lane === 'snipe') return structuredClone((await this.readDetail(itemId, lane)).detail);
+    const cached = this.fromCache(itemId, opts?.maxAgeMs);
+    if (cached !== undefined) return cached;
+    const key = `${lane}:${String(itemId)}`;
+    let shared = this.detailReads.get(key);
+    if (shared === undefined) {
+      const read = this.readDetail(itemId, lane);
+      const drop = (): void => {
+        if (this.detailReads.get(key) === read) this.detailReads.delete(key);
+      };
+      read.then(drop, drop);
+      this.detailReads.set(key, read);
+      shared = read;
     }
-    const read = await this.readDetail(itemId, lane);
-    return structuredClone(read.detail);
+    return structuredClone((await shared).detail);
   }
 
   async shippingQuote(itemId: ItemId, zip: string, lane: Lane): Promise<{ shipping: Cents; handling: Cents } | null> {
@@ -363,12 +405,12 @@ export class SgwApiAdapter implements SgwApi {
 
   async addFavorite(itemId: ItemId): Promise<void> {
     assertItemId('addFavorite', itemId);
-    await this.write('favorites', 'favorite.add', { itemId }, 'addFavorite', { query: { itemId } });
+    await this.guardedRun('favorites', 'favorite.add', { itemId }, 'addFavorite', WRITE_LANE, { query: { itemId } }, ackOf('addFavorite'));
   }
 
   async removeFavorite(itemId: ItemId): Promise<void> {
     assertItemId('removeFavorite', itemId);
-    await this.write('favorites', 'favorite.remove', { itemId }, 'removeFavorite', { query: { itemId } });
+    await this.guardedRun('favorites', 'favorite.remove', { itemId }, 'removeFavorite', WRITE_LANE, { query: { itemId } }, ackOf('removeFavorite'));
   }
 
   /** The note text is sent to SGW but never written to the audit log. */
@@ -377,22 +419,35 @@ export class SgwApiAdapter implements SgwApi {
     if (notes.length > FAVORITE_NOTE_MAX_CHARS) {
       throw invalidInput('saveFavoriteNote', `notes are limited to ${String(FAVORITE_NOTE_MAX_CHARS)} characters (got ${String(notes.length)})`);
     }
-    await this.write('favorites', 'favorite.note', { ref: `watchlist:${String(watchlistId)}` }, 'saveFavoriteNote', {
-      body: { notes, watchlistId },
-    });
+    await this.guardedRun(
+      'favorites',
+      'favorite.note',
+      { ref: `watchlist:${String(watchlistId)}` },
+      'saveFavoriteNote',
+      WRITE_LANE,
+      { body: { notes, watchlistId } },
+      ackOf('saveFavoriteNote'),
+    );
   }
 
-  /** Gated here, then handed to bid.ts (a stub that throws `paused` until T-100). */
+  /**
+   * Asks writesAllowed('bidding') here, then hands bid.ts a BidContext whose
+   * `sendWrite` is the guarded send for this bid. bid.ts is a stub that
+   * throws `paused` until T-100.
+   */
   async placeBid(
     req: { itemId: ItemId; sellerId: number; bidAmount: Cents; quantity: 1 },
     opts: { idempotencyKey: string; timeoutMs: number },
   ): Promise<BidResult> {
     assertItemId('placeBid', req.itemId);
-    await this.gate('bidding', 'bid.place', { itemId: req.itemId });
+    const target = { itemId: req.itemId };
+    const verdict = await this.ask('bidding');
+    if (!verdict.ok) throw await this.refuse('bid.place', target, verdict.why);
     const ctx: BidContext = {
       scheduler: this.deps.scheduler,
       clock: this.deps.clock,
       prepare: (endpoint, init) => this.prepare(endpoint, init),
+      sendWrite: (endpoint, init, parse) => this.guardedRun('bidding', 'bid.place', target, endpoint, 'snipe', init, parse),
       flagSchemaFailure: (endpoint, error) => {
         this.flagSchemaFailure(endpoint, error);
       },
@@ -400,65 +455,107 @@ export class SgwApiAdapter implements SgwApi {
     return placeBidPath(ctx, req, opts);
   }
 
-  private async write(
+  /**
+   * The guarded send used by every write (I1, I2, M2; see WRITE_GATE_MAX_AGE_MS):
+   * - writesAllowed is asked when the write is requested;
+   * - while the write is queued, it is asked again every
+   *   WRITE_GATE_MAX_AGE_MS / 2 on a clock timer, cleared when the write
+   *   settles;
+   * - build() refuses on the latest verdict (`ok:false`), or, only if the
+   *   refreshes fell behind, on a stale verdict. In the stale case it asks
+   *   again, re-prepares (bearer and expiry) and re-queues;
+   * - after WRITE_GATE_MAX_ATTEMPTS stale turns it gives up, audited as
+   *   `lane-busy`.
+   */
+  private async guardedRun<T>(
     feature: WriteFeature,
     kind: WriteKind,
     target: WriteTarget,
-    endpoint: AckEndpoint,
+    endpoint: SgwEndpointKey,
+    lane: Lane,
     init: SgwRequestInit,
-  ): Promise<void> {
-    await this.gate(feature, kind, target); // when the write is requested
-    let checkedAt = this.deps.clock.monotonic();
-    const request = await this.prepare(endpoint, init);
-    for (let attempt = 1; ; attempt += 1) {
-      const verdictAt = checkedAt;
-      try {
-        await this.run(
-          endpoint,
-          WRITE_LANE,
-          request,
-          (_res, raw) => {
-            ack(endpoint, raw);
-          },
-          {
+    parse: (res: HttpResponse, raw: unknown) => T,
+  ): Promise<T> {
+    const { clock } = this.deps;
+    let verdict = await this.ask(feature); // when the write is requested
+    if (!verdict.ok) throw await this.refuse(kind, target, verdict.why);
+    /** Keeps the newest-asked answer (answers can land out of order); returns the latest verdict. */
+    const adopt = (v: Verdict): Verdict => {
+      if (v.at >= verdict.at) verdict = v;
+      return verdict;
+    };
+    let settled = false;
+    let timer: number | undefined;
+    const keepFresh = (): void => {
+      timer = clock.setTimeout(() => {
+        timer = undefined;
+        if (settled) return;
+        this.ask(feature).then(adopt, () => undefined); // a failed ask just leaves the verdict to go stale
+        keepFresh();
+      }, WRITE_GATE_MAX_AGE_MS / 2);
+    };
+    keepFresh();
+    try {
+      for (let attempt = 1; ; attempt += 1) {
+        const request = await this.prepare(endpoint, { ...init, lane }); // M2: bearer and expiry on every attempt
+        try {
+          return await this.run(endpoint, lane, request, parse, {
             beforeSend: () => {
-              if (this.deps.clock.monotonic() - verdictAt > WRITE_GATE_MAX_AGE_MS) throw new StaleWriteGate();
+              if (!verdict.ok) throw new RefusedWrite(verdict.why);
+              if (clock.monotonic() - verdict.at > WRITE_GATE_MAX_AGE_MS) throw new StaleWriteGate();
             },
-          },
-        );
-        return;
-      } catch (e) {
-        if (!(e instanceof StaleWriteGate)) throw e;
-        if (attempt >= WRITE_GATE_MAX_ATTEMPTS) {
-          throw new SgwApiError(
-            'paused',
-            `${kind}: the write lane stayed busy, so writesAllowed could not be re-checked right before sending; nothing was sent`,
-          );
+          });
+        } catch (e) {
+          if (e instanceof RefusedWrite) throw await this.refuse(kind, target, e.why);
+          if (!(e instanceof StaleWriteGate)) throw e;
+          if (attempt >= WRITE_GATE_MAX_ATTEMPTS) throw await this.laneBusy(kind, target, lane);
         }
+        const latest = adopt(await this.ask(feature)); // the refreshes fell behind: ask now, before re-queueing
+        if (!latest.ok) throw await this.refuse(kind, target, latest.why);
       }
-      await this.gate(feature, kind, target); // again, right after the queue wait, before anything is sent
-      checkedAt = this.deps.clock.monotonic();
+    } finally {
+      settled = true;
+      if (timer !== undefined) clock.clearTimeout(timer);
     }
   }
 
   /**
-   * R4 as refined by ruling C1. It asks only the frozen
-   * `GlobalSwitches.writesAllowed(feature)`, which is false for the kill
-   * switch, dry-run, a failed health check and a bad session. A refusal
-   * sends nothing, records an audit intent (item or ref, action, why: never
-   * the note text) and rejects with SgwApiError('paused', why), as the port
-   * says a refused write does.
+   * One writesAllowed answer (ruling C1: the frozen port only; false for the
+   * kill switch, dry-run, a failed health check and a bad session), stamped
+   * with when it was asked.
    */
-  private async gate(feature: WriteFeature, kind: WriteKind, target: WriteTarget): Promise<void> {
-    const verdict = await this.deps.switches.writesAllowed(feature);
-    if (verdict.ok) return;
-    const why = verdict.why ?? 'writes are not allowed';
+  private async ask(feature: WriteFeature): Promise<Verdict> {
+    const at = this.deps.clock.monotonic();
+    const v = await this.deps.switches.writesAllowed(feature);
+    return v.ok ? { ok: true, at } : { ok: false, why: v.why ?? 'writes are not allowed', at };
+  }
+
+  /**
+   * A refused write: an audit intent (item or ref, action, why: never the
+   * note text) and SgwApiError('paused', why). Nothing was sent.
+   */
+  private async refuse(kind: WriteKind, target: WriteTarget, why: string): Promise<SgwApiError> {
+    await this.audit({ actor: 'system', kind, ...target, details: { action: WRITE_ACTION[kind], why } });
+    return new SgwApiError('paused', why);
+  }
+
+  /** The give-up: `write.blocked` / `lane-busy` audited, `paused` with retryAfterMs from the lane's nextAllowedAt. */
+  private async laneBusy(kind: WriteKind, target: WriteTarget, lane: Lane): Promise<SgwApiError> {
+    await this.audit({ actor: 'system', kind: 'write.blocked', ...target, details: { action: kind, reason: 'lane-busy' } });
+    const retryAfterMs = Math.max(0, this.deps.scheduler.stats().lanes[lane].nextAllowedAt - this.deps.clock.now());
+    return new SgwApiError(
+      'paused',
+      `${kind}: its verdict went stale ${String(WRITE_GATE_MAX_ATTEMPTS)} times while the ${lane} lane was busy; nothing was sent`,
+      { retryAfterMs },
+    );
+  }
+
+  private async audit(entry: Parameters<AuditLog['append']>[0]): Promise<void> {
     try {
-      await this.deps.audit.append({ actor: 'system', kind, ...target, details: { action: WRITE_ACTION[kind], why } });
+      await this.deps.audit.append(entry);
     } catch {
       // The refusal stands even if the log cannot be written.
     }
-    throw new SgwApiError('paused', why);
   }
 
   // ── ItemDetail cache (R6, see DETAIL_CACHE_TTL_MS) ────────────────────
@@ -655,14 +752,27 @@ function decode(endpoint: SgwEndpointKey, res: HttpResponse): unknown {
   }
 }
 
-/** Add/remove/note replies: only the envelope head matters (provisional schema, T-24). */
-function ack(endpoint: AckEndpoint, raw: unknown): void {
-  const head = parseEndpoint(endpoint, raw);
-  if (head.isUnauthorized === true) throw new SgwApiError('auth', `${endpoint}: SGW says unauthorized`);
-  if (!head.status) {
-    const message = htmlToText(head.message ?? '');
-    throw new SgwApiError('server', `${endpoint}: status false${message === '' ? '' : `: ${message}`}`);
-  }
+/** The parser for add/remove/note replies: only the envelope head matters (provisional schema, T-24). */
+function ackOf(endpoint: AckEndpoint): (res: HttpResponse, raw: unknown) => void {
+  return (_res, raw) => {
+    const head = parseEndpoint(endpoint, raw);
+    if (head.isUnauthorized === true) throw new SgwApiError('auth', `${endpoint}: SGW says unauthorized`);
+    if (!head.status) {
+      const message = htmlToText(head.message ?? '');
+      throw new SgwApiError('server', `${endpoint}: status false${message === '' ? '' : `: ${message}`}`);
+    }
+  };
+}
+
+/**
+ * Double quotes in `searchText` make buyerapi answer 403 (S-1 #7's notes).
+ * S-1 verified only the ASCII `"`. The curly quotes U+201C and U+201D and the
+ * fullwidth U+FF02 are stripped too, defensively.
+ */
+const QUOTES = /["“”＂]/g;
+
+function stripQuotes(text: string): string {
+  return text.replace(QUOTES, '');
 }
 
 // ── Search body (R1, R2) ────────────────────────────────────────────────────
@@ -753,7 +863,7 @@ function coerceExtra(key: string, field: BodyField, raw: string): string | numbe
     if (!ids.every((s) => /^\d+$/.test(s) && isPositiveInt(Number(s)))) throw bad('positive ids, comma-separated');
     return ids.map(Number).join(',');
   }
-  return value.replaceAll('"', '');
+  return stripQuotes(value);
 }
 
 /**
@@ -793,8 +903,8 @@ function searchBody(q: SearchQuery, now: EpochMs): Record<string, unknown> {
     ...SGW_SEARCH_BODY_DEFAULTS,
     ...extraFields(q.extra),
     layout: q.layout ?? SGW_SEARCH_BODY_DEFAULTS.layout,
-    // R2: double quotes make buyerapi answer 403.
-    searchText: q.searchText.replaceAll('"', '').trim(),
+    // R2 (and M3): double quotes make buyerapi answer 403; see stripQuotes.
+    searchText: stripQuotes(q.searchText).trim(),
     selectedCategoryIds: idList('categoryIds', q.categoryIds),
     selectedSellerIds: idList('sellerIds', q.sellerIds),
     lowPrice: q.lowPrice === undefined ? SGW_SEARCH_BODY_DEFAULTS.lowPrice : dollars('lowPrice', q.lowPrice),

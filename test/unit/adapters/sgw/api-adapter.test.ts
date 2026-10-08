@@ -9,7 +9,20 @@
 //   R7 no live network (FakeHttp only; MSW in the integration test).
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+import type * as BidModule from '../../../../src/adapters/sgw/bid';
+
+/** The BidContext the adapter hands bid.ts, captured so tests can drive ctx.sendWrite (I2). */
+const bidCapture = vi.hoisted((): { ctx: unknown } => ({ ctx: undefined }));
+vi.mock('../../../../src/adapters/sgw/bid', async (importOriginal) => {
+  const real = await importOriginal<typeof BidModule>();
+  const placeBid: typeof real.placeBid = (ctx, req, opts) => {
+    bidCapture.ctx = ctx;
+    return real.placeBid(ctx, req, opts); // the stub's own behaviour: always paused
+  };
+  return { ...real, placeBid };
+});
 
 import {
   CLOCK_LANE,
@@ -21,6 +34,7 @@ import {
   WRITE_GATE_MAX_AGE_MS,
   WRITE_GATE_MAX_ATTEMPTS,
   WRITE_LANE,
+  type BidContext,
   type SchemaFailure,
 } from '../../../../src/adapters/sgw/api-adapter';
 import { SGW_CONFIG_VERSION, SGW_ENDPOINTS } from '../../../../src/adapters/sgw/config';
@@ -56,6 +70,34 @@ const flush = (): Promise<void> =>
   new Promise((resolve) => {
     setImmediate(resolve);
   });
+
+/** Advances the fake clock in slices, draining promises after each, as real time lets async answers land. */
+async function advance(clock: FakeClock, ms: number, step = 250): Promise<void> {
+  let left = ms;
+  while (left > 0) {
+    const s = Math.min(step, left);
+    clock.advance(s);
+    left -= s;
+    await flush();
+  }
+}
+
+/** FakeSwitches whose answers can arrive late on the fake clock (a refresh that falls behind). State is read when asked. */
+class DelayedSwitches extends FakeSwitches {
+  delayMs = 0;
+  constructor(private readonly clock: FakeClock) {
+    super();
+  }
+  override writesAllowed(feature: SwitchFeature): Promise<{ ok: boolean; why?: string }> {
+    const answer = super.writesAllowed(feature);
+    if (this.delayMs <= 0) return answer;
+    return new Promise((resolve) => {
+      this.clock.setTimeout(() => {
+        resolve(answer);
+      }, this.delayMs);
+    });
+  }
+}
 
 // ── Test doubles ────────────────────────────────────────────────────────────
 
@@ -97,7 +139,7 @@ function setup(opts: SetupOpts = {}) {
   });
   const scheduler = new RecordingScheduler(inner);
   const audit = new FakeAuditLog(clock);
-  const switches = new FakeSwitches();
+  const switches = new DelayedSwitches(clock);
   const failures: SchemaFailure[] = [];
   const sessionBox = {
     value: opts.session === undefined ? { bearer: BEARER, expiresAt: T0 + 24 * 60 * MIN, buyerId: '42' } : opts.session,
@@ -337,6 +379,13 @@ describe('search request body', () => {
     expect(t.http.requests[0]?.body).toBe(recordedBody('search-grid-p1').body);
   });
 
+  it('M3: also strips curly and fullwidth double quotes from searchText, defensively (S-1 verified only ")', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    await t.api.search({ ...PYREX, searchText: '“pyrex” ＂bowl＂ "x"' }, 'interactive');
+    expect(bodyOf(t.http.requests[0]).searchText).toBe('pyrex bowl x');
+  });
+
   it('returns normalized listings; pickupOnly comes from the query filter only', async () => {
     const t = setup();
     scriptAll(t.http);
@@ -571,8 +620,34 @@ describe('R4/C1: every write asks GlobalSwitches.writesAllowed; a refusal is aud
     expect(t.http.requests).toHaveLength(0);
   });
 
-  // writesAllowed again right before the send: a write that waited in its lane is re-checked.
+  // I1: a queued write keeps its writesAllowed verdict fresh (asked again every
+  // WRITE_GATE_MAX_AGE_MS / 2, a local call) and build() checks the latest
+  // verdict right before the send. All on the real T-25 scheduler.
   const GAP: LaneConfig = { minIntervalMs: 120 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
+  const BUSY_LANES: Record<Lane, LaneConfig> = { ...FAST_LANES, background: GAP };
+  const ADD_URL = `${BASE}Favorite/AddToFavorite?itemId=${String(ITEM)}`;
+  const backgroundRead = (t: Setup): Promise<unknown> => t.api.search(PYREX, 'background');
+
+  it('a background read queued behind the write: the write goes out on its first turn (and stops refreshing)', async () => {
+    const t = setup({ lanes: BUSY_LANES });
+    scriptAll(t.http);
+    await backgroundRead(t); // A: starts the 120 s gap on the write lane
+    const write = t.api.addFavorite(ITEM);
+    await flush();
+    const behind = backgroundRead(t); // B: queued behind the write
+    await advance(t.clock, 120 * S);
+    await write;
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`, ADD_URL]);
+    expect(t.switches.checks.length).toBeGreaterThan(2); // refreshed while it waited
+    expect(new Set(t.switches.checks)).toEqual(new Set(['favorites']));
+    const asked = t.switches.checks.length;
+    await advance(t.clock, 5 * S);
+    expect(t.switches.checks).toHaveLength(asked); // the refresh timer was cleared when the write settled
+    await advance(t.clock, 120 * S);
+    await behind;
+    expect(t.http.requests).toHaveLength(3);
+    expect(t.audit.entries).toHaveLength(0);
+  });
 
   it.each([
     ['the kill switch', (s: FakeSwitches) => {
@@ -581,77 +656,109 @@ describe('R4/C1: every write asks GlobalSwitches.writesAllowed; a refusal is aud
     ['dry-run', (s: FakeSwitches) => {
       s.block('favorites', 'dry run');
     }, 'dry run'],
-  ])('%s turned on while the write waits in its lane: asked again before the send, audited, never reaches the network', async (_c, apply, why) => {
-    const t = setup({ lanes: { ...FAST_LANES, background: GAP } });
+  ])('%s turned on while the write is queued: the refreshed verdict refuses it at its turn, audited, ZERO HTTP for it', async (_c, apply, why) => {
+    const t = setup({ lanes: BUSY_LANES });
     scriptAll(t.http);
-    await t.api.search(PYREX, 'background'); // starts the 120 s gap on the write lane
+    await backgroundRead(t);
     const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
     await flush();
-    expect(t.switches.checks).toEqual(['favorites']); // asked when requested; now queued behind the gap
     apply(t.switches);
-    t.clock.advance(120 * S);
+    await advance(t.clock, 1 * S); // a refresh lands with ok:false
+    // From here on, no answer arrives within the test: the refusal must come from the verdict already held.
+    t.switches.delayMs = 60 * MIN;
+    await advance(t.clock, 119 * S);
     const err = await pending;
     expect(err).toBeInstanceOf(SgwApiError);
     expect((err as SgwApiError).kind).toBe('paused');
     expect((err as SgwApiError).message).toBe(why);
-    expect(t.switches.checks).toEqual(['favorites', 'favorites']);
     expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`]);
     expect(t.audit.entries).toEqual([
       expect.objectContaining({ kind: 'favorite.add', itemId: ITEM, details: { action: 'add', why } }),
     ]);
-    expect(t.inner.stats().lanes.background.usedToday).toBe(1); // the refused attempt cost no budget
+    expect(t.inner.stats().lanes.background.usedToday).toBe(1); // the refused turn cost no budget
     expect(t.failures).toHaveLength(0);
   });
 
-  it('a write that waited and is still allowed is re-checked, then sent exactly once', async () => {
-    const t = setup({ lanes: { ...FAST_LANES, background: GAP } });
+  it('M2: when the refreshes fell behind, the write is asked again AND re-prepared before it goes (fresh bearer)', async () => {
+    const t = setup({ lanes: BUSY_LANES });
     scriptAll(t.http);
-    await t.api.search(PYREX, 'background');
-    const pending = t.api.saveFavoriteNote(55, 'n');
+    await backgroundRead(t);
+    const write = t.api.addFavorite(ITEM);
     await flush();
-    t.clock.advance(120 * S);
-    await pending;
-    expect(t.switches.checks).toEqual(['favorites', 'favorites']);
-    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`, `${BASE}Favorite/Save`]);
+    t.switches.delayMs = 5 * S; // every refresh answer is 5 s old when it lands: stale at the write's turn
+    t.sessionBox.value = { bearer: 'rotated.bearer.token', expiresAt: T0 + 24 * 60 * MIN, buyerId: '42' };
+    await advance(t.clock, 120 * S - 250);
+    t.switches.delayMs = 0; // the stale path's own ask is answered at once
+    await advance(t.clock, 250);
+    await write;
+    const sent = t.http.requests[1];
+    expect(sent?.url).toBe(ADD_URL);
+    expect(header(sent, 'authorization')).toBe('Bearer rotated.bearer.token');
     expect(t.inner.stats().lanes.background.usedToday).toBe(2);
+  });
+
+  it('M2: a session that expired while the write was queued is caught by the re-prepare: auth, nothing sent', async () => {
+    const t = setup({ lanes: BUSY_LANES });
+    scriptAll(t.http);
+    await backgroundRead(t);
+    const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
+    await flush();
+    t.switches.delayMs = 5 * S;
+    t.sessionBox.value = { bearer: BEARER, expiresAt: T0 + 60 * S, buyerId: '42' };
+    await advance(t.clock, 120 * S - 250);
+    t.switches.delayMs = 0;
+    await advance(t.clock, 250);
+    const err = await pending;
+    expect(err).toBeInstanceOf(SgwApiError);
+    expect((err as SgwApiError).kind).toBe('auth');
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`]);
+  });
+
+  /** Enqueues a background read every 30 s for `forMs`, while advancing time; returns when `done` settles or time runs out. */
+  async function contend(t: Setup, done: Promise<unknown>, forMs: number, limitMs: number): Promise<void> {
+    const state = { settled: false };
+    void done.finally(() => {
+      state.settled = true;
+    });
+    for (let elapsed = 0; elapsed < limitMs && !state.settled; elapsed += 30 * S) {
+      if (elapsed < forMs) void backgroundRead(t).catch(() => undefined);
+      await advance(t.clock, 30 * S, 1 * S);
+    }
+  }
+
+  it('continuous contention with live refreshes: the write is sent on its turn', async () => {
+    const t = setup({ lanes: BUSY_LANES });
+    scriptAll(t.http);
+    await backgroundRead(t);
+    void backgroundRead(t); // two reads already queued ahead of the write
+    void backgroundRead(t);
+    await flush();
+    const write = t.api.addFavorite(ITEM);
+    await flush(); // the write is queued before the contending reads start
+    await contend(t, write, 10 * MIN, 30 * MIN);
+    await write;
+    const urls = t.http.requests.map((r) => r.url);
+    expect(urls.indexOf(ADD_URL)).toBe(3); // A, the two reads ahead, then the write
+    expect(urls.filter((u) => u === ADD_URL)).toHaveLength(1);
     expect(t.audit.entries).toHaveLength(0);
   });
 
-  it(`a write whose lane never frees in time gives up after ${String(WRITE_GATE_MAX_ATTEMPTS)} checks, paused, without sending`, async () => {
-    const clock = new FakeClock(T0);
-    const switches = new FakeSwitches();
-    let sent = 0;
-    /** A scheduler whose lane is always busy: every build() happens after the verdict went stale. */
-    const busy: RequestScheduler = {
-      run: <T>(r: ScheduledRequest<T>): Promise<T> => {
-        clock.advance(WRITE_GATE_MAX_AGE_MS + 1);
-        try {
-          r.build();
-        } catch (e) {
-          return Promise.reject(e instanceof Error ? e : new Error(String(e)));
-        }
-        sent += 1;
-        return Promise.reject(new Error('must not be sent'));
-      },
-      stats: () => {
-        throw new Error('unused');
-      },
-      pause: () => undefined,
-      resume: () => undefined,
-    };
-    const api = new SgwApiAdapter({
-      scheduler: busy,
-      clock,
-      session: { current: () => Promise.resolve({ bearer: BEARER, expiresAt: T0 + 60 * MIN, buyerId: '42' }) },
-      switches,
-      audit: new FakeAuditLog(clock),
-      health: { flagSchemaFailure: () => undefined },
-      sgwClock: new SgwClockAdapter(clock),
-    });
-    const err = await rejectsWith(api.addFavorite(ITEM), 'paused');
-    expect(err.message).toContain('re-check');
-    expect(sent).toBe(0);
-    expect(switches.checks).toHaveLength(WRITE_GATE_MAX_ATTEMPTS);
+  it(`continuous contention with refreshes that fall behind: gives up after ${String(WRITE_GATE_MAX_ATTEMPTS)} attempts, lane-busy audited, never silently`, async () => {
+    const t = setup({ lanes: BUSY_LANES });
+    scriptAll(t.http);
+    await backgroundRead(t);
+    const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
+    await flush();
+    t.switches.delayMs = 5 * S; // every verdict is 5 s old when it lands, so every turn finds it stale
+    await contend(t, pending, 3 * MIN, 120 * MIN);
+    const err = await pending;
+    expect(err).toBeInstanceOf(SgwApiError);
+    expect((err as SgwApiError).kind).toBe('paused');
+    expect((err as SgwApiError).retryAfterMs).toBeGreaterThanOrEqual(0);
+    expect(t.http.requests.map((r) => r.url)).not.toContain(ADD_URL);
+    expect(t.audit.entries).toEqual([
+      expect.objectContaining({ kind: 'write.blocked', itemId: ITEM, details: { action: 'favorite.add', reason: 'lane-busy' } }),
+    ]);
   });
 
   it('a write sent at once (free lane) is asked once: that check is the one right before the send', async () => {
@@ -693,6 +800,119 @@ describe('R4/C1: every write asks GlobalSwitches.writesAllowed; a refusal is aud
     expect(err.message).toContain('T-100');
     expect(t.switches.checks).toEqual(['bidding']);
     expect(t.http.requests).toHaveLength(0);
+  });
+});
+
+// ── I2: BidContext.sendWrite, the guarded send T-100's live PlaceBid must use ─
+
+describe('I2: ctx.sendWrite is the same guarded send, on the snipe lane, for bids', () => {
+  const PLACE_BID = `${BASE}ItemBid/PlaceBid`;
+  const BID_BODY = { itemId: ITEM, bidAmount: '70.00', sellerId: 12, quantity: 1 };
+
+  /** Calls placeBid (the stub rejects paused) and returns the BidContext it was handed. */
+  async function stubContext(t: Setup): Promise<BidContext> {
+    bidCapture.ctx = undefined;
+    await rejectsWith(
+      t.api.placeBid({ itemId: ITEM, sellerId: 12, bidAmount: 7000, quantity: 1 }, { idempotencyKey: 'k', timeoutMs: 20 * S }),
+      'paused',
+    );
+    expect(bidCapture.ctx).toBeDefined();
+    return bidCapture.ctx as BidContext;
+  }
+
+  it("sends once on the snipe lane, credentials 'omit', with the bearer, after writesAllowed('bidding')", async () => {
+    const t = setup();
+    t.http.on(PLACE_BID, json({ status: true, result: 0, message: 'ok' }));
+    const ctx = await stubContext(t);
+    const raw = await ctx.sendWrite('placeBid', { body: BID_BODY }, (_res, r) => r);
+    expect(raw).toEqual({ status: true, result: 0, message: 'ok' });
+    expect(t.scheduler.runs.at(-1)).toMatchObject({ endpoint: 'placeBid', lane: 'snipe' });
+    expect(t.http.requests).toHaveLength(1);
+    expect(t.http.requests[0]).toMatchObject({ method: 'POST', url: PLACE_BID, credentials: 'omit', body: JSON.stringify(BID_BODY) });
+    expect(header(t.http.requests[0], 'authorization')).toBe(`Bearer ${BEARER}`);
+    expect(t.switches.checks).toEqual(['bidding', 'bidding']); // placeBid's own check, then sendWrite's
+  });
+
+  it('refused by writesAllowed: paused(why), audited as bid.place, ZERO HTTP', async () => {
+    const t = setup();
+    t.http.on(PLACE_BID, json({ status: true, result: 0, message: 'ok' }));
+    const ctx = await stubContext(t);
+    t.switches.killAll('kill switch');
+    const err = await rejectsWith(ctx.sendWrite('placeBid', { body: BID_BODY }, (_res, r) => r), 'paused');
+    expect(err.message).toBe('kill switch');
+    expect(t.http.requests).toHaveLength(0);
+    expect(t.audit.entries).toEqual([
+      expect.objectContaining({ kind: 'bid.place', itemId: ITEM, details: { action: 'bid', why: 'kill switch' } }),
+    ]);
+  });
+
+  it('a bid queued on the snipe lane is refused at its turn when the kill switch flips meanwhile', async () => {
+    const snipeGap: LaneConfig = { minIntervalMs: 1 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 80 };
+    const t = setup({ lanes: { ...FAST_LANES, snipe: snipeGap } });
+    scriptAll(t.http);
+    t.http.on(PLACE_BID, json({ status: true, result: 0, message: 'ok' }));
+    const ctx = await stubContext(t);
+    await t.api.showBidModal(ITEM); // the snipe lane's 1 s gap starts
+    const pending = ctx.sendWrite('placeBid', { body: BID_BODY }, (_res, r) => r).catch((e: unknown) => e);
+    await flush();
+    t.switches.killAll('kill switch');
+    await advance(t.clock, 2 * S);
+    const err = await pending;
+    expect(err).toBeInstanceOf(SgwApiError);
+    expect((err as SgwApiError).kind).toBe('paused');
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}ItemBid/ShowBidModal?itemId=${String(ITEM)}`]);
+  });
+});
+
+// ── M1: concurrent itemDetail misses share one read ─────────────────────────
+
+describe('M1: concurrent itemDetail misses share one in-flight read per (lane, item); never on the snipe lane', () => {
+  it('two concurrent interactive reads of one item make one request; each caller gets its own copy', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    const [a, b] = await Promise.all([t.api.itemDetail(ITEM, 'interactive'), t.api.itemDetail(ITEM, 'interactive')]);
+    expect(t.http.requests).toHaveLength(1);
+    expect(a).toEqual(b);
+    expect(a).not.toBe(b);
+  });
+
+  it('a read queued on the background lane never makes an interactive caller wait behind it', async () => {
+    const gap: LaneConfig = { minIntervalMs: 120 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
+    const t = setup({ lanes: { ...FAST_LANES, background: gap } });
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'background');
+    let backgroundDone = false;
+    const queued = t.api.itemDetail(ITEM, 'background').then(() => {
+      backgroundDone = true;
+    });
+    await flush();
+    const now = await t.api.itemDetail(ITEM, 'interactive');
+    expect(now.itemId).toBe(ITEM);
+    expect(backgroundDone).toBe(false);
+    expect(t.http.requests).toHaveLength(2);
+    await advance(t.clock, 120 * S);
+    await queued;
+  });
+
+  it('snipe-lane reads are neither cached nor shared', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    await Promise.all([t.api.itemDetail(ITEM, 'snipe'), t.api.itemDetail(ITEM, 'snipe')]);
+    expect(t.http.requests).toHaveLength(2);
+  });
+
+  it('a failed shared read rejects every caller and is not remembered', async () => {
+    const t = setup();
+    t.http.on(`${BASE}ItemDetail/`, { status: 404, bodyText: '' }, json(loadFixture('item-detail-open')));
+    const both = await Promise.all([
+      t.api.itemDetail(ITEM, 'interactive').catch((e: unknown) => e),
+      t.api.itemDetail(ITEM, 'interactive').catch((e: unknown) => e),
+    ]);
+    expect(both.map((e) => (e instanceof SgwApiError ? e.kind : e))).toEqual(['server', 'server']);
+    expect(t.http.requests).toHaveLength(1);
+    const d = await t.api.itemDetail(ITEM, 'interactive');
+    expect(d.itemId).toBe(ITEM);
+    expect(t.http.requests).toHaveLength(2);
   });
 });
 

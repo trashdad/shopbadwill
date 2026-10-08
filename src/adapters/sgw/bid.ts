@@ -4,12 +4,20 @@
 //
 // api-adapter.ts calls this only after `GlobalSwitches.writesAllowed('bidding')`
 // said yes (ruling C1: false for the kill switch, bidding dry-run, failed
-// health and a bad session). The live path is expected to:
-// - build the request with `ctx.prepare('placeBid', { body })`, which applies
-//   `credentials: 'omit'` and the bearer exactly like every other request;
-// - send it through `ctx.scheduler` on the `snipe` lane;
-// - parse with `normalizePlaceBidRaw` (`status: true` alone is never success);
-// - report schema failures with `ctx.flagSchemaFailure`.
+// health and a bad session).
+//
+// T-100's live PlaceBid MUST send the bid with `ctx.sendWrite('placeBid',
+// { body }, parse)`. Never call `ctx.scheduler` directly for it. sendWrite is
+// the adapter's guarded send, bound to feature 'bidding', audit kind
+// `bid.place` and lane 'snipe':
+// - it asks writesAllowed('bidding') again, and keeps the verdict fresh while
+//   the bid waits in the snipe lane's queue;
+// - it re-checks the verdict right before the send and re-prepares the request
+//   (`credentials: 'omit'`, bearer, expiry) on a retry;
+// - a refusal is audited, sends nothing and rejects `paused`;
+// - schema failures are flagged to health.
+// The live path also parses with `normalizePlaceBidRaw` (`status: true` alone
+// is never success).
 import type { BidResult } from '../../domain/types';
 import { SgwApiError } from '../../ports/errors';
 import type { SgwApi } from '../../ports/sgw-api';

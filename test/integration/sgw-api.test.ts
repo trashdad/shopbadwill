@@ -214,19 +214,25 @@ describe('SgwApiAdapter over the real scheduler, fetch and MSW', () => {
     ]);
   });
 
-  it('the kill switch flipped while a write waits in its lane: asked again before the send, and the write never reaches the network', async () => {
+  it('the kill switch flipped while a write waits in its lane: its refreshed verdict refuses it, and it never reaches the network', async () => {
     const gap: LaneConfig = { minIntervalMs: 120_000, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
     const t = setup(T0, { ...FAST_LANES, background: gap });
     serveAll(t);
+    const drain = async (): Promise<void> => {
+      for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    };
     await t.api.search({ searchText: 'pyrex', categoryIds: [], sellerIds: [], page: 1 }, 'background');
     const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
-    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    await drain();
     expect(t.switches.checks).toEqual(['favorites']);
     t.switches.killAll('kill switch');
-    t.clock.advance(120_000);
+    for (let elapsed = 0; elapsed < 120_000; elapsed += 250) {
+      t.clock.advance(250); // the verdict is refreshed on this clock while the write waits
+      await drain();
+    }
     const err = await pending;
     expect(err instanceof SgwApiError ? [err.kind, err.message] : err).toEqual(['paused', 'kill switch']);
-    expect(t.switches.checks).toEqual(['favorites', 'favorites']);
+    expect(t.switches.checks.length).toBeGreaterThan(2);
     expect(started).toEqual([`POST ${BASE}Search/ItemListing`]);
     const [entry] = await t.audit.list({ limit: 1 });
     expect(entry).toMatchObject({ kind: 'favorite.add', itemId: ITEM, details: { action: 'add', why: 'kill switch' } });
