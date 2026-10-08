@@ -215,3 +215,65 @@ describe('copy and detail', () => {
     expect(s).toEqual(copy);
   });
 });
+
+describe('fix round 1', () => {
+  it('killed after send never says no bid was placed', () => {
+    const r = classifyOutcome(snipe(), null, null, { abort: 'killed' });
+    expect(r.outcome).toBe('network');
+    expect(r.notify.message).not.toContain('No bid was placed');
+    expect(r.notify.message).toContain('may have been placed');
+    expect(r.notify.message).toContain('Stopped (killed) after a bid may have been sent');
+    expect(r.stamp).toBeNull();
+  });
+  it('abort with an ambiguous attempt also falls through', () => {
+    const r = classifyOutcome(snipe({ attempt: { ambiguous: true } }), null, null, { abort: 'cap' });
+    expect(r.outcome).toBe('network');
+  });
+  it('abort after a registered bid uses the bid evidence', () => {
+    const r = classifyOutcome(snipe(), bid('outbid'), detail({ isHighBidder: false }), { abort: 'network' });
+    expect(r.outcome).toBe('outbid');
+  });
+  it('null bidResult with price below max is unconfirmed, not won', () => {
+    const r = classifyOutcome(snipe(), null, detail({ currentPrice: 1500 }));
+    expect(r.outcome).toBe('network');
+    expect(r.notify.message).toContain('Unconfirmed');
+    expect(r.stamp).toBeNull();
+  });
+  it('open-auction outbid is "Currently outbid", not "Lost"', () => {
+    const r = classifyOutcome(
+      snipe(),
+      bid('outbid'),
+      detail({ isClosed: false, serverTime: new Date(END_MS - 1000).toISOString(), isHighBidder: false }),
+    );
+    expect(r.outcome).toBe('outbid');
+    expect(r.final).toBe(false);
+    expect(r.notify.title).toMatch(/^Outbid:/);
+    expect(r.notify.message).toContain('Currently outbid at $23.50 (auction still open; your max $20.00)');
+    expect(r.notify.message).not.toContain('Lost');
+    expect(r.stamp).toBeNull();
+  });
+  it('shows the next-day marker when the end crosses midnight ET', () => {
+    const end = '2026-10-08T03:30:00.000Z'; // 8:30 PM PT Oct 7, 11:30 PM ET Oct 7
+    const late = '2026-10-08T04:30:00.000Z'; // 9:30 PM PT Oct 7, 12:30 AM ET Oct 8
+    const e = Date.parse(late);
+    const r = classifyOutcome(
+      snipe({ endTime: late, endTimeAtArm: late, measured: { firedAt: e - 8000 } }),
+      bid('outbid'),
+      detail({ endTime: late, isHighBidder: false }),
+      { userTz: 'America/New_York' },
+    );
+    expect(end).not.toBe(late);
+    expect(r.notify.message).toContain('9:30 PM PT');
+    expect(r.notify.message).toContain('12:30 AM ET (+1 day)');
+  });
+  it('dry-run reports a would-be-late fire', () => {
+    const r = classifyOutcome(
+      snipe({ dryRun: true, measured: { firedAt: END_MS + 1500 } }),
+      null,
+      detail({ isClosed: false, serverTime: new Date(END_MS - 8000).toISOString(), currentPrice: 1500, minimumBid: 1550 }),
+    );
+    expect(r.outcome).toBe('dry-run');
+    expect(r.notify.message).toContain('1.5 s AFTER the end (would have been late)');
+  });
+});
+

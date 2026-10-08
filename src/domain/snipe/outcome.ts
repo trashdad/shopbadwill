@@ -108,6 +108,7 @@ interface Verdict {
 
 /** Won or lost for a bid SGW accepted (or whose refusal we cannot confirm). */
 function judgeAccepted(s: Snipe, bid: BidResult | null, post: ItemDetail | null): Verdict {
+  const accepted = bid?.kind === 'accepted';
   if (bid?.kind === 'outbid') return { outcome: 'outbid', how: 'reported by SGW' };
   const high = post?.isHighBidder ?? bid?.isHighBidder ?? null;
   if (high === true) return { outcome: 'won', how: 'reported by SGW' };
@@ -116,7 +117,9 @@ function judgeAccepted(s: Snipe, bid: BidResult | null, post: ItemDetail | null)
   const price = post?.currentPrice;
   if (price !== undefined) {
     if (price > s.maxBid) return { outcome: 'outbid', how: 'inferred from the price' };
-    if (price < s.maxBid) return { outcome: 'won', how: 'inferred from the price' };
+    // A price below the max proves a win only if SGW confirmed the bid landed; with a lost
+    // response the bid may never have arrived.
+    if (price < s.maxBid && accepted) return { outcome: 'won', how: 'inferred from the price' };
   }
   return { outcome: 'unconfirmed', how: 'could not tell whether you lead' };
 }
@@ -154,28 +157,39 @@ export function classifyOutcome(
   let newEndTime: string | undefined;
   let showEnd = true;
 
-  if (ctx.abort === 'killed') {
+  const bidMayHaveGone =
+    bidResult === null
+      ? snipe.attempt.sentAt !== undefined || snipe.attempt.ambiguous === true
+      : bidResult.kind === 'accepted' || bidResult.kind === 'outbid' || bidResult.kind === 'rejected-unknown';
+  // An abort never overrides evidence that a bid went out: fall through to the judge path.
+  const abort = bidMayHaveGone ? undefined : ctx.abort;
+  const abortNote =
+    ctx.abort !== undefined && bidMayHaveGone
+      ? ` Stopped (${ctx.abort}) after a bid may have been sent: check the item.`
+      : '';
+
+  if (abort === 'killed') {
     outcome = 'killed';
     heading = 'Stopped';
     message = `Stopped before the bid. No bid was placed (your max ${max}).`;
     detail = 'Kill switch or disarm before firing; no bid sent.';
     showEnd = false;
-  } else if (ctx.abort === 'cap') {
+  } else if (abort === 'cap') {
     outcome = 'cap-blocked';
     heading = 'Blocked';
     message = `Not bid: a spending cap blocked it (your max ${max}).`;
     detail = 'A spending cap blocked the bid; no bid sent.';
-  } else if (ctx.abort === 'auth') {
+  } else if (abort === 'auth') {
     outcome = 'auth';
     heading = 'Not bid';
     message = 'Not bid: you were signed out of ShopGoodwill. Sign in before the next snipe.';
     detail = 'No valid session at verify time; no bid sent.';
-  } else if (ctx.abort === 'network') {
+  } else if (abort === 'network') {
     outcome = 'network';
     heading = 'Not bid';
     message = 'Not bid: could not reach ShopGoodwill (network problem). This is not an outbid.';
     detail = 'Network failure before the bid was sent.';
-  } else if (ctx.abort === 'ended') {
+  } else if (abort === 'ended') {
     outcome = 'ended';
     heading = 'Ended early';
     message = `Auction closed before the snipe could bid. No bid was placed (your max ${max}).`;
@@ -274,9 +288,9 @@ export function classifyOutcome(
       stampAs = final ? 'won' : null;
     } else if (v.outcome === 'outbid') {
       outcome = 'outbid';
-      heading = 'Lost';
+      heading = final ? 'Lost' : 'Outbid';
       if (price !== undefined) marginCents = price > snipe.maxBid ? price - snipe.maxBid : 0;
-      message = `Lost: outbid${at} (your max ${max})${marginCents ? `, short by ${formatMoney(marginCents)}` : ''}.${via}`;
+      message = `${final ? 'Lost: outbid' : 'Currently outbid'}${at} (${final ? '' : 'auction still open; '}your max ${max})${marginCents ? `, short by ${formatMoney(marginCents)}` : ''}.${via}`;
       detail = `Outbid; ${v.how}.`;
       stampAs = final ? 'lost' : null;
     } else {
@@ -295,7 +309,7 @@ export function classifyOutcome(
     kind: 'notify',
     snipeId: snipe.id,
     title: `${heading}: ${snipe.title}`,
-    message: showEnd ? `${message} Ended ${endedAt}.` : message,
+    message: `${showEnd ? `${message} Ended ${endedAt}.` : message}${abortNote}`,
   };
   const stamp: Classification['stamp'] =
     stampAs === null
@@ -312,7 +326,7 @@ export function classifyOutcome(
     itemId: snipe.itemId,
     title: snipe.title,
     outcome,
-    detail,
+    detail: `${detail}${abortNote}`,
     dryRun: snipe.dryRun,
     final,
     endTime: snipe.endTime,
@@ -326,7 +340,7 @@ export function classifyOutcome(
 
   return {
     outcome,
-    detail,
+    detail: `${detail}${abortNote}`,
     final,
     ...(finalPrice !== undefined ? { finalPrice } : {}),
     ...(marginCents !== undefined ? { marginCents } : {}),
