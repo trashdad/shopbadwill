@@ -1,6 +1,6 @@
 // Manual acceptance check for T-01 (not part of CI or the E2E suite):
 //
-//   pnpm build && node scripts/badge-check.ts
+//   pnpm build && pnpm exec tsx scripts/badge-check.ts
 //
 // Loads the unpacked Chromium build (.output/chrome-mv3) into Playwright's
 // bundled Chromium, makes ONE page load of https://shopgoodwill.com/ (the home

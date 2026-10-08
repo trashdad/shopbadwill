@@ -60,6 +60,7 @@ export default defineConfig(
     'playwright-report/',
     'test-results/',
     '.superpowers/',
+    'scripts/*-probe/**',
   ]),
 
   js.configs.recommended,
@@ -77,12 +78,13 @@ export default defineConfig(
     extends: [tseslint.configs.disableTypeChecked],
   },
 
-  // No unsanitized DOM sinks, no eval, no polyfill: everywhere.
+  // No unsanitized DOM sinks (innerHTML/outerHTML/insertAdjacentHTML...), no
+  // eval or new Function, no polyfill: everywhere. String timers are caught by
+  // @typescript-eslint/no-implied-eval (strictTypeChecked).
   noUnsanitized.configs.recommended,
   {
     rules: {
       'no-eval': 'error',
-      'no-implied-eval': 'error',
       'no-new-func': 'error',
       'no-restricted-imports': ['error', { paths: [NO_POLYFILL] }],
     },
@@ -123,12 +125,18 @@ export default defineConfig(
     },
   },
 
-  // Production code: no HTML-string DOM APIs, no Date.parse (PLAN §7.1, §1.8).
+  // Production code: no HTML-string DOM APIs, no Date.parse, no storage.sync
+  // (PLAN §7.1, §1.8).
   {
     files: ['src/**/*.{ts,tsx}'],
     rules: {
       'no-restricted-syntax': [
         'error',
+        {
+          selector:
+            "MemberExpression[property.name='sync'][object.type='MemberExpression'][object.property.name='storage'], MemberExpression[property.name='sync'][object.name='storage']",
+          message: 'No storage.sync: it uploads data to the browser vendor. Use storage.local.',
+        },
         {
           selector: "MemberExpression[property.name=/^(innerHTML|outerHTML)$/]",
           message: 'No innerHTML/outerHTML: build DOM nodes or render with Preact.',

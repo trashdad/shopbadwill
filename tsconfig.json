@@ -7,5 +7,8 @@
     "jsxImportSource": "preact",
     // TypeScript 6 no longer includes @types/* automatically.
     "types": ["node"]
-  }
+  },
+  // Replaces the generated exclude list, so it repeats it. Spike probes
+  // (scripts/*-probe/) are throwaway code and not type-checked.
+  "exclude": ["**/node_modules", ".output", "scripts/*-probe/**"]
 }

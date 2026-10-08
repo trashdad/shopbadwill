@@ -35,6 +35,7 @@ export default defineConfig({
     },
   }),
   // Function form: runs after WXT has loaded .env files into process.env.
+  // `version` is not set here: WXT takes it from package.json.
   manifest: ({ browser }) => {
     const isFirefox = browser === 'firefox';
     const googleClientId = process.env.SBW_GOOGLE_CLIENT_ID?.trim();
@@ -53,6 +54,13 @@ export default defineConfig({
       },
       ...(isFirefox
         ? {
+            // Firefox dashboard surface (§2.6); Chrome uses the optional
+            // sidePanel instead. Panel page: src/entrypoints/sidebar/.
+            sidebar_action: {
+              default_panel: 'sidebar.html',
+              default_title: 'ShopBadwill',
+              open_at_install: false,
+            },
             browser_specific_settings: {
               gecko: {
                 id: GECKO_ID,
