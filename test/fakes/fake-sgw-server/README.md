@@ -14,7 +14,7 @@ Raw request/response shapes are in `shapes.ts` (zod). T-24 owns the real adapter
 
 | Endpoint | Auth | Notes |
 | --- | --- | --- |
-| `POST Search/ItemListing` | no | String booleans required. 40 rows/page, `maxTotalRecords` 10000. `"` in `searchText` is 403. Malformed body (bad JSON, real booleans, wrong types) is 200 with zero rows. Row `minimumBid` is the starting minimum. `isFavorite` only when a valid bearer is sent. |
+| `POST Search/ItemListing` | no | String booleans required. 40 rows/page, `maxTotalRecords` 10000. `"` in `searchText` is 403. Malformed body (bad JSON, real booleans, wrong types) is 200 with zero rows. An unparseable `selectedCategoryIds` is 200 with unfiltered rows, and a non-numeric `lowPrice`/`highPrice` is 400 problem+json (both as on the real site, S-1). Responses follow the real shapes (`src/adapters/sgw/schemas.ts`); `test/contract/sgw/fake-server.test.ts` enforces it. Row `minimumBid` is the starting minimum. `isFavorite` only when a valid bearer is sent. |
 | `GET ItemDetail/GetItemDetailModelByItemId/{id}` | no | Naive-PT `endTime`, `serverTime` with ms, `minimumBid` is the next acceptable bid, `inWatchlist` is null when anonymous. |
 | `POST Dashboard/GetCurrentTime` | no | JSON string, naive Pacific, seconds only. |
 | `POST itemDetail/CalculateShipping` | no | Shape unverified on the real site. |

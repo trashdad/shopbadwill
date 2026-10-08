@@ -211,7 +211,23 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
     isFavorite: authed && isFav(it.itemId),
     shippingPrice: it.shippingPrice,
     imageURL: it.imageURL,
+    // Fields the real rows carry (search-grid-p1 fixture); the adapter schemas read some of them.
+    catFullName: `Category ${String(it.categoryId)}`,
+    buyNowPrice: 0,
+    relistId: 0,
+    startingPrice: it.minimumBid,
+    listingType: 0,
     };
+  };
+
+  /** SGW's `{status, message, data}` wrapper. */
+  const envelope = (data: unknown): Result => ok({ message: 'Ok', status: true, type: null, primaryKey: null, isUnauthorized: false, data });
+
+  /** GetCurrentTime's `data`: "MM/dd/yyyy HH:mm:ss" Pacific. */
+  const currentTimeText = (ms: number): string => {
+    const [d = '', t = ''] = epochToPacificNaive(ms, false).split('T');
+    const [y, m, day] = d.split('-');
+    return `${m ?? ''}/${day ?? ''}/${y ?? ''} ${t}`;
   };
 
   const routes = new Map<string, Route>();
@@ -223,13 +239,31 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
     name: 'Search/ItemListing',
     handler: ({ body, bearer }) => {
       const empty = ok({ searchResults: { items: [], itemCount: 0 }, maxTotalRecords: MAX_TOTAL_RECORDS, page: 1 });
+      const problem = (fields: string[]): Result => ({
+        status: 400,
+        body: {
+          errors: Object.fromEntries(fields.map((f) => [f, [`Could not convert string to decimal. Path '${f}'.`]])),
+          type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
+          title: 'One or more validation errors occurred.',
+          status: 400,
+          traceId: '00-fake-fake-00',
+        },
+      });
       const parsed = ItemListingRequestSchema.safeParse(parseJson(body));
       // Malformed bodies (bad JSON, non-string booleans...) get 200 with zero rows.
       if (!parsed.success) return empty;
       const q = parsed.data;
       if (q.searchText.includes('"')) return bad(403, 'Forbidden');
       const words = q.searchText.toLowerCase().split(/\s+/).filter(Boolean);
-      const cats = (q.selectedCategoryIds ?? '').split(',').filter(Boolean).map(Number);
+      // Real SGW: a non-numeric lowPrice/highPrice is a 400 problem+json (S-1 #7); an
+      // unparseable selectedCategoryIds is silently ignored: 200 with UNFILTERED rows (S-1 #10).
+      const badPrice = (['lowPrice', 'highPrice'] as const).filter((k) => {
+        const v = q[k];
+        return v !== undefined && v !== '' && !Number.isFinite(Number(v));
+      });
+      if (badPrice.length > 0) return problem(badPrice);
+      const catTokens = (q.selectedCategoryIds ?? '').split(',').filter(Boolean);
+      const cats = catTokens.every((t) => /^\d+$/.test(t)) ? catTokens.map(Number) : [];
       const sellers = (q.selectedSellerIds ?? '').split(',').filter(Boolean).map(Number);
       const lo = q.lowPrice === undefined || q.lowPrice === '' ? 0 : Number(q.lowPrice);
       const hi = q.highPrice === undefined || q.highPrice === '' || Number(q.highPrice) === 0 ? Infinity : Number(q.highPrice);
@@ -269,32 +303,52 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
       if (!it) return bad(404, 'Item not found');
       const now = serverNow();
       const v = bidding.view(it, bearer !== null);
+      const closed = itemEnd(it) <= now;
+      const all = [...v.bidHistory, ...it.bidHistory];
       return ok({
         itemId: it.itemId,
         title: it.title,
         description: it.description,
         currentPrice: v.currentPrice,
         minimumBid: v.minimumBid,
+        startingPrice: it.minimumBid,
         bidIncrement: it.bidIncrement,
+        numberOfBids: v.numBids,
+        // Convenience duplicates of the real fields; the real ones are what the adapter reads.
         numBids: v.numBids,
         isHighBidder: v.isHighBidder,
         endTime: itemEndRaw(it),
         serverTime: epochToPacificNaive(now, true),
         sellerId: it.sellerId,
+        sellerCompanyName: it.sellerName,
         sellerName: it.sellerName,
+        pickupState: 'WA',
         categoryId: it.categoryId,
+        categoryParentList: `${String(it.categoryId)}|Category ${String(it.categoryId)}`,
         pickupOnly: it.pickupOnly,
-        shippingPrice: it.shippingPrice,
-        isClosed: itemEnd(it) <= now,
-        inWatchlist: bearer === null ? null : isFav(it.itemId),
-        bidHistory: [...v.bidHistory, ...it.bidHistory],
+        shippingPrice: it.pickupOnly ? 0 : it.shippingPrice,
+        handlingPrice: 0,
+        allowShippingCalculation: it.pickupOnly || it.shippingPrice === null,
+        buyNowPrice: 0,
+        imageServer: 'https://example.invalid/img/',
+        imageUrlString: `${String(it.itemId)}.jpg`,
+        remainingTime: closed ? 'Auction Ended' : '1d 0h',
+        isClosed: closed,
+        isItemEndTimeExpire: closed,
+        inWatchlist: bearer === null ? false : isFav(it.itemId),
+        bidHistory: {
+          auctionClosed: closed,
+          isHighBidderLogIn: v.isHighBidder === true,
+          bidSummary: all.map((b) => ({ amount: b.bidAmount, time: b.bidTime, bidderName: b.bidderName })),
+          bidComplete: all.map((b) => ({ ...b, retracted: false, highBidderName: b.bidderName })),
+        },
       });
     },
   });
 
   add('POST', '/api/Dashboard/GetCurrentTime', {
     name: 'Dashboard/GetCurrentTime',
-    handler: () => ok(epochToPacificNaive(serverNow(), false)),
+    handler: () => envelope(currentTimeText(serverNow())),
   });
 
   add('POST', '/api/itemDetail/CalculateShipping', {
@@ -353,7 +407,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
           },
         ];
       });
-      return ok(rows);
+      return envelope(rows);
     },
   });
   add('POST', '/api/Favorite/Save', {
@@ -371,7 +425,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
   add('POST', '/api/SaveSearches/GetSaveSearches', {
     name: 'SaveSearches/GetSaveSearches',
     auth: true,
-    handler: () => ok(seed.savedSearches),
+    handler: () => envelope(seed.savedSearches),
   });
 
   // Bidding: proxy-bid state and faults live in ./bidding. The Bid cookie 403 stays here.

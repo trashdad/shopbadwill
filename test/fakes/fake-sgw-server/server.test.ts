@@ -78,6 +78,16 @@ describe('endpoint responses validate against the local shapes', () => {
     const p2 = await parse(await post('/api/Search/ItemListing', { ...SEARCH, page: 2 }), ItemListingResponseSchema);
     expect(p2.searchResults.items[0]?.itemId).not.toBe(body.searchResults.items[0]?.itemId);
   });
+  it('Search: unparseable categories give 200 with unfiltered rows; bad prices give 400 problem+json', async () => {
+    const all = await parse(await post('/api/Search/ItemListing', SEARCH), ItemListingResponseSchema);
+    const res = await post('/api/Search/ItemListing', { ...SEARCH, selectedCategoryIds: 'abc' });
+    expect(res.status).toBe(200);
+    const body = await parse(res, ItemListingResponseSchema);
+    expect(body.searchResults.items.map((i) => i.itemId)).toEqual(all.searchResults.items.map((i) => i.itemId));
+    const bad = await post('/api/Search/ItemListing', { ...SEARCH, lowPrice: 'abc' });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { errors: Record<string, string[]> }).errors).toHaveProperty('lowPrice');
+  });
   it('Search: filters by text and reports isFavorite only when authenticated', async () => {
     const q = { ...SEARCH, searchText: 'pyrex butterprint' };
     const anon = await parse(await post('/api/Search/ItemListing', q), ItemListingResponseSchema);
@@ -90,7 +100,7 @@ describe('endpoint responses validate against the local shapes', () => {
     const d = await parse(await get('/api/ItemDetail/GetItemDetailModelByItemId/279250057'), ItemDetailResponseSchema);
     expect(d.minimumBid).toBe(17);
     expect(d.endTime).toBe('2026-10-08T19:18:30.45');
-    expect(d.inWatchlist).toBeNull();
+    expect(d.inWatchlist).toBe(false); // anonymous: false means unknown
     const row = (await parse(await post('/api/Search/ItemListing', { ...SEARCH, searchText: 'butterprint' }), ItemListingResponseSchema))
       .searchResults.items[0];
     expect(row?.minimumBid).toBe(12.99);
@@ -111,17 +121,17 @@ describe('endpoint responses validate against the local shapes', () => {
   it('favorites: add, list, note, remove, saved searches', async () => {
     const h = auth();
     await parse(await get('/api/Favorite/AddToFavorite?itemId=279250102', h), AckResponseSchema);
-    let favs = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=open', {}, h), FavoritesResponseSchema);
+    let favs = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=open', {}, h), FavoritesResponseSchema).then((r) => r.data);
     const added = favs.find((f) => f.itemId === 279250102);
     expect(added).toBeDefined();
     expect(favs.some((f) => f.itemId === 279199001)).toBe(false); // closed
-    const closed = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=close', {}, h), FavoritesResponseSchema);
+    const closed = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=close', {}, h), FavoritesResponseSchema).then((r) => r.data);
     expect(closed.map((f) => f.itemId)).toEqual([279199001]);
     await parse(await post('/api/Favorite/Save', { notes: 'max 9', watchlistId: added?.watchlistId }, h), AckResponseSchema);
-    favs = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=all', {}, h), FavoritesResponseSchema);
+    favs = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=all', {}, h), FavoritesResponseSchema).then((r) => r.data);
     expect(favs.find((f) => f.itemId === 279250102)?.notes).toBe('max 9');
     await parse(await get('/api/Favorite/RemoveItemFromFavoriteList?itemId=279250102', h), AckResponseSchema);
-    favs = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=all', {}, h), FavoritesResponseSchema);
+    favs = await parse(await post('/api/Favorite/GetAllFavoriteItemsByType?Type=all', {}, h), FavoritesResponseSchema).then((r) => r.data);
     expect(favs.some((f) => f.itemId === 279250102)).toBe(false);
     await parse(await post('/api/SaveSearches/GetSaveSearches', {}, h), SavedSearchesResponseSchema);
   });
@@ -187,10 +197,11 @@ describe('scenario toggles', () => {
     await post('/__scenario', { skewMs: 600_000 });
     const d = await parse(await get('/api/ItemDetail/GetItemDetailModelByItemId/279250057'), ItemDetailResponseSchema);
     const skewed = pacificNaiveToEpoch(d.serverTime);
+    const toNaive = (s: string): string => s.replace(/^(\d{2})\/(\d{2})\/(\d{4}) /, '$3-$1-$2T');
     expect(skewed - before).toBeGreaterThan(599_000);
     expect(skewed - before).toBeLessThan(605_000);
     const t = await parse(await post('/api/Dashboard/GetCurrentTime'), GetCurrentTimeResponseSchema);
-    expect(pacificNaiveToEpoch(t) - before).toBeGreaterThan(598_000);
+    expect(pacificNaiveToEpoch(toNaive(t.data)) - before).toBeGreaterThan(598_000);
   });
   it('latency is at least the configured value, per endpoint', async () => {
     await post('/__scenario', { latencyMs: { 'Dashboard/GetCurrentTime': 200 } });
@@ -218,7 +229,7 @@ describe('scenario toggles', () => {
   it('pinned server clock ticks from serverNowMs; unknown preset is 400', async () => {
     await post('/__scenario', { serverNowMs: Date.parse('2026-10-08T19:18:00.000Z') });
     const t = await parse(await post('/api/Dashboard/GetCurrentTime'), GetCurrentTimeResponseSchema);
-    expect(t).toBe('2026-10-08T12:18:00');
+    expect(t.data).toBe('10/08/2026 12:18:00');
     expect((await post('/__scenario', { name: 'nope' })).status).toBe(400);
   });
   it('startFakeSgw accepts a named scenario', async () => {

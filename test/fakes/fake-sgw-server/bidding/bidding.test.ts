@@ -96,7 +96,7 @@ describe("PlaceBid proxy semantics over HTTP", () => {
       minimumBid: 5,
       isHighBidder: true,
     });
-    expect(d.bidHistory[0]).toMatchObject({ bidAmount: 4, bidderName: "you" });
+    expect(d.bidHistory.bidComplete[0]).toMatchObject({ bidAmount: 4, bidderName: "you" });
   });
   it("beats a hidden competitor max: price = competitor max + increment", async () => {
     await scenario({ bidding: { items: { [BIDDEN]: { competitorMax: 30 } } } });
