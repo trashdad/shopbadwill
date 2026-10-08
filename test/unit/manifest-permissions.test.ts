@@ -29,7 +29,10 @@ interface Manifest {
   commands?: Record<string, { suggested_key?: Record<string, string>; description?: string }>;
   minimum_chrome_version?: string;
   oauth2?: { client_id: string; scopes: string[] };
-  browser_specific_settings?: { gecko?: Record<string, unknown> };
+  browser_specific_settings?: {
+    gecko?: Record<string, unknown>;
+    gecko_android?: Record<string, unknown>;
+  };
   background?: { service_worker?: string; scripts?: string[] };
   sidebar_action?: { default_panel?: string; default_title?: string; open_at_install?: boolean };
 }
@@ -171,8 +174,10 @@ describe.each(TARGETS)('%s production manifest', (target) => {
     expect(manifestOf(target).version).toBe(pkg.version);
   });
 
-  it('requires only storage and alarms', () => {
-    expect(manifestOf(target).permissions).toEqual(['storage', 'alarms']);
+  it('requires only storage and alarms (plus no-prompt identity on Firefox)', () => {
+    // Firefox cannot make `identity` optional (it is PermissionNoPrompt only).
+    const required = target === 'firefox' ? ['storage', 'alarms', 'identity'] : ['storage', 'alarms'];
+    expect(manifestOf(target).permissions).toEqual(required);
   });
 
   it('requires host access only to shopgoodwill.com and buyerapi', () => {
@@ -195,9 +200,9 @@ describe.each(TARGETS)('%s production manifest', (target) => {
     }
   });
 
-  it('declares the kill-switch command with Ctrl+Shift+K', () => {
+  it('declares the kill-switch command with Alt+Shift+K', () => {
     expect(manifestOf(target).commands?.['kill-switch']).toEqual({
-      suggested_key: { default: 'Ctrl+Shift+K' },
+      suggested_key: { default: 'Alt+Shift+K' },
       description: expect.any(String) as string,
     });
   });
@@ -252,23 +257,20 @@ describe('chrome-only manifest keys', () => {
 
 describe('firefox-only manifest keys', () => {
   it('has the Firefox optional permissions', () => {
-    expect(manifestOf('firefox').optional_permissions).toEqual([
-      'notifications',
-      'identity',
-      'nativeMessaging',
-    ]);
+    expect(manifestOf('firefox').optional_permissions).toEqual(['notifications', 'nativeMessaging']);
   });
 
-  it('declares the fixed gecko id, Firefox 128 minimum and data collection', () => {
+  it('declares the fixed gecko id, Firefox 140 / Android 142 minimum and data collection', () => {
     expect(manifestOf('firefox').browser_specific_settings).toEqual({
       gecko: {
         id: 'shopbadwill@trashdad.github.io',
-        strict_min_version: '128.0',
+        strict_min_version: '140.0',
         data_collection_permissions: {
           required: ['none'],
           optional: ['technicalAndInteraction'],
         },
       },
+      gecko_android: { strict_min_version: '142.0' },
     });
   });
 

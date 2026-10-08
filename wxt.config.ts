@@ -17,9 +17,17 @@ const OPTIONAL_HOSTS = [
   'https://www.googleapis.com/*', // "Connect Google": Calendar API
   'https://ntfy.sh/*', // "Enable phone push"
 ];
+const REQUIRED_PERMISSIONS = {
+  chrome: ['storage', 'alarms'],
+  // Firefox cannot make `identity` optional (PermissionNoPrompt only); it shows
+  // no install prompt. Controller ruling A.
+  firefox: ['storage', 'alarms', 'identity'],
+};
 const OPTIONAL_PERMISSIONS = {
+  // WXT adds `sidePanel` as required once a sidepanel entrypoint exists (no
+  // install warning). Controller ruling D: accepted.
   chrome: ['notifications', 'identity', 'sidePanel', 'background', 'power', 'nativeMessaging'],
-  firefox: ['notifications', 'identity', 'nativeMessaging'],
+  firefox: ['notifications', 'nativeMessaging'],
 };
 
 export default defineConfig({
@@ -42,13 +50,14 @@ export default defineConfig({
 
     return {
       name: 'ShopBadwill',
-      permissions: ['storage', 'alarms'],
+      permissions: isFirefox ? REQUIRED_PERMISSIONS.firefox : REQUIRED_PERMISSIONS.chrome,
       host_permissions: [...SGW_HOSTS, ...(TEST_BUILD ? TEST_HOSTS : [])],
       optional_permissions: isFirefox ? OPTIONAL_PERMISSIONS.firefox : OPTIONAL_PERMISSIONS.chrome,
       optional_host_permissions: OPTIONAL_HOSTS,
       commands: {
         'kill-switch': {
-          suggested_key: { default: 'Ctrl+Shift+K' },
+          // Not Ctrl+Shift+K: that is Firefox's Web Console. Controller ruling C.
+          suggested_key: { default: 'Alt+Shift+K' },
           description: 'Kill switch: stop all ShopBadwill automation',
         },
       },
@@ -64,13 +73,16 @@ export default defineConfig({
             browser_specific_settings: {
               gecko: {
                 id: GECKO_ID,
-                strict_min_version: '128.0',
+                // 140/142: first versions supporting data_collection_permissions
+                // (controller ruling B; web-ext lint warns below that).
+                strict_min_version: '140.0',
                 data_collection_permissions: {
                   required: ['none'],
                   // Requested at runtime only when the user enables ntfy push.
                   optional: ['technicalAndInteraction'],
                 },
               },
+              gecko_android: { strict_min_version: '142.0' },
             },
           }
         : {

@@ -7,7 +7,7 @@ exports[`chrome production manifest > matches the committed permission snapshot 
     "kill-switch": {
       "description": "Kill switch: stop all ShopBadwill automation",
       "suggested_key": {
-        "default": "Ctrl+Shift+K",
+        "default": "Alt+Shift+K",
       },
     },
   },
@@ -64,14 +64,17 @@ exports[`firefox production manifest > matches the committed permission snapshot
         ],
       },
       "id": "shopbadwill@trashdad.github.io",
-      "strict_min_version": "128.0",
+      "strict_min_version": "140.0",
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0",
     },
   },
   "commands": {
     "kill-switch": {
       "description": "Kill switch: stop all ShopBadwill automation",
       "suggested_key": {
-        "default": "Ctrl+Shift+K",
+        "default": "Alt+Shift+K",
       },
     },
   },
@@ -96,12 +99,12 @@ exports[`firefox production manifest > matches the committed permission snapshot
   ],
   "optional_permissions": [
     "notifications",
-    "identity",
     "nativeMessaging",
   ],
   "permissions": [
     "storage",
     "alarms",
+    "identity",
   ],
   "web_accessible_resources": null,
 }
