@@ -82,6 +82,30 @@ describe('FakeMessaging', () => {
     expect(m.sent.map((s) => s.type)).toEqual(['rules.list', 'settings.get', 'quick.hideKeyword']);
   });
 
+  it('rejects a malformed payload, a wrong-shaped reply, and passes a valid round-trip', async () => {
+    const m = new FakeMessaging();
+    m.handle('settings.get', () => ({ nope: true }) as never);
+    m.handle('rules.list', () => []);
+    await expect(m.send('page.token', { bearer: 'not-a-jwt', capturedAt: 1 })).rejects.toThrow();
+    await expect(m.send('quick.hideKeyword', { term: '' })).rejects.toThrow();
+    expect(m.sent).toHaveLength(0);
+    await expect(m.send('settings.get', undefined)).rejects.toThrow();
+    await m.send('page.token', { bearer: 'aaa.bbb.ccc', capturedAt: 1 });
+    expect(await m.send('rules.list', undefined)).toEqual([]);
+    m.handle('rules.list', () => [{ bad: 1 }] as never);
+    await expect(m.send('rules.list', undefined)).rejects.toThrow();
+  });
+
+  it('rejects malformed ticks and broadcasts', () => {
+    const m = new FakeMessaging();
+    expect(() => {
+      m.emitTick(PORT_NAMES.snipeCountdown, { snipeId: 's1' } as never);
+    }).toThrow();
+    expect(() => {
+      m.broadcast('switches.changed', { killSwitch: 'yes' } as never);
+    }).toThrow();
+  });
+
   it('streams ticks to open ports and stops after disconnect', () => {
     const m = new FakeMessaging();
     const ticks: unknown[] = [];
@@ -99,9 +123,9 @@ describe('FakeMessaging', () => {
     const m = new FakeMessaging();
     const got: unknown[] = [];
     const off = m.onBroadcast('switches.changed', (p) => got.push(p));
-    m.broadcast('switches.changed', undefined as never);
+    m.broadcast('switches.changed', { killSwitch: false, writesAllowed: {} });
     off();
-    m.broadcast('switches.changed', undefined as never);
+    m.broadcast('switches.changed', { killSwitch: false, writesAllowed: {} });
     expect(got).toHaveLength(1);
   });
 });

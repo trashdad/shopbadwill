@@ -8,6 +8,11 @@ interface Timer {
   fn: () => void;
 }
 
+export interface ClockSource {
+  nextDue(): number | undefined;
+  fireNext(): void;
+}
+
 /**
  * Deterministic Clock. Time moves only through `advance` / `set`. `setTimeout`
  * timers fire in (time, creation) order; timers scheduled by a firing timer
@@ -19,6 +24,7 @@ export class FakeClock implements Clock {
   private nextId = 1;
   private nextSeq = 0;
   private readonly timers = new Map<number, Timer>();
+  private readonly sources = new Set<ClockSource>();
 
   constructor(startMs: EpochMs = 1_700_000_000_000) {
     this.wall = startMs;
@@ -47,19 +53,45 @@ export class FakeClock implements Clock {
     return this.timers.size;
   }
 
-  /** Moves wall and monotonic time forward by `ms`, firing due timers in order. */
+  /**
+   * Registers an event source (FakeAlarms) that fires interleaved with timers
+   * during `advance`. `nextDue` is the wall-clock time of its next event;
+   * `fireNext` fires exactly one due event.
+   */
+  addSource(src: ClockSource): void {
+    this.sources.add(src);
+  }
+
+  /** Moves wall and monotonic time forward by `ms`, firing due timers and source events in time order. */
   advance(ms: number): void {
     if (ms < 0) throw new RangeError('FakeClock.advance: ms must be >= 0');
     const target = this.mono + ms;
+    const targetWall = this.wall + ms;
     for (;;) {
-      let next: Timer | undefined;
+      let timer: Timer | undefined;
       for (const t of this.timers.values()) {
-        if (t.at <= target && (next === undefined || t.at < next.at || (t.at === next.at && t.seq < next.seq))) next = t;
+        if (t.at <= target && (timer === undefined || t.at < timer.at || (t.at === timer.at && t.seq < timer.seq))) timer = t;
       }
-      if (next === undefined) break;
-      this.timers.delete(next.id);
-      this.step(next.at);
-      next.fn();
+      let source: ClockSource | undefined;
+      let sourceDue = Infinity;
+      for (const src of this.sources) {
+        const due = src.nextDue();
+        if (due !== undefined && due <= targetWall && due < sourceDue) {
+          source = src;
+          sourceDue = due;
+        }
+      }
+      const timerWall = timer === undefined ? Infinity : this.wall + (timer.at - this.mono);
+      if (source !== undefined && sourceDue < timerWall) {
+        this.step(this.mono + Math.max(0, sourceDue - this.wall));
+        source.fireNext();
+      } else if (timer !== undefined) {
+        this.timers.delete(timer.id);
+        this.step(timer.at);
+        timer.fn();
+      } else {
+        break;
+      }
     }
     this.step(target);
   }

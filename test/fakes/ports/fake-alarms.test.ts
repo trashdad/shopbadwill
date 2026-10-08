@@ -135,3 +135,33 @@ describe('FakeAlarms.advance', () => {
     expect(n).toBe(0);
   });
 });
+
+describe('FakeAlarms coupled to the clock', () => {
+  it('fires a due alarm when only the shared clock advances', async () => {
+    const { alarms, fired, clock } = setup();
+    await alarms.create('a', { delayInMinutes: 1 });
+    clock.advance(MIN);
+    expect(fired).toEqual([{ name: 'a', scheduledTime: MIN, at: MIN }]);
+  });
+
+  it('interleaves alarms and clock timers in time order', async () => {
+    const { alarms, clock } = setup();
+    const log: string[] = [];
+    alarms.onAlarm((a) => log.push(`alarm:${a.name}@${String(clock.now())}`));
+    clock.setTimeout(() => log.push(`t1@${String(clock.now())}`), 10_000);
+    clock.setTimeout(() => log.push(`t2@${String(clock.now())}`), 50_000);
+    await alarms.create('a', { when: 30_000 });
+    await alarms.create('p', { when: 20_000, periodInMinutes: 0.5 });
+    clock.advance(60_000);
+    expect(log).toEqual(['t1@10000', 'alarm:p@20000', 'alarm:a@30000', 't2@50000', 'alarm:p@50000']);
+  });
+
+  it('a timer callback can create an alarm that fires within the same advance', () => {
+    const { alarms, fired, clock } = setup();
+    clock.setTimeout(() => {
+      void alarms.create('late', { when: clock.now() + 5000 });
+    }, 1000);
+    clock.advance(10_000);
+    expect(fired.map((f) => [f.name, f.at])).toEqual([['late', 6000]]);
+  });
+});

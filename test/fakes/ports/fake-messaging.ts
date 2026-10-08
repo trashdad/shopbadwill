@@ -1,6 +1,10 @@
+import type { z } from 'zod';
+
 import type { MessagingClient } from '../../../src/ports/messaging';
 import {
   MsgReplySchemas,
+  MsgSchema,
+  PortTickSchemas,
   type MsgBroadcastType,
   type MsgPayload,
   type MsgReply,
@@ -13,7 +17,8 @@ type Handler<K extends MsgType> = (payload: MsgPayload<K>) => MsgReply<K> | Prom
 
 /**
  * In-memory MessagingClient. Register background handlers with `handle`, push
- * stream ticks with `emitTick` and broadcasts with `broadcast`. A message
+ * stream ticks with `emitTick` and broadcasts with `broadcast`. Payloads, replies, ticks and broadcasts are parsed with the protocol schemas and a
+ * malformed one throws (ZodError). A message
  * without a handler resolves `undefined` if the protocol declares no reply for
  * it, and rejects otherwise (a missing handler is a test bug).
  */
@@ -30,13 +35,17 @@ export class FakeMessaging implements MessagingClient {
   }
 
   async send<K extends MsgType>(type: K, payload: MsgPayload<K>): Promise<MsgReply<K>> {
+    // Production validates the envelope body and the reply; so does the fake.
+    MsgSchema.parse(payload === undefined ? { type } : { type, payload });
     this.sent.push({ type, payload: structuredClone(payload) });
     const handler = this.handlers.get(type);
     if (handler === undefined) {
       if (type in MsgReplySchemas) throw new Error(`FakeMessaging: no handler for "${type}"`);
       return undefined as MsgReply<K>;
     }
-    return (await handler(structuredClone(payload) as never)) as MsgReply<K>;
+    const reply = await handler(structuredClone(payload) as never);
+    if (type in MsgReplySchemas) return (MsgReplySchemas as Record<string, z.ZodType>)[type]?.parse(reply) as MsgReply<K>;
+    return reply as MsgReply<K>;
   }
 
   connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void): () => void {
@@ -61,11 +70,13 @@ export class FakeMessaging implements MessagingClient {
 
   /** Test helper: the background streams a tick to every open port of that name. */
   emitTick<P extends PortName>(name: P, tick: PortTick<P>): void {
+    PortTickSchemas[name].parse(tick);
     for (const cb of [...(this.ports.get(name) ?? [])]) cb(structuredClone(tick) as never);
   }
 
   /** Test helper: the background broadcasts to every subscriber. */
   broadcast<K extends MsgBroadcastType>(type: K, payload: MsgPayload<K>): void {
+    MsgSchema.parse(payload === undefined ? { type } : { type, payload });
     for (const cb of [...(this.broadcasts.get(type) ?? [])]) cb(structuredClone(payload) as never);
   }
 

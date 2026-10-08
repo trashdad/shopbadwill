@@ -1,6 +1,6 @@
 import type { EpochMs } from '../../../src/domain/types';
 import type { AlarmInfo, Alarms } from '../../../src/ports/alarms';
-import type { FakeClock } from './fake-clock';
+import type { ClockSource, FakeClock } from './fake-clock';
 
 /** Production floor: Chrome and Firefox enforce 30 s in packed builds. */
 export const MIN_ALARM_MINUTES = 0.5;
@@ -26,8 +26,8 @@ export interface FakeAlarmsOptions {
   extraDelayMs?: number | (() => number);
 }
 
-/** Alarms with the production 30 s floor and an injectable firing delay. Driven by `advance`. */
-export class FakeAlarms implements Alarms {
+/** Alarms with the production 30 s floor and an injectable firing delay. Driven by the shared FakeClock (`clock.advance` or the `advance` alias). */
+export class FakeAlarms implements Alarms, ClockSource {
   /** One message per clamp, for assertions. */
   readonly warnings: string[] = [];
   extraDelayMs: number | (() => number);
@@ -39,6 +39,7 @@ export class FakeAlarms implements Alarms {
     opts: FakeAlarmsOptions = {},
   ) {
     this.extraDelayMs = opts.extraDelayMs ?? 0;
+    clock.addSource(this);
   }
 
   create(name: string, opts: { when?: EpochMs; delayInMinutes?: number; periodInMinutes?: number }): Promise<void> {
@@ -74,30 +75,30 @@ export class FakeAlarms implements Alarms {
     };
   }
 
-  /**
-   * Advances the clock by `ms` and fires every alarm that falls due (nominal
-   * time plus the extra delay), in order, with the clock set to each firing
-   * time. Periodic alarms repeat; one-shot alarms are removed.
-   */
+  /** Alias for `clock.advance(ms)`: alarms fire from the clock, interleaved with its timers. */
   advance(ms: number): void {
-    const target = this.clock.now() + ms;
-    for (;;) {
-      let next: Entry | undefined;
-      for (const entry of this.entries.values()) {
-        if (entry.fireAt <= target && (next === undefined || entry.fireAt < next.fireAt)) next = entry;
-      }
-      if (next === undefined) break;
-      this.clock.advance(Math.max(0, next.fireAt - this.clock.now()));
-      const info = toInfo(next);
-      if (next.periodMs === undefined) {
-        this.entries.delete(next.name);
-      } else {
-        next.scheduledTime += next.periodMs;
-        next.fireAt = next.scheduledTime + this.drawExtra();
-      }
-      for (const cb of [...this.listeners]) cb(info);
+    this.clock.advance(ms);
+  }
+
+  nextDue(): number | undefined {
+    let min: number | undefined;
+    for (const e of this.entries.values()) if (min === undefined || e.fireAt < min) min = e.fireAt;
+    return min;
+  }
+
+  /** Fires the earliest due alarm (called by the clock with time already at its firing time). */
+  fireNext(): void {
+    let next: Entry | undefined;
+    for (const entry of this.entries.values()) if (next === undefined || entry.fireAt < next.fireAt) next = entry;
+    if (next === undefined) return;
+    const info = toInfo(next);
+    if (next.periodMs === undefined) {
+      this.entries.delete(next.name);
+    } else {
+      next.scheduledTime += next.periodMs;
+      next.fireAt = next.scheduledTime + this.drawExtra();
     }
-    this.clock.advance(Math.max(0, target - this.clock.now()));
+    for (const cb of [...this.listeners]) cb(info);
   }
 
   /** The extra delay is drawn once per occurrence, when it is scheduled. */
