@@ -2,8 +2,6 @@
   "day": "2026-10-07",
   "used": {
     "interactive": 12,
-    "background": 20,
-    "snipe": 0,
-    "canary": 1
+    "background": 20
   }
 }

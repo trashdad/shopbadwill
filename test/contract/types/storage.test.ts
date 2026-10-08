@@ -1,20 +1,24 @@
 // §2.3 storage schema, version 1: key names, areas, per-key record schemas.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import { z } from 'zod';
 
 import {
   AUDIT_CHUNK_KEY_PREFIX,
   AuditChunkSchema,
+  CalendarStateSchema,
   QUARANTINE_KEY_PREFIX,
   QuarantineRecordSchema,
+  RequestBudgetSchema,
   STORAGE_KEYS,
   STORAGE_LIMITS,
   STORAGE_RECORDS,
   STORAGE_SCHEMA_VERSION,
   StorageMetaSchema,
+  type RequestBudget,
 } from '../../../src/domain/storage/schema';
+import { GoogleCredentialsSchema, type Lane } from '../../../src/domain/types';
 
 const EXAMPLES_DIR = path.join(import.meta.dirname, 'examples');
 const example = (name: string): unknown =>
@@ -100,6 +104,22 @@ describe('storage schema v1', () => {
   it('keys ItemId records by positive integer ids', () => {
     const tracked = STORAGE_RECORDS[STORAGE_KEYS.tracked].schema;
     expect(tracked.safeParse({ abc: example('TrackedItem') }).success).toBe(false);
+  });
+
+  it('accepts a request budget that has used only some lanes, and rejects unknown lanes', () => {
+    const day = '2026-10-07';
+    expect(RequestBudgetSchema.parse({ day, used: {} })).toEqual({ day, used: {} });
+    expect(RequestBudgetSchema.parse({ day, used: { snipe: 3 } })).toEqual({ day, used: { snipe: 3 } });
+    const full = { day, used: { interactive: 12, background: 20, snipe: 0, canary: 1 } };
+    expect(RequestBudgetSchema.parse(full)).toEqual(full);
+    expect(RequestBudgetSchema.safeParse({ day, used: { bulk: 1 } }).success).toBe(false);
+    expectTypeOf<RequestBudget['used']>().toEqualTypeOf<Partial<Record<Lane, number>>>();
+  });
+
+  it('keeps calendarId in one place: sbw:calendar, not the Google credentials', () => {
+    const credentials = { ...(example('GoogleCredentials') as object), calendarId: 'example@group.calendar.google.com' };
+    expect(GoogleCredentialsSchema.parse(credentials)).not.toHaveProperty('calendarId');
+    expect(CalendarStateSchema.parse(example('CalendarState'))).toHaveProperty('calendarId');
   });
 
   it('versions the store through sbw:meta.schemaVersion', () => {

@@ -100,7 +100,14 @@ export const DetailCacheEntrySchema = z.object({ detail: ItemDetailSchema, expir
 export type DetailCacheEntry = z.infer<typeof DetailCacheEntrySchema>;
 
 /** One `sbw:shippingCache` entry, keyed "itemId:zip" (24 h TTL). */
-export const ShippingCacheEntrySchema = z.object({ cents: CentsSchema, expiresAt: EpochMsSchema });
+export const ShippingCacheEntrySchema = z.object({
+  /**
+   * Shipping + handling combined, in cents: the part of the landed cost added
+   * to currentPrice (landed cost = currentPrice + shipping + handling, §3.5).
+   */
+  cents: CentsSchema,
+  expiresAt: EpochMsSchema,
+});
 export type ShippingCacheEntry = z.infer<typeof ShippingCacheEntrySchema>;
 
 /** `sbw:favoritesCache`: one list read per job run. */
@@ -109,6 +116,7 @@ export type FavoritesCache = z.infer<typeof FavoritesCacheSchema>;
 
 /** `sbw:calendar`: event id generations per item. */
 export const CalendarStateSchema = z.object({
+  /** The dedicated calendar's id (`CalendarSink.ensureCalendar()`); its only home. */
   calendarId: z.string().optional(),
   links: z.record(ItemIdSchema, CalendarLinkSchema),
 });
@@ -126,10 +134,13 @@ export const AuditMetaSchema = z.object({
 });
 export type AuditMeta = z.infer<typeof AuditMetaSchema>;
 
-/** `sbw:requestBudget`; budgets reset at local midnight. */
+/**
+ * `sbw:requestBudget`; budgets reset at local midnight. `used` is partial: a
+ * lane with no requests yet today has no entry (read a missing lane as 0).
+ */
 export const RequestBudgetSchema = z.object({
   day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  used: z.record(LaneSchema, z.number().int().nonnegative()),
+  used: z.partialRecord(LaneSchema, z.number().int().nonnegative()),
 });
 export type RequestBudget = z.infer<typeof RequestBudgetSchema>;
 

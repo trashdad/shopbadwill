@@ -28,6 +28,7 @@ const LAYER_ZONES = [
       './domain/snipe/types.ts',
       './domain/calendar/types.ts',
       './domain/audit/types.ts',
+      './domain/storage/schema.ts',
     ],
     message: 'src/adapters may import only src/adapters, src/ports and domain types (PLAN §2.1).',
   },

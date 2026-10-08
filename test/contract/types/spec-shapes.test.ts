@@ -31,6 +31,7 @@ import type {
   CheckCaps,
   ComputeFireAt,
   Effect,
+  LeadMs,
   Reduce,
   Snipe,
   SnipeEvent,
@@ -66,6 +67,15 @@ import type {
   StepOutcome,
   Watch,
 } from '../../../src/domain/watches/schema';
+import type {
+  MsgPayload,
+  MsgReply,
+  MsgType,
+  PortName,
+  PortTick,
+  SnipeCountdownTick,
+} from '../../../src/messaging/protocol';
+import type { MessagingClient } from '../../../src/ports/messaging';
 import type { RequestScheduler } from '../../../src/ports/request-scheduler';
 import type { SearchQueryFromUrl, SearchQueryToUrl } from '../../../src/ports/sgw-api';
 
@@ -490,7 +500,13 @@ interface SpecGoogleCredentials {
   grantedScopes: string[];
   connectedAt: EpochMs;
   account?: string;
-  calendarId?: string;
+}
+
+// ── §2.1 Messaging port (fix round 1) ───────────────────────────────────────
+interface SpecMessagingClient {
+  send<K extends MsgType>(type: K, payload: MsgPayload<K>): Promise<MsgReply<K>>;
+  connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void): () => void;
+  onBroadcast<K extends 'rules.changed' | 'switches.changed'>(type: K, cb: (payload: MsgPayload<K>) => void): () => void;
 }
 
 describe('§3 shapes (type level)', () => {
@@ -573,6 +589,7 @@ describe('§3 shapes (type level)', () => {
     expectTypeOf<SnipeEvent>().toEqualTypeOf<SpecSnipeEvent>();
     expectTypeOf<Effect['kind']>().toEqualTypeOf<SpecEffectKind>();
     expectTypeOf<Effect['snipeId']>().toEqualTypeOf<string>();
+    expectTypeOf<LeadMs>().toEqualTypeOf<number>();
     expectTypeOf<CapsCheck>().toEqualTypeOf<SpecCapsCheck>();
     expectTypeOf<CapsResult>().toEqualTypeOf<SpecCapsResult>();
     expectTypeOf<Reduce>().toEqualTypeOf<
@@ -590,5 +607,12 @@ describe('§3 shapes (type level)', () => {
     expectTypeOf<Settings>().toEqualTypeOf<SpecSettings>();
     expectTypeOf<SgwSessionRecord>().toEqualTypeOf<SpecSgwSessionRecord>();
     expectTypeOf<GoogleCredentials>().toEqualTypeOf<SpecGoogleCredentials>();
+  });
+
+  it('§2.1 / §3.12 Messaging port', () => {
+    expectTypeOf<MessagingClient>().toEqualTypeOf<SpecMessagingClient>();
+    expectTypeOf<PortName>().toEqualTypeOf<'sbw:snipe-countdown' | 'sbw:job-progress'>();
+    expectTypeOf<PortTick<'sbw:snipe-countdown'>>().toEqualTypeOf<SnipeCountdownTick>();
+    expectTypeOf<PortTick<'sbw:job-progress'>>().toEqualTypeOf<SpecJobRun>();
   });
 });

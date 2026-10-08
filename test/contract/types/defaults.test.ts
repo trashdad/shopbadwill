@@ -1,13 +1,15 @@
 // §15 user answers encoded as defaults (I-09), and the §3.4 lane table.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 
 import {
   DEFAULT_CAPS,
   DEFAULT_FAVORITE_WITHIN_HOURS,
   DEFAULT_SETTINGS,
   DEFAULT_WATCH_FAVORITE_MODE,
+  defaultSettings,
+  type DeepReadonly,
 } from '../../../src/domain/settings/defaults';
-import { SettingsSchema } from '../../../src/domain/settings/schema';
+import { SettingsSchema, type Settings } from '../../../src/domain/settings/schema';
 import { DEFAULT_LANES } from '../../../src/domain/types';
 import { WatchSchema } from '../../../src/domain/watches/schema';
 
@@ -54,13 +56,36 @@ describe('Settings defaults', () => {
     expect(DEFAULT_SETTINGS.ntfy).toBeUndefined();
   });
 
-  it('are deeply frozen, so no consumer can change the shared defaults', () => {
+  it('are deeply frozen and deeply readonly, so no consumer can change the shared constant', () => {
     expect(Object.isFrozen(DEFAULT_SETTINGS)).toBe(true);
     expect(Object.isFrozen(DEFAULT_SETTINGS.snipe.caps)).toBe(true);
     expect(Object.isFrozen(DEFAULT_SETTINGS.calendar.reminders)).toBe(true);
     expect(() => {
-      (DEFAULT_SETTINGS.dryRun as { bidding: boolean }).bidding = false;
+      // @ts-expect-error -- nested writes are compile errors (DeepReadonly), not just runtime TypeErrors
+      DEFAULT_SETTINGS.dryRun.bidding = false;
     }).toThrow(TypeError);
+    expect(() => {
+      // @ts-expect-error -- arrays are readonly too
+      DEFAULT_SETTINGS.calendar.reminders[0] = 1;
+    }).toThrow(TypeError);
+    expectTypeOf(DEFAULT_SETTINGS).toEqualTypeOf<DeepReadonly<Settings>>();
+  });
+
+  it('defaultSettings() returns a fresh, writable copy for consumers that change settings', () => {
+    const a = defaultSettings();
+    const b = defaultSettings();
+    expectTypeOf(a).toEqualTypeOf<Settings>();
+    expect(a).toEqual(DEFAULT_SETTINGS);
+    expect(a).not.toBe(b);
+    expect(Object.isFrozen(a)).toBe(false);
+    expect(Object.isFrozen(a.snipe.caps)).toBe(false);
+    a.dryRun.bidding = false;
+    a.calendar.reminders.push(1);
+    a.snipe.caps.perItemMax = 1;
+    expect(b.dryRun.bidding).toBe(true);
+    expect(DEFAULT_SETTINGS.dryRun.bidding).toBe(true);
+    expect(DEFAULT_SETTINGS.calendar.reminders).toEqual([60, 15, 5]);
+    expect(DEFAULT_CAPS.perItemMax).toBe(5000);
   });
 
   it('reject a Settings record of another schema version', () => {

@@ -50,8 +50,14 @@ export const SnipeOutcomeSchema = z.enum([
 ]);
 export type SnipeOutcome = z.infer<typeof SnipeOutcomeSchema>;
 
-/** Snipe lead time: configurable 3–30 s (§3.9); the default (8 s) is in settings/defaults.ts. */
+/**
+ * Snipe lead time in whole milliseconds: configurable 3–30 s (§3.9); the
+ * default (8 s) is in settings/defaults.ts. `.int()` is strict: a computed
+ * lead (e.g. T-90's clamp(p99 one-way latency + 5 s, 6 s, 15 s)) must be
+ * rounded (Math.round) before it is stored or armed.
+ */
 export const LeadMsSchema = z.number().int().min(3000).max(30000);
+export type LeadMs = z.infer<typeof LeadMsSchema>;
 
 const FallbackSchema = z.enum(['early-proxy', 'skip']);
 
@@ -134,16 +140,25 @@ export const EffectSchema = z.discriminatedUnion('kind', [
   /** Take clock samples per T-81's policy; the runner reports back with `verified` / `verify-failed`. */
   z.object({ kind: z.literal('sampleClock'), snipeId: SnipeIdSchema }),
   /**
-   * Read ItemDetail on lane `snipe`. `verify`: the T−60 s read (→ `verified` /
-   * `verify-failed`); `post-read`: the outcome read (→ `post-read`); `measure`:
-   * the dry-run read at fire time that measures real latency.
+   * Read ItemDetail on lane `snipe`; the runner then dispatches:
+   * - `verify` (the T−60 s read) → `verified`, or `verify-failed` with its reason;
+   * - `post-read` (the outcome read after `sent`, a `result` or `ambiguous`) → `post-read`;
+   * - `measure` (dry run only: the harmless read at fire time, in place of
+   *   PlaceBid, that measures real latency) → `post-read` with the detail it
+   *   read; the reducer resolves the snipe with outcome 'dry-run'.
    */
   z.object({
     kind: z.literal('readDetail'),
     snipeId: SnipeIdSchema,
     purpose: z.enum(['verify', 'post-read', 'measure']),
   }),
-  /** Send PlaceBid once; `amount` is derived only from `Snipe.maxBid`. The runner supplies the idempotency key (→ `sent`). */
+  /**
+   * Send PlaceBid at most once; `amount` is derived only from `Snipe.maxBid`.
+   * The runner (T-101's SendStrategy) generates the idempotency key, persists
+   * it as `attempt.idempotencyKey` and dispatches `sent { key }` BEFORE the
+   * request leaves, so a restarted worker treats the attempt as sent (§3.9
+   * idempotency rule); then it dispatches `result` or `ambiguous`.
+   */
   z.object({ kind: z.literal('placeBid'), snipeId: SnipeIdSchema, amount: CentsSchema }),
   z.object({ kind: z.literal('notify'), snipeId: SnipeIdSchema, title: z.string(), message: z.string() }),
   /** `CalendarSink.stamp(itemId, outcome, finalPrice)`. */

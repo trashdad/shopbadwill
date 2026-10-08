@@ -22,6 +22,12 @@ export class HttpTimeoutError extends Error {
  * Thrown by Http.send on a network failure. `beforeSend` is true only when the
  * implementation can prove no request bytes left (§3.9: only then is a bid
  * proven not to have arrived); it defaults to false (ambiguous).
+ *
+ * T-34's fetch adapter may set `beforeSend: true` only when it throws without
+ * having called fetch(): the request could not be built (bad URL, headers or
+ * body), or `navigator.onLine` was false when it checked just before the call.
+ * Any rejection from fetch() itself (TypeError "Failed to fetch", DNS, TLS,
+ * connection reset, abort) is `false`: fetch does not report whether bytes left.
  */
 export class HttpNetworkError extends Error {
   override readonly name = 'HttpNetworkError';

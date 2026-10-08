@@ -14,6 +14,7 @@ import * as googleAuth from '../../../src/ports/google-auth';
 import * as http from '../../../src/ports/http';
 import * as keepAlive from '../../../src/ports/keep-alive';
 import * as keepAwake from '../../../src/ports/keep-awake';
+import * as messaging from '../../../src/ports/messaging';
 import * as notifier from '../../../src/ports/notifier';
 import * as permissions from '../../../src/ports/permissions';
 import * as requestScheduler from '../../../src/ports/request-scheduler';
@@ -36,6 +37,7 @@ const INTERFACE_MODULES: Record<string, object> = {
   'http.ts': http,
   'keep-alive.ts': keepAlive,
   'keep-awake.ts': keepAwake,
+  'messaging.ts': messaging,
   'notifier.ts': notifier,
   'permissions.ts': permissions,
   'request-scheduler.ts': requestScheduler,

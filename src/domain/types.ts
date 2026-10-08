@@ -237,7 +237,10 @@ export const SgwSessionRecordSchema = z.object({
 });
 export type SgwSessionRecord = z.infer<typeof SgwSessionRecordSchema>;
 
-/** Stored at `sbw:google`. */
+/**
+ * Stored at `sbw:google`. The dedicated calendar's id is NOT here: its one
+ * home is `CalendarState.calendarId` (`sbw:calendar`, src/domain/storage/schema.ts).
+ */
 export const GoogleCredentialsSchema = z.object({
   provider: z.enum(['pkce', 'chrome-identity']),
   clientId: z.string().min(1),
@@ -246,6 +249,5 @@ export const GoogleCredentialsSchema = z.object({
   grantedScopes: z.array(z.string()),
   connectedAt: EpochMsSchema,
   account: z.string().optional(),
-  calendarId: z.string().optional(),
 });
 export type GoogleCredentials = z.infer<typeof GoogleCredentialsSchema>;

@@ -59,7 +59,13 @@ export const GcalEventBodySchema = z.object({
 });
 export type GcalEventBody = z.infer<typeof GcalEventBodySchema>;
 
-/** An event as Calendar returns it; `status` is required and may be 'tentative'. */
+/**
+ * An event as `CalendarApi` returns it: the NORMALIZED form, with `status`
+ * required (it may be 'tentative'). Google's raw responses can omit fields
+ * (a cancelled event may carry little more than id and status) or carry
+ * extras; T-64 parses them with its own lenient schemas
+ * (src/adapters/google/schemas.ts) and normalizes them to this shape.
+ */
 export const GcalEventSchema = GcalEventBodySchema.extend({
   id: z.string().min(1),
   status: z.enum(['confirmed', 'tentative', 'cancelled']),

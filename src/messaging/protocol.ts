@@ -37,13 +37,18 @@ const signal = <T extends string>(type: T) => z.object({ type: z.literal(type) }
 
 const ItemIdPayload = z.object({ itemId: ItemIdSchema });
 const IdPayload = z.object({ id: z.string().min(1) });
-/** Tap data is untrusted (I-27): a relayed token must at least be JWT-shaped. */
+/**
+ * Tap data is untrusted (I-27): a relayed token must at least be JWT-shaped.
+ * It is the bare JWT, without the "Bearer " prefix of the Authorization
+ * header (the tap strips it).
+ */
 const JwtSchema = z.string().regex(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/);
 
 export const MsgSchema = z.discriminatedUnion('type', [
   // ── content → background (§2.4 rule 3: the only types content may send) ──
   msg('page.listings', z.object({ url: z.string(), listings: z.array(ListingSchema), capturedAt: EpochMsSchema })),
   msg('page.detail', z.object({ detail: ItemDetailSchema })),
+  /** `bearer` is the bare JWT: no "Bearer " prefix. */
   msg('page.token', z.object({ bearer: JwtSchema, capturedAt: EpochMsSchema })),
   /** Card-selector report for health (I-08). */
   msg(
@@ -91,6 +96,12 @@ export const MsgSchema = z.discriminatedUnion('type', [
   signal('calendar.syncNow'),
   msg('calendar.ics', z.object({ itemIds: z.array(ItemIdSchema) })),
   msg('snipe.prepare', ItemIdPayload),
+  /**
+   * The handler (T-84) sets `state`, `history` and `armedAt` itself, and must
+   * also reset the runner-owned fields the payload may carry: `attempt`
+   * (→ {}), and clear `fireAt`, `wakeAlarm`, `measured`, `outcome` and
+   * `outcomeDetail`. It never trusts them from the UI.
+   */
   msg(
     'snipe.arm',
     z.object({
@@ -170,6 +181,11 @@ export const MSG_SENDER = Object.freeze({
 
 /** Every message type, in §3.12 order. */
 export const MSG_TYPES = Object.freeze(Object.keys(MSG_SENDER) as MsgType[]);
+
+/** The background → content/UI broadcasts ('rules.changed', 'switches.changed'). */
+export type MsgBroadcastType = {
+  [K in MsgType]: (typeof MSG_SENDER)[K] extends 'background' ? K : never;
+}[MsgType];
 
 /** Reply schemas for the §3.12 types that declare a `reply`. */
 export const MsgReplySchemas = Object.freeze({
