@@ -192,3 +192,19 @@ describe('AuditLog header-like and key-family leaks (raw storage dump)', () => {
     expect(e.details).toEqual({ author: 'bob' });
   });
 });
+
+describe('AuditLog escaped quotes (raw storage dump)', () => {
+  const dump = () => JSON.stringify(areas.local.dump());
+  const cases: Array<[string, string, string]> = [
+    ['escaped dq in header', String.raw`{"authorization":"Basic a\"b ESCSEC1"}`, 'ESCSEC1'],
+    ['escaped sq in header', String.raw`{'authorization':'Basic a\'b ESCSEC2'}`, 'ESCSEC2'],
+    ['escaped dq in key value', String.raw`{"password":"a\"b ESCSEC3"}`, 'ESCSEC3'],
+    ['escaped sq in key value', String.raw`password='a\'b ESCSEC4'`, 'ESCSEC4'],
+  ];
+  for (const [name, text, secret] of cases) {
+    it('redacts ' + name, async () => {
+      await log.append({ ...base, details: { t: text }, ref: text });
+      expect(dump()).not.toContain(secret);
+    });
+  }
+});

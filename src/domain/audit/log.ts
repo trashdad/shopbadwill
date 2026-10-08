@@ -22,10 +22,10 @@ const JWT_RE = /eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g;
 const BEARER_VALUE_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{6,}/gi;
 // key=value / key: value / "key":"value" secrets embedded in text.
 const KEYVAL_RE =
-  /(["']?)((?:access_?token|refresh_?token|id_?token|token|password|passwd|pwd|passphrase|secret|bearer|api[_-]?key|credentials?|session)[\w-]*|(?<![A-Za-z0-9])auth(?![A-Za-z0-9]))(["']?)(?:\s*[:=]\s*|%3[AD])("[^"]*"|'[^']*'|[^\s,&;}]+)/gi;
+  /(["']?)((?:access_?token|refresh_?token|id_?token|token|password|passwd|pwd|passphrase|secret|bearer|api[_-]?key|credentials?|session)[\w-]*|(?<![A-Za-z0-9])auth(?![A-Za-z0-9]))(["']?)(?:\s*[:=]\s*|%3[AD])("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,&;}]+)/gi;
 // Header-like keys: the WHOLE value (Basic x y, a=1; sid=2; Path=/) goes, not just its first word.
 const HEADER_RE =
-  /(["']?)([\w-]*(?:authorization|cookie)[\w-]*)(["']?)(?:\s*[:=]\s*|%3[AD])("[^"]*"|'[^']*'|[^\r\n}]*)/gi;
+  /(["']?)([\w-]*(?:authorization|cookie)[\w-]*)(["']?)(?:\s*[:=]\s*|%3[AD])("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\r\n}]*)/gi;
 const MAX_KEY_LENGTH = 100;
 
 export function isSecretKey(key: string): boolean {
