@@ -1,0 +1,82 @@
+{
+  "runId": "2026-10-08T03-28-05-772Z",
+  "pilot": false,
+  "startedAt": 1791430085787,
+  "skewMs": 1300,
+  "latencyMs": 150,
+  "placeBidStallMs": {
+    "main": 25000,
+    "long": 45000
+  },
+  "sgw": {
+    "main": "http://127.0.0.1:50117",
+    "long": "http://127.0.0.1:50118"
+  },
+  "collector": "http://127.0.0.1:50119",
+  "common": {
+    "holdLeadMs": 110000,
+    "verifyLeadMs": 60000,
+    "releaseAfterMs": 30000,
+    "gapMs": 60000,
+    "recoverAfterMs": 40000,
+    "hbIntervalMs": 20000,
+    "tickMs": 5000,
+    "leadMs": 8000,
+    "sampleGapMs": 20000,
+    "finalHopMs": 20,
+    "itemId": 279250057
+  },
+  "lanes": [
+    {
+      "browser": "firefox",
+      "cycles": 6,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "lane": "firefox-runner1",
+      "mode": "runner",
+      "runner": true,
+      "firstWakeDelayMs": 60000
+    },
+    {
+      "browser": "firefox",
+      "cycles": 6,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "lane": "firefox-base1",
+      "mode": "main",
+      "firstWakeDelayMs": 127000
+    },
+    {
+      "browser": "firefox",
+      "cycles": 6,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "lane": "firefox-runner2",
+      "mode": "runner",
+      "runner": true,
+      "firstWakeDelayMs": 194000
+    }
+  ],
+  "host": {
+    "platform": "Windows_NT 10.0.26200",
+    "cpus": 24,
+    "cpuModel": "Intel(R) Core(TM) Ultra 9 275HX",
+    "memGb": 31,
+    "node": "v25.7.0"
+  },
+  "chromium": "C:\\Users\\insan\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe",
+  "firefox": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+  "endedAt": 1791431429227,
+  "stopReason": "all lanes done",
+  "lanesDone": [
+    "firefox-runner1",
+    "firefox-base1",
+    "firefox-runner2"
+  ]
+}

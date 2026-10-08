@@ -1,0 +1,84 @@
+{
+  "runId": "2026-10-08T06-35-08-236Z",
+  "pilot": false,
+  "startedAt": 1791441308258,
+  "skewMs": 1300,
+  "latencyMs": 150,
+  "placeBidStallMs": {
+    "main": 25000,
+    "long": 45000
+  },
+  "sgw": {
+    "main": "http://127.0.0.1:64386",
+    "long": "http://127.0.0.1:64388"
+  },
+  "collector": "http://127.0.0.1:64389",
+  "common": {
+    "holdLeadMs": 300000,
+    "verifyLeadMs": 60000,
+    "releaseAfterMs": 90000,
+    "gapMs": 90000,
+    "recoverAfterMs": 100000,
+    "hbIntervalMs": 20000,
+    "tickMs": 5000,
+    "leadMs": 8000,
+    "sampleGapMs": 20000,
+    "finalHopMs": 20,
+    "itemId": 279250057
+  },
+  "lanes": [
+    {
+      "lane": "firefox-main1",
+      "browser": "firefox",
+      "mode": "main",
+      "cycles": 3,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 60000
+    },
+    {
+      "lane": "firefox-main2",
+      "browser": "firefox",
+      "mode": "main",
+      "cycles": 3,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 97000
+    },
+    {
+      "lane": "firefox-main3",
+      "browser": "firefox",
+      "mode": "main",
+      "cycles": 3,
+      "heartbeat": true,
+      "hbStopAtFire": false,
+      "abortMs": 20000,
+      "sgwKey": "main",
+      "firstWakeDelayMs": 134000
+    }
+  ],
+  "host": {
+    "platform": "Windows_NT 10.0.26200",
+    "cpus": 24,
+    "cpuModel": "Intel(R) Core(TM) Ultra 9 275HX",
+    "memGb": 31,
+    "node": "v25.7.0"
+  },
+  "chromium": "C:\\Users\\insan\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe",
+  "firefox": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+  "ffPrefs": {
+    "timer.maximum_firing_delay_tolerance_ms": "0.0",
+    "timer.minimum_firing_delay_tolerance_ms": "0.0"
+  },
+  "endedAt": 1791442800408,
+  "stopReason": "all lanes done",
+  "lanesDone": [
+    "firefox-main1",
+    "firefox-main2",
+    "firefox-main3"
+  ]
+}
