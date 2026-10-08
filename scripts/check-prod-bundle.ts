@@ -1,6 +1,6 @@
 // `pnpm check:prod-bundle`: greps the PRODUCTION outputs (.output/chrome-mv3,
 // .output/firefox-mv3) for tokens that must never ship, and fails on any hit:
-//   127.0.0.1  localhost  SBW_TEST  __scenario  innerHTML  eval(  new Function
+//   127.0.0.1  localhost  SBW_TEST  __scenario  sbw:test  innerHTML  eval(  new Function
 //
 // Single allowlist entry: Preact's own `dangerouslySetInnerHTML` handling in the
 // chunk that contains the Preact runtime. Nothing else is exempt, and the same
@@ -23,6 +23,7 @@ export const FORBIDDEN = [
   { name: 'localhost', pattern: /localhost/g },
   { name: 'SBW_TEST', pattern: /SBW_TEST/g },
   { name: '__scenario', pattern: /__scenario/g },
+  { name: 'sbw:test', pattern: /sbw:test/g },
   { name: 'innerHTML', pattern: /innerHTML/g },
   { name: 'eval(', pattern: /\beval\s*\(/g },
   { name: 'new Function', pattern: /new\s+Function\b/g },
