@@ -1,0 +1,58 @@
+{
+  "voter": "05-ux",
+  "own": "E",
+  "scores": {
+    "A": {
+      "coverage": 5,
+      "accuracy": 7,
+      "executability": 7,
+      "testing_safety": 6,
+      "clarity": 6,
+      "overall": 5,
+      "best_element": "Calendar idempotency and unattended-auth details: base32hex event IDs (so a 'sgw' prefix is invalid), 409/cancelled-event handling, the 7-day refresh-token expiry in Testing, and a personal-use GCP setup guide as a deliverable.",
+      "biggest_weakness": "Lopsided toward Google auth: highlight/hide, SPA DOM handling, the ToU ban on extensions, prior art and UX/QoL are barely covered, and it states Favorite/Save notes as 256 chars where the source README says 500."
+    },
+    "B": {
+      "coverage": 7,
+      "accuracy": 7,
+      "executability": 9,
+      "testing_safety": 8,
+      "clarity": 8,
+      "overall": 7,
+      "best_element": "Reliability tiers T0/T1/T2 (extension-only catch-up; opt-in background permission plus keep-awake; optional companion), plus 'No automated test may favorite, bid or touch a real account'.",
+      "biggest_weakness": "Calls SGW's ToS stance on automation 'unverified' although the Terms explicitly ban browser extensions, and it sets a hard minimum (Chrome 148, no polyfill) based on speculative version facts."
+    },
+    "C": {
+      "coverage": 7,
+      "accuracy": 7,
+      "executability": 9,
+      "testing_safety": 10,
+      "clarity": 7,
+      "overall": 8,
+      "best_element": "A test pyramid with fail-closed runtime schema validation, test-only hooks compiled out of production (with a CI proof), and threat-model rows that each name the test proving the control.",
+      "biggest_weakness": "Thin on the domain: it marks the ToS stance as unknown despite the explicit ban, and its calendar sync, UX and QoL coverage is shallow. Its heavy 'non-negotiable' process risks over-constraining Fable."
+    },
+    "D": {
+      "coverage": 8,
+      "accuracy": 8,
+      "executability": 9,
+      "testing_safety": 9,
+      "clarity": 8,
+      "overall": 9,
+      "best_element": "A Site Adapter split into Dom, Api, Session and Clock adapters, with versioned selectors and a healthCheck() that auto-disables all write automation. It is fed by a read-only Task 0 recon spike whose fixtures all downstream tasks consume.",
+      "biggest_weakness": "Asks for Playwright e2e that loads the extension in Firefox, which Playwright cannot do. Prior art, UX surfaces and QoL depth are thin."
+    },
+    "F": {
+      "coverage": 6,
+      "accuracy": 8,
+      "executability": 7,
+      "testing_safety": 9,
+      "clarity": 7,
+      "overall": 6,
+      "best_element": "A mock buyerapi with injectable latency, clock skew, token expiry and soft-close; a cap on total open exposure (sum of armed maxes); and an exhaustive snipe-outcome classification.",
+      "biggest_weakness": "Over-invests in the nice-to-have snipe engine while highlight/hide, daily checks and calendar sync get a line each. It also assumes Playwright extension E2E works on Firefox."
+    }
+  },
+  "ranking": ["D", "C", "B", "F", "A"],
+  "rationale": "D beats C because it gives Fable verified, specific site facts: card DOM, string booleans, the Bid-cookie 403, JWT IP/UA binding, and naive-PT endTime. It also states the ToU ban on extensions correctly and mandates a fixture-fed adapter boundary whose health check disables writes. Together these make parallel worker tasks buildable and safe. C has the strongest test and safety discipline, but its domain facts are thinner, it misreports the ToS stance as unknown, and it says little about calendar sync or UX, so Fable would have to fill more gaps."
+}

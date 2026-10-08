@@ -1,0 +1,6 @@
+A=04-calendar
+B=01-architect
+C=06-qa
+D=02-recon
+E=05-ux
+F=03-sniper
