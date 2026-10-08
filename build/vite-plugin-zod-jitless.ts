@@ -48,17 +48,15 @@ const REWRITES: Record<string, Rewrite[]> = {
   'doc.js': [
     {
       description: 'Doc.compile() body (const F = Function; ... new F(...); factory(...))',
-      pattern: /compile\(\)\s*\{[\s\S]*?return factory\(\.\.\.Object\.values\(this\.closed\)\);\s*\}/g,
+      pattern: /compile\(\)\s*\{\s*const F = Function;[\s\S]*?return factory\(\.\.\.Object\.values\(this\.closed\)\);\s*\}/g,
       replacement: `compile() {\n        throw new Error(${JSON.stringify(UNAVAILABLE)});\n    }`,
     },
   ],
 };
 
 const SEP = String.raw`[\\/]`;
-const NOT_SEP = String.raw`[^\\/]+`;
-const ZOD_CORE_FILE = new RegExp(
-  `${SEP}node_modules${SEP}(?:\\.pnpm${SEP}${NOT_SEP}${SEP}node_modules${SEP})?zod${SEP}v4${SEP}core${SEP}(util|compile|doc)\\.js$`,
-);
+// Any zod copy (hoisted, or at any .pnpm/zod@<ver>/node_modules/zod path), ESM or CJS.
+const ZOD_CORE_FILE = new RegExp(`${SEP}zod${SEP}v4${SEP}core${SEP}(util|compile|doc)\\.c?js$`);
 const FORBIDDEN_AFTER = [/\bnew\s+F\b/, /\bnew\s+Function\b/, /\bFunction\s*\(/, /\beval\s*\(/, /=\s*Function\s*;/];
 
 function zodVersionFor(id: string): string {
@@ -74,13 +72,13 @@ function zodVersionFor(id: string): string {
 export function stripZodJit(code: string, id: string, version = zodVersionFor(id)): string | null {
   const file = ZOD_CORE_FILE.exec(id.split('?')[0] ?? id)?.[1];
   if (file === undefined) return null;
-  const name = `${file}.js`;
+  const name = `${file}.js`; // .cjs shares the same patterns
   let out = code;
   for (const { description, pattern, replacement } of REWRITES[name] ?? []) {
     const matches = out.match(pattern)?.length ?? 0;
     if (matches !== 1) {
       throw new Error(
-        `[vite-plugin-zod-jitless] zod ${version}: core/${name}: expected exactly 1 match for ${description}, found ${String(matches)}. ` +
+        `[vite-plugin-zod-jitless] zod ${version}: core/${file}: expected exactly 1 match for ${description}, found ${String(matches)}. ` +
           'zod changed its eval/JIT code; update build/vite-plugin-zod-jitless.ts (the build is refused so eval cannot ship).',
       );
     }
@@ -92,7 +90,7 @@ export function stripZodJit(code: string, id: string, version = zodVersionFor(id
   const left = FORBIDDEN_AFTER.find((p) => p.test(remaining));
   if (left) {
     throw new Error(
-      `[vite-plugin-zod-jitless] zod ${version}: core/${name}: Function-constructor/eval code (${String(left)}) remains after transform. ` +
+      `[vite-plugin-zod-jitless] zod ${version}: core/${file}: Function-constructor/eval code (${String(left)}) remains after transform. ` +
         'Update build/vite-plugin-zod-jitless.ts.',
     );
   }

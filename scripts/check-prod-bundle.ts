@@ -26,6 +26,14 @@ export const FORBIDDEN = [
   { name: 'innerHTML', pattern: /innerHTML/g },
   { name: 'eval(', pattern: /\beval\s*\(/g },
   { name: 'new Function', pattern: /new\s+Function\b/g },
+  // Function-constructor signatures that survive in a bundle even when the
+  // spellings above do not match (zod's JIT probe and compiler, which
+  // build/vite-plugin-zod-jitless.ts strips).
+  { name: 'new F("")', pattern: /\bnew\s+F\(\s*""/g },
+  { name: 'const F = Function', pattern: /\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*Function\b/g },
+  { name: '= Function;', pattern: /=\s*Function\s*[;,)]/g },
+  { name: 'Function("', pattern: /(?<!new\s+)\bFunction\s*\(\s*["'`]/g },
+  { name: '(0, eval)', pattern: /\(\s*0\s*,\s*eval\s*\)/g },
 ] as const;
 
 export interface Finding {

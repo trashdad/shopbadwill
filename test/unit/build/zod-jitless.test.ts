@@ -36,6 +36,34 @@ describe('zod jitless transform (real zod source)', () => {
   });
 });
 
+describe('zod jitless: CJS and duplicate copies', () => {
+  for (const file of ['util.cjs', 'compile.cjs', 'doc.cjs']) {
+    it(`${file}: real installed CJS source is transformed clean`, () => {
+      const out = stripZodJit(read(file), coreFile(file), VERSION);
+      expect(out).not.toBeNull();
+      const code = stripComments(out ?? '');
+      for (const p of EVAL_PATTERNS) expect(code).not.toMatch(p);
+    });
+  }
+
+  it('matches a second zod copy at any pnpm path, with forward or back slashes', () => {
+    const src = read('util.js');
+    const ids = [
+      '/r/node_modules/.pnpm/zod@3.99.0/node_modules/zod/v4/core/util.js',
+      String.raw`C:\r\node_modules\.pnpm\zod@4.6.5\node_modules\zod\v4\core\util.cjs`,
+      '/r/node_modules/dep/node_modules/zod/v4/core/util.js?v=abc',
+    ];
+    for (const id of ids) expect(stripZodJit(src, id, VERSION), id).not.toBeNull();
+    expect(stripZodJit(src, '/r/node_modules/zod/v4/mini/util.js', VERSION)).toBeNull();
+  });
+
+  it('doc rewrite is anchored on the Function constructor inside compile()', () => {
+    const decoy = ['class A { compile() { return 1; } }', read('doc.js')].join(String.fromCharCode(10));
+    const out = stripZodJit(decoy, coreFile('doc.js'), VERSION) ?? '';
+    expect(out).toContain('compile() { return 1; }');
+  });
+});
+
 describe('zod jitless guard', () => {
   it.each(['util.js', 'compile.js', 'doc.js'])('%s: throws naming the zod version when a pattern is absent', (file) => {
     expect(() => stripZodJit('export const nothing = 1;\n', coreFile(file), '9.9.9')).toThrow(/zod 9\.9\.9/);

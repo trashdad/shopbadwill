@@ -9,6 +9,7 @@ import {
   scanDirectory,
   scanText,
 } from '../../../scripts/check-prod-bundle';
+import { stripZodJit } from '../../../build/vite-plugin-zod-jitless';
 
 // The real, minified Preact runtime (what Vite bundles), so the allowlist is
 // tested against Preact's actual innerHTML statement, not a hand-written copy.
@@ -119,5 +120,38 @@ describe('check-prod-bundle: Preact innerHTML allowlist', () => {
   it('still flags other forbidden tokens inside the Preact chunk', () => {
     const findings = scanText('p.js', `${preactSource};eval("x");`);
     expect(findings.map((f) => f.token)).toEqual(['eval(']);
+  });
+});
+
+describe('check-prod-bundle: zod Function-constructor signatures', () => {
+  const zodCore = path.join(path.dirname(require.resolve('zod/package.json')), 'v4', 'core');
+  const coreId = (name: string) => path.join(zodCore, name);
+
+  it('fails on zod original JIT sources (ESM and CJS), including a minified-style probe', async () => {
+    for (const name of ['util.js', 'compile.js', 'doc.js', 'util.cjs']) {
+      const findings = scanText(name, await readFile(coreId(name), 'utf8'));
+      expect(findings.length, name).toBeGreaterThan(0);
+    }
+    const tokens = scanText('util.js', await readFile(coreId('util.js'), 'utf8')).map((f) => f.token);
+    expect(tokens).toEqual(expect.arrayContaining(['const F = Function', 'new F("")']));
+    expect(scanText('m.js', 'try{const F=Function;return new F(""),!0}catch{return!1}').length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ['= Function;', 'var x=Function;'],
+    ['Function("', 'Function("return this")()'],
+    ['(0, eval)', '(0,eval)("1")'],
+  ])('flags %s', (token, code) => {
+    expect(scanText('a.js', code).map((f) => f.token)).toContain(token);
+  });
+
+  it('passes the transformed zod sources', async () => {
+    for (const name of ['util.js', 'compile.js', 'doc.js', 'util.cjs', 'compile.cjs', 'doc.cjs']) {
+      const out = stripZodJit(await readFile(coreId(name), 'utf8'), coreId(name));
+      expect(out, name).not.toBeNull();
+      // Comments mention `new Function`; bundlers strip them from production output.
+      const code = (out ?? '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      expect(scanText(name, code), name).toEqual([]);
+    }
   });
 });
