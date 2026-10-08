@@ -94,7 +94,7 @@ interface SpecListing {
   categoryId?: number;
   categoryPath?: string;
   shippingPrice?: Cents | null;
-  pickupOnly: boolean;
+  pickupOnly?: boolean;
   buyNowPrice?: Cents | null;
   imageUrl?: string;
   isFavorite?: boolean;
@@ -103,6 +103,7 @@ interface SpecListing {
   observedAt: EpochMs;
 }
 interface SpecItemDetail extends SpecListing {
+  pickupOnly: boolean;
   minimumBid: Cents;
   bidIncrement: Cents;
   serverTime: IsoUtc;

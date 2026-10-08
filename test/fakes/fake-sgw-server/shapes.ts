@@ -66,12 +66,16 @@ export const ItemDetailResponseSchema = z.object({
   pickupOnly: z.boolean(),
   shippingPrice: z.number().nullable(),
   isClosed: z.boolean(),
-  inWatchlist: z.boolean().nullable(),
-  bidHistory: z.array(z.object({ bidAmount: z.number(), bidTime: NaivePacificSchema, bidderName: z.string() })),
+  inWatchlist: z.boolean(),
+  bidHistory: z.object({
+    auctionClosed: z.boolean(),
+    isHighBidderLogIn: z.boolean(),
+    bidComplete: z.array(z.object({ bidAmount: z.number(), bidTime: NaivePacificSchema, bidderName: z.string() })),
+  }),
 });
 
-/** POST Dashboard/GetCurrentTime: a JSON string, naive Pacific, seconds only. */
-export const GetCurrentTimeResponseSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/);
+/** POST Dashboard/GetCurrentTime: the SGW envelope; data is "MM/dd/yyyy HH:mm:ss" Pacific (S-1). */
+export const GetCurrentTimeResponseSchema = z.object({ status: z.boolean(), data: z.string().regex(/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/) });
 
 /** Shape unverified on the real site (fable-prompt flags it). */
 export const CalculateShippingRequestSchema = z.looseObject({ itemId: z.number().int(), zipCode: z.string() });
@@ -88,7 +92,7 @@ export const FavoriteRowSchema = z.object({
   title: z.string(),
   currentPrice: z.number(),
 });
-export const FavoritesResponseSchema = z.array(FavoriteRowSchema);
+export const FavoritesResponseSchema = z.object({ status: z.boolean(), data: z.array(FavoriteRowSchema) });
 
 export const FavoriteSaveRequestSchema = z.object({ notes: z.string(), watchlistId: z.number().int() });
 
@@ -101,7 +105,7 @@ export const SavedSearchRowSchema = z.object({
   lowPrice: z.number(),
   highPrice: z.number(),
 });
-export const SavedSearchesResponseSchema = z.array(SavedSearchRowSchema);
+export const SavedSearchesResponseSchema = z.object({ status: z.boolean(), data: z.array(SavedSearchRowSchema) });
 
 export const ShowBidModalResponseSchema = z.object({ sellerId: z.number().int(), minimumBid: z.number() });
 export const PlaceBidRequestSchema = z.object({

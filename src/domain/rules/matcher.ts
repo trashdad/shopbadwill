@@ -186,6 +186,7 @@ function evalCondition(c: Condition, l: Listing, ctx: MatchContext, entry: Compi
       return yes('bids', `${String(l.numBids)} bids (${range(c.min, c.max, String)})`);
     }
     case 'pickupOnly': {
+      if (l.pickupOnly === undefined) return UNKNOWN;
       if (l.pickupOnly !== c.value) return NO;
       return yes('pickup', c.value ? 'pickup only' : 'ships (not pickup only)');
     }

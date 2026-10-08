@@ -59,7 +59,8 @@ export const ListingSchema = z.object({
   categoryPath: z.string().optional(),
   /** null = calculated, unknown until quoted. */
   shippingPrice: CentsSchema.nullable().optional(),
-  pickupOnly: z.boolean(),
+  /** undefined = unknown (search rows carry no pickup flag); ItemDetail requires it. */
+  pickupOnly: z.boolean().optional(),
   buyNowPrice: CentsSchema.nullable().optional(),
   imageUrl: z.string().optional(),
   /** Only meaningful when the request was authenticated. */
@@ -71,6 +72,7 @@ export const ListingSchema = z.object({
 export type Listing = z.infer<typeof ListingSchema>;
 
 export const ItemDetailSchema = ListingSchema.extend({
+  pickupOnly: z.boolean(),
   /** Next acceptable bid (detail value; use THIS for caps and snipes). */
   minimumBid: CentsSchema,
   bidIncrement: CentsSchema,

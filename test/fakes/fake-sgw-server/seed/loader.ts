@@ -25,6 +25,8 @@ export const SeedItemSchema = z.object({
   endsInMs: z.number().optional(),
   sellerId: z.number().int(),
   sellerName: z.string(),
+  /** The seller's 2-letter state, when known (fixture-seeded items); detail `pickupState`. */
+  sellerState: z.string().optional(),
   categoryId: z.number().int(),
   pickupOnly: z.boolean(),
   shippingPrice: z.number().nullable(),
