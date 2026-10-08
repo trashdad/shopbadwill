@@ -1,7 +1,14 @@
 import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_CAPS } from '../../../../src/domain/settings/defaults';
-import { checkCaps, exposure, localDayKey, spentToday, typoCheck } from '../../../../src/domain/snipe/caps';
+import {
+  checkCaps as realCheckCaps,
+  confirmsAmount,
+  exposure,
+  localDayKey,
+  spentToday,
+  typoCheck,
+} from '../../../../src/domain/snipe/caps';
 import type { CheckCaps, Snipe } from '../../../../src/domain/snipe/types';
 import type { ItemDetail } from '../../../../src/domain/types';
 
@@ -52,14 +59,23 @@ function detail(over: Partial<ItemDetail> = {}): ItemDetail {
   };
 }
 
+// Default detail so tests that are not about detail pass one (checkCaps fails closed without it).
+const checkCaps = (
+  s: Snipe,
+  o: readonly Snipe[],
+  spent: number,
+  caps: typeof CAPS,
+  d: ItemDetail | undefined = detail({ currentPrice: 500, minimumBid: 600 }),
+) => realCheckCaps(s, o, spent, caps, d);
+
 // Compile-time check: checkCaps is assignable to the frozen CheckCaps type.
-const asContract: CheckCaps = checkCaps;
+const asContract: CheckCaps = realCheckCaps;
 
 const has = (r: { violations: string[] }, kind: string): boolean => r.violations.some((v) => v.startsWith(kind));
 
 describe('checkCaps', () => {
   it('passes a small bid with nothing else going on', () => {
-    expect(asContract(snipe(), [], 0, CAPS)).toEqual({
+    expect(checkCaps(snipe(), [], 0, CAPS)).toEqual({
       ok: true,
       violations: [],
     });
@@ -93,7 +109,7 @@ describe('checkCaps', () => {
   });
 
   it('exposure counts every armed snipe as a potential win, plus shipping and handling', () => {
-    const caps = { ...CAPS, typoAbsolute: 100000, openExposureMax: 20000 };
+    const caps = { ...CAPS, perDayMax: 1000000, openExposureMax: 20000 };
     const others = [
       snipe({ id: 'a', maxBid: 5000, estShipping: 500 }),
       snipe({
@@ -132,6 +148,65 @@ describe('checkCaps', () => {
     );
   });
 
+  it('fails closed without detail', () => {
+    const r = realCheckCaps(snipe(), [], 0, CAPS);
+    expect(r.ok).toBe(false);
+    expect(has(r, 'per-item')).toBe(true);
+    expect(r.violations[0]).toContain('detail required');
+    expect(asContract(snipe(), [], 0, CAPS).ok).toBe(false);
+    expect(realCheckCaps(snipe(), [], 0, CAPS, detail()).ok).toBe(true);
+  });
+
+  it('rejects bad inputs with a violation instead of throwing', () => {
+    for (const bad of [{ maxBid: -1 }, { maxBid: 1.5 }, { estShipping: -5 }, { estHandling: 0.5 }, { maxBid: NaN }]) {
+      const r = checkCaps(snipe(bad), [], 0, CAPS);
+      expect(r.ok).toBe(false);
+      expect(has(r, 'invalid')).toBe(true);
+    }
+    expect(has(checkCaps(snipe(), [], -1, CAPS), 'invalid')).toBe(true);
+  });
+
+  it('a negative shipping estimate on another snipe never reduces the totals', () => {
+    const caps = { ...CAPS, openExposureMax: 1500 };
+    const others = [snipe({ id: 'a', maxBid: 1000, estShipping: -900 })];
+    expect(has(checkCaps(snipe({ maxBid: 600 }), others, 0, caps), 'exposure')).toBe(true);
+  });
+
+  describe('per-day cap with concurrent in-flight snipes', () => {
+    const caps = { ...CAPS, perDayMax: 10000, perItemMax: 5000 };
+    const fly = (id: string, state: Snipe['state'], over: Partial<Snipe> = {}): Snipe =>
+      snipe({ id, state, maxBid: 5000, estShipping: 0, ...over });
+
+    it('blocks the third of three concurrent $50 snipes on one local day', () => {
+      const a = fly('a', 'verified');
+      const b = fly('b', 'firing');
+      const c = fly('c', 'verified');
+      expect(checkCaps(a, [b], 0, caps).ok).toBe(true); // 100
+      expect(has(checkCaps(c, [a, b], 0, caps), 'per-day')).toBe(true); // 150
+    });
+
+    it('counts sent snipes but not armed, draft, dry-run or finished ones', () => {
+      const s = fly('s', 'verified');
+      expect(has(checkCaps(s, [fly('a', 'sent'), fly('b', 'sent')], 0, caps), 'per-day')).toBe(true);
+      const quiet = [fly('a', 'armed'), fly('b', 'draft'), fly('c', 'firing', { dryRun: true }), fly('d', 'resolved')];
+      expect(has(checkCaps(s, quiet, 0, { ...caps, openExposureMax: 100000 }), 'per-day')).toBe(false);
+    });
+
+    it('an in-flight snipe on a different local day does not count', () => {
+      const s = fly('s', 'verified', { endTime: '2026-10-08T20:00:00.000Z' });
+      // 2026-10-09T03:30Z is still 10-08 local (EDT); 04:30Z is 10-09 local.
+      const sameDay = fly('a', 'firing', { endTime: '2026-10-09T03:30:00.000Z' });
+      const nextDay = fly('b', 'firing', { endTime: '2026-10-09T04:30:00.000Z' });
+      expect(has(checkCaps(s, [sameDay, nextDay], 0, caps), 'per-day')).toBe(false);
+      expect(has(checkCaps(s, [sameDay, nextDay, fly('c', 'sent')], 0, caps), 'per-day')).toBe(true);
+    });
+
+    it('does not count the snipe itself twice', () => {
+      const s = fly('s', 'firing');
+      expect(has(checkCaps(s, [s, fly('a', 'sent')], 0, caps), 'per-day')).toBe(false);
+    });
+  });
+
   it('reports several violations at once', () => {
     const r = checkCaps(snipe({ maxBid: 30000 }), [], 10000, CAPS);
     expect(r.ok).toBe(false);
@@ -162,6 +237,24 @@ describe('checkCaps', () => {
       }),
       { numRuns: 500 },
     );
+  });
+});
+
+describe('confirmsAmount / typoCheck prompt', () => {
+  it('typoCheck exposes expectedCents and a prompt', () => {
+    const r = typoCheck(2000, detail({ currentPrice: 100 }), CAPS);
+    expect(r.needsConfirmation).toBe(true);
+    expect(r.expectedCents).toBe(2000);
+    expect(r.prompt).toBe('Type the amount to confirm: $20.00');
+    expect(typoCheck(100, undefined, CAPS).prompt).toBeUndefined();
+  });
+
+  it.each(['$20', '20', '20.00', '$20.00', ' 20.0 '])('accepts %j for $20.00', (typed) => {
+    expect(confirmsAmount(typed, 2000)).toBe(true);
+  });
+
+  it.each(['$2000', '20.01', '2', '', 'twenty', '-20', '20.001'])('rejects %j for $20.00', (typed) => {
+    expect(confirmsAmount(typed, 2000)).toBe(false);
   });
 });
 

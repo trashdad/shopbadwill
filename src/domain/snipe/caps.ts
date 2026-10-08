@@ -3,7 +3,7 @@
 // trailing `detail`), `exposure` totals the open commitments, and `spentToday`
 // is the only per-day accumulation (T-103 reuses it). `typoCheck` wraps
 // money.ts `exceedsTypo` (not re-implemented here).
-import { exceedsTypo, formatMoney } from '../money';
+import { exceedsTypo, formatMoney, parseCents } from '../money';
 import type { Cents, ItemDetail } from '../types';
 import type { CapsCheck, CapsResult, Snipe } from './types';
 
@@ -34,7 +34,15 @@ const OPEN_STATES: ReadonlySet<Snipe['state']> = new Set([
 
 /** Max bid plus the shipping and handling estimates that are known. */
 function landed(s: Snipe): Cents {
-  return s.maxBid + (s.estShipping ?? 0) + (s.estHandling ?? 0);
+  // Negative estimates can never reduce what we count.
+  return s.maxBid + Math.max(0, s.estShipping ?? 0) + Math.max(0, s.estHandling ?? 0);
+}
+
+/** In-flight states that are committed right now (the bid is being or has been placed). */
+const COMMITTED_STATES: ReadonlySet<Snipe['state']> = new Set(['verified', 'firing', 'sent']);
+
+function isCents(n: number | undefined): boolean {
+  return n === undefined || (Number.isSafeInteger(n) && n >= 0);
 }
 
 /** A dry-run snipe never places a bid, so it is no exposure. */
@@ -63,12 +71,20 @@ export function exposure(snipes: readonly Snipe[]): Exposure {
 
 /**
  * Checks one snipe against the caps. Violations are strings starting with the
- * kind: `per-item`, `per-day` or `exposure`. The typo guard is NOT a cap: see
- * `typoCheck`.
+ * kind: `per-item`, `per-day`, `exposure` or `invalid`. The typo guard is NOT a
+ * cap: see `typoCheck`.
  *
- * `detail` (optional) is the latest ItemDetail: its `minimumBid` is the next
- * acceptable bid (the search row's `startingMinimumBid` is never used) and its
- * Monotone in `maxBid`: raising it never removes a violation.
+ * `detail` is the latest ItemDetail. Its `minimumBid` is the next acceptable
+ * bid (the search row's `startingMinimumBid` is never used). Without it the
+ * check FAILS CLOSED with a `per-item` violation, so the runner must read the
+ * detail (it does at T-60) before firing.
+ *
+ * The day total is `spentToday` (resolved outcomes) plus this snipe plus every
+ * OTHER committed in-flight snipe (verified, firing, sent; non-dry-run) ending
+ * on the same local day (`timeZone`), so concurrent snipes cannot each pass a
+ * cap the group would break. Bad inputs (negative or non-integer cents) return
+ * an `invalid` violation instead of throwing. Monotone in `maxBid`: raising it
+ * never removes a violation.
  */
 export function checkCaps(
   s: Snipe,
@@ -76,17 +92,35 @@ export function checkCaps(
   spentToday: Cents,
   caps: CapsCheck,
   detail?: ItemDetail,
+  timeZone: string = DEFAULT_TIME_ZONE,
 ): CapsResult {
+  if (!isCents(s.maxBid) || !isCents(s.estShipping) || !isCents(s.estHandling) || !isCents(spentToday)) {
+    return { ok: false, violations: ['invalid: maxBid, shipping, handling and spent-today must be whole cents >= 0'] };
+  }
   const violations: string[] = [];
 
   // Per item: what we would pay is at least the next acceptable bid.
-  const itemCost = Math.max(s.maxBid, detail?.minimumBid ?? 0);
-  if (itemCost > caps.perItemMax) {
-    violations.push(`per-item: ${formatMoney(itemCost)} exceeds the ${formatMoney(caps.perItemMax)} per-item cap`);
+  if (detail === undefined) {
+    violations.push('per-item: item detail required (next acceptable bid unknown)');
+  } else {
+    const itemCost = Math.max(s.maxBid, detail.minimumBid);
+    if (itemCost > caps.perItemMax) {
+      violations.push(`per-item: ${formatMoney(itemCost)} exceeds the ${formatMoney(caps.perItemMax)} per-item cap`);
+    }
   }
 
-  // Per day: already spent today plus this snipe if it wins.
-  const dayTotal = spentToday + landed(s);
+  // Per day: resolved spend today, this snipe, and other committed in-flight snipes that day.
+  const dayKey = localDayKey(new Date(s.endTime).getTime(), timeZone);
+  const inFlight = others
+    .filter(
+      (o) =>
+        o.id !== s.id &&
+        !o.dryRun &&
+        COMMITTED_STATES.has(o.state) &&
+        localDayKey(new Date(o.endTime).getTime(), timeZone) === dayKey,
+    )
+    .reduce((sum, o) => sum + landed(o), 0);
+  const dayTotal = spentToday + inFlight + landed(s);
   if (dayTotal > caps.perDayMax) {
     violations.push(`per-day: ${formatMoney(dayTotal)} would exceed the ${formatMoney(caps.perDayMax)} daily cap`);
   }
@@ -104,27 +138,44 @@ export function checkCaps(
   return { ok: violations.length === 0, violations };
 }
 
+export interface TypoResult {
+  needsConfirmation: boolean;
+  reason?: string;
+  /** The amount the user must retype (the max bid). */
+  expectedCents?: Cents;
+  /** Text for the confirmation prompt. */
+  prompt?: string;
+}
+
 /**
- * Typo guard: a confirmation step at ARMING time, not a cap (controller ruling).
- * Contract for the arming handler (T-84/T-85): when `needsConfirmation` is true,
- * `snipe.arm` must carry `typedConfirmation` equal to the formatted max
- * (`formatCents(maxBid)`); otherwise it refuses. `checkCaps` (run again at fire
- * time) never reports typo, so a confirmed snipe is not blocked later.
- * `detail.currentPrice` feeds the 3x rule; without detail only the absolute
- * threshold applies. Throws RangeError on a malformed multiplier/absolute.
+ * Typo guard: a confirmation step at ARMING time, not a cap. Contract for the
+ * arming handler (T-84/T-85): when `needsConfirmation` is true, `snipe.arm` must
+ * carry a `typedConfirmation` for which `confirmsAmount(typed, maxBid)` is true
+ * (compared by VALUE, so "$20", "20" and "20.00" all match $20.00), otherwise
+ * it refuses. `checkCaps` (run again at fire time) never reports typo, so a
+ * confirmed snipe is not blocked later. `detail.currentPrice` feeds the 3x rule;
+ * without detail only the absolute threshold applies. Throws RangeError on a
+ * malformed multiplier/absolute.
  */
 export function typoCheck(
   maxBid: Cents,
   detail: ItemDetail | undefined,
   caps: Pick<CapsCheck, 'typoMultiplier' | 'typoAbsolute'>,
-): { needsConfirmation: boolean; reason?: string } {
+): TypoResult {
   if (!exceedsTypo(maxBid, detail?.currentPrice ?? 0, caps.typoMultiplier, caps.typoAbsolute)) {
     return { needsConfirmation: false };
   }
   return {
     needsConfirmation: true,
     reason: `${formatMoney(maxBid)} is above ${String(caps.typoMultiplier)}x the current price or the ${formatMoney(caps.typoAbsolute)} threshold`,
+    expectedCents: maxBid,
+    prompt: `Type the amount to confirm: ${formatMoney(maxBid)}`,
   };
+}
+
+/** True when `typed` parses (via `parseCents`) to exactly `maxBid` cents. */
+export function confirmsAmount(typed: string, maxBid: Cents): boolean {
+  return parseCents(typed) === maxBid;
 }
 
 // ── Spent today ─────────────────────────────────────────────────────────────
