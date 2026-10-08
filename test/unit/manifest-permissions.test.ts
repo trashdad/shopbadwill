@@ -4,13 +4,22 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { permissionSurface, readSnapshot } from '../../scripts/permissions-snapshot';
 
 // Builds both production manifests exactly as `pnpm build` and
 // `pnpm build:firefox` do (same wxt.config.ts, mode "production", MV3), and
 // both test builds as `pnpm build:test` does (SBW_TEST=1, mode "test"), into
 // .output/manifest-test/ so the real .output/<browser>-mv3 builds are left
-// alone. Then checks them against the permissions table (§2.5) and a committed
-// snapshot. Any added permission, host or manifest capability fails.
+// alone. Then checks them against the permissions table (§2.5) and the committed
+// snapshots test/snapshots/permissions.{chrome,firefox}.json (the same files and
+// the same permissionSurface() that `pnpm check:permissions` uses on .output/).
+// Any added permission, host or manifest capability fails.
+//
+// Why it builds instead of reading .output/: the unit suite runs before any
+// `pnpm build` (CI `unit` job, task gates), and a stale .output/ would make the
+// check vacuous. Each WXT build takes about a second, all four go into one temp
+// dir inside .output/ in a single sequential beforeAll, and nothing else in the
+// unit suite builds, so the .wxt/ regeneration cannot race another test.
 
 type Target = 'chrome' | 'firefox';
 type Kind = 'production' | 'test';
@@ -131,27 +140,6 @@ function allRequested(manifest: Manifest): string[] {
   ];
 }
 
-/** The parts of a manifest that grant or expose capabilities. */
-function permissionSurface(manifest: Manifest) {
-  return {
-    manifest_version: manifest.manifest_version,
-    permissions: manifest.permissions ?? [],
-    optional_permissions: manifest.optional_permissions ?? [],
-    host_permissions: manifest.host_permissions ?? [],
-    optional_host_permissions: manifest.optional_host_permissions ?? [],
-    content_script_matches: (manifest.content_scripts ?? []).map((script) => script.matches ?? []),
-    web_accessible_resources: manifest.web_accessible_resources ?? null,
-    externally_connectable: manifest.externally_connectable ?? null,
-    content_security_policy: manifest.content_security_policy ?? null,
-    commands: manifest.commands ?? {},
-    minimum_chrome_version: manifest.minimum_chrome_version ?? null,
-    oauth2: manifest.oauth2
-      ? { ...manifest.oauth2, client_id: '<SBW_GOOGLE_CLIENT_ID>' }
-      : null,
-    browser_specific_settings: manifest.browser_specific_settings ?? null,
-  };
-}
-
 beforeAll(async () => {
   // Sequential: each WXT build regenerates .wxt/.
   await buildManifests('production');
@@ -207,8 +195,8 @@ describe.each(TARGETS)('%s production manifest', (target) => {
     });
   });
 
-  it('matches the committed permission snapshot', () => {
-    expect(permissionSurface(manifestOf(target))).toMatchSnapshot();
+  it('matches the committed permission snapshot (test/snapshots/permissions.<browser>.json)', async () => {
+    expect(permissionSurface(manifestOf(target))).toEqual(await readSnapshot(target));
   });
 });
 
@@ -217,8 +205,13 @@ describe.each(TARGETS)('%s test build (SBW_TEST=1)', (target) => {
     const production = permissionSurface(manifestOf(target));
     expect(permissionSurface(manifestOf(target, 'test'))).toEqual({
       ...production,
-      host_permissions: [...production.host_permissions, TEST_HOST],
+      host_permissions: [...(production.host_permissions as string[]), TEST_HOST],
     });
+  });
+
+  it('is the only build that mentions 127.0.0.1 (production manifests never do)', () => {
+    expect(JSON.stringify(manifestOf(target))).not.toContain('127.0.0.1');
+    expect(JSON.stringify(manifestOf(target, 'test'))).toContain('127.0.0.1');
   });
 });
 

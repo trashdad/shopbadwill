@@ -17,7 +17,7 @@
     "build:firefox": "wxt build -b firefox --mv3",
     "build:test": "tsx scripts/build-test.ts",
     "lint": "eslint . --max-warnings=0",
-    "lint:webext": "web-ext lint --source-dir .output/firefox-mv3 --warnings-as-errors",
+    "lint:webext": "tsx scripts/lint-webext.ts",
     "typecheck": "tsc --noEmit",
     "test:unit": "tsx scripts/run-vitest.ts unit",
     "test:contract": "tsx scripts/run-vitest.ts contract",
