@@ -1,5 +1,6 @@
 import preact from '@preact/preset-vite';
 import { defineConfig } from 'wxt';
+import { zodJitless } from './build/vite-plugin-zod-jitless';
 
 // Read at config load, BEFORE WXT loads .env files, so only the shell
 // environment can make a test build: `SBW_TEST=1 pnpm build`.
@@ -35,7 +36,7 @@ export default defineConfig({
   // Explicit imports only, so ESLint can enforce where `wxt/browser` is used.
   imports: false,
   vite: () => ({
-    plugins: [preact()],
+    plugins: [zodJitless(), preact()],
     define: {
       // Literal `false` in production, so `if (import.meta.env.SBW_TEST)` blocks
       // (and the string "SBW_TEST") are compiled out.
