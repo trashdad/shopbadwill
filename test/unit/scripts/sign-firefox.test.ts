@@ -32,6 +32,12 @@ describe('scripts/sign-firefox.ts', () => {
     const r = run({ AMO_JWT_ISSUER: 'issuer' });
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/skipped/);
+    expect(r.stderr).toMatch(/WARNING: only one AMO credential is set \(AMO_JWT_SECRET is missing\)/);
+  });
+
+  it('warns about the other missing key too, and stays silent when both are absent', () => {
+    expect(run({ AMO_JWT_SECRET: 'secret' }).stderr).toMatch(/AMO_JWT_ISSUER is missing/);
+    expect(run({}).stderr).not.toMatch(/WARNING/);
   });
 
   it('fails fast before any network call when keys are set but the source zip is missing', () => {

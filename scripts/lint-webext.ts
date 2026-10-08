@@ -6,7 +6,8 @@
 // uses the same detector, so a first-party innerHTML (or a second Preact one)
 // still fails. Notices are printed but do not fail the run.
 //
-//   pnpm build:firefox && pnpm lint:webext
+//   pnpm build:firefox && pnpm lint:webext [-- --self-hosted]
+// Extra CLI args are forwarded to `web-ext lint` (the release workflow passes --self-hosted).
 import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -36,6 +37,12 @@ const COLUMN_SLACK_AFTER = 12;
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const sourceDir = path.join(root, '.output', 'firefox-mv3');
 
+/** web-ext lint arguments: fixed ones plus any extra CLI args (a leading `--` separator is dropped). */
+export function webExtLintArgs(dir: string, extra: readonly string[]): string[] {
+  const forwarded = extra[0] === '--' ? extra.slice(1) : extra;
+  return ['lint', '--source-dir', dir, '--output', 'json', ...forwarded];
+}
+
 function describe(m: LintMessage): string {
   const where = m.file === undefined ? '' : `${m.file}:${String(m.line ?? '?')}:${String(m.column ?? '?')}  `;
   return `${where}${m.code ?? 'UNKNOWN'}: ${m.message ?? ''}`;
@@ -63,7 +70,7 @@ async function main(): Promise<void> {
   const webExtCli = path.join(root, 'node_modules', 'web-ext', 'bin', 'web-ext.js');
   const result = spawnSync(
     process.execPath,
-    [webExtCli, 'lint', '--source-dir', sourceDir, '--output', 'json'],
+    [webExtCli, ...webExtLintArgs(sourceDir, process.argv.slice(2))],
     { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
   );
   const start = result.stdout.indexOf('{');
@@ -97,4 +104,7 @@ async function main(): Promise<void> {
   console.log(`lint:webext: OK (${String(report.notices.length)} notices, ${String(allowed)} allowlisted)`);
 }
 
-await main();
+// Only run when executed directly (so webExtLintArgs stays importable by tests).
+if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}

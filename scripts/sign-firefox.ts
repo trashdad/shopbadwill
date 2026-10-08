@@ -23,6 +23,10 @@ const issuer = process.env.AMO_JWT_ISSUER?.trim() ?? '';
 const secret = process.env.AMO_JWT_SECRET?.trim() ?? '';
 
 if (issuer === '' || secret === '') {
+  if (issuer !== '' || secret !== '') {
+    const missing = issuer === '' ? 'AMO_JWT_ISSUER' : 'AMO_JWT_SECRET';
+    console.warn(`sign:firefox: WARNING: only one AMO credential is set (${missing} is missing); likely a misconfiguration. Skipping.`);
+  }
   console.log('sign:firefox: skipped (AMO_JWT_ISSUER / AMO_JWT_SECRET not set); no signing attempted, no network used.');
   process.exit(0);
 }
