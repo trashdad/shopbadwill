@@ -8,7 +8,11 @@ export class BrowserKeepAlive implements KeepAlive {
   start(intervalMs: number): void {
     this.stop();
     this.timer = setInterval(() => {
-      browser.runtime.getPlatformInfo().catch(() => undefined);
+      try {
+        browser.runtime.getPlatformInfo().catch(() => undefined);
+      } catch {
+        // 'Extension context invalidated' can throw synchronously.
+      }
     }, intervalMs);
   }
 

@@ -7,7 +7,7 @@ import { BrowserClock } from '../../src/adapters/browser/clock';
 import { BrowserHttp } from '../../src/adapters/browser/http';
 import { BrowserKeepAlive } from '../../src/adapters/browser/keep-alive';
 import { BrowserKeepAwake } from '../../src/adapters/browser/keep-awake';
-import { BrowserNotifier } from '../../src/adapters/browser/notifier';
+import { BrowserNotifier, NOTIFIER_MAP_KEY } from '../../src/adapters/browser/notifier';
 import { BrowserPermissions } from '../../src/adapters/browser/permissions';
 import { createStorageAreas } from '../../src/adapters/browser/storage';
 import { HttpNetworkError, HttpTimeoutError } from '../../src/ports/errors';
@@ -15,6 +15,7 @@ import { mswServer } from '../setup/vitest.setup';
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -37,11 +38,18 @@ describe('BrowserAlarms', () => {
     expect(spy).toHaveBeenLastCalledWith('c', { delayInMinutes: 1 });
   });
 
-  it('never detects persist support under Firefox', async () => {
-    vi.stubEnv('FIREFOX', 'true');
+  it('detects persist support from the Chrome UA, never under Firefox', async () => {
     const spy = vi.spyOn(browser.alarms, 'create');
-    await new BrowserAlarms().create('d', { delayInMinutes: 1 });
-    expect(spy).toHaveBeenLastCalledWith('d', { delayInMinutes: 1 });
+    vi.stubGlobal('navigator', { userAgent: 'Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36', onLine: true });
+    await new BrowserAlarms().create('d1', { delayInMinutes: 1 });
+    expect(spy).toHaveBeenLastCalledWith('d1', { delayInMinutes: 1, persistAcrossSessions: true });
+    vi.stubGlobal('navigator', { userAgent: 'Mozilla/5.0 Chrome/149.0.0.0 Safari/537.36', onLine: true });
+    await new BrowserAlarms().create('d2', { delayInMinutes: 1 });
+    expect(spy).toHaveBeenLastCalledWith('d2', { delayInMinutes: 1 });
+    vi.stubGlobal('navigator', { userAgent: 'Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36', onLine: true });
+    vi.stubEnv('FIREFOX', 'true');
+    await new BrowserAlarms().create('d3', { delayInMinutes: 1 });
+    expect(spy).toHaveBeenLastCalledWith('d3', { delayInMinutes: 1 });
   });
 
   it('lists, fires and clears', async () => {
@@ -143,10 +151,52 @@ describe('BrowserNotifier', () => {
     const cb = vi.fn();
     n.onAction(cb);
     await fakeBrowser.notifications.onButtonClicked.trigger(id, 1);
-    expect(cb).toHaveBeenLastCalledWith(id, 'open');
+    await vi.waitFor(() => {
+      expect(cb).toHaveBeenLastCalledWith(id, 'open');
+    });
     await fakeBrowser.notifications.onClicked.trigger(id);
-    expect(cb).toHaveBeenLastCalledWith(id, 'click');
+    await vi.waitFor(() => {
+      expect(cb).toHaveBeenLastCalledWith(id, 'click');
+    });
     expect(tabs).toHaveBeenCalledWith({ url: 'https://example.test/' });
+    // The click consumed the stored mapping.
+    expect((await browser.storage.session.get(NOTIFIER_MAP_KEY))[NOTIFIER_MAP_KEY]).toEqual({});
+  });
+
+  it('resolves actions and the url after a service-worker restart (new instance, same storage)', async () => {
+    const tabs = vi.spyOn(browser.tabs, 'create').mockResolvedValue({} as never);
+    const id = await new BrowserNotifier({ supportsActions: true }).notify({
+      title: 't',
+      message: 'm',
+      actions: [{ id: 'snooze', title: 'Snooze' }],
+      openUrlOnClick: 'https://example.test/x',
+    });
+    const restarted = new BrowserNotifier({ supportsActions: true });
+    const cb = vi.fn();
+    restarted.onAction(cb);
+    await fakeBrowser.notifications.onButtonClicked.trigger(id, 0);
+    await vi.waitFor(() => {
+      expect(cb).toHaveBeenCalledWith(id, 'snooze');
+    });
+    await fakeBrowser.notifications.onClicked.trigger(id);
+    await vi.waitFor(() => {
+      expect(tabs).toHaveBeenCalledWith({ url: 'https://example.test/x' });
+    });
+  });
+
+  it('drops mappings on close and caps stored entries', async () => {
+    const n = new BrowserNotifier({ supportsActions: true });
+    n.onAction(vi.fn());
+    const id = await n.notify({ title: 't', message: 'm', openUrlOnClick: 'https://example.test/' });
+    await fakeBrowser.notifications.onClosed.trigger(id, false);
+    await vi.waitFor(async () => {
+      expect((await browser.storage.session.get(NOTIFIER_MAP_KEY))[NOTIFIER_MAP_KEY]).toEqual({});
+    });
+    for (let i = 0; i < 60; i++) {
+      await n.notify({ title: 't', message: 'm', openUrlOnClick: `https://example.test/${String(i)}` });
+    }
+    const map = (await browser.storage.session.get(NOTIFIER_MAP_KEY))[NOTIFIER_MAP_KEY] as Record<string, unknown>;
+    expect(Object.keys(map)).toHaveLength(50);
   });
 });
 
@@ -223,6 +273,20 @@ describe('BrowserKeepAlive', () => {
     k.stop();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(spy).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('BrowserKeepAlive resilience', () => {
+  it('survives getPlatformInfo throwing synchronously', async () => {
+    vi.useFakeTimers();
+    const spy = vi.spyOn(browser.runtime, 'getPlatformInfo').mockImplementation(() => {
+      throw new Error('Extension context invalidated.');
+    });
+    const k = new BrowserKeepAlive();
+    k.start(1000);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(spy).toHaveBeenCalledTimes(3);
+    k.stop();
   });
 });
 
