@@ -20,8 +20,6 @@ import {
   SgwApiAdapter,
   WRITE_LANE,
   type SchemaFailure,
-  type WriteFeature,
-  type WriteSwitches,
 } from '../../../../src/adapters/sgw/api-adapter';
 import { SgwClockAdapter } from '../../../../src/adapters/sgw/clock-adapter';
 import { searchQueryFromUrl } from '../../../../src/adapters/sgw/query-url';
@@ -35,7 +33,7 @@ import { FakeAuditLog } from '../../../fakes/ports/fake-audit-log';
 import { FakeClock } from '../../../fakes/ports/fake-clock';
 import { FakeHttp, type HttpStep } from '../../../fakes/ports/fake-http';
 import { FakeStorage } from '../../../fakes/ports/fake-storage';
-import { FakeSwitches } from '../../../fakes/ports/fake-switches';
+import { FakeSwitches, type SwitchFeature } from '../../../fakes/ports/fake-switches';
 
 const BASE = 'https://buyerapi.shopgoodwill.com/api/';
 const S = 1000;
@@ -77,24 +75,6 @@ class RecordingScheduler implements RequestScheduler {
   }
 }
 
-/** GlobalSwitches (T-03 fake) plus the synchronous kill switch / dry-run view the adapter reads. */
-class TestSwitches extends FakeSwitches implements WriteSwitches {
-  killSwitch = false;
-  dryRun: Record<WriteFeature, boolean> = { favorites: false, bidding: false };
-  readonly stateReads: WriteFeature[] = [];
-
-  state(feature: WriteFeature): { killSwitch: boolean; dryRun: boolean } {
-    this.stateReads.push(feature);
-    return { killSwitch: this.killSwitch, dryRun: this.dryRun[feature] };
-  }
-
-  override writesAllowed(feature: 'favorites' | 'calendar' | 'bidding'): Promise<{ ok: boolean; why?: string }> {
-    if (this.killSwitch) return Promise.resolve({ ok: false, why: 'kill switch' });
-    if (feature !== 'calendar' && this.dryRun[feature]) return Promise.resolve({ ok: false, why: 'dry run' });
-    return super.writesAllowed(feature);
-  }
-}
-
 interface SetupOpts {
   start?: number;
   lanes?: Record<Lane, LaneConfig>;
@@ -114,7 +94,7 @@ function setup(opts: SetupOpts = {}) {
   });
   const scheduler = new RecordingScheduler(inner);
   const audit = new FakeAuditLog(clock);
-  const switches = new TestSwitches();
+  const switches = new FakeSwitches();
   const failures: SchemaFailure[] = [];
   const sessionBox = {
     value: opts.session === undefined ? { bearer: BEARER, expiresAt: T0 + 24 * 60 * MIN, buyerId: '42' } : opts.session,
@@ -287,10 +267,70 @@ describe('search request body', () => {
     expect(body.isWeddingCatagory).toBe('false');
   });
 
-  it('never sends extra URL params: they are kept for the URL round trip only', async () => {
+  it('C7: extra.sus = "true" puts searchUSOnlyShipping: "true" in the body, in place; the rest is the recorded body', async () => {
+    const recorded = recordedBody('search-grid-p1');
+    const t = setup({ start: recorded.capturedAt });
+    scriptAll(t.http);
+    await t.api.search({ ...PYREX, layout: 'grid', extra: { sus: 'true' } }, 'interactive');
+    const expected = JSON.parse(recorded.body) as Record<string, unknown>;
+    expect(expected.searchUSOnlyShipping).toBe('false');
+    expected.searchUSOnlyShipping = 'true';
+    expect(t.http.requests[0]?.body).toBe(JSON.stringify(expected));
+  });
+
+  it('C7: forwards every known non-named URL param, coerced the way SGW_SEARCH_BODY_DEFAULTS types its field', async () => {
     const t = setup();
     scriptAll(t.http);
-    await t.api.search({ ...PYREX, extra: { sus: 'true', foo: 'bar' } }, 'interactive');
+    await t.api.search(
+      {
+        ...PYREX,
+        extra: {
+          sus: 'true',
+          sis: 'FALSE',
+          scs: ' true ',
+          sbn: 'true',
+          UseBuyerPrefs: 'false',
+          wc: 'true',
+          mci: 'true',
+          hmt: 'false',
+          ss: '12',
+          cadb: '30',
+          cln: '2',
+          catIds: '12,34',
+          sg: 'grp',
+          pn: 'AB-1"2',
+        },
+      },
+      'interactive',
+    );
+    const body = bodyOf(t.http.requests[0]);
+    expect(body).toMatchObject({
+      // "true"/"false" strings where the default is one
+      searchUSOnlyShipping: 'true',
+      searchInternationalShippingOnly: 'false',
+      searchCanadaShipping: 'true',
+      searchBuyNowOnly: 'true',
+      useBuyerPrefs: 'false',
+      isWeddingCatagory: 'true',
+      // real JSON booleans where the default is one
+      isMultipleCategoryIds: true,
+      isFromHeaderMenuTab: false,
+      // a JSON number where the default is one
+      savedSearchId: 12,
+      // numeric strings where the default is one
+      closedAuctionDaysBack: '30',
+      categoryLevelNo: '2',
+      // an id list, and free text with the 403-causing quotes stripped
+      catIds: '12,34',
+      selectedGroup: 'grp',
+      partNumber: 'AB-12',
+    });
+  });
+
+  it('C7: unknown keys, a param with no body default (ihp), pageSize and the closed-auction date are not sent', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    await t.api.search({ ...PYREX, extra: { foo: 'bar', ihp: 'true', ps: '120', caed: '1/1/2020' } }, 'interactive');
     expect(t.http.requests[0]?.body).toBe(recordedBody('search-grid-p1').body);
   });
 
@@ -325,6 +365,13 @@ describe('R1: invalid search params never reach SGW', () => {
     ['a fractional seller id', { ...PYREX, sellerIds: [1.5] }],
     ['page 0', { ...PYREX, page: 0 }],
     ['a negative sortColumn', { ...PYREX, sortColumn: -1 }],
+    // C7: a known non-named param whose value cannot be coerced.
+    ['sus=maybe in the URL', searchQueryFromUrl('https://shopgoodwill.com/categories/listing?st=pyrex&sus=maybe') ?? PYREX],
+    ['extra.mci = "yes"', { ...PYREX, extra: { mci: 'yes' } }],
+    ['extra.sbn = "1"', { ...PYREX, extra: { sbn: '1' } }],
+    ['extra.ss = "x"', { ...PYREX, extra: { ss: 'x' } }],
+    ['extra.cadb = "-1"', { ...PYREX, extra: { cadb: '-1' } }],
+    ['extra.catIds = "abc"', { ...PYREX, extra: { catIds: 'abc' } }],
   ];
 
   it.each(invalid)('%s: SgwApiError before any HTTP call, health not flagged', async (_name, q) => {
@@ -427,9 +474,9 @@ describe("R3: credentials 'omit' on every request, bearer only on auth endpoints
   });
 });
 
-// ── R4: the write gate ──────────────────────────────────────────────────────
+// ── R4 (refined by ruling C1): the write gate is GlobalSwitches.writesAllowed ─
 
-const WRITES: Array<[string, Call, { kind: string; feature: WriteFeature; itemId?: number; ref?: string; action: string }]> = [
+const WRITES: Array<[string, Call, { kind: string; feature: SwitchFeature; itemId?: number; ref?: string; action: string }]> = [
   ['addFavorite', (a) => a.addFavorite(ITEM), { kind: 'favorite.add', feature: 'favorites', itemId: ITEM, action: 'add' }],
   ['removeFavorite', (a) => a.removeFavorite(ITEM), { kind: 'favorite.remove', feature: 'favorites', itemId: ITEM, action: 'remove' }],
   [
@@ -444,58 +491,58 @@ const WRITES: Array<[string, Call, { kind: string; feature: WriteFeature; itemId
   ],
 ];
 
-describe('R4: writes are gated by the kill switch, then dry-run, then writesAllowed', () => {
-  it.each(WRITES)('%s with dry-run on: an audit intent (item and action only), paused, ZERO HTTP', async (_m, call, w) => {
-    const t = setup();
-    scriptAll(t.http);
-    t.switches.dryRun[w.feature] = true;
-    await rejectsWith(call(t.api), 'paused');
-    expect(t.http.requests).toHaveLength(0);
-    expect(t.scheduler.runs).toHaveLength(0);
-    const entries = t.audit.entries;
-    expect(entries).toHaveLength(1);
-    const e = entries[0];
-    expect(e).toMatchObject({ actor: 'system', kind: w.kind, dryRun: true, details: { action: w.action } });
-    expect(Object.keys(e?.details ?? {})).toEqual(['action']);
-    expect(e?.itemId).toBe(w.itemId);
-    expect(e?.ref).toBe(w.ref);
-    expect(JSON.stringify(entries)).not.toContain('secret-ish');
-  });
+describe('R4/C1: every write asks GlobalSwitches.writesAllowed; a refusal is audited and sends nothing', () => {
+  const refusals: Array<[string, (s: FakeSwitches, f: SwitchFeature) => void, string]> = [
+    ['dry-run', (s, f) => {
+      s.block(f, 'dry run');
+    }, 'dry run'],
+    ['the kill switch', (s) => {
+      s.killAll('kill switch');
+    }, 'kill switch'],
+    ['a failed health check', (s, f) => {
+      s.block(f, 'health check failed');
+    }, 'health check failed'],
+  ];
 
-  it.each(WRITES)('%s with the kill switch on: paused, ZERO HTTP, a block entry; checked before dry-run', async (_m, call, w) => {
-    const t = setup();
-    scriptAll(t.http);
-    t.switches.killSwitch = true;
-    t.switches.dryRun[w.feature] = true;
-    const err = await rejectsWith(call(t.api), 'paused');
-    expect(err.message).toContain('kill switch');
-    expect(t.http.requests).toHaveLength(0);
-    expect(t.scheduler.runs).toHaveLength(0);
-    expect(t.audit.entries).toHaveLength(1);
-    expect(t.audit.entries[0]).toMatchObject({ actor: 'system', kind: 'write.blocked', details: { action: w.kind, reason: 'kill-switch' } });
-    expect(t.audit.entries[0]?.dryRun).toBeUndefined();
-    // The dry-run intent is never recorded while the kill switch is on.
-    expect(t.audit.kinds).not.toContain(w.kind);
-  });
+  for (const [cause, apply, why] of refusals) {
+    it.each(WRITES)(`%s refused by ${cause}: SgwApiError(paused, why), an audit intent (item, action, why), ZERO HTTP`, async (_m, call, w) => {
+      const t = setup();
+      scriptAll(t.http);
+      apply(t.switches, w.feature);
+      const err = await rejectsWith(call(t.api), 'paused');
+      expect(err.message).toBe(why);
+      expect(t.switches.checks).toEqual([w.feature]);
+      expect(t.http.requests).toHaveLength(0);
+      expect(t.scheduler.runs).toHaveLength(0);
+      const entries = t.audit.entries;
+      expect(entries).toHaveLength(1);
+      const e = entries[0];
+      expect(e).toMatchObject({ actor: 'system', kind: w.kind, details: { action: w.action, why } });
+      expect(Object.keys(e?.details ?? {}).sort()).toEqual(['action', 'why']);
+      expect(e?.itemId).toBe(w.itemId);
+      expect(e?.ref).toBe(w.ref);
+      expect(JSON.stringify(entries)).not.toContain('secret-ish');
+    });
+  }
 
-  it.each(WRITES)('%s when writesAllowed says no (health, session): paused, ZERO HTTP, a block entry with the reason', async (_m, call, w) => {
+  it('a refusal with no `why` still rejects paused and audits a reason', async () => {
     const t = setup();
-    scriptAll(t.http);
-    t.switches.block(w.feature, 'health check failed');
-    await rejectsWith(call(t.api), 'paused');
+    t.switches.writesAllowed = () => Promise.resolve({ ok: false });
+    const err = await rejectsWith(t.api.addFavorite(ITEM), 'paused');
+    expect(err.message).toBe('writes are not allowed');
+    expect(t.audit.entries[0]?.details).toEqual({ action: 'add', why: 'writes are not allowed' });
     expect(t.http.requests).toHaveLength(0);
-    expect(t.audit.entries[0]).toMatchObject({ kind: 'write.blocked', details: { action: w.kind, reason: 'health check failed' } });
   });
 
   it('dry-run without a session still records the intent and sends nothing', async () => {
     const t = setup({ session: null });
-    t.switches.dryRun.favorites = true;
+    t.switches.block('favorites', 'dry run');
     await rejectsWith(t.api.addFavorite(ITEM), 'paused');
     expect(t.audit.kinds).toEqual(['favorite.add']);
     expect(t.http.requests).toHaveLength(0);
   });
 
-  it('a live favorite write goes out once, on the write lane, with the bearer', async () => {
+  it('a live favorite write goes out once, on the write lane, with the bearer, unaudited by the adapter', async () => {
     const t = setup();
     scriptAll(t.http);
     await t.api.addFavorite(ITEM);
@@ -509,46 +556,16 @@ describe('R4: writes are gated by the kill switch, then dry-run, then writesAllo
     expect(t.http.requests[0]?.body).toBeUndefined();
     expect(t.http.requests[2]?.body).toBe('{"notes":"wrap carefully","watchlistId":55}');
     expect(t.scheduler.runs.map((r) => r.lane)).toEqual([WRITE_LANE, WRITE_LANE, WRITE_LANE]);
+    expect(t.switches.checks).toEqual(['favorites', 'favorites', 'favorites']);
     expect(t.audit.entries).toHaveLength(0);
   });
 
-  it('a kill switch flipped while the write waits in its lane still stops it (checked again right before sending)', async () => {
-    const gap: LaneConfig = { minIntervalMs: 120 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
-    const t = setup({ lanes: { ...FAST_LANES, background: gap } });
-    scriptAll(t.http);
-    await t.api.search(PYREX, 'background'); // starts the 120 s gap on the background lane
-    let outcome: unknown;
-    const pending = t.api.addFavorite(ITEM).then(
-      () => 'sent',
-      (e: unknown) => e,
-    );
-    void pending.then((v) => (outcome = v));
-    await flush();
-    expect(outcome).toBeUndefined(); // queued behind the gap
-    t.switches.killSwitch = true;
-    t.clock.advance(120 * S);
-    await flush();
-    await pending;
-    expect(outcome).toBeInstanceOf(SgwApiError);
-    expect((outcome as SgwApiError).kind).toBe('paused');
-    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`]);
-    await flush();
-    expect(t.audit.entries[0]).toMatchObject({ kind: 'write.blocked', details: { action: 'favorite.add', reason: 'kill-switch' } });
-  });
-
-  it('a dry-run turned on while the write waits in its lane still stops it', async () => {
-    const gap: LaneConfig = { minIntervalMs: 120 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
-    const t = setup({ lanes: { ...FAST_LANES, background: gap } });
-    scriptAll(t.http);
-    await t.api.search(PYREX, 'background');
-    const pending = t.api.removeFavorite(ITEM).catch((e: unknown) => e);
-    await flush();
-    t.switches.dryRun.favorites = true;
-    t.clock.advance(120 * S);
-    const err = await pending;
-    expect(err).toBeInstanceOf(SgwApiError);
-    expect((err as SgwApiError).kind).toBe('paused');
-    expect(t.http.requests).toHaveLength(1);
+  it('an audit log that fails never turns a refusal into a send', async () => {
+    const t = setup();
+    t.audit.append = () => Promise.reject(new Error('storage full'));
+    t.switches.block('favorites', 'dry run');
+    await rejectsWith(t.api.addFavorite(ITEM), 'paused');
+    expect(t.http.requests).toHaveLength(0);
   });
 
   it('a note over 256 characters is refused before the gate and before any HTTP call', async () => {
@@ -630,7 +647,7 @@ describe('schema failure → SgwApiError(schema) and health flagged', () => {
       scheduler,
       clock,
       session: { current: () => Promise.resolve(null) },
-      switches: new TestSwitches(),
+      switches: new FakeSwitches(),
       audit: new FakeAuditLog(clock),
       health: {
         flagSchemaFailure: () => {
@@ -702,13 +719,13 @@ describe('R6: itemDetail cache (key item id; 60 s for open auctions; never in th
   it('never serves a cached detail inside the last 5 minutes before the end', async () => {
     const t = setup({ start: ITEM_END - DETAIL_NO_CACHE_BEFORE_END_MS - 2 * S });
     detail(t);
-    await t.api.itemDetail(ITEM, 'snipe');
+    await t.api.itemDetail(ITEM, 'interactive');
     t.clock.advance(1 * S);
-    await t.api.itemDetail(ITEM, 'snipe');
+    await t.api.itemDetail(ITEM, 'interactive');
     expect(t.http.requests).toHaveLength(1); // still outside the window: cached
     t.clock.advance(1 * S); // now exactly 5 min before the end
-    await t.api.itemDetail(ITEM, 'snipe');
-    await t.api.itemDetail(ITEM, 'snipe');
+    await t.api.itemDetail(ITEM, 'interactive');
+    await t.api.itemDetail(ITEM, 'interactive');
     expect(t.http.requests).toHaveLength(3);
     expect(DETAIL_NO_CACHE_BEFORE_END_MS).toBe(5 * MIN);
   });
@@ -716,9 +733,9 @@ describe('R6: itemDetail cache (key item id; 60 s for open auctions; never in th
   it('never caches across the end time (a read just before the end is never served after it)', async () => {
     const t = setup({ start: ITEM_END - 30 * S });
     detail(t);
-    await t.api.itemDetail(ITEM, 'snipe');
+    await t.api.itemDetail(ITEM, 'interactive');
     t.clock.advance(40 * S);
-    await t.api.itemDetail(ITEM, 'snipe');
+    await t.api.itemDetail(ITEM, 'interactive');
     expect(t.http.requests).toHaveLength(2);
   });
 
@@ -770,6 +787,84 @@ describe('R6: itemDetail cache (key item id; 60 s for open auctions; never in th
     await rejectsWith(t.api.itemDetail(0, 'interactive'), 'schema');
     await rejectsWith(t.api.itemDetail(1.5, 'interactive'), 'schema');
     expect(t.http.requests).toHaveLength(0);
+  });
+});
+
+// ── C6: itemDetail is auth 'optional': the bearer on the snipe lane only ────
+
+describe('C6: snipe-lane itemDetail carries the bearer when there is one, and bypasses the cache', () => {
+  /** item-detail-open as a logged-in leader would see it. */
+  const leading = (): Record<string, unknown> => {
+    const raw = loadFixture<Record<string, unknown> & { bidHistory: Record<string, unknown> }>('item-detail-open');
+    raw.inWatchlist = true;
+    raw.bidHistory.isHighBidderLogIn = true;
+    return raw;
+  };
+
+  it('a snipe-lane read carries the bearer when the session has a token, and reads isHighBidder/inWatchlist', async () => {
+    const t = setup();
+    t.http.on(`${BASE}ItemDetail/`, json(leading()));
+    const d = await t.api.itemDetail(ITEM, 'snipe');
+    expect(header(t.http.requests[0], 'authorization')).toBe(`Bearer ${BEARER}`);
+    expect(t.http.requests[0]?.credentials).toBe('omit');
+    expect(d.isHighBidder).toBe(true);
+    expect(d.inWatchlist).toBe(true);
+  });
+
+  it.each([
+    ['no session', null],
+    ['an expired session', { bearer: BEARER, expiresAt: T0 - 1, buyerId: '42' }],
+  ])('a snipe-lane read with %s is anonymous and does not throw', async (_name, session) => {
+    const t = setup({ session });
+    t.http.on(`${BASE}ItemDetail/`, json(leading()));
+    const d = await t.api.itemDetail(ITEM, 'snipe');
+    expect(t.http.requests).toHaveLength(1);
+    expect(header(t.http.requests[0], 'authorization')).toBeUndefined();
+    expect(d.isHighBidder).toBeNull();
+    expect(d.inWatchlist).toBeNull();
+  });
+
+  it.each(['background', 'interactive', 'canary'] satisfies Lane[])(
+    'a %s-lane read never carries the bearer, even with a token',
+    async (lane) => {
+      const t = setup();
+      t.http.on(`${BASE}ItemDetail/`, json(leading()));
+      const d = await t.api.itemDetail(ITEM, lane);
+      expect(header(t.http.requests[0], 'authorization')).toBeUndefined();
+      expect(d.isHighBidder).toBeNull();
+    },
+  );
+
+  it('a snipe-lane read ignores a fresh cache entry', async () => {
+    const t = setup();
+    t.http.on(`${BASE}ItemDetail/`, json(leading()));
+    const cached = await t.api.itemDetail(ITEM, 'interactive');
+    expect(cached.isHighBidder).toBeNull();
+    t.clock.advance(1 * S);
+    const live = await t.api.itemDetail(ITEM, 'snipe');
+    expect(t.http.requests).toHaveLength(2);
+    expect(live.isHighBidder).toBe(true);
+  });
+
+  it('a snipe-lane read is never written to the cache (an authenticated detail never reaches other lanes)', async () => {
+    const t = setup();
+    t.http.on(`${BASE}ItemDetail/`, json(leading()));
+    await t.api.itemDetail(ITEM, 'snipe');
+    const other = await t.api.itemDetail(ITEM, 'interactive');
+    expect(t.http.requests).toHaveLength(2);
+    expect(other.isHighBidder).toBeNull();
+    await t.api.itemDetail(ITEM, 'interactive');
+    expect(t.http.requests).toHaveLength(2); // the interactive read itself was cached
+  });
+
+  it('a snipe-lane read still makes its item the one serverTimeSample samples (anonymously, on the clock lane)', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    await t.api.itemDetail(ITEM, 'snipe');
+    const sample = await t.api.serverTimeSample();
+    expect(sample.source).toBe('itemDetail');
+    expect(t.http.requests[1]?.url).toBe(`${BASE}ItemDetail/GetItemDetailModelByItemId/${String(ITEM)}`);
+    expect(header(t.http.requests[1], 'authorization')).toBeUndefined();
   });
 });
 

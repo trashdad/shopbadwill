@@ -70,7 +70,8 @@ export interface SgwEndpoint {
   readonly query?: readonly string[];
   /** POST body: 'json' (application/json), 'none' (the site posts `null`, i.e. no body). */
   readonly body: 'json' | 'none';
-  readonly auth: 'none' | 'required';
+  /** 'optional': anonymous works; the adapter adds the bearer only where its policy says (itemDetail: snipe lane, T-26 ruling C6). */
+  readonly auth: 'none' | 'required' | 'optional';
   readonly write: boolean;
   readonly evidence: 'observed' | 'bundle' | 'community';
 }
@@ -78,8 +79,8 @@ export interface SgwEndpoint {
 export const SGW_ENDPOINTS = {
   /** Anonymous. Body: SGW_SEARCH_BODY_DEFAULTS + overrides. Always 40 rows per page. S-1 #3, #4, #6, #7, #8, #10. */
   search: { method: 'POST', path: 'Search/ItemListing', body: 'json', auth: 'none', write: false, evidence: 'observed' },
-  /** Anonymous. serverTime, bidIncrement, the NEXT acceptable minimumBid, bidHistory. Open, closed and pickup items: S-1 #5, #11, #12. */
-  itemDetail: { method: 'GET', path: 'ItemDetail/GetItemDetailModelByItemId/{itemId}', body: 'none', auth: 'none', write: false, evidence: 'observed' },
+  /** Anonymous or with the bearer (`isHighBidderLogIn`/`inWatchlist` are real only then). serverTime, bidIncrement, the NEXT acceptable minimumBid, bidHistory. Open, closed and pickup items: S-1 #5, #11, #12 (anonymous). */
+  itemDetail: { method: 'GET', path: 'ItemDetail/GetItemDetailModelByItemId/{itemId}', body: 'none', auth: 'optional', write: false, evidence: 'observed' },
   /** Anonymous. The site POSTs with a null body; `data` is SGW_TIME.currentTime. S-1 #2, #5, #9 (page calls). */
   currentTime: { method: 'POST', path: 'Dashboard/GetCurrentTime', body: 'none', auth: 'none', write: false, evidence: 'observed' },
   /** Anonymous. The item page's own call; `state` is the seller's 2-letter state (Listing.sellerState for search rows). S-1 #5. */

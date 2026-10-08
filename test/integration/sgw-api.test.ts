@@ -7,7 +7,7 @@ import { http, HttpResponse } from 'msw';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { BrowserHttp } from '../../src/adapters/browser/http';
-import { SgwApiAdapter, type SchemaFailure, type WriteFeature, type WriteSwitches } from '../../src/adapters/sgw/api-adapter';
+import { SgwApiAdapter, type SchemaFailure } from '../../src/adapters/sgw/api-adapter';
 import { SgwClockAdapter } from '../../src/adapters/sgw/clock-adapter';
 import { searchQueryFromUrl } from '../../src/adapters/sgw/query-url';
 import { SgwRequestScheduler } from '../../src/adapters/sgw/request-scheduler';
@@ -30,19 +30,6 @@ const BEARER = 'hhhh.pppp.ssss';
 
 const ZERO_GAP: LaneConfig = { minIntervalMs: 0, jitterMs: 0, maxConcurrent: 1, dailyBudget: 1000 };
 const FAST_LANES: Record<Lane, LaneConfig> = { interactive: ZERO_GAP, background: ZERO_GAP, snipe: ZERO_GAP, canary: ZERO_GAP };
-
-class Switches extends FakeSwitches implements WriteSwitches {
-  killSwitch = false;
-  dryRun: Record<WriteFeature, boolean> = { favorites: false, bidding: false };
-  state(feature: WriteFeature): { killSwitch: boolean; dryRun: boolean } {
-    return { killSwitch: this.killSwitch, dryRun: this.dryRun[feature] };
-  }
-  override writesAllowed(feature: 'favorites' | 'calendar' | 'bidding'): Promise<{ ok: boolean; why?: string }> {
-    if (this.killSwitch) return Promise.resolve({ ok: false, why: 'kill switch' });
-    if (feature !== 'calendar' && this.dryRun[feature]) return Promise.resolve({ ok: false, why: 'dry run' });
-    return super.writesAllowed(feature);
-  }
-}
 
 interface Seen {
   method: string;
@@ -72,7 +59,7 @@ function setup(start = T0) {
     lanes: FAST_LANES,
   });
   const audit = createAuditLog(new Repo({ local: new FakeStorage(), session: new FakeStorage() }, clock));
-  const switches = new Switches();
+  const switches = new FakeSwitches();
   const failures: SchemaFailure[] = [];
   const api = new SgwApiAdapter({
     scheduler,
@@ -207,10 +194,10 @@ describe('SgwApiAdapter over the real scheduler, fetch and MSW', () => {
     expect(searchBody.searchPickupOnly).toBe('true');
   });
 
-  it('a write in dry-run records an audit intent and makes ZERO HTTP requests', async () => {
+  it('a write refused for dry-run (writesAllowed) records an audit intent and makes ZERO HTTP requests', async () => {
     const t = setup();
-    t.switches.dryRun.favorites = true;
-    t.switches.dryRun.bidding = true;
+    t.switches.block('favorites', 'dry run');
+    t.switches.block('bidding', 'dry run');
     expect(await kindOf(t.api.addFavorite(ITEM))).toBe('paused');
     expect(await kindOf(t.api.removeFavorite(ITEM))).toBe('paused');
     expect(await kindOf(t.api.saveFavoriteNote(55, 'note'))).toBe('paused');
@@ -219,21 +206,42 @@ describe('SgwApiAdapter over the real scheduler, fetch and MSW', () => {
     ).toBe('paused');
     expect(started).toEqual([]);
     const entries = await t.audit.list({ limit: 10 });
-    expect(entries.map((e) => [e.kind, e.itemId ?? e.ref, e.dryRun, e.details])).toEqual([
-      ['bid.place', ITEM, true, { action: 'bid' }],
-      ['favorite.note', 'watchlist:55', true, { action: 'note' }],
-      ['favorite.remove', ITEM, true, { action: 'remove' }],
-      ['favorite.add', ITEM, true, { action: 'add' }],
+    expect(entries.map((e) => [e.kind, e.itemId ?? e.ref, e.details])).toEqual([
+      ['bid.place', ITEM, { action: 'bid', why: 'dry run' }],
+      ['favorite.note', 'watchlist:55', { action: 'note', why: 'dry run' }],
+      ['favorite.remove', ITEM, { action: 'remove', why: 'dry run' }],
+      ['favorite.add', ITEM, { action: 'add', why: 'dry run' }],
     ]);
   });
 
-  it('a write with the kill switch on makes ZERO HTTP requests and is audited as blocked', async () => {
+  it('a write refused for the kill switch (writesAllowed) records an audit intent and makes ZERO HTTP requests', async () => {
     const t = setup();
-    t.switches.killSwitch = true;
+    t.switches.killAll('kill switch');
     expect(await kindOf(t.api.addFavorite(ITEM))).toBe('paused');
     expect(started).toEqual([]);
     const [entry] = await t.audit.list({ limit: 1 });
-    expect(entry).toMatchObject({ kind: 'write.blocked', itemId: ITEM, details: { action: 'favorite.add', reason: 'kill-switch' } });
+    expect(entry).toMatchObject({ kind: 'favorite.add', itemId: ITEM, details: { action: 'add', why: 'kill switch' } });
+  });
+
+  it('C6: itemDetail carries the bearer on the snipe lane only', async () => {
+    const t = setup();
+    serveAll(t);
+    await t.api.itemDetail(ITEM, 'background');
+    await t.api.itemDetail(ITEM, 'snipe');
+    await t.api.itemDetail(ITEM, 'interactive', { maxAgeMs: 0 });
+    expect(t.seen.map((s) => s.authorization)).toEqual([null, `Bearer ${BEARER}`, null]);
+    expect(t.seen.every((s) => s.credentials === 'omit')).toBe(true);
+  });
+
+  it('C7: known non-named URL params reach the wire coerced; unknown ones do not', async () => {
+    const t = setup();
+    serveAll(t);
+    const q = searchQueryFromUrl('https://shopgoodwill.com/categories/listing?st=pyrex&sus=true&mci=true&ss=12&foo=bar');
+    if (q === null) throw new Error('fixture URL did not parse');
+    await t.api.search(q, 'interactive');
+    const body = JSON.parse(t.seen[0]?.body ?? '{}') as Record<string, unknown>;
+    expect(body).toMatchObject({ searchUSOnlyShipping: 'true', isMultipleCategoryIds: true, savedSearchId: 12 });
+    expect('foo' in body).toBe(false);
   });
 
   it('R1: a search URL with an unparseable filter never reaches SGW', async () => {

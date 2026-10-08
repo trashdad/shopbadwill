@@ -7,10 +7,13 @@
 //
 // - Everything goes through `RequestScheduler.run`; the adapter has no Http.
 // - `credentials: 'omit'` on every request, read or write: never a cookie (the
-//   site's `Bid` cookie 403s a second bid, §1.7). The bearer goes only to the
-//   endpoints config.ts marks `auth: 'required'`, and only while SgwSession
-//   holds an unexpired token. Without one the call fails with `auth` and
-//   nothing is sent. Anonymous reads never carry it, even when it exists.
+//   site's `Bid` cookie 403s a second bid, §1.7). The bearer goes to:
+//   - endpoints config.ts marks `auth: 'required'`, and only while SgwSession
+//     holds an unexpired token. Without one the call fails with `auth` and
+//     nothing is sent;
+//   - `auth: 'optional'` ones (itemDetail) on the snipe lane only, when a
+//     usable token exists (ruling C6). Without one they stay anonymous.
+//   Every other request is anonymous, even when a token exists.
 // - Inputs are checked before anything is sent. Search filters per S-1:
 //   SGW answers 400 to a non-numeric price, and silently ignores a meaningless
 //   category filter, returning unfiltered rows. Double quotes in `searchText`
@@ -18,14 +21,16 @@
 //   Invalid input is SgwApiError('schema') with "invalid-query"/"invalid-input"
 //   in the message: the frozen error kinds have no closer match, and it is
 //   never reported to health.
-// - Writes pass `gate()`: the kill switch first, then the feature's dry-run,
-//   then GlobalSwitches.writesAllowed (health, session). A refusal sends
-//   nothing, is audited and throws `paused`. The kill switch and dry-run are
-//   read again right before the request leaves (`guard()` in build()), so
-//   one flipped while the write waited in its lane still stops it.
+// - Every write asks `GlobalSwitches.writesAllowed(feature)` first (ruling C1).
+//   That is false for the kill switch, dry-run, a failed health check and a
+//   bad session. A refusal sends nothing, records an audit intent (item,
+//   action, why) and rejects with SgwApiError('paused', why). Callers ask
+//   writesAllowed themselves first; this check is defense in depth. It runs
+//   when the write is called: a switch flipped while the write waits in its
+//   lane's queue is not seen again.
 // - A reply that fails its schema throws SgwApiError('schema') and is
 //   reported to health (`flagSchemaFailure`), so writes can fail closed.
-import type { AuditEntry, AuditLog } from '../../domain/audit/types';
+import type { AuditLog } from '../../domain/audit/types';
 import { formatCents } from '../../domain/money';
 import { formatPacificNaive, parsePacific } from '../../domain/time/pacific';
 import type {
@@ -53,6 +58,7 @@ import {
   SGW_API_BASE,
   SGW_ENDPOINTS,
   SGW_SEARCH_BODY_DEFAULTS,
+  SGW_SEARCH_URL_PARAMS,
   SGW_SHIPPING_QUOTE_BODY_FIELDS,
   type SgwEndpoint,
   type SgwEndpointKey,
@@ -86,7 +92,11 @@ export const REQUEST_TIMEOUT_MS = 20_000;
  *   served from or stored in the cache: every call reads SGW. So a cached
  *   detail never crosses the item's end time, and the snipe window always
  *   sees live data;
- * - a stored time in the future (the clock moved back) counts as stale.
+ * - a stored time in the future (the clock moved back) counts as stale;
+ * - snipe-lane reads (ruling C6) bypass the cache entirely: they never read
+ *   from it and never write to it. They may carry the bearer, so an
+ *   authenticated detail (isHighBidder, inWatchlist) never reaches another
+ *   lane, and a snipe always sees live data.
  * The end time is SGW's clock and `now` is the local one; the 5-minute margin
  * also absorbs a local clock running up to 5 minutes slow.
  */
@@ -121,20 +131,6 @@ export const SHIPPING_COUNTRY = 'US';
 
 // ── Dependencies ────────────────────────────────────────────────────────────
 
-export type WriteFeature = 'favorites' | 'bidding';
-
-/**
- * GlobalSwitches plus the two settings R4 tells apart. The frozen port only
- * answers writesAllowed(feature); the adapter also needs to know WHICH
- * refusal is in effect (a kill-switch block and a dry-run intent are audited
- * differently), and needs it synchronously to re-check inside build(). T-36's
- * switches implement this from their in-memory Settings copy.
- */
-export interface WriteSwitches extends GlobalSwitches {
-  /** `Settings.killSwitch` and `Settings.dryRun[feature]`, right now. */
-  state(feature: WriteFeature): { killSwitch: boolean; dryRun: boolean };
-}
-
 /** A reply that failed its schema. */
 export interface SchemaFailure {
   endpoint: SgwEndpointKey;
@@ -143,9 +139,11 @@ export interface SchemaFailure {
 }
 
 /**
- * Where schema failures are flagged. The SgwHealth port has no "flag" call,
- * so T-36 wires this to the health state that makes writesAllowed fail
- * closed. It must not throw (if it does, the schema error still surfaces).
+ * Where schema failures are flagged (ruling C2). The SgwHealth port has no
+ * "flag" call, so this is injected. T-36 wires it so that a schema failure
+ * makes `GlobalSwitches.writesAllowed` fail closed. In practice that means
+ * persisting a failing health marker or HealthReport, which T-30 owns.
+ * It must not throw. If it does, the schema error still surfaces.
  */
 export interface SgwHealthFlag {
   flagSchemaFailure(f: SchemaFailure): void;
@@ -156,8 +154,9 @@ export interface ApiAdapterDeps {
   clock: Clock;
   /** Bearer source (T-28). */
   session: Pick<SgwSession, 'current'>;
-  switches: WriteSwitches;
-  /** Records dry-run intents and blocked writes (T-35/T-41). */
+  /** The frozen port, asked before every write (ruling C1). */
+  switches: GlobalSwitches;
+  /** Records refused-write intents (T-35/T-41). */
   audit: Pick<AuditLog, 'append'>;
   health: SgwHealthFlag;
   /** T-29's sample builders. */
@@ -173,6 +172,8 @@ export interface SgwRequestInit {
   /** JSON body for `body: 'json'` endpoints (default `{}`); `body: 'none'` endpoints send none. */
   body?: unknown;
   timeoutMs?: number;
+  /** The lane the request runs on. An `auth: 'optional'` endpoint carries the bearer only on `snipe` (ruling C6). */
+  lane?: Lane;
 }
 
 /** What the PlaceBid path (bid.ts, T-100) gets from the adapter. */
@@ -185,14 +186,13 @@ export interface BidContext {
    * SgwApiError('auth'), sending nothing, without a usable session.
    */
   prepare(endpoint: SgwEndpointKey, init?: SgwRequestInit): Promise<HttpRequest>;
-  /** Call inside build(): throws SgwApiError('paused') if the kill switch or bidding dry-run came on meanwhile. */
-  guardSend(): void;
   /** Reports a reply that failed its schema. */
   flagSchemaFailure(endpoint: SgwEndpointKey, error: SgwApiError): void;
 }
 
 // ── Adapter ─────────────────────────────────────────────────────────────────
 
+type WriteFeature = 'favorites' | 'bidding';
 type WriteKind = 'favorite.add' | 'favorite.remove' | 'favorite.note' | 'bid.place';
 const WRITE_ACTION: Record<WriteKind, string> = {
   'favorite.add': 'add',
@@ -201,7 +201,6 @@ const WRITE_ACTION: Record<WriteKind, string> = {
   'bid.place': 'bid',
 };
 type AckEndpoint = 'addFavorite' | 'removeFavorite' | 'saveFavoriteNote';
-type NewAuditEntry = Omit<AuditEntry, 'seq' | 'at'>;
 
 /** The object of a write, as audited: the item, or a ref for a note. */
 interface WriteTarget {
@@ -224,8 +223,6 @@ interface DetailRead {
 
 interface RunOptions {
   priority?: number;
-  /** Runs inside build(), right before the request leaves; may throw to stop it. */
-  beforeSend?: () => void;
 }
 
 const US_ZIP = /^\d{5}(-\d{4})?$/;
@@ -250,11 +247,19 @@ export class SgwApiAdapter implements SgwApi {
     );
   }
 
-  /** Anonymous (config.ts): `isHighBidder` and `inWatchlist` come back null. Cache policy: DETAIL_CACHE_TTL_MS. */
+  /**
+   * `auth: 'optional'` (ruling C6). On the snipe lane the read carries the
+   * bearer when a usable token exists, so `isHighBidder` and `inWatchlist` are
+   * real, and it bypasses the cache both ways. On every other lane it is
+   * anonymous (those two fields come back null) and cached per
+   * DETAIL_CACHE_TTL_MS.
+   */
   async itemDetail(itemId: ItemId, lane: Lane, opts?: { maxAgeMs?: number }): Promise<ItemDetail> {
     assertItemId('itemDetail', itemId);
-    const cached = this.fromCache(itemId, opts?.maxAgeMs);
-    if (cached !== undefined) return cached;
+    if (lane !== 'snipe') {
+      const cached = this.fromCache(itemId, opts?.maxAgeMs);
+      if (cached !== undefined) return cached;
+    }
     const read = await this.readDetail(itemId, lane);
     return structuredClone(read.detail);
   }
@@ -359,15 +364,11 @@ export class SgwApiAdapter implements SgwApi {
     opts: { idempotencyKey: string; timeoutMs: number },
   ): Promise<BidResult> {
     assertItemId('placeBid', req.itemId);
-    const target = { itemId: req.itemId };
-    await this.gate('bidding', 'bid.place', target);
+    await this.gate('bidding', 'bid.place', { itemId: req.itemId });
     const ctx: BidContext = {
       scheduler: this.deps.scheduler,
       clock: this.deps.clock,
       prepare: (endpoint, init) => this.prepare(endpoint, init),
-      guardSend: () => {
-        this.guard('bidding', 'bid.place', target);
-      },
       flagSchemaFailure: (endpoint, error) => {
         this.flagSchemaFailure(endpoint, error);
       },
@@ -384,74 +385,43 @@ export class SgwApiAdapter implements SgwApi {
   ): Promise<void> {
     await this.gate(feature, kind, target);
     const request = await this.prepare(endpoint, init);
-    await this.run(
-      endpoint,
-      WRITE_LANE,
-      request,
-      (_res, raw) => {
-        ack(endpoint, raw);
-      },
-      {
-        beforeSend: () => {
-          this.guard(feature, kind, target);
-        },
-      },
-    );
+    await this.run(endpoint, WRITE_LANE, request, (_res, raw) => {
+      ack(endpoint, raw);
+    });
   }
 
   /**
-   * R4, in this order: the kill switch, the feature's dry-run, then
-   * writesAllowed (health, session). Any refusal sends nothing, is audited
-   * and throws `paused`, which is what the port says a dry-run write does.
-   * A dry-run intent records only the item (or ref) and the action.
+   * R4 as refined by ruling C1. It asks only the frozen
+   * `GlobalSwitches.writesAllowed(feature)`, which is false for the kill
+   * switch, dry-run, a failed health check and a bad session. A refusal
+   * sends nothing, records an audit intent (item or ref, action, why: never
+   * the note text) and rejects with SgwApiError('paused', why), as the port
+   * says a refused write does.
    */
   private async gate(feature: WriteFeature, kind: WriteKind, target: WriteTarget): Promise<void> {
-    const { killSwitch, dryRun } = this.deps.switches.state(feature);
-    if (killSwitch) {
-      await this.audit(blocked(kind, target, 'kill-switch'));
-      throw new SgwApiError('paused', `${kind}: the kill switch is on; nothing was sent`);
-    }
-    if (dryRun) {
-      await this.audit(intent(kind, target));
-      throw new SgwApiError('paused', `${kind}: dry run; the intent was recorded, nothing was sent`);
-    }
     const verdict = await this.deps.switches.writesAllowed(feature);
-    if (!verdict.ok) {
-      const why = verdict.why ?? 'writes are not allowed';
-      await this.audit(blocked(kind, target, why));
-      throw new SgwApiError('paused', `${kind}: ${why}; nothing was sent`);
-    }
-  }
-
-  /** The kill switch and dry-run again, synchronously, inside build() (the write may have waited in its lane). */
-  private guard(feature: WriteFeature, kind: WriteKind, target: WriteTarget): void {
-    const { killSwitch, dryRun } = this.deps.switches.state(feature);
-    if (!killSwitch && !dryRun) return;
-    void this.audit(killSwitch ? blocked(kind, target, 'kill-switch') : intent(kind, target));
-    throw new SgwApiError(
-      'paused',
-      `${kind}: ${killSwitch ? 'the kill switch' : 'dry run'} came on while the write waited; nothing was sent`,
-    );
-  }
-
-  private async audit(entry: NewAuditEntry): Promise<void> {
+    if (verdict.ok) return;
+    const why = verdict.why ?? 'writes are not allowed';
     try {
-      await this.deps.audit.append(entry);
+      await this.deps.audit.append({ actor: 'system', kind, ...target, details: { action: WRITE_ACTION[kind], why } });
     } catch {
       // The refusal stands even if the log cannot be written.
     }
+    throw new SgwApiError('paused', why);
   }
 
   // ── ItemDetail cache (R6, see DETAIL_CACHE_TTL_MS) ────────────────────
 
+  /** A live read. Snipe-lane reads (maybe authenticated) are never stored in the cache. */
   private async readDetail(itemId: ItemId, lane: Lane, priority?: number): Promise<DetailRead> {
-    const request = await this.prepare('itemDetail', { path: { itemId } });
+    const request = await this.prepare('itemDetail', { path: { itemId }, lane });
+    const authenticated = request.headers?.Authorization !== undefined;
     const read = await this.run(
       'itemDetail',
       lane,
       request,
       (res, raw): DetailRead => {
-        const detail = normalizeItemDetail(raw, { observedAt: res.endedAt, authenticated: false });
+        const detail = normalizeItemDetail(raw, { observedAt: res.endedAt, authenticated });
         if (detail.itemId !== itemId) {
           throw new SgwApiError('schema', `itemDetail: asked for item ${String(itemId)}, got ${String(detail.itemId)}`);
         }
@@ -459,16 +429,18 @@ export class SgwApiAdapter implements SgwApi {
       },
       priority === undefined ? {} : { priority },
     );
-    this.remember(read.detail);
+    this.remember(read.detail, lane !== 'snipe');
     return read;
   }
 
-  private remember(detail: ItemDetail): void {
+  /** Updates the clock item and, unless `cache` is false (snipe lane), the cache entry. */
+  private remember(detail: ItemDetail, cache: boolean): void {
     const now = this.deps.clock.now();
     const endMs = parsePacific(detail.endTimeRaw);
     if (!detail.isClosed && endMs > now) this.clockItem = { itemId: detail.itemId, endMs };
     else if (this.clockItem?.itemId === detail.itemId) this.clockItem = undefined;
 
+    if (!cache) return;
     this.details.delete(detail.itemId);
     if (detail.isClosed || now >= endMs - DETAIL_NO_CACHE_BEFORE_END_MS) return;
     if (this.details.size >= DETAIL_CACHE_MAX_ENTRIES) {
@@ -493,11 +465,20 @@ export class SgwApiAdapter implements SgwApi {
 
   // ── Requests ──────────────────────────────────────────────────────────
 
-  /** Builds the request from config.ts: `credentials: 'omit'` always, the bearer only where auth is required. */
+  /**
+   * Builds the request from config.ts. `credentials: 'omit'` always. The
+   * bearer goes to `auth: 'required'` endpoints (or SgwApiError('auth')), and
+   * to `auth: 'optional'` ones only on the snipe lane with a usable token.
+   */
   private async prepare(endpoint: SgwEndpointKey, init: SgwRequestInit = {}): Promise<HttpRequest> {
     const ep: SgwEndpoint = SGW_ENDPOINTS[endpoint];
     const headers: Record<string, string> = {};
-    if (ep.auth === 'required') headers.Authorization = `Bearer ${await this.bearer(endpoint)}`;
+    if (ep.auth === 'required') {
+      headers.Authorization = `Bearer ${await this.requiredBearer(endpoint)}`;
+    } else if (ep.auth === 'optional' && init.lane === 'snipe') {
+      const bearer = await this.usableBearer();
+      if (bearer !== undefined) headers.Authorization = `Bearer ${bearer}`;
+    }
     let url =
       SGW_API_BASE +
       ep.path.replace(/\{(\w+)\}/g, (_whole, name: string) => {
@@ -529,7 +510,7 @@ export class SgwApiAdapter implements SgwApi {
   }
 
   /** The session's bearer, or SgwApiError('auth') before anything is sent. Never logged. */
-  private async bearer(endpoint: SgwEndpointKey): Promise<string> {
+  private async requiredBearer(endpoint: SgwEndpointKey): Promise<string> {
     const session = await this.deps.session.current();
     if (session === null || session.bearer === '') {
       throw new SgwApiError('auth', `${endpoint}: no SGW session; sign in on shopgoodwill.com`);
@@ -537,6 +518,16 @@ export class SgwApiAdapter implements SgwApi {
     if (session.expiresAt <= this.deps.clock.now()) {
       throw new SgwApiError('auth', `${endpoint}: the SGW session has expired; sign in on shopgoodwill.com`);
     }
+    return session.bearer;
+  }
+
+  /**
+   * The bearer if the session has an unexpired one, else undefined (never
+   * throws). A token known to be expired is not sent: it would only earn a 401.
+   */
+  private async usableBearer(): Promise<string | undefined> {
+    const session = await this.deps.session.current();
+    if (session === null || session.bearer === '' || session.expiresAt <= this.deps.clock.now()) return undefined;
     return session.bearer;
   }
 
@@ -551,10 +542,7 @@ export class SgwApiAdapter implements SgwApi {
     const scheduled: ScheduledRequest<T> = {
       lane,
       endpoint,
-      build: () => {
-        opts.beforeSend?.();
-        return { ...request, headers: { ...request.headers } };
-      },
+      build: () => ({ ...request, headers: { ...request.headers } }),
       parse: (res) => parse(res, decode(endpoint, res)),
     };
     if (opts.priority !== undefined) scheduled.priority = opts.priority;
@@ -623,14 +611,6 @@ function ack(endpoint: AckEndpoint, raw: unknown): void {
   }
 }
 
-function intent(kind: WriteKind, target: WriteTarget): NewAuditEntry {
-  return { actor: 'system', kind, ...target, dryRun: true, details: { action: WRITE_ACTION[kind] } };
-}
-
-function blocked(kind: WriteKind, target: WriteTarget, reason: string): NewAuditEntry {
-  return { actor: 'system', kind: 'write.blocked', ...target, details: { action: kind, reason } };
-}
-
 // ── Search body (R1, R2) ────────────────────────────────────────────────────
 
 function flag(b: boolean | undefined): 'true' | 'false' {
@@ -658,11 +638,95 @@ function pacificToday(now: EpochMs): string {
   return `${String(Number(m))}/${String(Number(d))}/${y}`;
 }
 
+type BodyField = keyof typeof SGW_SEARCH_BODY_DEFAULTS;
+
+/**
+ * Body fields the adapter always sets itself, never from `extra`:
+ * - `pageSize`: always 40 rows per page (§3.3);
+ * - `closedAuctionEndingDate`: Pacific today. A saved URL's date goes stale.
+ */
+const ADAPTER_OWNED_FIELDS: ReadonlySet<string> = new Set<BodyField>(['pageSize', 'closedAuctionEndingDate']);
+
+function parseBool(v: string): boolean | undefined {
+  const t = v.toLowerCase();
+  return t === 'true' ? true : t === 'false' ? false : undefined;
+}
+
+/**
+ * One `extra` value, coerced the way SGW_SEARCH_BODY_DEFAULTS types its field.
+ * Throws invalid-query when it cannot be (R1: nothing is sent):
+ * - a JSON boolean default becomes a JSON boolean;
+ * - a "true"/"false" default becomes that string;
+ * - a JSON number default becomes a safe integer >= 0;
+ * - a numeric-string default becomes a digit string;
+ * - an empty-string default depends on the field:
+ *   - `searchBuyNowOnly`: "", "true" or "false";
+ *   - `catIds`: positive ids, comma-separated;
+ *   - anything else: free text with double quotes stripped (they 403).
+ */
+function coerceExtra(key: string, field: BodyField, raw: string): string | number | boolean {
+  const value = raw.trim();
+  const bad = (expected: string): SgwApiError => invalidQuery(`${key} (${field}) must be ${expected}, got ${JSON.stringify(raw)}`);
+  const def: string | number | boolean = SGW_SEARCH_BODY_DEFAULTS[field];
+  if (typeof def === 'boolean') {
+    const b = parseBool(value);
+    if (b === undefined) throw bad('true or false');
+    return b;
+  }
+  if (typeof def === 'number') {
+    const n = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+    if (!Number.isSafeInteger(n)) throw bad('a whole number');
+    return n;
+  }
+  if (def === 'true' || def === 'false') {
+    const b = parseBool(value);
+    if (b === undefined) throw bad('true or false');
+    return flag(b);
+  }
+  if (/^\d+$/.test(def)) {
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw bad('a whole number');
+    return String(Number(value));
+  }
+  if (field === 'searchBuyNowOnly') {
+    if (value === '') return '';
+    const b = parseBool(value);
+    if (b === undefined) throw bad('empty, true or false');
+    return flag(b);
+  }
+  if (field === 'catIds') {
+    if (value === '') return '';
+    const ids = value.split(',').map((s) => s.trim());
+    if (!ids.every((s) => /^\d+$/.test(s) && isPositiveInt(Number(s)))) throw bad('positive ids, comma-separated');
+    return ids.map(Number).join(',');
+  }
+  return value.replaceAll('"', '');
+}
+
+/**
+ * Ruling C7: the `extra` keys that SGW_SEARCH_URL_PARAMS knows but that are not
+ * named query fields (`sus`, `sis`, `scs`, `sbn`, `cadb`, `mci`, …), mapped to
+ * their body fields and coerced. Not sent:
+ * - keys SGW_SEARCH_URL_PARAMS does not know (URL round trip only, T-50);
+ * - params with no body default to type them by (`ihp`: isFromHomePage);
+ * - ADAPTER_OWNED_FIELDS.
+ * Named params in `extra` were already refused (R1).
+ */
+function extraFields(extra: Readonly<Record<string, string>> | undefined): Partial<Record<BodyField, string | number | boolean>> {
+  const out: Partial<Record<BodyField, string | number | boolean>> = {};
+  for (const [key, raw] of Object.entries(extra ?? {})) {
+    if (!Object.hasOwn(SGW_SEARCH_URL_PARAMS, key)) continue;
+    const field: string = SGW_SEARCH_URL_PARAMS[key as keyof typeof SGW_SEARCH_URL_PARAMS];
+    if (ADAPTER_OWNED_FIELDS.has(field) || !Object.hasOwn(SGW_SEARCH_BODY_DEFAULTS, field)) continue;
+    out[field as BodyField] = coerceExtra(key, field as BodyField, raw);
+  }
+  return out;
+}
+
 /**
  * The ItemListing body: SGW_SEARCH_BODY_DEFAULTS in the site's key order with
- * the query's values. Never forwards `q.extra`: those keys are kept for the
- * URL round trip only (T-50). One whose name is a mapped param means its
- * value did not parse, and is refused here (R1).
+ * the query's values. Known `extra` params go in through extraFields (C7). An
+ * `extra` key that is a named param means its value did not parse, so it is
+ * refused here (R1).
  */
 function searchBody(q: SearchQuery, now: EpochMs): Record<string, unknown> {
   const unparsed = invalidSearchParams(q);
@@ -673,6 +737,7 @@ function searchBody(q: SearchQuery, now: EpochMs): Record<string, unknown> {
   }
   return {
     ...SGW_SEARCH_BODY_DEFAULTS,
+    ...extraFields(q.extra),
     layout: q.layout ?? SGW_SEARCH_BODY_DEFAULTS.layout,
     // R2: double quotes make buyerapi answer 403.
     searchText: q.searchText.replaceAll('"', '').trim(),
