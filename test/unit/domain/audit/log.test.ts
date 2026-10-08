@@ -62,7 +62,7 @@ describe('redactDetails', () => {
 
   it('strips HTML and truncates to 2 kB', () => {
     const d = redactDetails({ message: '<p>Hi <script>x</script>there</p>', big: 'a'.repeat(5000) });
-    expect(d.message).toBe('Hi xthere');
+    expect(d.message).toBe('Hi there');
     expect(String(d.big).length).toBeLessThanOrEqual(2048);
     expect(String(d.big)).toContain('truncated');
   });
@@ -94,5 +94,73 @@ describe('redactDetails', () => {
     expect(d.deep).toContain('[max depth]');
     expect(redactDetails(null)).toEqual({});
     expect(redactDetails('str')).toEqual({});
+  });
+});
+
+describe('AuditLog leak paths (raw storage dump)', () => {
+  const dump = () => JSON.stringify(areas.local.dump());
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sigSIG123';
+
+  it('drops a secret key beyond the depth cap', async () => {
+    let deep: Record<string, unknown> = { password: 'DEEPSECRET' };
+    for (let i = 0; i < 20; i++) deep = { n: deep };
+    await log.append({ ...base, details: { deep } as never });
+    expect(dump()).not.toContain('DEEPSECRET');
+  });
+
+  it('redacts a secret inside an array element', async () => {
+    await log.append({ ...base, details: { list: [{ token: 'ARRSECRET' }, 'Bearer ARRSECRET2xx', 'ok'] } as never });
+    expect(dump()).not.toContain('ARRSECRET');
+  });
+
+  it('redacts JSON-string, key=value and key: value secrets', async () => {
+    await log.append({
+      ...base,
+      details: {
+        a: '{"access_token":"JSONSECRET1","x":1}',
+        b: 'https://x/y?token=QSSECRET2&z=1',
+        c: 'password: COLONSECRET3 done',
+        d: "refresh_token='QUOTESECRET4'",
+      },
+    });
+    const d = dump();
+    for (const s of ['JSONSECRET1', 'QSSECRET2', 'COLONSECRET3', 'QUOTESECRET4']) expect(d).not.toContain(s);
+  });
+
+  it('redacts Bearer in ref and undo.ref', async () => {
+    await log.append({ ...base, ref: 'Bearer REFSECRET123', details: {}, undo: { kind: 'disarm', ref: 'Bearer UNDOSECRET123' } });
+    const d = dump();
+    expect(d).not.toContain('REFSECRET123');
+    expect(d).not.toContain('UNDOSECRET123');
+  });
+
+  it('drops unknown top-level and undo fields', async () => {
+    const e = { ...base, details: {}, extra: 'UNKNOWNSECRET', undo: { kind: 'disarm', ref: 'r', evil: 'UNDOEVIL' } };
+    await log.append(e as never);
+    expect(dump()).not.toMatch(/UNKNOWNSECRET|UNDOEVIL/);
+  });
+
+  it('redacts tag-split Bearer and JWT', async () => {
+    const split = jwt.slice(0, 12) + '<b>' + jwt.slice(12);
+    await log.append({ ...base, details: { m: 'Bearer <b>TAGSPLITSECRET</b>', j: split, k: 'Bearer&nbsp;x' } });
+    const d = dump();
+    expect(d).not.toContain('TAGSPLITSECRET');
+    expect(d).not.toContain('sigSIG123');
+  });
+
+  it('handles unclosed script and entity-encoded markup', async () => {
+    await log.append({
+      ...base,
+      details: { s: 'hi <script>token=SCRIPTSECRET', e: 'Bearer &lt;b&gt;ENTSECRET123&lt;/b&gt;', n: '&#60;i&#62;x&#60;/i&#62;' },
+    });
+    const d = dump();
+    expect(d).not.toMatch(/SCRIPTSECRET|ENTSECRET123|<i>|&lt;/);
+  });
+
+  it('truncation does not leave a lone high surrogate', () => {
+    const d = redactDetails({ s: 'a'.repeat(2048 - '...[truncated]'.length - 1) + '\u{1F600}'.repeat(10) });
+    const s = String(d.s);
+    const before = s.charCodeAt(s.indexOf('...[truncated]') - 1);
+    expect(before >= 0xd800 && before <= 0xdbff).toBe(false);
   });
 });
