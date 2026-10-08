@@ -274,3 +274,43 @@ It could keep calling SGW after SGW had asked it to stop. The user's "considerat
 - `normalizeSearch` sets `pickupOnly` from the query filter only: `pickupOnly: true` gives true, `excludePickupOnly: true` gives false, neither leaves it unset.
 - `test/contract/types/spec-shapes.test.ts`: `SpecListing.pickupOnly` is optional, `SpecItemDetail` requires it.
 - Tests: two matcher cases (unknown for both condition values); `test/fakes/ports/fake-shared.test.ts` detail builder now sets `pickupOnly` explicitly.
+
+## T-51 contract change: JobRun.candidates
+
+Approved by the controller on 2026-10-08 (T-51 ruling R5) and made in `task/T-51`.
+
+**Why.** Per-item, per-watch working state must survive service-worker death between ticks.
+
+The daily job runs one SGW request per alarm tick, and the worker dies between ticks. The only state that survives is the persisted `JobRun` (PLAN §2.3: "resumable state lives in the active run"). The two-pass evaluation (rulings R1–R3) has to carry some per-item state from one tick to the next:
+- which watch or watches selected an item;
+- the search row and the fetched detail, until the item's quote arrives;
+- the quote;
+- the per-watch ids the run will add to `seenItemIds`.
+
+The frozen `JobRun` had no field for any of this. `Repo.set` parses before writing, so zod strips any extra key. Without per-watch attribution, an item that only a `local` watch found could be favorited on SGW for an `sgw` watch.
+
+### Changes
+
+1. **`JobRun.candidates?: JobCandidate[]`** in `src/domain/watches/schema.ts`. It is optional; runs written before this change have none. Each `JobCandidate` has:
+   - `itemId`;
+   - `watchIds`: at least one; the watches whose search returned the item and whose optimistic pass selected it;
+   - `endTime`;
+   - `status`: one of `pending`, `matched`, `rejected`, `skipped-budget` or `failed`;
+   - optional `row` (`Listing`) and `detail` (`ItemDetail`). T-51 drops both once the strict pass decides, which keeps `sbw:jobRuns` small;
+   - optional `quote`: `{ shipping, handling }`, or `null` when no quote is available;
+   - optional `note`.
+2. **Exports.** `type JobCandidate` is exported. Its zod schema is module-private and validated only through `JobRunSchema`. Exporting a new `*Schema` would add it to the locked list in `test/contract/types/examples.test.ts` and require example files, which are outside T-51's ownership.
+3. **Who reads it.** T-52 reads it through `seenUpdates(run)` (`src/domain/jobs/daily-job.ts`): candidates that are `matched` or `rejected`, grouped per watch, to record with `recordSeen` at the end of the run. Candidates that are `skipped-budget` or `failed` are left out so tomorrow's run retries them. No other card needs to read it.
+4. **No migration.** This adds an optional field, and `sbw:meta.schemaVersion` stays 1 (§2.3).
+
+### Tests
+
+- `test/contract/types/spec-shapes.test.ts`:
+  - adds `SpecJobCandidate`;
+  - `SpecJobRun` gains `candidates?`;
+  - asserts `JobCandidate` equals `SpecJobCandidate`.
+- `test/unit/domain/jobs/daily-job.test.ts`:
+  - **"R5 JobRun.candidates"**: a `Repo.set` → `get` round trip of a run whose candidates include `row`, `detail` and `quote`, which proves nothing is stripped;
+  - the property test asserts `JobRunSchema.parse(run)` equals `run` for every finished run.
+
+**Follow-up for the next PLAN edit.** Add `candidates?` to PLAN §3.6 `JobRun` and to contracts.md.
