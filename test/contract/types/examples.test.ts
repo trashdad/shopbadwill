@@ -99,6 +99,7 @@ const EXPECTED_SCHEMAS: Record<string, string[]> = {
     'AuditChunk',
     'AuditMeta',
     'RequestBudget',
+    'RequestSchedulerState',
     'GoogleAccess',
     'QuarantineRecord',
   ],

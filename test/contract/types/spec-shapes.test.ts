@@ -195,6 +195,8 @@ interface SpecLaneConfig {
 interface SpecSchedulerStats {
   lanes: Record<SpecLane, { usedToday: number; budget: number; nextAllowedAt: EpochMs; backoffUntil?: EpochMs }>;
   cacheHits: number;
+  /** Contract change (T-25): present while every lane is paused; until null = open-ended. */
+  paused?: { until: EpochMs | null; reason: string };
 }
 
 // ── §3.5 ────────────────────────────────────────────────────────────────────

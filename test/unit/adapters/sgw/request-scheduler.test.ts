@@ -12,7 +12,14 @@ import {
   localDay,
   type SchedulerEvent,
 } from '../../../../src/adapters/sgw/request-scheduler';
-import { RequestBudgetSchema, STORAGE_KEYS } from '../../../../src/domain/storage/schema';
+import {
+  QUARANTINE_KEY_PREFIX,
+  QuarantineRecordSchema,
+  RequestBudgetSchema,
+  RequestSchedulerStateSchema,
+  STORAGE_KEYS,
+  type RequestSchedulerState,
+} from '../../../../src/domain/storage/schema';
 import { DEFAULT_LANES, RequestSchedulerStatsSchema, type Lane, type LaneConfig } from '../../../../src/domain/types';
 import { HttpNetworkError, SgwApiError } from '../../../../src/ports/errors';
 import type { HttpRequest } from '../../../../src/ports/http';
@@ -47,7 +54,6 @@ interface Opts {
   random?: () => number;
   considerateMode?: 'normal' | 'tight';
   lanes?: Record<Lane, LaneConfig>;
-  stateKey?: string;
   storage?: FakeStorage;
   clock?: FakeClock;
 }
@@ -65,7 +71,6 @@ function setup(opts: Opts = {}) {
     random: opts.random ?? (() => 0),
     ...(opts.considerateMode === undefined ? {} : { considerateMode: opts.considerateMode }),
     ...(opts.lanes === undefined ? {} : { lanes: opts.lanes }),
-    ...(opts.stateKey === undefined ? {} : { stateKey: opts.stateKey }),
   });
   const events: SchedulerEvent[] = [];
   sched.onEvent((e) => events.push(e));
@@ -486,7 +491,7 @@ describe('RequestScheduler: backoff and blocks', () => {
       reason: 'SGW is refusing requests; automation paused',
       until,
     });
-    expect(h.sched.pauseState()).toEqual({ cause: 'blocked', reason: 'SGW is refusing requests; automation paused', until });
+    expect(h.sched.stats().paused).toEqual({ reason: 'SGW is refusing requests; automation paused', until });
     expect(h.notifier.sent).toHaveLength(1);
     expect(h.notifier.sent[0]?.id).toBe(PAUSE_NOTIFICATION_ID);
     expect(h.notifier.sent[0]?.notification).toMatchObject({ id: PAUSE_NOTIFICATION_ID, message: 'SGW is refusing requests; automation paused' });
@@ -496,7 +501,6 @@ describe('RequestScheduler: backoff and blocks', () => {
       const err = await failure(h.sched.run(req(lane)));
       expect(err.kind).toBe('paused');
       expect(err.retryAfterMs).toBe(6 * HOUR);
-      expect(h.sched.stats().lanes[lane].backoffUntil).toBe(until);
       expect(h.sched.stats().lanes[lane].nextAllowedAt).toBeGreaterThanOrEqual(until);
     }
     expect(h.sent).toHaveLength(3);
@@ -505,7 +509,7 @@ describe('RequestScheduler: backoff and blocks', () => {
     expect((await failure(h.sched.run(req('canary')))).kind).toBe('paused');
     await h.advance(1);
     await expect(h.sched.run(req('canary'))).resolves.toBe('ok');
-    expect(h.sched.pauseState()).toBeNull();
+    expect(h.sched.stats().paused).toBeUndefined();
     expect(h.notifier.sent).toHaveLength(1);
   });
 
@@ -516,7 +520,7 @@ describe('RequestScheduler: backoff and blocks', () => {
       await h.sched.run(req(lane)).catch(() => undefined);
     }
     expect(h.sent).toHaveLength(4);
-    expect(h.sched.pauseState()).toBeNull();
+    expect(h.sched.stats().paused).toBeUndefined();
     expect(h.notifier.sent).toHaveLength(0);
   });
 
@@ -527,7 +531,7 @@ describe('RequestScheduler: backoff and blocks', () => {
       expect((await failure(h.sched.run(req(lane)))).kind).toBe('rate-limited');
     }
     const until = T0 + 30 * S;
-    expect(h.sched.pauseState()).toMatchObject({ cause: 'rate-limited', until });
+    expect(h.sched.stats().paused).toEqual({ reason: 'SGW is rate-limiting requests', until });
     expect(h.events).toContainEqual(expect.objectContaining({ type: 'paused', cause: 'rate-limited', until }));
     expect(h.notifier.sent).toHaveLength(1);
 
@@ -561,13 +565,14 @@ describe('RequestScheduler: pause and resume', () => {
     const err = await failure(h.sched.run(req('interactive')));
     expect(err.kind).toBe('paused');
     expect(err.message).toContain('health check failed');
-    expect(h.sched.pauseState()).toEqual({ cause: 'manual', reason: 'health check failed', until: null });
+    expect(h.sched.stats().paused).toEqual({ reason: 'health check failed', until: null });
+    expect(h.events).toContainEqual({ type: 'paused', cause: 'manual', reason: 'health check failed', until: null });
 
     await h.advance(10 * HOUR, HOUR);
     expect((await failure(h.sched.run(req('interactive')))).kind).toBe('paused');
 
     h.sched.resume();
-    expect(h.sched.pauseState()).toBeNull();
+    expect(h.sched.stats().paused).toBeUndefined();
     await expect(h.sched.run(req('interactive'))).resolves.toBe('ok');
     expect(h.events.map((e) => e.type)).toEqual(['paused', 'resumed']);
     expect(h.notifier.sent).toHaveLength(0);
@@ -589,7 +594,9 @@ describe('RequestScheduler: pause and resume', () => {
     const h = setup();
     h.sched.pause('considerate mode', T0 + MIN);
     expect((await failure(h.sched.run(req('interactive')))).retryAfterMs).toBe(MIN);
-    expect(h.sched.stats().lanes.interactive.backoffUntil).toBe(T0 + MIN);
+    expect(h.sched.stats().paused).toEqual({ reason: 'considerate mode', until: T0 + MIN });
+    expect(h.sched.stats().lanes.interactive.nextAllowedAt).toBe(T0 + MIN);
+    expect(h.sched.stats().lanes.interactive.backoffUntil).toBeUndefined();
     await h.advance(MIN);
     await expect(h.sched.run(req('interactive'))).resolves.toBe('ok');
   });
@@ -599,10 +606,10 @@ describe('RequestScheduler: pause and resume', () => {
     h.sched.pause('blocked for a while', T0 + HOUR);
     h.sched.pause('brief', T0 + MIN);
     await h.advance(MIN);
-    expect(h.sched.pauseState()).toMatchObject({ reason: 'blocked for a while', until: T0 + HOUR });
+    expect(h.sched.stats().paused).toEqual({ reason: 'blocked for a while', until: T0 + HOUR });
     h.sched.pause('until resumed');
     h.sched.pause('brief again', T0 + 2 * HOUR);
-    expect(h.sched.pauseState()).toMatchObject({ reason: 'until resumed', until: null });
+    expect(h.sched.stats().paused).toEqual({ reason: 'until resumed', until: null });
   });
 
   it('resume() keeps per-lane backoffs that SGW asked for', async () => {
@@ -806,46 +813,114 @@ describe('RequestScheduler: contract', () => {
     h.reply({ status: 403 });
     for (const lane of ['interactive', 'background', 'snipe'] as const) await h.sched.run(req(lane)).catch(() => undefined);
     await flush();
-    expect(h.sched.pauseState()?.cause).toBe('blocked');
+    expect(h.sched.stats().paused?.reason).toBe('SGW is refusing requests; automation paused');
   });
 });
 
-// ── Opt-in state persistence (service-worker restarts) ───────────────────────
+// ── Persisted state (service-worker restarts) ───────────────────────────────
 
-describe('RequestScheduler: state persistence (stateKey)', () => {
-  const stateKey = 'sbw:requestSchedulerState';
+describe('RequestScheduler: persisted state (sbw:requestSchedulerState)', () => {
+  const KEY = STORAGE_KEYS.requestSchedulerState;
+  const state = (over: Partial<RequestSchedulerState> = {}): RequestSchedulerState => ({
+    version: 1,
+    pause: null,
+    consecutive403: 0,
+    consecutive429: 0,
+    lanes: {},
+    ...over,
+  });
+  const stored = (storage: FakeStorage): RequestSchedulerState =>
+    RequestSchedulerStateSchema.parse(storage.dump()[KEY]);
 
-  it('a restarted scheduler honours a 6 h block pause and lane backoffs', async () => {
+  it('writes pause and backoff state on every change, by default', async () => {
+    const h = setup();
+    h.reply({ status: 429 });
+    await h.sched.run(req('interactive')).catch(() => undefined);
+    await h.sched.flush();
+    expect(stored(h.storage)).toEqual(
+      state({
+        consecutive429: 1,
+        lanes: {
+          interactive: { lastEndAt: T0, gapJitterMs: 0, backoffUntil: T0 + 30 * S, backoffKind: 'rate-limited', failures: 1 },
+        },
+      }),
+    );
+
+    h.reply({ status: 403 });
+    for (const lane of ['background', 'snipe', 'canary'] as const) await h.sched.run(req(lane)).catch(() => undefined);
+    await h.sched.flush();
+    expect(stored(h.storage).pause).toEqual({ cause: 'blocked', reason: 'SGW is refusing requests; automation paused', until: T0 + 6 * HOUR });
+
+    h.sched.resume();
+    await h.sched.flush();
+    expect(stored(h.storage).pause).toBeNull();
+  });
+
+  it('a new instance over the same storage honours an active pause, with the right retryAfterMs', async () => {
     const storage = new FakeStorage();
     const clock = new FakeClock(T0);
-    const a = setup({ storage, clock, stateKey });
+    const a = setup({ storage, clock });
     a.reply({ status: 403 });
     for (const lane of ['interactive', 'background', 'snipe'] as const) await a.sched.run(req(lane)).catch(() => undefined);
     await a.sched.flush();
 
     clock.advance(10 * MIN);
-    const b = setup({ storage, clock, stateKey });
+    const b = setup({ storage, clock });
     const err = await failure(b.sched.run(req('canary')));
     expect(err.kind).toBe('paused');
-    expect(b.sched.pauseState()).toMatchObject({ cause: 'blocked', until: T0 + 6 * HOUR });
-    expect(b.sched.stats().lanes.background.backoffUntil).toBe(T0 + 6 * HOUR);
+    expect(err.retryAfterMs).toBe(6 * HOUR - 10 * MIN);
+    expect(b.sched.stats().paused).toEqual({ reason: 'SGW is refusing requests; automation paused', until: T0 + 6 * HOUR });
     expect(b.sent).toHaveLength(0);
     expect(b.notifier.sent).toHaveLength(0);
 
+    // The per-lane 403 backoff survived too.
     b.sched.resume();
-    expect((await failure(b.sched.run(req('background')))).kind).toBe('blocked');
+    const blocked = await failure(b.sched.run(req('background')));
+    expect(blocked.kind).toBe('blocked');
+    expect(blocked.retryAfterMs).toBe(HOUR - 10 * MIN);
+    expect(b.sched.stats().lanes.background.backoffUntil).toBe(T0 + HOUR);
     expect(b.sent).toHaveLength(0);
   });
 
-  it('a restarted scheduler keeps the background gap', async () => {
+  it('a new instance honours a 429 backoff and keeps counting consecutive 429s', async () => {
     const storage = new FakeStorage();
     const clock = new FakeClock(T0);
-    const a = setup({ storage, clock, stateKey });
+    const a = setup({ storage, clock });
+    a.reply({ status: 429, headers: { 'retry-after': '600' } });
+    await a.sched.run(req('interactive')).catch(() => undefined);
+    await a.sched.flush();
+
+    clock.advance(100 * S);
+    const b = setup({ storage, clock });
+    const err = await failure(b.sched.run(req('interactive')));
+    expect(err).toMatchObject({ kind: 'rate-limited', retryAfterMs: 500 * S });
+    expect(b.sent).toHaveLength(0);
+
+    // Two more 429s complete the burst begun before the restart.
+    b.reply({ status: 429 });
+    await b.sched.run(req('background')).catch(() => undefined);
+    expect(b.sched.stats().paused).toBeUndefined();
+    await b.sched.run(req('snipe')).catch(() => undefined);
+    expect(b.sched.stats().paused).toMatchObject({ reason: 'SGW is rate-limiting requests' });
+  });
+
+  it('reads the state at construction: paused before anything is sent', async () => {
+    const storage = new FakeStorage();
+    storage.seed({ [KEY]: state({ pause: { cause: 'manual', reason: 'health check failed', until: null } }) });
+    const h = setup({ storage });
+    await flush();
+    expect(h.sched.stats().paused).toEqual({ reason: 'health check failed', until: null });
+  });
+
+  it('a new instance keeps the background gap', async () => {
+    const storage = new FakeStorage();
+    const clock = new FakeClock(T0);
+    const a = setup({ storage, clock });
     await a.sched.run(req('background'));
     await a.sched.flush();
 
     clock.advance(10 * S);
-    const b = setup({ storage, clock, stateKey });
+    const b = setup({ storage, clock });
     const next = track(b.sched.run(req('background')));
     await flush();
     expect(b.sent).toHaveLength(0);
@@ -855,18 +930,74 @@ describe('RequestScheduler: state persistence (stateKey)', () => {
     expect(next.value).toBe('ok');
   });
 
-  it('ignores an invalid saved state', async () => {
+  it('ignores an expired pause and expired backoffs', async () => {
     const storage = new FakeStorage();
-    storage.seed({ [stateKey]: { pause: 'yes', lanes: 7 } });
-    const h = setup({ storage, stateKey });
+    storage.seed({
+      [KEY]: state({
+        pause: { cause: 'blocked', reason: 'SGW is refusing requests; automation paused', until: T0 - 1 },
+        consecutive403: 2,
+        lanes: { interactive: { lastEndAt: T0 - HOUR, gapJitterMs: 0, backoffUntil: T0 - 1, backoffKind: 'blocked', failures: 0 } },
+      }),
+    });
+    const h = setup({ storage });
     await expect(h.sched.run(req('interactive'))).resolves.toBe('ok');
+    const s = h.sched.stats();
+    expect(s.paused).toBeUndefined();
+    expect(s.lanes.interactive.backoffUntil).toBeUndefined();
+    await h.sched.flush();
+    expect(stored(storage).pause).toBeNull();
   });
 
-  it('without a stateKey, only sbw:requestBudget is written', async () => {
+  it('an expired pause from a previous worker is ignored after a restart', async () => {
+    const storage = new FakeStorage();
+    const clock = new FakeClock(T0);
+    const a = setup({ storage, clock });
+    a.reply({ status: 403 });
+    for (const lane of ['interactive', 'background', 'snipe'] as const) await a.sched.run(req(lane)).catch(() => undefined);
+    await a.sched.flush();
+
+    clock.advance(6 * HOUR);
+    const b = setup({ storage, clock });
+    await expect(b.sched.run(req('canary'))).resolves.toBe('ok');
+    await expect(b.sched.run(req('interactive'))).resolves.toBe('ok');
+    expect(b.sched.stats().paused).toBeUndefined();
+  });
+
+  it('corrupt state does not wedge the scheduler: it is quarantined, flagged, and means no pause', async () => {
+    for (const corrupt of [{ pause: 'yes', lanes: 7 }, { ...state({ pause: { cause: 'manual', reason: 'x', until: null } }), version: 2 }]) {
+      const storage = new FakeStorage();
+      storage.seed({ [KEY]: corrupt });
+      const h = setup({ storage });
+      await expect(h.sched.run(req('interactive'))).resolves.toBe('ok');
+      expect(h.sched.stats().paused).toBeUndefined();
+      expect(h.events).toContainEqual(expect.objectContaining({ type: 'state-invalid', key: KEY }) as SchedulerEvent);
+
+      await h.sched.flush();
+      const quarantined = QuarantineRecordSchema.parse(storage.dump()[QUARANTINE_KEY_PREFIX + KEY]);
+      expect(quarantined.value).toEqual(corrupt);
+      expect(quarantined.at).toBe(T0);
+      expect(stored(storage).lanes.interactive?.lastEndAt).toBe(T0);
+    }
+  });
+
+  it('a corrupt budget record is quarantined and flagged as well', async () => {
+    const storage = new FakeStorage();
+    storage.seed({ [STORAGE_KEYS.requestBudget]: { day: 'yesterday', used: { canary: -1 } } });
+    const h = setup({ storage });
+    await expect(h.sched.run(req('canary'))).resolves.toBe('ok');
+    expect(h.events).toContainEqual(expect.objectContaining({ type: 'state-invalid', key: STORAGE_KEYS.requestBudget }) as SchedulerEvent);
+    await h.sched.flush();
+    expect(QuarantineRecordSchema.safeParse(storage.dump()[QUARANTINE_KEY_PREFIX + STORAGE_KEYS.requestBudget]).success).toBe(true);
+  });
+
+  it('writes only its two contract records, both valid', async () => {
     const h = setup();
     h.reply({ status: 403 });
     for (const lane of ['interactive', 'background', 'snipe'] as const) await h.sched.run(req(lane)).catch(() => undefined);
     await h.sched.flush();
-    expect(Object.keys(h.storage.dump())).toEqual([STORAGE_KEYS.requestBudget]);
+    const dump = h.storage.dump();
+    expect(Object.keys(dump).sort()).toEqual([STORAGE_KEYS.requestBudget, STORAGE_KEYS.requestSchedulerState].sort());
+    expect(RequestBudgetSchema.safeParse(dump[STORAGE_KEYS.requestBudget]).success).toBe(true);
+    expect(RequestSchedulerStateSchema.safeParse(dump[STORAGE_KEYS.requestSchedulerState]).success).toBe(true);
   });
 });

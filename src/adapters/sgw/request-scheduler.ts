@@ -20,15 +20,29 @@
 // - Requests go out exactly as `build()` made them: no header, user-agent or
 //   credential changes, ever.
 // - considerateMode 'tight' halves every budget and doubles every interval.
+// - Pause, backoff and spacing state lives in `sbw:requestSchedulerState`
+//   (contract change, T-25): written on every change, read at construction,
+//   so a restarted worker never forgets a pause or backoff SGW asked for.
+//   Expired entries are ignored; an invalid record is quarantined (same
+//   `sbw:quarantine:<key>` record as the T-33 Repo) and flagged with a
+//   `state-invalid` event, and means no pause.
 //
 // All timing goes through the Clock port (no Date.now, no global timers), so
 // the whole thing runs deterministically on FakeClock.
-import { z } from 'zod';
+import type { z } from 'zod';
 
-import { RequestBudgetSchema, STORAGE_KEYS, type RequestBudget } from '../../domain/storage/schema';
+import {
+  QUARANTINE_KEY_PREFIX,
+  REQUEST_SCHEDULER_STATE_VERSION,
+  RequestBudgetSchema,
+  RequestSchedulerStateSchema,
+  STORAGE_KEYS,
+  type QuarantineRecord,
+  type RequestBudget,
+  type RequestSchedulerState,
+} from '../../domain/storage/schema';
 import {
   DEFAULT_LANES,
-  EpochMsSchema,
   LaneSchema,
   type EpochMs,
   type Lane,
@@ -84,12 +98,14 @@ export type SchedulerEvent =
   | ({ type: 'paused' } & PauseState)
   | { type: 'resumed' }
   | { type: 'backoff'; lane: Lane; kind: BackoffKind; status: number; until: EpochMs }
-  | { type: 'budget-exhausted'; lane: Lane; day: string; budget: number };
+  | { type: 'budget-exhausted'; lane: Lane; day: string; budget: number }
+  /** A stored record failed its schema: it was quarantined and treated as absent. */
+  | { type: 'state-invalid'; key: string; error: string };
 
 export interface RequestSchedulerDeps {
   clock: Clock;
   http: Http;
-  /** `storage.local`; holds `sbw:requestBudget` (and `stateKey`, if given). */
+  /** `storage.local`; holds `sbw:requestBudget` and `sbw:requestSchedulerState`. */
   storage: Storage;
   /** Tells the user when SGW's answers pause every lane. */
   notifier?: Notifier;
@@ -99,12 +115,6 @@ export interface RequestSchedulerDeps {
   lanes?: Readonly<Record<Lane, Readonly<LaneConfig>>>;
   /** Defaults to 'normal'; change it later with setConsiderateMode(). */
   considerateMode?: ConsiderateMode;
-  /**
-   * Opt-in: a storage key under which pause, backoff and spacing state is
-   * saved, so a service-worker restart cannot forget a block. Off by default:
-   * the key is not part of the v1 storage contract yet (see the T-25 report).
-   */
-  stateKey?: string;
 }
 
 // ── Local day (budgets reset at local midnight) ─────────────────────────────
@@ -153,26 +163,6 @@ export function parseRetryAfter(headers: Record<string, string>, now: EpochMs): 
   return Math.min(Math.max(0, ms), RETRY_AFTER_CAP_MS);
 }
 
-// ── Saved state (opt-in, `stateKey`) ────────────────────────────────────────
-
-const SavedLaneSchema = z.object({
-  lastEndAt: EpochMsSchema.optional(),
-  gapJitterMs: z.number().int().nonnegative(),
-  backoffUntil: EpochMsSchema.optional(),
-  backoffKind: z.enum(['rate-limited', 'blocked', 'server']).optional(),
-  failures: z.number().int().nonnegative(),
-});
-
-const SavedStateSchema = z.object({
-  pause: z
-    .object({ cause: z.enum(['manual', 'blocked', 'rate-limited']), reason: z.string(), until: EpochMsSchema.nullable() })
-    .nullable(),
-  streak403: z.number().int().nonnegative(),
-  streak429: z.number().int().nonnegative(),
-  lanes: z.partialRecord(LaneSchema, SavedLaneSchema),
-});
-type SavedState = z.infer<typeof SavedStateSchema>;
-
 // ── Implementation ──────────────────────────────────────────────────────────
 
 interface Waiting {
@@ -208,14 +198,13 @@ export class SgwRequestScheduler implements RequestScheduler {
   private readonly notifier: Notifier | undefined;
   private readonly random: () => number;
   private readonly laneConfigs: Readonly<Record<Lane, Readonly<LaneConfig>>>;
-  private readonly stateKey: string | undefined;
   private mode: ConsiderateMode;
 
   private readonly lanes: Record<Lane, LaneState>;
   private budget: RequestBudget = { day: '', used: {} };
   private pauseInfo: PauseState | undefined;
-  private streak403 = 0;
-  private streak429 = 0;
+  private consecutive403 = 0;
+  private consecutive429 = 0;
 
   private readonly cache = new Map<string, { value: unknown; expiresAt: EpochMs }>();
   private readonly shared = new Map<string, Promise<unknown>>();
@@ -232,7 +221,6 @@ export class SgwRequestScheduler implements RequestScheduler {
     this.notifier = deps.notifier;
     this.random = deps.random ?? Math.random;
     this.laneConfigs = deps.lanes ?? DEFAULT_LANES;
-    this.stateKey = deps.stateKey;
     this.mode = deps.considerateMode ?? 'normal';
     const fresh = (): LaneState => ({
       queue: [],
@@ -246,6 +234,9 @@ export class SgwRequestScheduler implements RequestScheduler {
       failures: 0,
     });
     this.lanes = { interactive: fresh(), background: fresh(), snipe: fresh(), canary: fresh() };
+    // Read the saved budget and state now, so a restarted worker is paused
+    // (and stats() is right) before anything asks it to send.
+    void this.load();
   }
 
   // ── RequestScheduler port ──────────────────────────────────────────────
@@ -282,16 +273,16 @@ export class SgwRequestScheduler implements RequestScheduler {
       const ls = this.lanes[lane];
       const usedToday = this.usedToday(lane, now);
       const budget = this.config(lane).dailyBudget;
-      let backoffUntil = ls.backoffUntil !== undefined && ls.backoffUntil > now ? ls.backoffUntil : undefined;
-      if (pause !== undefined && pause.until !== null) backoffUntil = Math.max(backoffUntil ?? 0, pause.until);
+      const backoffUntil = ls.backoffUntil !== undefined && ls.backoffUntil > now ? ls.backoffUntil : undefined;
       let nextAllowedAt = Math.max(this.gapEndsAt(lane), backoffUntil ?? 0);
+      if (pause !== undefined && pause.until !== null) nextAllowedAt = Math.max(nextAllowedAt, pause.until);
       if (usedToday >= budget) nextAllowedAt = Math.max(nextAllowedAt, nextLocalMidnight(now));
       return backoffUntil === undefined ? { usedToday, budget, nextAllowedAt } : { usedToday, budget, nextAllowedAt, backoffUntil };
     };
-    return {
-      lanes: { interactive: one('interactive'), background: one('background'), snipe: one('snipe'), canary: one('canary') },
-      cacheHits: this.cacheHits,
-    };
+    const lanes = { interactive: one('interactive'), background: one('background'), snipe: one('snipe'), canary: one('canary') };
+    return pause === undefined
+      ? { lanes, cacheHits: this.cacheHits }
+      : { lanes, cacheHits: this.cacheHits, paused: { until: pause.until, reason: pause.reason } };
   }
 
   /** Pauses every lane until `untilMs`, or until resume(). A pause never shortens a longer one. */
@@ -303,8 +294,8 @@ export class SgwRequestScheduler implements RequestScheduler {
   resume(): void {
     const had = this.pauseInfo !== undefined;
     this.pauseInfo = undefined;
-    this.streak403 = 0;
-    this.streak429 = 0;
+    this.consecutive403 = 0;
+    this.consecutive429 = 0;
     this.saveState();
     if (had) this.emit({ type: 'resumed' });
     for (const lane of LANES) this.pump(lane);
@@ -312,7 +303,7 @@ export class SgwRequestScheduler implements RequestScheduler {
 
   // ── Extras for the composition root (T-36) and the health panel ────────
 
-  /** Loads the persisted budget (and saved state). run() awaits it; call it early so stats() is right from the start. */
+  /** Resolves once the saved budget and state are read (started at construction; run() awaits it). */
   load(): Promise<void> {
     this.loading ??= this.restore();
     return this.loading;
@@ -335,12 +326,6 @@ export class SgwRequestScheduler implements RequestScheduler {
       }
       this.pump(lane);
     }
-  }
-
-  /** The all-lane pause in effect, or null. stats() cannot express an open-ended pause; this can. */
-  pauseState(): PauseState | null {
-    const p = this.activePause(this.clock.now());
-    return p === undefined ? null : { ...p };
   }
 
   /** Subscribes to scheduler events. Returns an unsubscribe function. */
@@ -491,16 +476,16 @@ export class SgwRequestScheduler implements RequestScheduler {
     const now = this.clock.now();
     const { status } = res;
     const endpoint = item.req.endpoint;
-    this.streak403 = status === 403 ? this.streak403 + 1 : 0;
-    this.streak429 = status === 429 ? this.streak429 + 1 : 0;
+    this.consecutive403 = status === 403 ? this.consecutive403 + 1 : 0;
+    this.consecutive429 = status === 429 ? this.consecutive429 + 1 : 0;
     const retryAfter = parseRetryAfter(res.headers, now);
 
     if (status === 403) {
       const wait = Math.max(BLOCKED_BACKOFF_MS, retryAfter ?? 0);
       this.backOff(lane, 'blocked', status, now + wait);
       item.reject(new SgwApiError('blocked', `${endpoint}: SGW refused the request (403)`, { status, retryAfterMs: wait }));
-      if (this.streak403 >= BURST_THRESHOLD) {
-        this.streak403 = 0;
+      if (this.consecutive403 >= BURST_THRESHOLD) {
+        this.consecutive403 = 0;
         this.autoPause('blocked', BLOCKED_MESSAGE, now + Math.max(BLOCK_PAUSE_MS, retryAfter ?? 0), BLOCKED_MESSAGE);
       }
       return;
@@ -514,8 +499,8 @@ export class SgwRequestScheduler implements RequestScheduler {
       ls.failures = Math.min(ls.failures + 1, MAX_FAILURES);
       this.backOff(lane, kind, status, now + wait);
       item.reject(new SgwApiError(kind, `${endpoint}: SGW answered ${String(status)}`, { status, retryAfterMs: wait }));
-      if (status === 429 && this.streak429 >= BURST_THRESHOLD) {
-        this.streak429 = 0;
+      if (status === 429 && this.consecutive429 >= BURST_THRESHOLD) {
+        this.consecutive429 = 0;
         const until = Math.max(...LANES.map((l) => this.lanes[l].backoffUntil ?? 0));
         const minutes = Math.ceil((until - now) / 60_000);
         this.autoPause(
@@ -639,23 +624,42 @@ export class SgwRequestScheduler implements RequestScheduler {
   // ── Persistence ─────────────────────────────────────────────────────────
 
   private async restore(): Promise<void> {
-    try {
-      const parsed = RequestBudgetSchema.safeParse(await this.storage.get<unknown>(STORAGE_KEYS.requestBudget));
-      if (parsed.success) this.budget = parsed.data;
-    } catch {
-      // Unreadable storage: start the day's count from zero.
-    }
-    if (this.stateKey === undefined) return;
-    try {
-      const parsed = SavedStateSchema.safeParse(await this.storage.get<unknown>(this.stateKey));
-      if (parsed.success) this.adopt(parsed.data);
-    } catch {
-      // Unreadable saved state: in-memory state only.
-    }
+    const budget = await this.readValidated(STORAGE_KEYS.requestBudget, RequestBudgetSchema);
+    if (budget !== undefined) this.budget = budget;
+    const state = await this.readValidated(STORAGE_KEYS.requestSchedulerState, RequestSchedulerStateSchema);
+    if (state !== undefined) this.adopt(state);
   }
 
-  /** Merges saved state into this (fresh) instance, keeping whichever is stricter. */
-  private adopt(saved: SavedState): void {
+  /**
+   * Reads and validates one record. Missing: undefined. Invalid: quarantined
+   * (copied to `sbw:quarantine:<key>` as a QuarantineRecord, then removed, as
+   * the T-33 Repo does), flagged with a `state-invalid` event, and undefined.
+   * A corrupt record never wedges the scheduler and never means "paused".
+   */
+  private async readValidated<S extends z.ZodType>(key: string, schema: S): Promise<z.infer<S> | undefined> {
+    let raw: unknown;
+    try {
+      raw = await this.storage.get<unknown>(key);
+    } catch {
+      return undefined; // unreadable storage: in-memory defaults
+    }
+    if (raw === undefined) return undefined;
+    const parsed = schema.safeParse(raw);
+    if (parsed.success) return parsed.data;
+    const error = parsed.error.message;
+    this.emit({ type: 'state-invalid', key, error });
+    try {
+      const record: QuarantineRecord = { at: this.clock.now(), error, value: raw };
+      await this.storage.set({ [QUARANTINE_KEY_PREFIX + key]: record });
+      await this.storage.remove([key]);
+    } catch {
+      // Quarantine failed: the next write replaces the record anyway.
+    }
+    return undefined;
+  }
+
+  /** Merges saved state into this fresh instance, keeping whichever is stricter. Expired entries are ignored. */
+  private adopt(saved: RequestSchedulerState): void {
     const now = this.clock.now();
     const mono = this.clock.monotonic();
     if (saved.pause !== null && (saved.pause.until === null || saved.pause.until > now)) {
@@ -664,8 +668,8 @@ export class SgwRequestScheduler implements RequestScheduler {
         this.pauseInfo = { ...saved.pause };
       }
     }
-    this.streak403 = Math.max(this.streak403, saved.streak403);
-    this.streak429 = Math.max(this.streak429, saved.streak429);
+    this.consecutive403 = Math.max(this.consecutive403, saved.consecutive403);
+    this.consecutive429 = Math.max(this.consecutive429, saved.consecutive429);
     for (const lane of LANES) {
       const s = saved.lanes[lane];
       if (s === undefined) continue;
@@ -684,28 +688,31 @@ export class SgwRequestScheduler implements RequestScheduler {
     }
   }
 
+  /** Persists pause, backoff and spacing state (evaluated when the write runs: the latest state). */
   private saveState(): void {
-    const key = this.stateKey;
-    if (key === undefined) return;
-    this.write(() => ({ [key]: this.snapshot() }));
+    this.write(() => ({ [STORAGE_KEYS.requestSchedulerState]: this.snapshot() }));
   }
 
-  private snapshot(): SavedState {
-    const lanes: SavedState['lanes'] = {};
+  private snapshot(): RequestSchedulerState {
+    const now = this.clock.now();
+    const lanes: RequestSchedulerState['lanes'] = {};
     for (const lane of LANES) {
       const ls = this.lanes[lane];
+      const backoff = ls.backoffUntil !== undefined && ls.backoffUntil > now;
+      if (ls.lastEndAt === undefined && !backoff && ls.failures === 0) continue; // nothing a restart needs
       lanes[lane] = {
         ...(ls.lastEndAt === undefined ? {} : { lastEndAt: ls.lastEndAt }),
         gapJitterMs: ls.gapJitterMs,
-        ...(ls.backoffUntil === undefined ? {} : { backoffUntil: ls.backoffUntil }),
-        ...(ls.backoffKind === undefined ? {} : { backoffKind: ls.backoffKind }),
+        ...(backoff ? { backoffUntil: ls.backoffUntil, backoffKind: ls.backoffKind } : {}),
         failures: ls.failures,
       };
     }
+    const pause = this.activePause(now);
     return {
-      pause: this.pauseInfo === undefined ? null : { ...this.pauseInfo },
-      streak403: this.streak403,
-      streak429: this.streak429,
+      version: REQUEST_SCHEDULER_STATE_VERSION,
+      pause: pause === undefined ? null : { ...pause },
+      consecutive403: this.consecutive403,
+      consecutive429: this.consecutive429,
       lanes,
     };
   }

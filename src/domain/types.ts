@@ -208,7 +208,11 @@ export const DEFAULT_LANES: Readonly<Record<Lane, Readonly<LaneConfig>>> = Objec
   canary: Object.freeze({ minIntervalMs: 120000, jitterMs: 0, maxConcurrent: 1, dailyBudget: 4 }),
 });
 
-/** `RequestScheduler.stats()`; also the `health.get` reply's `budget` (I-08). */
+/**
+ * `RequestScheduler.stats()`; also the `health.get` reply's `budget` (I-08).
+ * `paused` (contract change, T-25) is present while every lane is paused;
+ * `until: null` = open-ended (manual or health pause, until resume()).
+ */
 export const RequestSchedulerStatsSchema = z.object({
   lanes: z.record(
     LaneSchema,
@@ -220,6 +224,7 @@ export const RequestSchedulerStatsSchema = z.object({
     }),
   ),
   cacheHits: z.number().int().nonnegative(),
+  paused: z.object({ until: EpochMsSchema.nullable(), reason: z.string() }).optional(),
 });
 export type RequestSchedulerStats = z.infer<typeof RequestSchedulerStatsSchema>;
 
