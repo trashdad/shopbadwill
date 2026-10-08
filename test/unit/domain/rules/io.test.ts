@@ -68,6 +68,23 @@ describe('importRules', () => {
     expect(r).toEqual({ ok: false, errors: [expect.stringContaining('Rule 2 ("Broken")')] });
   });
 
+  it('rejects more than 500 rules with a clear message', () => {
+    const many = Array.from({ length: 501 }, (_, i) => rule({ id: `i${String(i)}` }));
+    const r = importRules(exportRules(many), [], opts());
+    expect(r).toEqual({ ok: false, errors: [expect.stringContaining('more than 500')] });
+  });
+
+  it('does not pollute prototypes from __proto__ / constructor keys', () => {
+    const text = `{"format":"shopbadwill.rules","version":1,"__proto__":{"polluted":true},"constructor":{"prototype":{"polluted":true}},"rules":[{"id":"a","name":"P","enabled":true,"action":"hide","all":[],"createdAt":1,"updatedAt":1,"__proto__":{"polluted":true},"constructor":"x"}]}`;
+    const r = importRules(text, [], opts());
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(Object.keys(r.rules[0] ?? {})).not.toContain('constructor');
+    const bad = importRules('{"format":"shopbadwill.rules","version":1,"rules":[{"__proto__":{"id":"x"}}]}', [], opts());
+    expect(bad.ok).toBe(false);
+    expect(({} as Record<string, unknown>)['id']).toBeUndefined();
+  });
+
   it('refuses oversized input', () => {
     expect(importRules('x'.repeat(2_000_001), [], opts()).ok).toBe(false);
   });

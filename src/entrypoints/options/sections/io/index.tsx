@@ -1,7 +1,7 @@
 import type { VNode } from 'preact';
 import { useRef, useState } from 'preact/hooks';
 
-import { exportRules, importRules, RULE_TEMPLATES, ruleFromTemplate, type RuleTemplate } from '../../../../domain/rules/io';
+import { exportRules, importRules, MAX_IMPORT_CHARS, RULE_TEMPLATES, ruleFromTemplate, type RuleTemplate } from '../../../../domain/rules/io';
 import type { Rule } from '../../../../domain/rules/schema';
 import { describeError } from '../../../../ui/components/describeError';
 import { Card, Field } from '../../../../ui/components/Field';
@@ -35,6 +35,8 @@ export function IoSection(props: IoSectionProps): VNode {
   const [errors, setErrors] = useState<string[]>([]);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState(false);
+  const inFlight = useRef(new Set<string>());
+  const [adding, setAdding] = useState<ReadonlySet<string>>(new Set());
 
   const doExport = (): void => {
     client.send('rules.list', undefined).then(
@@ -91,14 +93,28 @@ export function IoSection(props: IoSectionProps): VNode {
   };
 
   const onFile = (e: Event): void => {
-    const file = (e.currentTarget as HTMLInputElement).files?.[0];
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    // Reset so choosing the same file again fires `change` again.
+    const reset = (): void => {
+      input.value = '';
+    };
     if (file === undefined) return;
+    if (file.size > MAX_IMPORT_CHARS) {
+      reset();
+      setPreview(null);
+      setErrors(['That file is too large to be a rules export (over 2 MB). It was not read.']);
+      setStatus({ message: 'That file could not be imported. Nothing was changed.', tone: 'error' });
+      return;
+    }
     file.text().then(
       (text) => {
+        reset();
         setPasted(text);
         runPreview(text);
       },
       () => {
+        reset();
         setStatus({ message: 'Could not read that file.', tone: 'error' });
       },
     );
@@ -118,7 +134,10 @@ export function IoSection(props: IoSectionProps): VNode {
       setPasted('');
     } catch (e) {
       const left = preview.rules.length - saved;
-      setPreview({ ...preview, rules: preview.rules.slice(saved) });
+      const rest = preview.rules.slice(saved);
+      setPreview({ ...preview, rules: rest });
+      // So a fresh preview cannot re-add what was already saved.
+      setPasted(exportRules(rest, now()));
       setStatus({
         message: `Added ${String(saved)}, but could not add the other ${String(left)}. ${describeError(e)}`,
         tone: 'error',
@@ -129,11 +148,24 @@ export function IoSection(props: IoSectionProps): VNode {
   };
 
   const addTemplate = (t: RuleTemplate): void => {
+    if (inFlight.current.has(t.id)) return;
+    inFlight.current.add(t.id);
+    setAdding((cur) => new Set(cur).add(t.id));
+    const done = (): void => {
+      inFlight.current.delete(t.id);
+      setAdding((cur) => {
+        const next = new Set(cur);
+        next.delete(t.id);
+        return next;
+      });
+    };
     client.send('rules.save', ruleFromTemplate(t, { now: now(), newId })).then(
       () => {
+        done();
         setStatus({ message: `Added "${t.name}". You can find it under Rules.`, tone: 'ok' });
       },
       (e: unknown) => {
+        done();
         setStatus({ message: `Could not add "${t.name}". ${describeError(e)}`, tone: 'error' });
       },
     );
@@ -264,6 +296,7 @@ export function IoSection(props: IoSectionProps): VNode {
                 <button
                   type="button"
                   aria-label={`Add "${t.name}"`}
+                  disabled={adding.has(t.id)}
                   onClick={() => {
                     addTemplate(t);
                   }}

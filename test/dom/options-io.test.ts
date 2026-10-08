@@ -83,4 +83,67 @@ describe('io section', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add "No clothing lots: hide by keyword"' }));
     await screen.findByText(/Could not add/);
   });
+
+  it('reads a chosen file and previews it; re-picking the same file fires again', async () => {
+    app();
+    const input = screen.getByLabelText<HTMLInputElement>('Or choose an exported file');
+    const file = new File([exportRules([rule()])], 'rules.json', { type: 'application/json' });
+    fireEvent.change(input, { target: { files: [file] } });
+    await screen.findByText(/Will be added/);
+    expect(input.value).toBe('');
+  });
+
+  it('refuses an oversized file without reading it', async () => {
+    const fake = app();
+    const input = screen.getByLabelText('Or choose an exported file');
+    let read = false;
+    const big = { size: 2_000_001, text: () => { read = true; return Promise.resolve(''); } };
+    fireEvent.change(input, { target: { files: [big] } });
+    await screen.findByLabelText('Problems with the import');
+    expect(screen.getByText(/too large/)).toBeTruthy();
+    expect(read).toBe(false);
+    expect(saved(fake)).toHaveLength(0);
+  });
+
+  it('reports 501 rules as too many', async () => {
+    app();
+    const many = Array.from({ length: 501 }, (_, i) => rule({ id: `i${String(i)}` }));
+    fireEvent.input(screen.getByLabelText('Paste exported rules'), { target: { value: exportRules(many) } });
+    fireEvent.click(screen.getByRole('button', { name: 'Preview import' }));
+    await screen.findByText(/more than 500/);
+  });
+
+  it('keeps only the unsaved remainder after a partial save failure', async () => {
+    const fake = new FakeMessaging();
+    fake.handle('rules.list', () => []);
+    let calls = 0;
+    fake.handle('rules.save', () => {
+      if (++calls === 2) throw new MessagingError('handler_error', 'Disk full');
+      return undefined;
+    });
+    let n = 0;
+    render(h(IoSection, { client: fake, now: () => 1000, newId: () => `id-${String(++n)}` }));
+    const three = [rule({ id: 'a', name: 'A' }), rule({ id: 'b', name: 'B' }), rule({ id: 'c', name: 'C' })];
+    fireEvent.input(screen.getByLabelText('Paste exported rules'), { target: { value: exportRules(three) } });
+    fireEvent.click(screen.getByRole('button', { name: 'Preview import' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Add 3 rules' }));
+    await screen.findByText(/Added 1, but could not add the other 2/);
+    expect(screen.getByRole('button', { name: 'Add 2 rules' })).toBeTruthy();
+    const box = screen.getByLabelText<HTMLTextAreaElement>('Paste exported rules');
+    const names = (JSON.parse(box.value) as { rules: Rule[] }).rules.map((r) => r.name);
+    expect(names).toEqual(['B', 'C']);
+  });
+
+  it('ignores repeated clicks on a template while it is saving', async () => {
+    const fake = new FakeMessaging();
+    fake.handle('rules.list', () => []);
+    fake.handle('rules.save', () => new Promise<undefined>((r) => setTimeout(() => { r(undefined); }, 20)));
+    render(h(IoSection, { client: fake }));
+    const btn = screen.getByRole('button', { name: 'Add "Local pickup only items: hide"' });
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+    await screen.findByText(/Added "Local pickup/);
+    expect(saved(fake)).toHaveLength(1);
+  });
 });
