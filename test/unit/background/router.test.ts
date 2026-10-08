@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createRouter, type RouterSender } from '../../../src/background/router';
+import { createRouter, type MessageResponse, type OnMessageEvent, type RouterSender } from '../../../src/background/router';
 import { createMessagingClient, MessagingError, type ClientRuntime } from '../../../src/messaging/client';
 
 const ID = 'ext-id';
@@ -18,8 +18,9 @@ const env = (type: string, payload?: unknown) => ({
 function setup(quickFavorite = true) {
   const router = createRouter({
     runtimeId: ID,
-    extensionOrigin: EXT_ORIGIN,
+    getURL: (path) => `${EXT_ORIGIN}/${path}`,
     isQuickFavoriteEnabled: () => quickFavorite,
+    log: () => undefined,
   });
   return router;
 }
@@ -163,6 +164,157 @@ describe('router validation and envelope', () => {
     expect(() => router.register('rules.changed', vi.fn())).toThrow(/broadcast/);
     off();
     expect(() => router.register('settings.get', vi.fn())).not.toThrow();
+  });
+});
+
+describe('router hardening', () => {
+  it('rejects a falsy runtimeId and a malformed getURL at construction', () => {
+    const base = { getURL: (p: string) => `${EXT_ORIGIN}/${p}`, isQuickFavoriteEnabled: () => true };
+    expect(() => createRouter({ ...base, runtimeId: '' })).toThrow(/runtimeId/);
+    expect(() => createRouter({ ...base, runtimeId: ID, getURL: () => 'https://x.example/' })).toThrow(/getURL/);
+  });
+
+  it('derives the prefix from getURL (moz-extension uuid differs from runtime id)', async () => {
+    const router = createRouter({
+      runtimeId: 'shopbadwill@x',
+      getURL: (p) => `moz-extension://uuid-1234/${p}`,
+      isQuickFavoriteEnabled: () => true,
+      log: () => undefined,
+    });
+    router.register('kill.set', () => undefined);
+    const ok = await router.handle(env('kill.set', { on: true }), { id: 'shopbadwill@x', url: 'moz-extension://uuid-1234/dash.html' });
+    expect(ok).toEqual({ ok: true });
+  });
+
+  it('fails closed when isQuickFavoriteEnabled throws, and handle never rejects', async () => {
+    const log = vi.fn();
+    const router = createRouter({
+      runtimeId: ID,
+      getURL: (p) => `${EXT_ORIGIN}/${p}`,
+      isQuickFavoriteEnabled: () => {
+        throw new Error('storage down');
+      },
+      log,
+    });
+    const h = vi.fn();
+    router.register('quick.favorite', h);
+    await expect(router.handle(env('quick.favorite', { itemId: 5 }), SGW_TAB)).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'disabled' },
+    });
+    expect(h).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalled();
+  });
+
+  it('hides handler error detail from content, keeps it for UI, and logs it', async () => {
+    const log = vi.fn();
+    const router = createRouter({ runtimeId: ID, getURL: (p) => `${EXT_ORIGIN}/${p}`, isQuickFavoriteEnabled: () => true, log });
+    router.register('quick.track', () => {
+      throw new Error('secret /path detail');
+    });
+    router.register('kill.set', () => {
+      throw new Error('secret /path detail');
+    });
+    const c = await router.handle(env('quick.track', { itemId: 1 }), SGW_TAB);
+    expect(c).toEqual({ ok: false, error: { code: 'handler_error', message: 'internal error' } });
+    const u = await router.handle(env('kill.set', { on: true }), POPUP);
+    expect(u).toEqual({ ok: false, error: { code: 'handler_error', message: 'secret /path detail' } });
+    expect(log).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects spoofed origins and foreign extension urls', async () => {
+    const router = setup();
+    router.register('rules.evaluate', () => []);
+    router.register('kill.set', () => undefined);
+    for (const url of [
+      'https://shopgoodwill.com@evil.example/',
+      'https://evil.example/?https://shopgoodwill.com',
+      'https://evil.example/#https://shopgoodwill.com/',
+    ]) {
+      expect(await router.handle(env('rules.evaluate', { listings: [] }), { id: ID, tab: { id: 1 }, url })).toMatchObject({
+        ok: false,
+        error: { code: 'bad_sender' },
+      });
+    }
+    // lookalike / foreign extension pages are not "ours": from a tab they are not shopgoodwill, so bad_sender
+    for (const url of ['chrome-extension://ext-id.evil/x', 'chrome-extension://other/x']) {
+      expect(await router.handle(env('kill.set', { on: true }), { id: ID, tab: { id: 1 }, url })).toMatchObject({
+        ok: false,
+        error: { code: 'bad_sender' },
+      });
+      // tab-less sender with a foreign extension url
+      expect(await router.handle(env('kill.set', { on: true }), { id: ID, url })).toMatchObject({
+        ok: false,
+        error: { code: 'bad_sender' },
+      });
+    }
+  });
+
+  it('a stale unregister does not remove a newer handler', async () => {
+    const router = setup();
+    const off = router.register('settings.get', vi.fn());
+    off();
+    const second = vi.fn(() => undefined as never);
+    router.register('settings.get', second);
+    off(); // stale
+    await router.handle(env('settings.get'), POPUP);
+    expect(second).toHaveBeenCalled();
+  });
+
+  it('lets content send content-allowed types', async () => {
+    const router = setup();
+    const open = vi.fn();
+    const dom = vi.fn();
+    router.register('ui.openSnipe', open);
+    router.register('page.domHealth', dom);
+    expect(await router.handle(env('ui.openSnipe', { itemId: 7 }), SGW_TAB)).toEqual({ ok: true });
+    const health = { url: 'https://shopgoodwill.com/', configVersion: '1', pageKind: 'listing', cardsFound: 3, fallbackUsed: false };
+    expect(await router.handle(env('page.domHealth', health), SGW_TAB)).toEqual({ ok: true });
+    expect(open).toHaveBeenCalled();
+    expect(dom).toHaveBeenCalled();
+  });
+});
+
+describe('router.listen', () => {
+  function stubEvent() {
+    const ls = new Set<Parameters<OnMessageEvent['addListener']>[0]>();
+    const ev: OnMessageEvent = {
+      addListener: (l) => {
+        ls.add(l);
+      },
+      removeListener: (l) => {
+        ls.delete(l);
+      },
+    };
+    return { ev, ls };
+  }
+
+  it('responds asynchronously with the envelope, returns true, and can be removed', async () => {
+    const router = setup();
+    router.register('rules.evaluate', () => []);
+    const { ev, ls } = stubEvent();
+    const off = router.listen(ev);
+    expect(ls.size).toBe(1);
+    const [listener] = [...ls];
+    const sendResponse = vi.fn<(r: MessageResponse) => void>();
+    const kept = listener?.(env('rules.evaluate', { listings: [] }), SGW_TAB, sendResponse);
+    expect(kept).toBe(true);
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledWith({ ok: true, reply: [] });
+    });
+    const bad = vi.fn<(r: MessageResponse) => void>();
+    listener?.(env('rules.evaluate', { listings: [] }), { ...SGW_TAB, id: 'x' }, bad);
+    await vi.waitFor(() => {
+      expect(bad).toHaveBeenCalledWith(expect.objectContaining({ ok: false }));
+    });
+    off();
+    expect(ls.size).toBe(0);
+  });
+
+  it('defaults to browser.runtime.onMessage', () => {
+    const router = setup();
+    const off = router.listen();
+    off();
   });
 });
 

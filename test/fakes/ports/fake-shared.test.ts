@@ -8,6 +8,7 @@ import { FakeAuditLog } from './fake-audit-log';
 import { FakeCalendarApi } from './fake-calendar-api';
 import { FakeClock } from './fake-clock';
 import { FakeGoogleAuth } from './fake-google-auth';
+import { MessagingError } from '../../../src/messaging/errors';
 import { FakeMessaging } from './fake-messaging';
 import { FakeSgwApi } from './fake-sgw-api';
 import { FakeSwitches } from './fake-switches';
@@ -73,27 +74,46 @@ describe('FakeAuditLog', () => {
 });
 
 describe('FakeMessaging', () => {
-  it('routes send to handlers, resolves undefined for reply-less messages, rejects unhandled replies', async () => {
+  it('routes send to handlers and resolves undefined for reply-less messages', async () => {
     const m = new FakeMessaging();
     m.handle('rules.list', () => []);
+    m.handle('quick.hideKeyword', () => undefined);
     expect(await m.send('rules.list', undefined)).toEqual([]);
-    await expect(m.send('settings.get', undefined)).rejects.toThrow('no handler');
     await m.send('quick.hideKeyword', { term: 'lamp' });
-    expect(m.sent.map((s) => s.type)).toEqual(['rules.list', 'settings.get', 'quick.hideKeyword']);
+    expect(m.sent.map((s) => s.type)).toEqual(['rules.list', 'quick.hideKeyword']);
   });
 
-  it('rejects a malformed payload, a wrong-shaped reply, and passes a valid round-trip', async () => {
+  it('rejects with no_handler (reply or not) like the router', async () => {
+    const m = new FakeMessaging();
+    await expect(m.send('settings.get', undefined)).rejects.toMatchObject({ code: 'no_handler' });
+    await expect(m.send('quick.hideKeyword', { term: 'x' })).rejects.toMatchObject({ code: 'no_handler' });
+  });
+
+  it('rejects a throwing handler with handler_error', async () => {
+    const m = new FakeMessaging();
+    m.handle('settings.get', () => {
+      throw new Error('boom');
+    });
+    await expect(m.send('settings.get', undefined)).rejects.toMatchObject({ code: 'handler_error', message: 'boom' });
+  });
+
+  it('throws on a duplicate handle(), as router.register does', () => {
+    const m = new FakeMessaging();
+    m.handle('rules.list', () => []);
+    expect(() => m.handle('rules.list', () => [])).toThrow(/already registered/);
+  });
+
+  it('rejects malformed payloads with invalid_message and wrong-shaped replies with bad_reply', async () => {
     const m = new FakeMessaging();
     m.handle('settings.get', () => ({ nope: true }) as never);
-    m.handle('rules.list', () => []);
-    await expect(m.send('page.token', { bearer: 'not-a-jwt', capturedAt: 1 })).rejects.toThrow();
-    await expect(m.send('quick.hideKeyword', { term: '' })).rejects.toThrow();
+    m.handle('page.token', () => undefined);
+    await expect(m.send('page.token', { bearer: 'not-a-jwt', capturedAt: 1 })).rejects.toMatchObject({
+      code: 'invalid_message',
+    });
+    await expect(m.send('quick.hideKeyword', { term: '' })).rejects.toBeInstanceOf(MessagingError);
     expect(m.sent).toHaveLength(0);
-    await expect(m.send('settings.get', undefined)).rejects.toThrow();
+    await expect(m.send('settings.get', undefined)).rejects.toMatchObject({ code: 'bad_reply' });
     await m.send('page.token', { bearer: 'aaa.bbb.ccc', capturedAt: 1 });
-    expect(await m.send('rules.list', undefined)).toEqual([]);
-    m.handle('rules.list', () => [{ bad: 1 }] as never);
-    await expect(m.send('rules.list', undefined)).rejects.toThrow();
   });
 
   it('rejects malformed ticks and broadcasts', () => {

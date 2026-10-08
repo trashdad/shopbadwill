@@ -12,6 +12,7 @@
 import { z } from 'zod';
 
 import type { MessagingClient } from '../ports/messaging';
+import { MessagingError } from './errors';
 import {
   MSG_VERSION,
   MsgEnvelopeSchema,
@@ -42,17 +43,7 @@ export const MessageResponseSchema = z.union([
   z.object({ ok: z.literal(false), error: z.object({ code: RouterErrorCodeSchema, message: z.string() }) }),
 ]);
 
-/** Router codes, plus client-side 'transport' (sendMessage threw) and 'no_response' (no valid envelope came back). */
-export type MessagingErrorCode = z.infer<typeof RouterErrorCodeSchema> | 'transport' | 'no_response';
-
-export class MessagingError extends Error {
-  readonly code: MessagingErrorCode;
-  constructor(code: MessagingErrorCode, message: string, options?: { cause?: unknown }) {
-    super(message, options);
-    this.name = 'MessagingError';
-    this.code = code;
-  }
-}
+export { MessagingError, type MessagingErrorCode } from './errors';
 
 /** The slice of browser.runtime the client uses. */
 export interface ClientPort {

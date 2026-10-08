@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 
+import { MessagingError } from '../../../src/messaging/errors';
 import type { MessagingClient } from '../../../src/ports/messaging';
 import {
   MsgReplySchemas,
@@ -18,9 +19,9 @@ type Handler<K extends MsgType> = (payload: MsgPayload<K>) => MsgReply<K> | Prom
 /**
  * In-memory MessagingClient. Register background handlers with `handle`, push
  * stream ticks with `emitTick` and broadcasts with `broadcast`. Payloads, replies, ticks and broadcasts are parsed with the protocol schemas and a
- * malformed one throws (ZodError). A message
- * without a handler resolves `undefined` if the protocol declares no reply for
- * it, and rejects otherwise (a missing handler is a test bug).
+ * malformed one throws. `send` rejects with MessagingError exactly like the
+ * production client + router: invalid_message, no_handler, handler_error,
+ * bad_reply. A duplicate `handle()` throws, as router.register does.
  */
 export class FakeMessaging implements MessagingClient {
   /** Every send(), in order. */
@@ -29,23 +30,35 @@ export class FakeMessaging implements MessagingClient {
   private readonly ports = new Map<PortName, Set<(t: never) => void>>();
   private readonly broadcasts = new Map<MsgBroadcastType, Set<(p: never) => void>>();
 
+  /** Registers the handler for `type`. Like router.register, a duplicate throws. */
   handle<K extends MsgType>(type: K, handler: Handler<K>): this {
+    if (this.handlers.has(type)) throw new Error(`FakeMessaging: handler already registered for "${type}"`);
     this.handlers.set(type, handler);
     return this;
   }
 
   async send<K extends MsgType>(type: K, payload: MsgPayload<K>): Promise<MsgReply<K>> {
-    // Production validates the envelope body and the reply; so does the fake.
-    MsgSchema.parse(payload === undefined ? { type } : { type, payload });
+    // Production behavior (client + router): the same errors, as MessagingError.
+    const parsed = MsgSchema.safeParse(payload === undefined ? { type } : { type, payload });
+    if (!parsed.success) {
+      throw new MessagingError('invalid_message', `invalid "${type}" message: ${parsed.error.message}`, { cause: parsed.error });
+    }
     this.sent.push({ type, payload: structuredClone(payload) });
     const handler = this.handlers.get(type);
-    if (handler === undefined) {
-      if (type in MsgReplySchemas) throw new Error(`FakeMessaging: no handler for "${type}"`);
-      return undefined as MsgReply<K>;
+    if (handler === undefined) throw new MessagingError('no_handler', `no handler for "${type}"`);
+    let reply: unknown;
+    try {
+      reply = await handler(structuredClone(payload) as never);
+    } catch (e) {
+      throw new MessagingError('handler_error', e instanceof Error ? e.message : String(e), { cause: e });
     }
-    const reply = await handler(structuredClone(payload) as never);
-    if (type in MsgReplySchemas) return (MsgReplySchemas as Record<string, z.ZodType>)[type]?.parse(reply) as MsgReply<K>;
-    return reply as MsgReply<K>;
+    const schema = (MsgReplySchemas as Record<string, z.ZodType | undefined>)[type];
+    if (schema === undefined) return undefined as MsgReply<K>;
+    const checked = schema.safeParse(reply);
+    if (!checked.success) {
+      throw new MessagingError('bad_reply', `invalid reply to "${type}": ${checked.error.message}`, { cause: checked.error });
+    }
+    return checked.data as MsgReply<K>;
   }
 
   connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void): () => void {

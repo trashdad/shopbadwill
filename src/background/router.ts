@@ -66,12 +66,28 @@ export type Handler<K extends MsgType> = (
 ) => MsgReply<K> | Promise<MsgReply<K>>;
 
 export interface RouterDeps {
-  /** browser.runtime.id */
+  /** browser.runtime.id; must be non-empty. */
   runtimeId: string;
-  /** Scheme + host of the extension's own pages without a trailing slash, e.g. `chrome-extension://<id>` (browser.runtime.getURL('/') minus the slash). */
-  extensionOrigin: string;
-  /** settings.overlay.quickFavorite; gates quick.favorite from content. */
+  /**
+   * browser.runtime.getURL. The router derives the extension's page prefix from
+   * `getURL('')` (`chrome-extension://<id>/`, or `moz-extension://<per-install-uuid>/`
+   * on Firefox, which is not the runtime id).
+   */
+  getURL: (path: string) => string;
+  /** settings.overlay.quickFavorite; gates quick.favorite from content. A throw counts as off. */
   isQuickFavoriteEnabled: () => boolean | Promise<boolean>;
+  /** Receives handler and gate failures, including the detail withheld from content senders. Defaults to console.error. */
+  log?: (message: string, error: unknown) => void;
+}
+
+type MessageListener = (
+  raw: unknown,
+  sender: RouterSender,
+  sendResponse: (response: MessageResponse) => void,
+) => boolean;
+export interface OnMessageEvent {
+  addListener(l: MessageListener): void;
+  removeListener(l: MessageListener): void;
 }
 
 export interface Router {
@@ -79,8 +95,8 @@ export interface Router {
   register<K extends MsgType>(type: K, handler: Handler<K>): () => void;
   /** Validates and dispatches one raw runtime message. Never rejects. */
   handle(raw: unknown, sender: RouterSender): Promise<MessageResponse>;
-  /** Installs the runtime.onMessage listener. Returns a function that removes it. */
-  listen(): () => void;
+  /** Installs the runtime.onMessage listener (default: browser.runtime.onMessage). Returns a function that removes it. */
+  listen(onMessage?: OnMessageEvent): () => void;
 }
 
 const fail = (code: MessageErrorCode, message: string): MessageResponse => ({ ok: false, error: { code, message } });
@@ -99,13 +115,19 @@ function isKnownType(type: unknown): type is MsgType {
 }
 
 export function createRouter(deps: RouterDeps): Router {
+  if (!deps.runtimeId) throw new Error('createRouter: runtimeId must be non-empty');
+  const extensionPrefix = deps.getURL('');
+  if (!/^[a-z-]+-extension:\/\/[^/]+\/$/.test(extensionPrefix)) {
+    throw new Error(`createRouter: getURL('') must be an extension origin ending in "/", got "${extensionPrefix}"`);
+  }
+  const log = deps.log ?? ((message: string, error: unknown) => { console.error(message, error); });
   const handlers = new Map<MsgType, Handler<MsgType>>();
 
   /** Returns the sender class, or an error response. */
   function classify(sender: RouterSender): SenderClass | MessageResponse {
     if (sender.id !== deps.runtimeId) return fail('bad_sender', 'sender.id is not this extension');
     // Prefix match, not URL.origin: non-special schemes (chrome-extension:, moz-extension:) have no usable origin in every runtime.
-    const isExtensionPage = sender.url !== undefined && sender.url.startsWith(`${deps.extensionOrigin}/`);
+    const isExtensionPage = sender.url !== undefined && sender.url.startsWith(extensionPrefix);
     const origin = originOf(sender.url);
     if (sender.tab === undefined) {
       // Popup, options, dashboard, background: no tab. A web url here is not ours.
@@ -120,7 +142,7 @@ export function createRouter(deps: RouterDeps): Router {
     return 'content';
   }
 
-  async function handle(raw: unknown, sender: RouterSender): Promise<MessageResponse> {
+  async function dispatch(raw: unknown, sender: RouterSender): Promise<MessageResponse> {
     const senderClass = classify(sender);
     if (typeof senderClass !== 'string') return senderClass;
 
@@ -136,8 +158,14 @@ export function createRouter(deps: RouterDeps): Router {
     if (!parsed.success) return fail('invalid_message', `invalid "${type}" message: ${parsed.error.message}`);
     const msg = parsed.data;
 
-    if (senderClass === 'content' && type === 'quick.favorite' && !(await deps.isQuickFavoriteEnabled())) {
-      return fail('disabled', 'quick favorite is turned off');
+    if (senderClass === 'content' && type === 'quick.favorite') {
+      let enabled = false; // fail closed
+      try {
+        enabled = await deps.isQuickFavoriteEnabled();
+      } catch (e) {
+        log(`router: isQuickFavoriteEnabled threw for "${type}"`, e);
+      }
+      if (!enabled) return fail('disabled', 'quick favorite is turned off');
     }
 
     const handler = handlers.get(type);
@@ -147,7 +175,9 @@ export function createRouter(deps: RouterDeps): Router {
     try {
       reply = await handler((msg as { payload?: never }).payload, { sender, senderClass });
     } catch (e) {
-      return fail('handler_error', e instanceof Error ? e.message : String(e));
+      log(`router: handler for "${type}" threw`, e);
+      // Detail stays with extension pages; a content script gets a generic message.
+      return fail('handler_error', senderClass === 'content' ? 'internal error' : e instanceof Error ? e.message : String(e));
     }
 
     const schema = (MsgReplySchemas as Record<string, ZodType | undefined>)[type];
@@ -155,6 +185,16 @@ export function createRouter(deps: RouterDeps): Router {
     const checked = schema.safeParse(reply);
     if (!checked.success) return fail('bad_reply', `handler for "${type}" returned an invalid reply`);
     return { ok: true, reply: checked.data };
+  }
+
+  /** Never rejects: any unexpected failure becomes a handler_error envelope. */
+  async function handle(raw: unknown, sender: RouterSender): Promise<MessageResponse> {
+    try {
+      return await dispatch(raw, sender);
+    } catch (e) {
+      log('router: unexpected failure', e);
+      return fail('handler_error', 'internal error');
+    }
   }
 
   return {
@@ -167,18 +207,13 @@ export function createRouter(deps: RouterDeps): Router {
       };
     },
     handle,
-    listen() {
-      const listener = (
-        raw: unknown,
-        sender: RouterSender,
-        sendResponse: (response: MessageResponse) => void,
-      ): boolean => {
-        void handle(raw, sender).then(sendResponse);
+    listen(onMessage = browser.runtime.onMessage) {
+      const listener: MessageListener = (raw, sender, sendResponse) => {
+        handle(raw, sender).then(sendResponse, (e: unknown) => {
+          log('router: respond failed', e);
+          sendResponse(fail('handler_error', 'internal error'));
+        });
         return true; // respond asynchronously
-      };
-      const onMessage = browser.runtime.onMessage as unknown as {
-        addListener(l: typeof listener): void;
-        removeListener(l: typeof listener): void;
       };
       onMessage.addListener(listener);
       return () => {
