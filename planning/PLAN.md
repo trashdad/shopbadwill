@@ -1653,3 +1653,17 @@ Source: `.superpowers/sdd/PLAN/preflight-scan.md` §6 (I-01…I-42, all accepted
 | A-5 | `sidePanel` is required on Chrome (WXT adds it for the sidepanel entrypoint; there is no install warning). | §2.5 |
 | A-6 | The kill-switch shortcut's suggested key is `Alt+Shift+K`, because `Ctrl+Shift+K` is Firefox's Web Console. | §2.5, T-01, T-36, T-86 |
 | A-7 | T-74 owns `scripts/sign-firefox.ts` and replaces T-01's stub. | T-74, T-01 (stub noted) |
+
+---
+
+## 17. Contracts v1 frozen (T-02, 2026-10-07)
+
+The interface contract is frozen as **code**: `src/ports/**`, `src/domain/**/types.ts` and `schema.ts`, `src/domain/settings/**`, `src/domain/storage/schema.ts`, `src/messaging/protocol.ts`. **Where §3 above differs from the code, the code wins.** All 22 resolution decisions plus the review amendments are in `docs/CONTRACT-DECISIONS.md`. Highlights that change §3/§2.3 text:
+- `MessagingClient` port (`src/ports/messaging.ts`): `send`, `connect`, `onBroadcast` (for `rules.changed`, `switches.changed`).
+- Shared error classes in `src/ports/errors.ts` (`SgwApiError`, `CalendarApiError`, `GoogleAuthError`, `HttpTimeoutError`, `HttpNetworkError{beforeSend}`) — the only runtime code in ports.
+- Several §3.3/§3.4/§3.11 data shapes live in `src/domain/types.ts`; adapters may also import `src/domain/storage/schema.ts` (keys + record schemas).
+- `calendarId` lives only in `CalendarState` (`sbw:calendar`); removed from `GoogleCredentials`.
+- `RequestBudget.used` is a partial Lane record.
+- `GcalEventSchema` is the normalized form; T-64 parses raw Google responses leniently.
+- Defaults: caps 5000/10000/20000, `requiredDryRuns` 5, `Watch.favoriteMode` `'sgw'`, `typoAbsolute` 2500, `features.landedCost` false (onboarding offers it), `snipe.keepAlive` true; `defaultSettings()` returns a mutable clone of the deep-frozen `DEFAULT_SETTINGS`.
+- T-35 defines the message reply/error envelope (not in §3).
