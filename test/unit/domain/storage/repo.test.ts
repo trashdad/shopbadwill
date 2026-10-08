@@ -37,6 +37,7 @@ describe('Repo records', () => {
     expect(dump[quarantineKey(STORAGE_KEYS.awake)]).toMatchObject({ at: clock.now(), value: ['not', 'numbers'] });
     const listed = await repo.listQuarantined();
     expect(listed.map((q) => q.key)).toEqual([STORAGE_KEYS.awake]);
+    expect(listed[0]?.generation).toBe(0);
     await repo.clearQuarantine(STORAGE_KEYS.awake);
     expect(await repo.listQuarantined()).toEqual([]);
   });
@@ -48,12 +49,36 @@ describe('Repo records', () => {
     expect(areas.local.dump()).toEqual({});
   });
 
-  it('truncates a huge quarantined value', async () => {
-    areas.local.seed({ [STORAGE_KEYS.awake]: Array.from({ length: 50_000 }, () => 'xxxxxxxxxx') });
-    await repo.get(STORAGE_KEYS.awake);
-    const q = areas.local.dump()[quarantineKey(STORAGE_KEYS.awake)] as { value: string };
-    expect(typeof q.value).toBe('string');
-    expect(q.value.length).toBeLessThan(101_000);
+  it('keeps a huge corrupt record intact (rules)', async () => {
+    const big = Array.from({ length: 20_000 }, (_, n) => ({ id: 'rule-' + String(n), junk: 'xxxxxxxxxx' }));
+    areas.local.seed({ [STORAGE_KEYS.rules]: big });
+    expect(await repo.get(STORAGE_KEYS.rules)).toEqual([]);
+    const q = areas.local.dump()[quarantineKey(STORAGE_KEYS.rules)] as { value: unknown };
+    expect(q.value).toEqual(big);
+    expect(areas.local.dump()[STORAGE_KEYS.rules]).toBeUndefined();
+  });
+
+  it('keeps the last 3 quarantine generations and never overwrites an earlier one', async () => {
+    for (let n = 1; n <= 4; n++) {
+      areas.local.seed({ [STORAGE_KEYS.awake]: ['bad' + String(n)] });
+      clock.advance(1000);
+      await repo.get(STORAGE_KEYS.awake);
+    }
+    const items = await repo.listQuarantined();
+    expect(items.map((q) => [q.generation, q.record.value])).toEqual([
+      [0, ['bad4']],
+      [1, ['bad3']],
+      [2, ['bad2']],
+    ]);
+    expect((items[0]?.record.at ?? 0) > (items[1]?.record.at ?? 0)).toBe(true);
+    await repo.clearQuarantine(STORAGE_KEYS.awake);
+    expect(await repo.listQuarantined()).toEqual([]);
+  });
+
+  it('drops a corrupt cache instead of quarantining it', async () => {
+    areas.local.seed({ [STORAGE_KEYS.shippingCache]: 'garbage' });
+    expect(await repo.get(STORAGE_KEYS.shippingCache)).toEqual({});
+    expect(areas.local.dump()).toEqual({});
   });
 
   it('set validates and refuses to write an invalid value', async () => {
@@ -125,6 +150,32 @@ describe('Repo audit ring', () => {
     expect(Object.keys(areas.local.dump()).filter((k) => k.startsWith('sbw:audit:'))).toHaveLength(20);
   }, 60_000);
 
+  it('rebuilds a corrupt auditMeta from the chunks instead of overwriting live ones', async () => {
+    const mk = (from: number, n: number) =>
+      Array.from({ length: n }, (_, i) => ({ seq: from + i, at: 1, actor: 'system', kind: 'x', details: {} }));
+    const slot0 = mk(1, 500);
+    areas.local.seed({
+      [auditChunkKey(0)]: slot0,
+      [auditChunkKey(1)]: mk(501, 3),
+      [STORAGE_KEYS.auditMeta]: { nextSeq: 'oops' },
+    });
+    const e = await repo.appendAudit(entry(1));
+    expect(e.seq).toBe(504);
+    const d = areas.local.dump();
+    expect(d[auditChunkKey(0)]).toEqual(slot0);
+    expect((d[auditChunkKey(1)] as unknown[]).length).toBe(4);
+    expect(d[STORAGE_KEYS.auditMeta]).toEqual({ nextSeq: 505, head: 1, tail: 0 });
+    expect(d[quarantineKey(STORAGE_KEYS.auditMeta)]).toBeDefined();
+  });
+
+  it('rebuilds a missing auditMeta and rolls to the next slot when the head chunk is full', async () => {
+    const full = Array.from({ length: 500 }, (_, i) => ({ seq: 501 + i, at: 1, actor: 'system', kind: 'x', details: {} }));
+    areas.local.seed({ [auditChunkKey(1)]: full });
+    expect((await repo.appendAudit(entry(1))).seq).toBe(1001);
+    expect(await repo.get(STORAGE_KEYS.auditMeta)).toEqual({ nextSeq: 1002, head: 2, tail: 1 });
+    expect(areas.local.dump()[auditChunkKey(1)]).toEqual(full);
+  });
+
   it('quarantines a corrupt chunk and carries on', async () => {
     await repo.appendAudit(entry(1));
     areas.local.seed({ [auditChunkKey(0)]: 'garbage' });
@@ -164,6 +215,18 @@ describe('Repo caches', () => {
     expect(stored.new).toBeDefined();
     expect(stored.i0).toBeUndefined();
   });
+
+  it('evicts the least recently written entry, never the one just written (even with the shortest TTL)', async () => {
+    const cap = CACHE_MAX_ENTRIES[k];
+    // Integer-like ids, as real item ids are: object key order would be numeric, not insertion order.
+    for (let i = 0; i < cap; i++) await repo.putCached(k, String(1000 + i), { cents: i, expiresAt: clock.now() + 100_000 });
+    await repo.putCached(k, '5', { cents: 9, expiresAt: clock.now() + 1 });
+    const stored = await repo.get(k);
+    expect(Object.keys(stored)).toHaveLength(cap);
+    expect(stored['5']).toEqual({ cents: 9, expiresAt: clock.now() + 1 });
+    expect(stored['1000']).toBeUndefined();
+    expect(stored['1001']).toBeDefined();
+  }, 60_000);
 
   it('pruneCaches removes expired entries', async () => {
     await repo.putCached(k, 'a', { cents: 1, expiresAt: clock.now() + 5 });

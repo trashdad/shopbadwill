@@ -3,7 +3,7 @@
 // record is moved to `sbw:quarantine:<key>` and replaced by its default, and
 // the audit "ring" (20 chunks of 500) and the TTL caches are kept within
 // quota. Never `storage.sync`: only `local` and `session` exist on the port.
-import type { z } from 'zod';
+import { z } from 'zod';
 
 import type { Clock } from '../../ports/clock';
 import type { Storage, StorageAreas } from '../../ports/storage';
@@ -66,14 +66,19 @@ export const CACHE_MAX_ENTRIES: Readonly<Record<CacheKey, number>> = Object.free
   [STORAGE_KEYS.shippingCache]: 1000,
 });
 
-/** A quarantined value larger than this (as JSON) is stored as a truncated preview. */
-const QUARANTINE_MAX_JSON_CHARS = 100_000;
+/** Quarantine generations kept per key (newest first), so a repeat corruption never destroys an earlier record. */
+export const QUARANTINE_KEEP = 3;
+
+/** Internal recency list (oldest first) per cache, since JS objects order integer-like keys numerically. */
+const CACHE_ORDER_PREFIX = 'sbw:cacheOrder:';
 
 type Entries = Record<string, { expiresAt: number }>;
 
 export interface QuarantinedItem {
   /** The original key (without the quarantine prefix). */
   key: string;
+  /** 0 is the newest quarantined record, 1 the one before it, and so on. */
+  generation: number;
   record: QuarantineRecord;
 }
 
@@ -155,16 +160,46 @@ export class Repo {
     const out: QuarantinedItem[] = [];
     for (const key of keys) {
       for (const storage of [this.areas.local, this.areas.session]) {
-        const raw = await storage.get<unknown>(quarantineKey(key));
-        const parsed = QuarantineRecordSchema.safeParse(raw);
-        if (parsed.success) out.push({ key, record: parsed.data });
+        for (let generation = 0; generation < QUARANTINE_KEEP; generation++) {
+          const raw = await storage.get<unknown>(quarantineGenKey(key, generation));
+          const parsed = QuarantineRecordSchema.safeParse(raw);
+          if (parsed.success) out.push({ key, generation, record: parsed.data });
+        }
       }
     }
     return out;
   }
 
   async clearQuarantine(key: string): Promise<void> {
-    await Promise.all([this.areas.local.remove([quarantineKey(key)]), this.areas.session.remove([quarantineKey(key)])]);
+    const keys = Array.from({ length: QUARANTINE_KEEP }, (_, g) => quarantineGenKey(key, g));
+    await Promise.all([this.areas.local.remove(keys), this.areas.session.remove(keys)]);
+  }
+
+  /** Quarantines whatever is stored under `key` now (full value kept) and removes it. No-op when empty. */
+  async quarantineStored(key: StorageKey, error: string): Promise<void> {
+    const storage = this.area(STORAGE_RECORDS[key].area);
+    const raw = await storage.get<unknown>(key);
+    if (raw !== undefined) await this.quarantine(storage, key, raw, error);
+  }
+
+  /**
+   * Non-destructive scan of every stored record except `sbw:meta` (audit slots
+   * included): which exist, and which fail their schema. Nothing is quarantined.
+   */
+  async inspectStored(): Promise<{ present: string[]; invalid: string[] }> {
+    const present: string[] = [];
+    const invalid: string[] = [];
+    const check = async (storage: Storage, key: string, schema: z.ZodType) => {
+      const raw = await storage.get<unknown>(key);
+      if (raw === undefined) return;
+      present.push(key);
+      if (!schema.safeParse(raw).success) invalid.push(key);
+    };
+    for (const [key, rec] of Object.entries(STORAGE_RECORDS)) {
+      if (key !== STORAGE_KEYS.meta) await check(this.area(rec.area), key, rec.schema);
+    }
+    for (let i = 0; i < STORAGE_LIMITS.auditChunkCount; i++) await check(this.areas.local, auditChunkKey(i), AuditChunkSchema);
+    return { present, invalid };
   }
 
   // ── audit ring ───────────────────────────────────────────────────────────
@@ -176,7 +211,7 @@ export class Repo {
   /** Appends an entry (stamping `seq` and `at`), rolling and wrapping chunks as needed. */
   appendAudit(e: Omit<AuditEntry, 'seq' | 'at'>): Promise<AuditEntry> {
     return this.withLock('audit', async () => {
-      const meta = await this.get(STORAGE_KEYS.auditMeta);
+      const meta = await this.loadAuditMeta();
       let { head, tail } = meta;
       let chunk = await this.readAuditChunk(head);
       // A crash between the chunk write and the meta write leaves the chunk ahead of the meta.
@@ -198,7 +233,7 @@ export class Repo {
 
   /** Newest first. `before` keeps entries with `seq < before`. */
   async listAudit(q: { limit: number; before?: number; kinds?: string[] }): Promise<AuditEntry[]> {
-    const meta = await this.get(STORAGE_KEYS.auditMeta);
+    const meta = await this.loadAuditMeta();
     const out: AuditEntry[] = [];
     for (let n = meta.head; n >= meta.tail && out.length < q.limit; n--) {
       const chunk = await this.readAuditChunk(n);
@@ -215,10 +250,35 @@ export class Repo {
 
   /** Every kept entry, oldest first, as JSON. */
   async exportAuditJson(): Promise<string> {
-    const meta = await this.get(STORAGE_KEYS.auditMeta);
+    const meta = await this.loadAuditMeta();
     const all: AuditEntry[] = [];
     for (let n = meta.tail; n <= meta.head; n++) all.push(...(await this.readAuditChunk(n)));
     return JSON.stringify(all, null, 2);
+  }
+
+  /**
+   * `sbw:auditMeta`, or, when it is missing or was invalid (and so quarantined),
+   * rebuilt from the chunks: seq s lives in chunk floor((s - 1) / 500), so the
+   * highest and lowest chunk numbers present give head and tail, and the
+   * highest seq gives nextSeq. Without this an append would overwrite live chunks.
+   */
+  private async loadAuditMeta(): Promise<AuditMeta> {
+    const found = await this.find(STORAGE_KEYS.auditMeta);
+    if (found) return found;
+    let head = -1;
+    let tail = Number.POSITIVE_INFINITY;
+    let maxSeq = 0;
+    for (let slot = 0; slot < STORAGE_LIMITS.auditChunkCount; slot++) {
+      const chunk = (await this.readValidated(this.areas.local, auditChunkKey(slot), AuditChunkSchema)) ?? [];
+      const last = chunk[chunk.length - 1];
+      if (!last) continue;
+      const n = Math.floor((last.seq - 1) / STORAGE_LIMITS.auditChunkSize);
+      head = Math.max(head, n);
+      tail = Math.min(tail, n);
+      for (const e of chunk) maxSeq = Math.max(maxSeq, e.seq);
+    }
+    if (head < 0) return DEFAULTS[STORAGE_KEYS.auditMeta]();
+    return { nextSeq: maxSeq + 1, head, tail };
   }
 
   private async readAuditChunk(n: number): Promise<AuditEntry[]> {
@@ -235,11 +295,18 @@ export class Repo {
     return entry && entry.expiresAt > this.clock.now() ? (entry as CacheEntryOf<K>) : undefined;
   }
 
-  /** Stores an entry, then drops expired entries and evicts down to the cap. */
+  /**
+   * Stores an entry, then drops expired entries and evicts down to the cap,
+   * least recently written first. The entry just written is never evicted.
+   */
   async putCached<K extends CacheKey>(key: K, id: string, entry: CacheEntryOf<K>): Promise<void> {
     await this.withLock(key, async () => {
       const all = { ...((await this.get(key)) as Entries), [id]: entry as { expiresAt: number } };
-      await this.set(key, this.prune(all, key) as StorageValue<K>);
+      const order = (await this.readCacheOrder(key)).filter((x) => x !== id);
+      order.push(id);
+      const { kept, order: nextOrder } = this.prune(all, key, order, id);
+      await this.set(key, kept as StorageValue<K>);
+      await this.areas.local.set({ [CACHE_ORDER_PREFIX + key]: nextOrder });
     });
   }
 
@@ -249,23 +316,41 @@ export class Repo {
     for (const key of CACHE_KEYS) {
       await this.withLock(key, async () => {
         const all = (await this.get(key)) as Entries;
-        const kept = this.prune(all, key);
+        const { kept, order } = this.prune(all, key, await this.readCacheOrder(key));
         const n = Object.keys(all).length - Object.keys(kept).length;
         if (n > 0) {
           removed += n;
           await this.set(key, kept as StorageValue<typeof key>);
+          await this.areas.local.set({ [CACHE_ORDER_PREFIX + key]: order });
         }
       });
     }
     return removed;
   }
 
-  private prune(all: Entries, key: CacheKey): Entries {
+  private async readCacheOrder(key: CacheKey): Promise<string[]> {
+    const parsed = z.array(z.string()).safeParse(await this.areas.local.get<unknown>(CACHE_ORDER_PREFIX + key));
+    return parsed.success ? parsed.data : [];
+  }
+
+  /** Expired entries go; over the cap, the least recently written go (never `protect`). */
+  private prune(all: Entries, key: CacheKey, order: string[], protect?: string): { kept: Entries; order: string[] } {
     const now = this.clock.now();
-    let live = Object.entries(all).filter(([, v]) => v.expiresAt > now);
-    const cap = CACHE_MAX_ENTRIES[key];
-    if (live.length > cap) live = live.sort((a, b) => b[1].expiresAt - a[1].expiresAt).slice(0, cap);
-    return Object.fromEntries(live);
+    const known = new Set(order);
+    // Entries with no recency record count as oldest.
+    let ids = [...Object.keys(all).filter((id) => !known.has(id)), ...order].filter((id) => {
+      const e = all[id];
+      return e !== undefined && e.expiresAt > now;
+    });
+    const cap = Math.max(1, CACHE_MAX_ENTRIES[key]);
+    if (ids.length > cap) {
+      const evictable = ids.filter((id) => id !== protect);
+      const drop = new Set(evictable.slice(0, ids.length - cap));
+      ids = ids.filter((id) => !drop.has(id));
+    }
+    const kept: Entries = {};
+    for (const id of ids) kept[id] = all[id] as { expiresAt: number };
+    return { kept, order: ids };
   }
 
   // ── internals ────────────────────────────────────────────────────────────
@@ -283,16 +368,23 @@ export class Repo {
     return undefined;
   }
 
+  /**
+   * Moves a rejected value to `sbw:quarantine:<key>`, keeping the full value and
+   * the last QUARANTINE_KEEP generations. The quarantine copy is written before
+   * the original is removed, so a crash cannot lose it. Caches are disposable
+   * and are dropped instead.
+   */
   private async quarantine(storage: Storage, key: string, value: unknown, error: string): Promise<void> {
-    let kept: unknown = value;
-    try {
-      const json = JSON.stringify(value);
-      if (json.length > QUARANTINE_MAX_JSON_CHARS) kept = `[truncated ${String(json.length)} chars] ${json.slice(0, QUARANTINE_MAX_JSON_CHARS)}`;
-    } catch {
-      kept = '[unserialisable]';
+    if ((CACHE_KEYS as readonly string[]).includes(key)) {
+      await storage.remove([key]);
+      return;
     }
-    const record: QuarantineRecord = { at: this.clock.now(), error, value: kept };
-    await storage.set({ [quarantineKey(key)]: record });
+    for (let g = QUARANTINE_KEEP - 1; g >= 1; g--) {
+      const older = await storage.get<unknown>(quarantineGenKey(key, g - 1));
+      if (older !== undefined) await storage.set({ [quarantineGenKey(key, g)]: older });
+    }
+    const record: QuarantineRecord = { at: this.clock.now(), error, value };
+    await storage.set({ [quarantineGenKey(key, 0)]: record });
     await storage.remove([key]);
   }
 }
@@ -303,4 +395,8 @@ export function auditChunkKey(slot: number): AuditChunkKey {
 
 export function quarantineKey(key: string): QuarantineKey {
   return (QUARANTINE_KEY_PREFIX + key) as QuarantineKey;
+}
+
+function quarantineGenKey(key: string, generation: number): string {
+  return generation === 0 ? quarantineKey(key) : quarantineKey(key) + '#' + String(generation);
 }

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { StorageTooNewError, migrate, migrations, type Migration } from '../../../../src/domain/storage/migrations';
-import { Repo } from '../../../../src/domain/storage/repo';
+import { Repo, quarantineKey } from '../../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../../src/domain/storage/schema';
 import { FakeClock } from '../../../fakes/ports/fake-clock';
 import { FakeStorageAreas } from '../../../fakes/ports/fake-storage';
@@ -20,7 +20,7 @@ describe('migrate', () => {
   it('runs 0 -> 1 on empty storage and writes a valid meta', async () => {
     const installed = clock.now();
     const r = await migrate(repo);
-    expect(r).toEqual({ from: 0, to: 1, recovered: false, ran: [{ from: 0, to: 1 }] });
+    expect(r).toEqual({ from: 0, to: 1, recovered: false, ran: [{ from: 0, to: 1 }], health: 'ok', metaRestamped: false });
     expect(await repo.find(STORAGE_KEYS.meta)).toEqual({ schemaVersion: 1, installedAt: installed, lastMigrationAt: installed });
   });
 
@@ -74,11 +74,40 @@ describe('migrate', () => {
     expect(areas.local.dump()[STORAGE_KEYS.meta]).toMatchObject({ schemaVersion: 9 });
   });
 
-  it('treats corrupt meta as version 0', async () => {
+  it('quarantines a corrupt meta, then migrates from 0 when the store is otherwise empty', async () => {
     areas.local.seed({ [STORAGE_KEYS.meta]: 'junk' });
     const r = await migrate(repo);
-    expect(r.ran).toHaveLength(1);
+    expect(r).toMatchObject({ health: 'ok', ran: [{ from: 0, to: 1 }] });
+    expect(areas.local.dump()[quarantineKey(STORAGE_KEYS.meta)]).toMatchObject({ value: 'junk' });
     expect((await repo.find(STORAGE_KEYS.meta))?.schemaVersion).toBe(1);
+  });
+
+  it('does not re-run migrations from 0 when meta is corrupt but data exists; re-stamps if the data validates', async () => {
+    areas.local.seed({ [STORAGE_KEYS.meta]: { schemaVersion: 'x' }, [STORAGE_KEYS.awake]: [1, 2] });
+    let ran = 0;
+    const list: Migration[] = [{ from: 0, to: 1, run: () => ((ran += 1), Promise.resolve()) }];
+    const r = await migrate(repo, list);
+    expect(ran).toBe(0);
+    expect(r).toMatchObject({ health: 'ok', metaRestamped: true, ran: [] });
+    expect(areas.local.dump()[quarantineKey(STORAGE_KEYS.meta)]).toBeDefined();
+    expect((await repo.find(STORAGE_KEYS.meta))?.schemaVersion).toBe(1);
+    expect(await repo.get(STORAGE_KEYS.awake)).toEqual([1, 2]);
+  });
+
+  it('flags meta-corrupt and leaves everything alone when existing data does not validate', async () => {
+    areas.local.seed({ [STORAGE_KEYS.meta]: 'junk', [STORAGE_KEYS.awake]: ['bad'] });
+    let ran = 0;
+    const list: Migration[] = [{ from: 0, to: 1, run: () => ((ran += 1), Promise.resolve()) }];
+    const r = await migrate(repo, list);
+    expect(ran).toBe(0);
+    expect(r).toMatchObject({ health: 'meta-corrupt', metaRestamped: false, ran: [] });
+    const d = areas.local.dump();
+    expect(d[STORAGE_KEYS.meta]).toBeUndefined();
+    expect(d[STORAGE_KEYS.awake]).toEqual(['bad']);
+    expect(d[quarantineKey(STORAGE_KEYS.meta)]).toBeDefined();
+    // Still flagged on the next start (meta is now missing, data still present).
+    expect(await migrate(repo, list)).toMatchObject({ health: 'meta-corrupt' });
+    expect(ran).toBe(0);
   });
 
   it('fails loudly when a step is missing', async () => {
