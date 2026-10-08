@@ -1,6 +1,6 @@
 # ShopBadwill Implementation Plan
 
-Plan version 1.0 · 2026-10-07 · Author: Fable (lead planner) · Source brief: `planning/fable-prompt.md`
+Plan version 1.1 · 2026-10-07 · Author: Fable (lead planner) · Source brief: `planning/fable-prompt.md`
 
 **How to read this document.** Sections 1–2 explain the decisions and the shape of the system. Section 3 is the frozen interface contract: every worker reads it. Sections 4–6 are what the orchestrator dispatches: spikes, phases and task cards. Sections 7–14 are the supporting material (tests, threats, budgets, setup, release, risks, QoL, open questions).
 
@@ -18,12 +18,12 @@ Plan version 1.0 · 2026-10-07 · Author: Fable (lead planner) · Source brief: 
 
 - WXT builds Chrome MV3 and Firefox MV3 from one codebase, emits per-browser manifests, provides `wxt:locationchange` for SPA routing, `createShadowRootUi`, and a Vitest fake browser (`wxt/testing/vitest-plugin`, `wxt/testing/fake-browser`; verified on wxt.dev for v0.21.4 on 2026-10-07).
 - WXT targets **MV2 for Firefox by default**, so every Firefox build and gate command passes `-b firefox --mv3` (verified on wxt.dev). Output dirs: `.output/chrome-mv3`, `.output/firefox-mv3`.
-- Minimum browsers: Chrome 148 (native `browser.*` with promise-returning `onMessage`), Firefox 128 (MV3 event pages, `world: "MAIN"` content scripts). The dev machine has Chrome, Chromium and Firefox 157.
+- Minimum browsers: Chrome 148 (native `browser.*` with promise-returning `onMessage`), Firefox 140 (`strict_min_version 140.0`, required by `data_collection_permissions`; MV3 event pages and `world: "MAIN"` content scripts are available from 128), Firefox for Android 142 (`gecko_android` `strict_min_version 142.0`). The dev machine has Chrome, Chromium and Firefox 157.
 - webextension-polyfill is archived (repo banner: "archived by the owner on Jul 30, 2026"), so it is not used.
-- Preact (via `@wxt-dev/module-preact`) for popup, options, dashboard and in-page Shadow DOM UI. Small, no runtime HTML strings, works with the no-`innerHTML` lint rule.
+- Preact (via `@preact/preset-vite` in `wxt.config.ts`; there is no `@wxt-dev/module-preact` on npm) for popup, options, dashboard and in-page Shadow DOM UI. Small, no runtime HTML strings, works with the no-`innerHTML` lint rule.
 - zod for every API response and every stored record; the same schemas run in contract tests and at runtime (fail closed).
 
-Rejected: **Plasmo** (stalled, last release ~Sep 2025). **CRXJS** (Chrome-first, weak Firefox). **Hand-rolled Vite config** (would re-implement per-browser manifests, SPA navigation and fake browser that WXT already provides). **React** (heavier, no benefit over Preact here). **Lit** (viable, but Preact keeps one component model across all surfaces and WXT has a first-party module).
+Rejected: **Plasmo** (stalled, last release ~Sep 2025). **CRXJS** (Chrome-first, weak Firefox). **Hand-rolled Vite config** (would re-implement per-browser manifests, SPA navigation and fake browser that WXT already provides). **React** (heavier, no benefit over Preact here). **Lit** (viable, but Preact keeps one component model across all surfaces and plugs into WXT's Vite build through `@preact/preset-vite`).
 
 ### 1.2 How the daily job wakes, per browser
 
@@ -60,7 +60,7 @@ Why T2 is "wake-and-launch" rather than a companion that bids: the JWT is likely
 
 Why T3 is rejected: it needs the SGW token off-device, on a server with a different IP and UA (likely rejected by the JWT binding ⚠), and it concentrates account and money risk in a remote host. Prior art (Gixen, BidPulse) runs this way only because they are services; a personal tool does not need it.
 
-Firefox: T1 has no keep-awake and no `background` equivalent ⚠ [S-7, S-8]. Firefox users get T0 plus the fallback policy, and T2 if built. Chrome is therefore the primary browser for sniping; Firefox is fully supported for requirements 1–4.
+Firefox: T1 has no keep-awake and no `background` equivalent ⚠ [S-7, S-8]. Per §15 Q2, sniping is first-class on both browsers: Firefox runs the same engine, gets the runner-page `SnipeHost` (T-116, Phase 4) when S-7 says the event page cannot be held alive, plus the fallback policy, and T2 if built. Without keep-awake, Firefox snipes need the PC awake at fire time.
 
 ### 1.5 SGW authentication
 
@@ -96,8 +96,8 @@ Rejected: **content-script fetches on the SGW origin** (needs an open tab; split
 
 ### 1.8 Other decisions made here
 
-- **Auto-favorite is per watch**, three modes: `sgw` (favorite immediately), `sgw-late` (favorite only within N hours of end, default 6), `local` (track locally only). Default for new watches: `local` **ASSUMPTION** pending open question Q5.
-- **Dry-run is global and on by default** for favoriting, calendar writes and bidding; each automation has its own switch. Live bidding additionally requires completing ≥5 dry-run snipes with on-time fires.
+- **Auto-favorite is per watch**, three modes: `sgw` (favorite immediately), `sgw-late` (favorite only within N hours of end, default 6), `local` (track locally only). Default for new watches: `sgw` (§15 Q5; the `Watch` schema default in T-02).
+- **Dry-run is global and on by default** for favoriting, calendar writes and bidding; each automation has its own switch. Live bidding additionally requires completing ≥5 (`requiredDryRuns`) dry-run snipes; an on-time rate below 95% is a warning the user can override with typed confirmation, which is audited.
 - **Hiding is never silent**: collapsed stub with rule name, page bar "N hidden · show", per-card Why?, one-click undo, global off.
 - **Money is integer cents** everywhere in the domain; strings only at the API edge (`bidAmount: "12.00"`).
 - **Time is epoch milliseconds or RFC 3339 UTC** in the domain; the raw Pacific string is kept beside it for audit.
@@ -119,7 +119,7 @@ shopbadwill/
       money.ts                  cents math, increment math, formatting
       time/pacific.ts           naive-PT parsing, DST, dual display
       rules/{schema,matcher,keywords,preview}.ts
-      watches/{schema,query-url}.ts
+      watches/{schema,helpers}.ts   no SGW URL param names (query-url lives in adapters/sgw, I-26)
       jobs/daily-job.ts         resumable JobRun state machine
       favorites/reconcile.ts
       calendar/{event-id,event-builder,reconciler,ics}.ts
@@ -139,9 +139,10 @@ shopbadwill/
         session-adapter.ts      token capture, expiry, logged-out state
         clock-adapter.ts        server offset, RTT, Pacific parsing glue
         health.ts               healthCheck() that fails closed
+        query-url.ts            SGW search-URL params <-> SearchQuery
       google/{auth-pkce,auth-chrome-identity,calendar-api,schemas}.ts
       ntfy/ntfy-sink.ts
-      browser/{clock,http,storage,alarms,notifier,permissions,keepawake,snipe-host,messaging}.ts
+      browser/{clock,http,storage,alarms,notifier,permissions,keepawake,snipe-host}.ts   (no messaging adapter: src/messaging/ is the only layer)
     background/
       main.ts                   composition root: wires adapters, registers listeners, reconcile()
       router.ts                 message dispatch with sender validation
@@ -222,7 +223,7 @@ All keys live in `storage.local` unless marked `session`. Every record is valida
 | `sbw:snipes` | `Record<SnipeId, Snipe>` | durable; survives restart |
 | `sbw:audit:<chunk>` | `AuditEntry[]` chunks of 500 | ring of 20 chunks |
 | `sbw:auditMeta` | `{ nextSeq, head, tail }` | |
-| `sbw:sgwSession` | `SgwSession` | access token + exp (+ refresh token only if S-2 approves) |
+| `sbw:sgwSession` | `SgwSessionRecord` | access token + exp (+ refresh token only if S-2 approves) |
 | `sbw:google` | `GoogleCredentials` | refresh token, client id (+ secret if required), grantedScopes |
 | `sbw:requestBudget` | `{ day: 'YYYY-MM-DD', used: Record<Lane, number> }` | |
 | `sbw:awake` | `number[]` heartbeat epochs, 14 days | |
@@ -240,7 +241,7 @@ Transport: `browser.runtime.sendMessage` for request/response, `browser.runtime.
 
 1. `sender.id === browser.runtime.id` (drop otherwise).
 2. Origin class: messages from a content script must have `sender.tab` and `sender.url` whose origin is `https://shopgoodwill.com`; messages that are UI-only (anything under `snipe.*`, `settings.set`, `calendar.connect`, `kill.*`, `audit.undo`, `favorites.*`) are rejected if `sender.tab` is present and `sender.url` is not an extension page.
-3. Content scripts may send only the `page.*`, `rules.evaluate`, `quick.*` and `landedCost.get` types. `quick.favorite` is honoured only when `settings.overlay.quickFavorite` is on and the item is not yet favorited; `quick.hideSeller` creates a local rule; neither can arm a snipe, place a bid, or write to the calendar.
+3. Content scripts may send only the `page.*`, `rules.evaluate`, `quick.*`, `landedCost.get` and `ui.openSnipe` types (`ui.openSnipe` only opens the dashboard prefilled; it never arms). `quick.favorite` is honoured only when `settings.overlay.quickFavorite` is on and the item is not yet favorited; `quick.hideSeller` creates a local rule; neither can arm a snipe, place a bid, or write to the calendar.
 
 The full union is in §3.12.
 
@@ -253,19 +254,19 @@ The full union is in §3.12.
 | host `https://shopgoodwill.com/*` | required | required (install-time grant, revocable; checked with `permissions.contains`) | install | content scripts, tap |
 | host `https://buyerapi.shopgoodwill.com/*` | required | required | install | background API calls (CORS bypass) |
 | `notifications` | optional | optional | onboarding step 5 / options | local alerts, preflight, outcomes |
-| `identity` | optional | optional (needed for `launchWebAuthFlow`) | "Connect Google" click | OAuth |
+| `identity` | optional | **required** (Firefox does not accept `identity` as an optional permission; needed for `launchWebAuthFlow`) | Chrome: "Connect Google" click; Firefox: install | OAuth |
 | host `https://oauth2.googleapis.com/*`, `https://www.googleapis.com/*` | optional | optional | "Connect Google" click | token + Calendar API |
-| `sidePanel` | optional | n/a (`sidebar_action` manifest key) | "Open dashboard" click | dashboard |
+| `sidePanel` | required (WXT adds it once a sidepanel entrypoint exists; no install warning) | n/a (`sidebar_action` manifest key) | install | dashboard |
 | `background` | optional | n/a | "Enable keep-alive" in snipe settings | T1: start early / shut down late ⚠ [S-8] |
 | `power` | optional | n/a | same | T1: `requestKeepAwake('system')` |
 | `nativeMessaging` | optional | optional | "Install companion" | T2 only |
 | host `https://ntfy.sh/*` (or user's server) | optional | optional | "Enable phone push" | ntfy fallback |
 | `webRequest` | optional, only if S-2 picks it | same | onboarding | token capture fallback |
-| `commands` (manifest key, not a permission) | yes | yes | — | kill-switch shortcut |
+| `commands` (manifest key, not a permission) | yes | yes | — | kill-switch shortcut, suggested key `Alt+Shift+K` (`Ctrl+Shift+K` is Firefox's Web Console) |
 | `unlimitedStorage` | not requested | not requested | — | 10 MB is enough with caches capped |
 | `scripting`, `tabs`, `cookies`, `webNavigation` | not requested | not requested | — | not needed; `wxt:locationchange` handles SPA routing |
 
-Firefox additionally declares `browser_specific_settings.gecko.id = "shopbadwill@trashdad.github.io"` (fixed; required for signing and a stable redirect URL), `gecko.strict_min_version = "128.0"`, and `gecko.data_collection_permissions = { required: ["none"] }` with `optional: ["technicalAndInteraction"]` **only** when ntfy is enabled (ntfy sends auction data to a third party).
+Firefox additionally declares `browser_specific_settings.gecko.id = "shopbadwill@trashdad.github.io"` (fixed; required for signing and a stable redirect URL), `gecko.strict_min_version = "140.0"` (required by `data_collection_permissions`), `gecko_android.strict_min_version = "142.0"`, and `gecko.data_collection_permissions = { required: ["none"] }` with `optional: ["technicalAndInteraction"]` **only** when ntfy is enabled (ntfy sends auction data to a third party).
 
 The permissions snapshot test (`test/unit/manifest-permissions.test.ts`) diff-checks both production manifests against a committed JSON; any addition fails CI. Test builds add `http://127.0.0.1/*` and the CI step `check-prod-bundle` proves it is absent from production manifests.
 
@@ -276,15 +277,16 @@ The permissions snapshot test (`test/unit/manifest-permissions.test.ts`) diff-ch
 | Background | service worker, 30 s idle kill, 5 min/event, fetch >30 s kills | event page (`background.scripts`), ~30 s idle (pref), DOM available | WXT emits both `service_worker` and `scripts`; all long work is tick-driven; no job step exceeds one request |
 | Alarms persistence | `persistAcrossSessions` (150+), pre-150 "unpredictable" | not persisted across restart | `reconcile()` on every background start; feature-detect the property |
 | Alarm floor | 30 s packed, none unpacked | 30 s | `Alarms` port and fake enforce the floor; manual check on a packed build |
-| Keep-alive | extension API calls reset idle timer | ⚠ S-7 | `KeepAlive` heartbeat; runner-page fallback |
+| Keep-alive | extension API calls reset idle timer | ⚠ S-7 | `KeepAlive` heartbeat; runner-page `SnipeHost` (T-116, Phase 4) when S-7 requires it |
 | Keep-awake / background | `power`, `background` ⚠ MV3 | none found | T1 Chrome-only; Firefox = T0 + fallback policy |
 | Offscreen documents | yes | no | not used; JSON only, no DOMParser in background |
 | Dashboard surface | `sidePanel` | `sidebar_action` | same Preact app, two entrypoints |
-| Identity | `getAuthToken`, `launchWebAuthFlow` (chromiumapp.org) | `launchWebAuthFlow` only, allizom or loopback redirect | PKCE on both; client type differs |
+| Identity | `getAuthToken`, `launchWebAuthFlow` (chromiumapp.org); `identity` optional | `launchWebAuthFlow` only, allizom or loopback redirect; `identity` required (cannot be optional) | PKCE on both; client type differs |
 | Host permissions | granted at install | granted at install since 127, revocable | `permissions.contains` check at every job start; UI prompt to re-grant |
 | `world: "MAIN"` content scripts | 111+ | 128+ | tap works on both |
 | Notifications | buttons, `requireInteraction` | `basic` only, no buttons | Notifier port exposes `supportsActions`; preflight uses a click-to-open-dashboard notification on Firefox |
 | `browser.*` namespace | 148+ native | native | min Chrome 148 |
+| Minimum version | 148 | 140 (`strict_min_version`; `data_collection_permissions` needs it), Android 142 (`gecko_android`) | manifest |
 | Distribution | Load unpacked (Developer mode) | must be signed: `web-ext sign --channel unlisted` | release task |
 | E2E | Playwright Chromium (`launchPersistentContext`) | no Playwright; Selenium/geckodriver `install_addon(temporary=true)` or `web-ext run` | separate lanes |
 | Data collection declaration | n/a | `data_collection_permissions` required | manifest |
@@ -293,7 +295,7 @@ The permissions snapshot test (`test/unit/manifest-permissions.test.ts`) diff-ch
 
 ## 3. Interface contracts (frozen at the end of Phase 0 by T-02)
 
-Conventions: money is `Cents` (integer); instants are `EpochMs` (number) or `IsoUtc` (RFC 3339 with `Z`); raw site strings keep a `Raw` suffix. All interfaces are in `src/ports/*.ts` and `src/domain/types.ts`; zod schemas with the same names plus `Schema` live beside them. Workers must not add fields to these types without a contract-change PR that updates this section.
+Conventions: money is `Cents` (integer); instants are `EpochMs` (number) or `IsoUtc` (RFC 3339 with `Z`); raw site strings keep a `Raw` suffix. All interfaces are in `src/ports/*.ts` and `src/domain/types.ts`; zod schemas with the same names plus `Schema` live beside them. Workers must not add fields to these types without a contract-change PR that updates this section; after the freeze, additions are batched into one contract-change PR per phase. v1.1 (I-08): the `export function`/`export const` lines below are contract *types*; T-02 exports them as types (e.g. `type Reduce = …`) and the implementing card exports the function.
 
 ### 3.1 Domain types
 
@@ -314,6 +316,7 @@ export interface Listing {
   endTimeRaw: PacificNaiveRaw;
   sellerId: number;
   sellerName?: string;
+  sellerState?: string;                 // 2-letter US state, for the 'location' condition; if S-1 finds no source field, T-02 drops 'location' (I-08)
   categoryId?: number;
   categoryPath?: string;                // "Collectibles > Glass"
   shippingPrice?: Cents | null;         // null = calculated, unknown until quoted
@@ -365,7 +368,7 @@ export interface TrackedItem {
 }
 ```
 
-Example `Listing` (from fixture `search-grid-page1.json`, row 0, sanitized):
+Example `Listing` (from fixture `search-grid-p1.json`, row 0, sanitized):
 ```json
 { "itemId": 279250057, "title": "Vintage Pyrex Butterfly Gold Bowl 403", "currentPrice": 1299,
   "startingMinimumBid": 1299, "numBids": 0, "endTime": "2026-10-08T02:18:30.000Z",
@@ -442,8 +445,9 @@ export interface SearchQuery {           // typed subset of the ItemListing body
   searchDescriptions?: boolean; closedAuctions?: boolean; sortColumn?: number; sortDescending?: boolean;
   page: number;                          // 1-based; always 40 rows per page
   layout?: 'grid' | 'list';
+  extra?: Record<string, string>;        // unknown URL params, preserved for the round-trip (I-08)
 }
-export const searchQueryFromUrl: (url: string) => SearchQuery | null;      // src/domain/watches/query-url.ts
+export const searchQueryFromUrl: (url: string) => SearchQuery | null;      // src/adapters/sgw/query-url.ts (I-26)
 export const searchQueryToUrl: (q: SearchQuery) => string;
 
 export interface SgwApi {
@@ -503,7 +507,7 @@ export interface HealthReport { ok: boolean; checkedAt: EpochMs; configVersion: 
 export interface SgwHealth { run(mode: 'anonymous' | 'full'): Promise<HealthReport>; last(): Promise<HealthReport | null>; }
 ```
 
-**Fail-closed rule.** `GlobalSwitches` (§3.11) exposes `writesAllowed(feature)`. It is false whenever: kill switch on, `dryRun[feature]` on, last `HealthReport.ok === false` within 24 h, or `SgwSession.state() !== 'ok'`. Every write path checks it; the adapter checks it again.
+**Fail-closed rule.** `GlobalSwitches` (§3.11) exposes `writesAllowed(feature)`. It is false whenever: kill switch on, `dryRun[feature]` on, last `HealthReport.ok === false` within 24 h, or `SgwSession.state()` is neither `'ok'` nor `'expiring'` (I-08: an expiring session still writes). Every write path checks it; the adapter checks it again.
 
 ### 3.4 Request scheduler / rate limiter
 
@@ -564,9 +568,17 @@ export type JobStep =
   | { kind: 'search'; watchId: string; page: number }
   | { kind: 'favoritesList' }
   | { kind: 'detail'; itemId: ItemId; reason: 'new-match' | 'calendar' }
-  | { kind: 'favorite'; itemId: ItemId; watchId: string }
+  | { kind: 'favorite'; itemId: ItemId; watchId: string; notBefore?: EpochMs /* sgw-late */ }
+  | { kind: 'quote'; itemId: ItemId }                 // landed-cost quote, planned by T-51 (I-07)
   | { kind: 'calendarUpsert'; itemId: ItemId }
-  | { kind: 'notifyDigest' };
+  | { kind: 'notifyDigest' }
+  | { kind: 'postEnd'; itemId: ItemId };              // outcome read ≥ 2 min after end (T-103, I-07)
+export type StepOutcome =                             // one variant per step kind; T-02 fixes the payloads (I-07, I-08)
+  | { kind: 'search'; items: Listing[]; total: number } | { kind: 'favoritesList'; items: Favorite[] }
+  | { kind: 'detail' | 'postEnd'; detail: ItemDetail } | { kind: 'quote'; quote: { shipping: Cents; handling: Cents } | null }
+  | { kind: 'favorite' | 'calendarUpsert' | 'notifyDigest'; done: true }
+  | { kind: 'deferred'; until: EpochMs }              // notBefore not reached
+  | { kind: 'error'; message: string; retryable: boolean };
 export interface JobRun { id: string; trigger: 'scheduled' | 'catch-up' | 'manual'; startedAt: EpochMs; finishedAt?: EpochMs;
   status: 'running' | 'done' | 'failed' | 'paused'; steps: JobStep[]; cursor: number;
   results: { newMatches: ItemId[]; favorited: ItemId[]; calendarUpserts: ItemId[]; errors: Array<{ step: number; message: string }> }; }
@@ -614,6 +626,11 @@ export interface CalendarApi {   // thin typed Calendar v3 subset; every respons
   eventsDelete(calendarId: string, eventId: string): Promise<void>;                              // 404/410 → noop
   eventsListByPrivateProp(calendarId: string, key: string, value: string): Promise<GcalEvent[]>;
 }
+export interface GcalEventBody {   // the Calendar v3 fields DesiredEvent maps to (I-08)
+  summary: string; description: string; start: { dateTime: IsoUtc; timeZone: 'UTC' }; end: { dateTime: IsoUtc; timeZone: 'UTC' };
+  reminders: { useDefault: false; overrides: DesiredEvent['reminders'] }; extendedProperties: { private: DesiredEvent['privateProps'] };
+  source?: { title: string; url: string }; status?: 'confirmed' | 'cancelled'; }
+export interface GcalEvent extends GcalEventBody { id: string; status: 'confirmed' | 'tentative' | 'cancelled'; etag?: string; }
 export class CalendarApiError extends Error { code: 'conflict' | 'not-found' | 'auth' | 'insufficient-scope' | 'rate-limited' | 'offline' | 'schema' | 'other'; status?: number; }
 
 export interface AuthStatus { connected: boolean; provider: 'pkce' | 'chrome-identity' | 'none'; account?: string;
@@ -630,7 +647,7 @@ export interface GoogleAuthProvider {
 Example `DesiredEvent`:
 ```json
 { "itemId": 279250057, "generation": 0, "title": "SGW ends: Vintage Pyrex Butterfly Gold Bowl 403 ($12.99)",
-  "description": "https://shopgoodwill.com/item/279250057\nCurrent $12.99 · Bids 0 · Ends 7:18 PM PT / 10:18 PM EDT\nShopBadwill watch: Pyrex",
+  "description": "https://shopgoodwill.com/item/279250057\nCurrent $12.99 · Bids 0 · Ends 7:18 PM PT · 10:18 PM ET\nShopBadwill watch: Pyrex",
   "startUtc": "2026-10-08T02:18:30.000Z", "durationMin": 15, "sourceUrl": "https://shopgoodwill.com/item/279250057",
   "reminders": [{"method":"popup","minutes":60},{"method":"popup","minutes":15},{"method":"popup","minutes":5}],
   "privateProps": { "sbwItemId": "279250057", "sbwGen": "0", "sbwState": "open" } }
@@ -659,10 +676,13 @@ export type SnipeEvent =
   | { type: 'result'; now: EpochMs; result: BidResult } | { type: 'ambiguous'; now: EpochMs }
   | { type: 'post-read'; now: EpochMs; detail: ItemDetail } | { type: 'preflight-failed'; now: EpochMs; reason: string }
   | { type: 'apply-fallback'; now: EpochMs; mode: 'early-proxy' | 'skip' };
-export function reduce(s: Snipe, e: SnipeEvent, caps: CapsCheck): { next: Snipe; effects: Effect[] };  // pure; Effects: 'scheduleWake' | 'holdKeepAwake' | 'sampleClock' | 'readDetail' | 'placeBid' | 'notify' | 'stampCalendar' | 'audit' | 'applyFallbackProxy'
+export type Effect = { kind: 'scheduleWake' | 'holdKeepAwake' | 'sampleClock' | 'readDetail' | 'placeBid' | 'notify' | 'stampCalendar'
+  | 'audit' | 'applyFallbackProxy' | 'proposeRearm'; snipeId: string /* T-02 adds the per-kind payloads (I-08) */ };
+export function reduce(s: Snipe, e: SnipeEvent, capsResult: CapsResult): { next: Snipe; effects: Effect[] };  // pure; the caller runs checkCaps first (I-08)
 export function computeFireAt(endMs: EpochMs, leadMs: number, oneWayLatencyMs: number): EpochMs;   // end − lead − oneWay; oneWay = rtt/2 of lowest-RTT sample
 export interface CapsCheck { perItemMax: Cents; perDayMax: Cents; openExposureMax: Cents; typoMultiplier: 3; typoAbsolute: Cents; }
-export function checkCaps(s: Snipe, others: Snipe[], spentToday: Cents, caps: CapsCheck): { ok: boolean; violations: string[] };
+export interface CapsResult { ok: boolean; violations: string[]; }
+export function checkCaps(s: Snipe, others: Snipe[], spentToday: Cents, caps: CapsCheck): CapsResult;
 export interface SnipeHost {   // where the final timer runs; background by default, runner page on Firefox if S-7 says so
   acquire(snipeId: string): Promise<void>; release(snipeId: string): Promise<void>;
 }
@@ -699,7 +719,8 @@ export interface GlobalSwitches { writesAllowed(feature: 'favorites' | 'calendar
 ### 3.11 Session and credentials records
 
 ```ts
-export interface SgwSession { bearer: string; capturedAt: EpochMs; expiresAt: EpochMs; buyerId: string; source: 'tap' | 'webRequest'; refreshToken?: string /* only if S-2 approves */; }
+export interface SgwSessionRecord { bearer: string; capturedAt: EpochMs;   // renamed from SgwSession to avoid the §3.3 port name (I-08)
+  expiresAt: EpochMs; buyerId: string; source: 'tap' | 'webRequest'; refreshToken?: string /* only if S-2 approves */; }
 export interface GoogleCredentials { provider: 'pkce' | 'chrome-identity'; clientId: string; clientSecret?: string; refreshToken?: string; grantedScopes: string[]; connectedAt: EpochMs; account?: string; calendarId?: string; }
 ```
 
@@ -711,6 +732,8 @@ export type Msg =
   | { type: 'page.listings'; payload: { url: string; listings: Listing[]; capturedAt: EpochMs } }
   | { type: 'page.detail'; payload: { detail: ItemDetail } }
   | { type: 'page.token'; payload: { bearer: string; capturedAt: EpochMs } }
+  | { type: 'page.domHealth'; payload: { url: string; configVersion: string; pageKind: string; cardsFound: number; fallbackUsed: boolean } }   // card-selector report for health (I-08)
+  | { type: 'ui.openSnipe'; payload: { itemId: ItemId } }   // "Snipe…" deep link: opens the dashboard prefilled, never arms (I-08)
   | { type: 'rules.evaluate'; payload: { listings: Listing[] }; reply: MatchResult[] }
   | { type: 'landedCost.get'; payload: { itemIds: ItemId[] }; reply: Record<ItemId, Cents | null> }
   | { type: 'quick.hideSeller'; payload: { sellerId: number; sellerName: string } }
@@ -720,19 +743,21 @@ export type Msg =
   // UI → background
   | { type: 'settings.get'; reply: Settings } | { type: 'settings.set'; payload: Partial<Settings> }
   | { type: 'rules.list'; reply: Rule[] } | { type: 'rules.save'; payload: Rule } | { type: 'rules.delete'; payload: { id: string } }
-  | { type: 'rules.preview'; payload: { rule: Rule; listings: Listing[] }; reply: { matched: number; total: number; ids: ItemId[] } }
+  | { type: 'rules.preview'; payload: { rule: Rule; tabId?: number }; reply: { matched: number; total: number; ids: ItemId[] } }   // background uses the last page.listings from tabId, else the most recent SGW tab (I-08)
   | { type: 'watches.list'; reply: Watch[] } | { type: 'watches.save'; payload: Watch } | { type: 'watches.delete'; payload: { id: string } }
+  | { type: 'watches.importSaved'; reply: { imported: number; skipped: number } }   // SGW saved searches → watches (I-33)
   | { type: 'job.runNow'; payload: { watchIds?: string[] } } | { type: 'job.status'; reply: JobRun | null }
   | { type: 'tracked.list'; reply: TrackedItem[] } | { type: 'tracked.remove'; payload: { itemId: ItemId } }
   | { type: 'favorites.sync' }
   | { type: 'calendar.connect' /* gesture */; reply: AuthStatus } | { type: 'calendar.disconnect' } | { type: 'calendar.status'; reply: AuthStatus }
   | { type: 'calendar.syncNow' } | { type: 'calendar.ics'; payload: { itemIds: ItemId[] }; reply: { ics: string } }
-  | { type: 'snipe.prepare'; payload: { itemId: ItemId }; reply: { detail: ItemDetail; estAllIn: Cents | null; caps: ReturnType<typeof checkCaps> } }
+  | { type: 'snipe.prepare'; payload: { itemId: ItemId }; reply: { detail: ItemDetail; estAllIn: Cents | null; caps: CapsResult } }
   | { type: 'snipe.arm'; payload: { snipe: Omit<Snipe, 'state' | 'history' | 'armedAt'>; typedConfirmation?: string } ; reply: Snipe }
   | { type: 'snipe.disarm'; payload: { id: string } } | { type: 'snipe.list'; reply: Snipe[] }
-  | { type: 'kill.set'; payload: { on: boolean } } | { type: 'health.get'; reply: { sgw: HealthReport | null; session: SgwSession['expiresAt'] | null; google: AuthStatus; budget: RequestScheduler['stats'] } }
+  | { type: 'kill.set'; payload: { on: boolean } } | { type: 'health.get'; reply: { sgw: HealthReport | null; session: SgwSessionRecord['expiresAt'] | null;
+      sessionState: 'ok' | 'expiring' | 'expired' | 'logged-out'; google: AuthStatus; budget: ReturnType<RequestScheduler['stats']> } }
   | { type: 'audit.list'; payload: { limit: number; before?: number }; reply: AuditEntry[] } | { type: 'audit.undo'; payload: { seq: number } }
-  | { type: 'permissions.request'; payload: { permissions?: string[]; origins?: string[] }; reply: boolean }   // gesture
+  // no 'permissions.request': UI pages call browser.permissions.request in their click handlers via src/ui/permissions.ts (I-21)
   // background → content/UI broadcasts
   | { type: 'rules.changed' } | { type: 'switches.changed'; payload: { killSwitch: boolean; writesAllowed: Record<string, boolean> } };
 ```
@@ -778,7 +803,7 @@ Exit criteria:
 USER STEP on the test calendar from S-4. Insert `sbv…g0`, delete it, insert the same id again (expect 409 or 200?), `events.get` with the id (status `cancelled`?), patch `status:'confirmed'` (revives?). Exit: documented matrix; `CalendarSink.upsert` recreate path chosen (`patch-revive` vs `bump-generation`).
 
 ### S-6 · Firefox E2E harness — card T-12
-Exit criteria: a CI job installs the `.output/firefox-mv3` build temporarily with Selenium/geckodriver (`install_addon(temporary=True)`, Python 3.14 on the dev machine, `selenium` pinned) or WebDriver BiDi `webExtension.install`, navigates to a page served by the fake SGW server with a hostname override, and asserts a Shadow DOM badge is present; the background's `reconcile()` ran (checked through a test-only `sbw:test:state` page compiled only in test builds). Documents what is and isn't reachable (no SW handle in Firefox). Fallback if Selenium fails: `web-ext run` smoke with `--pref` and a screenshot assertion.
+Exit criteria: a CI job installs the `.output/firefox-mv3` build temporarily with Selenium/geckodriver (`install_addon(temporary=True)`, Python 3.14 on the dev machine, `selenium` pinned) or WebDriver BiDi `webExtension.install`, navigates to a static fixture page that T-12 serves itself with a hostname override (the fake SGW server serves buyerapi JSON only), and asserts a Shadow DOM badge is present; the background's `reconcile()` ran (checked through a test-only `sbw:test:state` page compiled only in test builds). Documents what is and isn't reachable (no SW handle in Firefox). Fallback if Selenium fails: `web-ext run` smoke with `--pref` and a screenshot assertion.
 
 ### S-7 · Dry-run snipe timing measurement — card T-13
 Against the fake SGW server with injected 150 ms latency and +1.3 s clock skew. Exit criteria: on Chromium and Firefox, with the extension packed (not unpacked, so alarm floors apply) and no visible extension window, 20 scheduled dry-run fires each: alarm wake latency distribution; whether `KeepAlive` heartbeats keep the background alive for ≥6 min on both; tight-timer fire error (target: p95 ≤ 50 ms, max ≤ 250 ms); verdict for Firefox: background-host OK or runner-page fallback required (T-116). Also measures how often the worker died during a 20 s stalled fetch and whether the restart path recovered.
@@ -801,13 +826,13 @@ USER STEP-heavy (the worker writes a script and a checklist). Exit criteria:
 | **1 · Overlay (req. 1)** | Rules engine, site adapter, overlay, options, popup | write rules in options and see highlights/hidden stubs/Why?/undo on live SGW pages they browse; kill switch works | static+unit+contract+dom+integration green; Chromium E2E overlay green; Firefox smoke green; manual acceptance A-1 signed |
 | **2 · Watches, daily job, favorites (req. 2–3)** | Resumable daily job, catch-up, favorites reconcile, dashboard, audit log, notifications, landed cost | create a watch from a search, have it run overnight in dry-run, see the activity log, then enable real favoriting | E2E "daily job + catch-up + restart" green; canary workflow passing nightly; A-2 signed (one real favorite via undo-able action, user-approved) |
 | **3 · Google Calendar and onboarding (req. 4) = MVP complete** | PKCE auth, calendar sync, stamping, .ics, onboarding, setup guides, release pipeline | connect Google, see events with 60/15/5 popups on their phone, install a signed Firefox build | E2E calendar green against fake Google; A-3 signed ("popups arrived on the phone with the PC off"); release v0.1.0 artifacts for both browsers |
-| **4 · Snipe engine, dry-run** | State machine, timing, caps, preflight, runner, arming UI, kill switch, outcome report, soak tooling | arm dry-run snipes and read a timing report after a week | E2E snipe scenarios green; S-7 verdicts incorporated; dry-run soak ≥5 fires with on-time ≥95% on the user's machine; A-4 signed |
+| **4 · Snipe engine, dry-run** | State machine, timing, caps, preflight, runner, arming UI, kill switch, outcome report, soak tooling, Firefox runner-page host (when S-7 requires it) | arm dry-run snipes and read a timing report after a week, on Chrome and Firefox | E2E snipe scenarios green on Chromium **and** Firefox (Firefox through the T-116 runner-page host when the S-7 verdict is runner-page); S-7 verdicts incorporated; dry-run soak ≥5 fires with on-time ≥95% on the user's machine, on **both** Chrome and Firefox; A-4 signed |
 | **5 · Live bidding with caps** | PlaceBid adapter, idempotent send, live gating, outcome stamping | place one real snipe on a cheap item they chose; see WON/LOST on the calendar | E2E money paths green; PlaceBid response catalogue captured (USER STEP); A-5 signed after the first real snipe |
 | **6 · Reliability T2 and later QoL** | Windows wake-and-launch companion, bid groups, relist detector, import/export, comps | wake the PC from sleep for a snipe; win one of N | S-8 verdicts; E2E group cancellation; A-6 signed |
 
-**Task counts per phase (86 cards):** Phase 0 = 14 (T-01…T-14, incl. 8 spikes) · Phase 1 = 22 (T-20…T-41) · Phase 2 = 12 (T-50…T-61) · Phase 3 = 13 (T-62…T-74; T-63 conditional) · Phase 4 = 12 (T-80…T-91) · Phase 5 = 6 (T-100…T-105) · Phase 6 = 7 (T-110…T-116; T-116 conditional).
+**Task counts per phase (86 cards):** Phase 0 = 14 (T-01…T-14, incl. 8 spikes) · Phase 1 = 22 (T-20…T-41) · Phase 2 = 12 (T-50…T-61) · Phase 3 = 13 (T-62…T-74; T-63 conditional) · Phase 4 = 13 (T-80…T-91 plus T-116; T-116 is required when the S-7 verdict is runner-page) · Phase 5 = 6 (T-100…T-105) · Phase 6 = 6 (T-110…T-115).
 
-**Parallelism.** Within a phase, every distinct lane letter in §6 can run concurrently; the widest fronts are Phase 0 (lanes A–L after T-01/T-02) and Phase 1 (lanes A–N after T-02/T-03/T-07). The critical path is T-01 → T-02 → T-07 → T-24 → T-26 → T-36 → T-39 → T-52 → T-59 → T-67 → T-72 → T-84 → T-89 → T-101 → T-104.
+**Parallelism.** Within a phase, every distinct lane letter in §6 can run concurrently; the widest fronts are Phase 0 (lanes A–L after T-01/T-02) and Phase 1 (lanes A–N after T-02/T-03/T-07). The critical path is T-01 → T-02 → T-07 → T-24 → T-26 → T-36 → T-39 ⇒ T-52 → T-59 ⇒ T-67 → T-72 ⇒ T-84 → T-89 ⇒ T-101 → T-104 (→ = declared dependency; ⇒ = phase-gate edge, not a card dependency).
 
 Release cadence: tag `v0.1.0` at end of Phase 3 (MVP), `v0.2.0` after Phase 4 (dry-run snipes), `v0.3.0` after Phase 5 (live), `v0.4.0` after Phase 6.
 
@@ -815,41 +840,47 @@ Release cadence: tag `v0.1.0` at end of Phase 3 (MVP), `v0.2.0` after Phase 4 (d
 
 ## 6. Task cards
 
-Card format: **ID · Title** (size · lane). Goal · Consumes/Produces · Owns (files; no two parallel cards share a file) · Deps · Tests first · Acceptance · Gate. Lanes: cards in the same phase with different lane letters can run concurrently; same letter = sequential. Package scripts are defined by T-01 and named consistently: `pnpm lint`, `pnpm typecheck`, `pnpm test:unit [path]`, `pnpm test:contract`, `pnpm test:dom`, `pnpm test:integration`, `pnpm test:e2e:chromium`, `pnpm test:e2e:firefox`, `pnpm build`, `pnpm build:firefox` (= `wxt build -b firefox --mv3`), `pnpm lint:webext`, `pnpm check:permissions`, `pnpm check:prod-bundle`, `pnpm check:all` (everything except e2e). Every card's gate implicitly includes `pnpm lint && pnpm typecheck` on its owned files.
+Card format: **ID · Title** (size · lane). Goal · Consumes/Produces · Owns (files; no two parallel cards share a file) · Deps · Tests first · Acceptance · Gate. Lanes: cards in the same phase with different lane letters can run concurrently; same letter = sequential. Package scripts are defined by T-01 and named consistently: `pnpm lint`, `pnpm typecheck`, `pnpm test:unit [filter]`, `pnpm test:contract`, `pnpm test:dom`, `pnpm test:integration`, `pnpm test:e2e:chromium`, `pnpm test:e2e:firefox`, `pnpm build`, `pnpm build:firefox` (= `wxt build -b firefox --mv3`), `pnpm build:test` (`SBW_TEST=1` test build), `pnpm lint:webext` (→ `scripts/lint-webext.ts`), `pnpm check:permissions`, `pnpm check:prod-bundle`, `pnpm check:all` (everything except e2e), `pnpm fake:sgw`, `pnpm fake:google`, `pnpm canary`, `pnpm release`, `pnpm sign:firefox`. Every card's gate implicitly includes `pnpm lint && pnpm typecheck` on its owned files.
+
+**v1.1 standing rules.**
+- **Gate filters (I-03).** A filter is matched against test-file paths, so it names the test location without a leading `src/`: `pnpm test:unit -- domain/time` runs `test/unit/domain/time/*.test.ts`. `passWithNoTests` is off, so a filter that matches nothing fails.
+- **`package.json` and the lockfile (I-02).** Only T-01 edits `package.json`. It declares every script above, pointing at files that later cards own. A dependency needed later is a request to the orchestrator, who alone regenerates `pnpm-lock.yaml` on `dev`.
+- **Background registration (I-01).** `src/background/main.ts` is frozen after T-36. A later card adds a handler, job, step executor or provider as its own module: a file under `src/background/handlers/` or `src/background/jobs/` exporting `register(ctx: BackgroundContext)`, or a file under `src/background/jobs/steps/`, or a test hook under `src/test-hooks/` (loaded only when `SBW_TEST`). T-36's glob registries load these modules, so the module counts as owned by the card that adds it.
+- **UI registration (I-06).** The options page, the dashboard and the popup each load `import.meta.glob('./sections/*/index.tsx')`, and the overlay loads `src/content/ui/badges/*.tsx`. A later card adds one section folder or one badge file and never edits the shell.
 
 ### Phase 0
 
 **T-01 · Repo scaffold and toolchain** (L · A)
-Goal: WXT 0.21.x project with TypeScript strict, ESLint (`typescript-eslint`, `eslint-plugin-no-unsanitized`, `import/no-restricted-paths` per §2.1), Vitest with `WxtVitest()` plugin, Playwright config for Chromium, `web-ext` dev dependency, Preact module, pnpm, Node 25 `.nvmrc`, `.editorconfig`, package scripts listed above, `wxt.config.ts` with per-browser manifest (permissions per §2.5, `gecko.id`, `data_collection_permissions`, `commands` for kill switch), build-time `oauth2.client_id` injection via env (unused until Phase 3), `import.meta.env.SBW_TEST` flag for test builds.
-Produces: project skeleton; `entrypoints/background.ts` printing a heartbeat; `entrypoints/sgw.content.ts` mounting an empty Shadow DOM badge "ShopBadwill ready".
-Owns: root config files, `package.json`, `wxt.config.ts`, `entrypoints/background.ts`, `entrypoints/sgw.content.ts`, `src/entrypoints/**` placeholders, `README.md` (dev section only).
+Goal: WXT 0.21.x project with TypeScript strict, ESLint (`typescript-eslint`, `eslint-plugin-no-unsanitized`, `import/no-restricted-paths` per §2.1, `no-restricted-syntax` for `Date.parse`, `innerHTML`, `dangerouslySetInnerHTML` and `eval`, a ban on `storage.sync`, and ignores for `scripts/*-probe/**`), Vitest with `WxtVitest()` plugin (include `test/**`, `scripts/**`, `companion/**`; `passWithNoTests: false`), Playwright config for Chromium, `web-ext` dev dependency, Preact via `@preact/preset-vite`, pnpm, Node 25 `.nvmrc`, `.editorconfig`; dependencies `zod` plus dev dependencies `fast-check`, `msw`, `happy-dom`, `@testing-library/preact` and `tsx`; every package script listed above, each pointing at the file a later card owns; `wxt.config.ts` with `srcDir: 'src'` and a per-browser manifest encoding all of §2.5 (required and optional permissions incl. `background`, `power`, `nativeMessaging` and the ntfy optional host; `webRequest` is left to T-31; `gecko.id`, `strict_min_version 140.0`, `gecko_android` `strict_min_version 142.0`, `data_collection_permissions`, `commands` for the kill switch with suggested key `Alt+Shift+K`), the version read from `package.json` (§11), test-build additions (`http://127.0.0.1/*` host permission and content-script matches for the fake host), build-time `oauth2.client_id` injection via env (unused until Phase 3), `import.meta.env.SBW_TEST` flag for test builds.
+Produces: project skeleton; `src/entrypoints/background.ts` printing a heartbeat; `src/entrypoints/sgw.content.ts` mounting an empty Shadow DOM badge "ShopBadwill ready"; stub `scripts/{permissions-snapshot,check-prod-bundle}.ts` that exit 0 (T-06 replaces them) and a stub `scripts/sign-firefox.ts` (T-74 replaces it); a first `scripts/lint-webext.ts` wrapper with the single Preact allowlist entry (T-06 owns it afterwards).
+Owns: root config files, `package.json` (the only card that edits it), `wxt.config.ts`, `src/entrypoints/**` placeholders (incl. `background.ts` and `sgw.content.ts`), the stub scripts and wrapper above, the smoke tests below, `README.md` (dev section only).
 Deps: none.
-Tests first: `test/unit/smoke.test.ts` (fakeBrowser storage round-trip); `test/unit/manifest-permissions.test.ts` snapshot of both prod manifests.
-Acceptance: `pnpm build` and `pnpm build:firefox` produce `.output/chrome-mv3` and `.output/firefox-mv3`; `pnpm lint:webext` passes on the Firefox build with `--warnings-as-errors`; loading unpacked shows the badge on a SGW search page (manual, screenshot pasted).
+Tests first: `test/unit/smoke.test.ts` (fakeBrowser storage round-trip); one smoke test per remaining suite (`test/{contract,dom,integration}/smoke.test.ts`), so `check:all` never runs an empty suite; `test/unit/manifest-permissions.test.ts` snapshot of both prod manifests (T-06 then takes this file over).
+Acceptance: `pnpm build` and `pnpm build:firefox` produce `.output/chrome-mv3` and `.output/firefox-mv3`; `pnpm lint:webext` passes on the Firefox build (warnings are errors except the single allowlisted Preact `innerHTML` entry); `pnpm test:unit -- smoke` runs only the matched file (no literal `--` reaches Vitest) and a filter that matches nothing fails; loading unpacked shows the badge on a SGW search page (manual, screenshot pasted).
 Gate: `pnpm check:all && pnpm build && pnpm build:firefox && pnpm lint:webext`.
 
 **T-02 · Contracts v1** (L · B)
-Goal: encode §3 verbatim as TypeScript plus zod schemas and fixtures-of-contracts (one valid and one invalid JSON example per type).
+Goal: encode §3, as amended in v1.1 (I-07, I-08, I-21: `StepOutcome`, `Effect`, `GcalEvent(Body)`, `CapsResult`, `SearchQuery.extra`, `Listing.sellerState`, `SgwSessionRecord`, the new messages, no `permissions.request`), as TypeScript plus zod schemas and fixtures-of-contracts (one valid and one invalid JSON example per type, in `test/contract/types/examples/**`). §3 functions are exported as types only; implementations stay with their cards. `defaults.ts` encodes the §15 defaults: caps 5000 / 10000 / 20000 cents, `requiredDryRuns` 5, and the `Watch` schema default `favoriteMode: 'sgw'` (I-09). Later contract additions (e.g. T-111, T-112, T-113 in Phase 6) go through one contract-change PR per phase.
 Produces: `src/ports/*.ts`, `src/domain/types.ts`, `src/domain/settings/{schema,defaults}.ts`, `src/domain/storage/schema.ts` (key names, v1), `src/messaging/protocol.ts`, `src/domain/snipe/types.ts`, `src/domain/calendar/types.ts`, `src/domain/rules/schema.ts`, `src/domain/watches/schema.ts`, `src/domain/audit/types.ts`.
-Owns: those files and `test/contract/types/*.test.ts`.
+Owns: those files, `test/contract/types/*.test.ts` and `test/contract/types/examples/**`.
 Deps: T-01.
-Tests first: each schema parses its valid example and rejects its invalid example; `Msg` union discriminates every `type`; `Settings` defaults parse; `eventIdFor` regex test lives here as a type-level constant test.
+Tests first: each schema parses its valid example and rejects its invalid example; `Msg` union discriminates every `type`; `Settings` defaults parse and equal the §15 values (caps 5000/10000/20000, `requiredDryRuns` 5); a new `Watch` defaults to `favoriteMode: 'sgw'`. (The `eventIdFor` test belongs to T-65.)
 Acceptance: `pnpm typecheck` clean; contract-change PR template added (`.github/PULL_REQUEST_TEMPLATE/contract-change.md`).
 Gate: `pnpm test:contract -- test/contract/types`.
 
 **T-03 · Fake ports and test utilities** (M · C)
 Goal: in-memory fakes for every port, usable in unit and integration tests.
-Produces: `test/fakes/ports/{fake-clock,fake-alarms,fake-storage,fake-notifier,fake-permissions,fake-keepawake,fake-keepalive,fake-http}.ts`, `test/fixtures/load.ts` (typed fixture loader), `test/setup/vitest.setup.ts` (fakeBrowser.reset in beforeEach, MSW `setupServer` for Node).
-Owns: those files, `vitest.config.ts` test section (coordinate with T-01: T-01 creates the file, T-03 only edits `setupFiles`; serialize by making T-03 depend on T-01).
+Produces: `test/fakes/ports/{fake-clock,fake-alarms,fake-storage,fake-notifier,fake-permissions,fake-keepawake,fake-keepalive,fake-http}.ts`, shared fakes `test/fakes/ports/{fake-sgw-api,fake-audit-log,fake-switches,fake-messaging,fake-google-auth,fake-calendar-api}.ts` (I-30), `test/fixtures/load.ts` (typed fixture loader that reads T-07's `test/fixtures/sgw/manifest.json`, validated by the schema T-03 ships in `test/fixtures/manifest-schema.ts`), `test/setup/vitest.setup.ts` (fakeBrowser.reset in beforeEach, MSW `setupServer` for Node with `onUnhandledRequest: 'bypass'` for 127.0.0.1, so the fake servers are reachable).
+Owns: those files, `test/fakes/ports/*.test.ts`, `vitest.config.ts` test section (coordinate with T-01: T-01 creates the file, T-03 only edits `setupFiles`; serialize by making T-03 depend on T-01).
 Deps: T-01, T-02.
 Tests first: `FakeAlarms` rejects `delayInMinutes < 0.5` by clamping and records a warning; `FakeAlarms.advance(ms)` fires due alarms with configurable extra delay; `FakeClock` drives `setTimeout` deterministically; `FakeHttp` scripted responses with latency and abort support.
 Acceptance: fakes implement the port interfaces (typecheck), 100% branch coverage on FakeAlarms clamp logic.
-Gate: `pnpm test:unit -- test/fakes`.
+Gate: `pnpm test:unit -- test/fakes/ports`.
 
 **T-04 · Fake buyerapi server** (L · D)
-Goal: Node HTTP server emulating the endpoints in §3.3 with SGW's quirks: string booleans, 40 rows/page, 403 on double quotes in `searchText`, 200-with-zero-rows on malformed body, naive-PT `endTime`, ms `serverTime`, `Bid` cookie 403 behaviour, bearer validation with configurable expiry, `GetCurrentTime` seconds-only, injectable per-endpoint latency, clock skew, error codes (403/429/5xx), and a scenario API (`POST /__scenario`) for tests; seeded from the Task 0 fixtures once they exist (until then from hand-written samples with the same schema).
+Goal: Node HTTP server emulating the endpoints in §3.3 with SGW's quirks: string booleans, 40 rows/page, 403 on double quotes in `searchText`, 200-with-zero-rows on malformed body, naive-PT `endTime`, ms `serverTime`, `Bid` cookie 403 behaviour, bearer validation with configurable expiry, `GetCurrentTime` seconds-only, injectable per-endpoint latency, clock skew, error codes (403/429/5xx), and a scenario API (`POST /__scenario`) for tests; a seed loader that reads `seed/**` (hand-written samples with the same schema until T-24 re-seeds from the Task 0 fixtures); a request log `GET /__log` that stamps each request with the client-declared fake time from an `x-sbw-fake-now` header (used by T-59).
 Owns: `test/fakes/fake-sgw-server/**`.
-Deps: T-02 (schemas). Re-seeded by T-24 after fixtures land (T-24 owns `test/fixtures/sgw/**`, not the server).
+Deps: T-02 (schemas). Re-seeded by T-24 after fixtures land (T-07 owns `test/fixtures/sgw/**`; T-24 owns only the seed data `test/fakes/fake-sgw-server/seed/**`).
 Tests first: server contract tests: each endpoint response validates against the zod schema in T-02; scenario toggles verified (quote→403, skew applied to serverTime, latency ≥ configured).
 Acceptance: `pnpm fake:sgw` starts on 127.0.0.1:8787; documented scenario list in `test/fakes/fake-sgw-server/README.md`. Bidding endpoints are stubs returning `result:-3` until T-88.
 Gate: `pnpm test:unit -- test/fakes/fake-sgw-server`.
@@ -863,14 +894,14 @@ Acceptance: `pnpm fake:google` on 127.0.0.1:8788.
 Gate: `pnpm test:unit -- test/fakes/fake-google-server`.
 
 **T-06 · CI workflow, permission snapshot, prod-bundle check** (M · F)
-Goal: `.github/workflows/ci.yml` with jobs `static` → `unit` → `contract` → `e2e-chromium` (headless `chromium` channel, fakes started as services) → `e2e-firefox` (geckodriver; allowed to be `continue-on-error` until S-6 lands, then required); `scripts/permissions-snapshot.ts`; `scripts/check-prod-bundle.ts` greps production outputs for `127.0.0.1`, `localhost`, `SBW_TEST`, `__scenario`, `innerHTML`, `eval(` and fails on any hit.
-Owns: `.github/workflows/ci.yml`, `scripts/permissions-snapshot.ts`, `scripts/check-prod-bundle.ts`, `test/snapshots/permissions.{chrome,firefox}.json`.
-Deps: T-01.
-Tests first: a unit test for `check-prod-bundle` using a fixture bundle containing each forbidden token.
+Goal: `.github/workflows/ci.yml` with jobs `static` → `unit` (Vitest unit + dom) → `contract` → `integration` → `e2e-chromium` (headless `chromium` channel, fakes started as services) → `e2e-firefox` (geckodriver; allowed to be `continue-on-error` until S-6 lands, then required); both E2E jobs pass with zero specs until T-39 and T-12 land; `scripts/permissions-snapshot.ts` and `scripts/check-prod-bundle.ts` replace T-01's stubs; `check-prod-bundle` greps production outputs for `127.0.0.1`, `localhost`, `SBW_TEST`, `__scenario`, `innerHTML`, `eval(` and `new Function` and fails on any hit, except one allowlist entry: Preact's single `innerHTML` assignment in the Preact vendor chunk; `scripts/lint-webext.ts` (what `pnpm lint:webext` runs) runs `web-ext lint` and fails on any warning or error except the same single allowlist entry (`UNSAFE_VAR_ASSIGNMENT`/`innerHTML` in the Preact vendor chunk).
+Owns: `.github/workflows/ci.yml`, `scripts/permissions-snapshot.ts`, `scripts/check-prod-bundle.ts` (both replace T-01's stubs), `scripts/lint-webext.ts` (from T-01's first version), `test/snapshots/permissions.{chrome,firefox}.json`, `test/unit/scripts/check-prod-bundle.test.ts`; edits `test/unit/manifest-permissions.test.ts` (created by T-01), rewiring it to the snapshot JSONs and owning it from then on.
+Deps: T-01, T-04, T-05.
+Tests first: a unit test for `check-prod-bundle` using a fixture bundle containing each forbidden token (incl. `new Function`), plus one that passes the allowlisted Preact `innerHTML` and fails the same token in a first-party chunk; `manifest-permissions.test.ts` diffs both prod manifests against `test/snapshots/permissions.{chrome,firefox}.json`.
 Acceptance: CI green on a PR; a deliberate added permission fails `check:permissions` (demonstrated in the PR, then reverted).
-Gate: `pnpm check:permissions && pnpm check:prod-bundle` after `pnpm build && pnpm build:firefox`.
+Gate: `pnpm test:unit -- scripts/check-prod-bundle manifest-permissions && pnpm build && pnpm build:firefox && pnpm check:permissions && pnpm check:prod-bundle && pnpm lint:webext`.
 
-**T-07 · S-1 SGW recon (Task 0)** (L · G) — see §4 S-1. Owns: `scripts/capture-fixtures.ts`, `scripts/sanitize-fixtures.ts`, `test/fixtures/sgw/**`, `src/adapters/sgw/config.ts` (v1 fill), `docs/spikes/S-1.md`, `docs/USER-STEPS/S-1.md`. Deps: T-02. Tests first: `sanitize-fixtures` unit test proves titles, seller names, bidder masks, image URLs and ids are replaced deterministically and that no `Authorization`/`Cookie`/`Set-Cookie` survives. Gate: `pnpm test:unit -- scripts && pnpm test:contract` (fixtures validate against schemas; any mismatch is a documented schema fix, not a fixture edit).
+**T-07 · S-1 SGW recon (Task 0)** (L · G) — see §4 S-1. Owns: `scripts/capture-fixtures.ts`, `scripts/sanitize-fixtures.ts`, `test/fixtures/sgw/**`, `src/adapters/sgw/config.ts` (v1 fill), `docs/spikes/S-1.md`, `docs/USER-STEPS/S-1.md`, `test/unit/scripts/{sanitize-fixtures,fixtures-manifest}.test.ts`. Deps: T-02. Tests first: `sanitize-fixtures.test.ts` proves titles, seller names, bidder masks, image URLs and ids are replaced deterministically and that no `Authorization`/`Cookie`/`Set-Cookie` survives; `fixtures-manifest.test.ts` proves every fixture is well-formed JSON/HTML and has a provenance entry in `manifest.json`. Gate: `pnpm test:unit -- scripts/sanitize-fixtures scripts/fixtures-manifest` (validation against the endpoint schemas moves to T-24, which writes them).
 
 **T-08 · S-2 Session spike** (L · H) — §4 S-2. Owns: `docs/spikes/S-2.md`, `docs/USER-STEPS/S-2.md`, `scripts/jwt-claims-only.ts` (decodes a pasted JWT locally and prints claim *names* plus `exp/iat`, never values). Deps: T-07. Gate: spike doc contains the five verdicts and the resulting `SgwSession` contract note.
 
@@ -880,7 +911,7 @@ Gate: `pnpm check:permissions && pnpm check:prod-bundle` after `pnpm build && pn
 
 **T-11 · S-5 Event-ID behaviour** (S · I, after T-10) — §4 S-5. Owns: `docs/spikes/S-5.md`, `docs/USER-STEPS/S-5.md`. Deps: T-10. Gate: matrix present; `CalendarSink` recreate strategy recorded.
 
-**T-12 · S-6 Firefox E2E harness** (L · J) — §4 S-6. Owns: `test/e2e/firefox/**`, `test/e2e/firefox/requirements.txt`, CI job body for `e2e-firefox` (edits `ci.yml` only after T-06 merges; sequential dependency). Deps: T-01, T-06. Tests first: a smoke spec asserting the badge Shadow DOM exists on a fake-served page. Gate: `pnpm test:e2e:firefox` green locally and in CI.
+**T-12 · S-6 Firefox E2E harness** (L · J) — §4 S-6. Owns: `test/e2e/firefox/**` (incl. the static fixture page T-12 serves itself from `test/e2e/firefox/fixtures/`), `test/e2e/firefox/requirements.txt`, `src/test-hooks/{index,state}.ts` (`installTestHooks()`, which loads every `src/test-hooks/*.ts` module by glob only when `SBW_TEST`, and the `sbw:test:state` page), CI job body for `e2e-firefox` (edits `ci.yml` only after T-06 merges; sequential dependency). Deps: T-01, T-06, T-04. Tests first: a smoke spec asserting the badge Shadow DOM exists on the fixture page. Gate: `pnpm test:e2e:firefox` green locally and in CI.
 
 **T-13 · S-7 Dry-run timing measurement** (L · K) — §4 S-7. Owns: `scripts/timing-probe/**`, `docs/spikes/S-7.md`. Deps: T-01, T-04. Gate: distributions for both browsers in the doc; Firefox host verdict recorded; `KeepAlive` interval confirmed ≤ 25 s.
 
@@ -889,38 +920,38 @@ Gate: `pnpm check:permissions && pnpm check:prod-bundle` after `pnpm build && pn
 ### Phase 1 — Overlay
 
 **T-20 · Pacific time module** (M · A)
-Goal: `parsePacific`, `parsePacificDetailed`, `formatDual(ms, userTz)` ("7:18 PM PT · 10:18 PM EDT"), `relative(ms, now)`.
-Owns: `src/domain/time/pacific.ts`, `test/unit/domain/time/*.test.ts`.
+Goal: `parsePacific`, `parsePacificDetailed`, `formatDual(ms, userTz)` ("7:18 PM PT · 10:18 PM ET", §15 Q7), `relative(ms, now)`; the shared time display components in `src/ui/time/**` (moved from T-37, I-14).
+Owns: `src/domain/time/pacific.ts`, `src/ui/time/**`, `test/unit/domain/time/*.test.ts`.
 Deps: T-02.
 Tests first: table tests for `2026-10-07T19:18:30`, fractional `…:17.45`, DST spring-forward nonexistent `2026-03-08T02:30:00` (→ `nonexistent:true`, resolves to 03:30 PDT), fall-back ambiguous `2026-11-01T01:30:00` (→ `ambiguous:true`, earlier instant), `Date.parse` misuse guarded (a test asserts the module never calls `Date.parse` on raw input, via a lint rule `no-restricted-syntax`). Property test: `format(parse(x)) === x` for 10k generated naive strings outside DST transitions.
 Acceptance: uses `Intl.DateTimeFormat` with `America/Los_Angeles` only; zero dependencies.
-Gate: `pnpm test:unit -- src/domain/time`.
+Gate: `pnpm test:unit -- domain/time`.
 
 **T-21 · Money module** (S · A)
-Goal: `Cents` parse/format, `nextAcceptable(current, increment)`, `allInToBid(allIn, shipping, handling)`, `exceedsTypo(max, current, multiplier, absolute)`.
-Owns: `src/domain/money.ts`, `test/unit/domain/money.test.ts`.
+Goal: `Cents` parse/format, `nextAcceptable(current, increment)`, `allInToBid(allIn, shipping, handling)`, `exceedsTypo(max, current, multiplier, absolute)` (the only implementation; T-82 reuses it); the shared money display components in `src/ui/money/**` (moved from T-37, I-14).
+Owns: `src/domain/money.ts`, `src/ui/money/**`, `test/unit/domain/money.test.ts`.
 Deps: T-02.
 Tests first: property tests: `format(parse(s)) === s` for `/^\d+\.\d{2}$/`; no floating drift over 1e6 additions; `bidAmount` string always two decimals.
-Gate: `pnpm test:unit -- src/domain/money`.
+Gate: `pnpm test:unit -- domain/money`.
 
 **T-22 · Keyword compiler** (M · B)
 Goal: `compileKeyword` with modes any/all/none, wholeWord, safe regex (length cap, nested-quantifier rejection, per-test time budget via a pre-check and a 5 ms watchdog pattern), NFKC folding, misspelling-variant hook (stub returning `[term]`, filled in Phase 6).
 Owns: `src/domain/rules/keywords.ts`, `test/unit/domain/rules/keywords.test.ts`.
 Deps: T-02.
 Tests first: "men" does not match "women" with wholeWord; "women" matches `women` and `WOMEN'S`; negative keyword excludes; catastrophic regex `(a+)+$` rejected at compile; unicode "Pÿrex" folds.
-Gate: `pnpm test:unit -- src/domain/rules/keywords`.
+Gate: `pnpm test:unit -- domain/rules/keywords`.
 
 **T-23 · Rule matcher and preview** (M · B, after T-22)
 Goal: `evaluate`, `evaluateBatch`, precedence, `unknownConditions`, `preview(rule, listings)`.
 Owns: `src/domain/rules/{matcher,preview}.ts`, `test/unit/domain/rules/matcher.test.ts`.
 Deps: T-22, T-20, T-21.
 Tests first: table of 30 cases across every `Condition.kind`; hide beats highlight; landedCost unknown → `unknownConditions++` and no match; `endsWithin` uses `ctx.now`; disabled rule ignored; reasons name field and detail.
-Gate: `pnpm test:unit -- src/domain/rules`.
+Gate: `pnpm test:unit -- domain/rules`.
 
 **T-24 · SGW schemas and contract tests** (M · C)
-Goal: zod schemas for every endpoint in `config.ts`; normalizers to `Listing`/`ItemDetail`/`Favorite`; contract tests over fixtures; re-seed the fake server from fixtures.
+Goal: zod schemas for every endpoint in `config.ts`; normalizers to `Listing`/`ItemDetail`/`Favorite`; contract tests that validate every T-07 fixture against the endpoint schemas (moved from T-07's gate; a mismatch is a documented schema fix, not a fixture edit); re-seed the fake server from fixtures through T-04's seed loader.
 Owns: `src/adapters/sgw/schemas.ts`, `src/adapters/sgw/normalize.ts`, `test/contract/sgw/*.test.ts`, `test/fakes/fake-sgw-server/seed/**` (seed data only).
-Deps: T-07, T-02, T-20, T-21.
+Deps: T-07, T-02, T-20, T-21, T-04.
 Tests first: every fixture parses; a fixture with a renamed field fails with a `schema` error naming the path; `minimumBid` from search maps to `startingMinimumBid`, from detail to `minimumBid`; `message` HTML is stripped to text.
 Gate: `pnpm test:contract -- test/contract/sgw`.
 
@@ -929,55 +960,55 @@ Goal: §3.4 lanes, budgets, jitter, cache, backoff, pause/resume, persistence of
 Owns: `src/adapters/sgw/request-scheduler.ts`, `test/unit/adapters/sgw/request-scheduler.test.ts`.
 Deps: T-02, T-03.
 Tests first (fake clock): two background requests are ≥120 s apart; interactive ≥1 s; never two in flight; budget exhaustion throws `budget`; 429 doubles backoff with cap; three 403s pause all lanes 6 h and emit an event; cache hit skips network; considerate `tight` halves budgets; day rollover resets.
-Gate: `pnpm test:unit -- src/adapters/sgw/request-scheduler`.
+Gate: `pnpm test:unit -- adapters/sgw/request-scheduler`.
 
 **T-26 · ApiAdapter (reads + gated writes)** (L · D, after T-25)
-Goal: `SgwApi` over the scheduler: search (quote stripping, string booleans), itemDetail (cache), shippingQuote (shape per S-1), favorites list, addFavorite/removeFavorite/saveFavoriteNote (gated by `GlobalSwitches`), savedSearches, showBidModal, `serverTimeSample`. `placeBid` throws `paused` always in this phase (live in T-100).
-Owns: `src/adapters/sgw/api-adapter.ts`, `test/unit/adapters/sgw/api-adapter.test.ts`, `test/integration/sgw-api.test.ts` (MSW).
+Goal: `SgwApi` over the scheduler: search (quote stripping, string booleans), itemDetail (cache), shippingQuote (shape per S-1), favorites list, addFavorite/removeFavorite/saveFavoriteNote (gated by `GlobalSwitches`), savedSearches, showBidModal, `serverTimeSample`. `placeBid` delegates to a stub `src/adapters/sgw/bid.ts`, imported by `api-adapter.ts`, that always throws `paused` in this phase (T-100 replaces the stub with the live path).
+Owns: `src/adapters/sgw/api-adapter.ts`, `src/adapters/sgw/bid.ts` (stub), `test/unit/adapters/sgw/api-adapter.test.ts`, `test/integration/sgw-api.test.ts` (MSW).
 Deps: T-24, T-25.
 Tests first: request bodies match fixtures byte-for-byte for a known query; `credentials:'omit'` always; bearer attached only to auth endpoints; a write with dry-run on records an audit intent and makes no HTTP call; schema failure → `SgwApiError('schema')` and health flagged.
-Gate: `pnpm test:unit -- src/adapters/sgw/api-adapter && pnpm test:integration -- sgw-api`.
+Gate: `pnpm test:unit -- adapters/sgw/api-adapter && pnpm test:integration -- sgw-api`.
 
 **T-27 · DomAdapter** (L · E)
-Goal: `SgwDom` over rendered fixtures: ranked selectors (`app-home-product-items` → `a[href^="/item/"]` id regex → `.feat-item_*`), list layout per S-1, idempotent decoration (data attributes, class toggles, stub element), `pageKind`.
+Goal: `SgwDom` over rendered fixtures: ranked selectors (`app-home-product-items` → `a[href^="/item/"]` id regex → `.feat-item_*`), list layout per S-1, idempotent decoration (data attributes, class toggles, stub element), `pageKind`. `config.ts` is read-only after T-07: a missing selector is a T-07 follow-up, not a Phase 1 edit.
 Owns: `src/adapters/sgw/dom-adapter.ts`, `src/content/ui/stub.ts`, `test/dom/dom-adapter.test.ts`.
 Deps: T-07, T-02.
 Tests first (jsdom/happy-dom over fixtures): finds all 40 cards on grid and list; extracts itemIds; a fixture with the primary selector removed still finds cards via fallback and reports `configVersion` drift; applying the same `Decoration` twice yields one stub; simulated SPA re-render (replace container innerHTML in the test only) re-discovers without duplicates; never selects `_ngcontent-*`.
 Gate: `pnpm test:dom`.
 
 **T-28 · SessionAdapter** (M · F)
-Goal: `SgwSession` with JWT shape validation (three base64url parts, `exp` claim), expiry from `exp`, `expiring` at < 12 h, logged-out detection (401 from any auth call clears), refresh per S-2 verdict (behind `SBW_SESSION_REFRESH` config constant).
+Goal: `SgwSession` with JWT shape validation (three base64url parts, `exp` claim), expiry from `exp`, `expiring` at < 12 h, logged-out detection (401 from any auth call clears), refresh per S-2 verdict (behind an `SBW_SESSION_REFRESH` constant kept in `session-adapter.ts`; `config.ts` is read-only after T-07).
 Owns: `src/adapters/sgw/session-adapter.ts`, `test/unit/adapters/sgw/session-adapter.test.ts`.
-Deps: T-08, T-02.
-Tests first: observe stores and never logs the bearer (spy on console and audit); `state()` transitions by fake clock; `clear()` on 401; refresh path tested in both verdict configurations.
-Gate: `pnpm test:unit -- src/adapters/sgw/session-adapter`.
+Deps: T-08, T-02, T-03.
+Tests first: observe stores and never logs the bearer (spy on console and audit); a token whose `buyerId` differs from the stored session's is rejected unless the session is `logged-out` (tap data is untrusted, §8); `state()` transitions by fake clock; `clear()` on 401; refresh path tested in both verdict configurations.
+Gate: `pnpm test:unit -- adapters/sgw/session-adapter`.
 
 **T-29 · ClockAdapter** (M · F)
 Goal: `SgwClock`: samples, lowest-RTT offset, confidence levels (≥3 samples and rtt ≤ 400 ms → high), `serverNow`, `serverTime` parsing per S-1 verdict.
 Owns: `src/adapters/sgw/clock-adapter.ts`, `test/unit/adapters/sgw/clock-adapter.test.ts`.
-Deps: T-20, T-07.
+Deps: T-20, T-07, T-03.
 Tests first: offset equals the lowest-RTT sample's `server − (sent + rtt/2)`; a seconds-only sample never outranks an ms sample at equal RTT; samples older than 30 min expire.
-Gate: `pnpm test:unit -- src/adapters/sgw/clock-adapter`.
+Gate: `pnpm test:unit -- adapters/sgw/clock-adapter`.
 
 **T-30 · Health check** (M · E, after T-27)
 Goal: `SgwHealth.run('anonymous')`: one cached search schema check, one cached detail schema check, card-selector check (from the last content-script report), clock sanity; `run('full')` adds session. Stores `HealthReport`; emits `health.fail` audit.
 Owns: `src/adapters/sgw/health.ts`, `test/unit/adapters/sgw/health.test.ts`.
 Deps: T-24, T-27, T-29.
-Tests first: schema drift → `ok:false` with the failing check named; `writesAllowed` false after failure; passes again after a good report; uses cache (no new requests) when a report < 6 h exists.
-Gate: `pnpm test:unit -- src/adapters/sgw/health`.
+Tests first: schema drift → `ok:false` with the failing check named (T-30 asserts only `HealthReport.ok`; the `writesAllowed` effect is tested in T-36); passes again after a good report; uses cache (no new requests) when a report < 6 h exists.
+Gate: `pnpm test:unit -- adapters/sgw/health`.
 
 **T-31 · api-tap (MAIN world)** (M · G)
 Goal: `src/content/api-tap.main.ts`: wraps `XMLHttpRequest.prototype.{open,setRequestHeader,send}` and `window.fetch` to observe buyerapi requests only; relays `{nonce, kind, url, status, body}` via `window.postMessage` to the isolated script, with a per-page nonce exchanged through a `data-sbw-nonce` attribute the isolated script sets before the tap runs (WXT `runAt: 'document_start'`, `world: 'MAIN'`). Observes the `Authorization` header (S-2) and relays it once per change. Never alters anything; passes through all errors.
-Owns: `src/content/api-tap.main.ts`, `entrypoints/api-tap.content.ts`, `test/dom/api-tap.test.ts`.
+Owns: `src/content/api-tap.main.ts`, `src/entrypoints/api-tap.content.ts`, `test/dom/api-tap.test.ts`; only if S-2 picks `webRequest`: its `wxt.config.ts` entry and the `test/snapshots/permissions.*.json` update (the only Phase 1 editor of either).
 Deps: T-08 verdict, T-02.
-Tests first (jsdom with mocked XHR/fetch): a buyerapi ItemListing response is relayed with the nonce; non-buyerapi traffic is not; a message without the nonce is ignored by the receiver; wrapping preserves return values and exceptions; wrapping twice is a no-op.
+Tests first (jsdom with mocked XHR/fetch): a buyerapi ItemListing response is relayed with the nonce; non-buyerapi traffic is not; the receiver treats every relayed message as untrusted: it schema-validates the payload and drops malformed messages and tokens that are not JWT-shaped (the nonce is anti-collision only, not authentication); wrapping preserves return values and exceptions; wrapping twice is a no-op.
 Gate: `pnpm test:dom -- api-tap`.
 
 **T-32 · Content overlay (ISOLATED)** (L · G, after T-31)
-Goal: `src/content/sgw-overlay.ts` + Preact Shadow DOM UI (`createShadowRootUi`): receives tap listings, sends `page.listings`/`page.token`, requests `rules.evaluate`, applies decorations through `SgwDom`, renders stubs with rule name, the "N hidden · show" bar, Why? popover, undo (local re-show + optional "disable rule"), quick actions (hide seller, hide keyword, favorite if enabled, track), dual-time badge; reacts to `wxt:locationchange` and a debounced `MutationObserver`; shows the "SGW layout changed, filters paused" banner when zero cards parse on a `search` page.
-Owns: `src/content/sgw-overlay.ts`, `src/content/ui/**` (except `stub.ts`), `entrypoints/sgw.content.ts` (replaces T-01 placeholder — T-01 is complete before this starts).
-Deps: T-27, T-31, T-35.
-Tests first (dom tests against fixtures with a fake messaging client): idempotent under three re-renders; hidden count matches; Why? text equals `MatchReason.detail`; no `innerHTML` (lint); keyboard: stubs and bar operable with Tab/Enter; a `text/html` title with `<script>` renders as text.
+Goal: `src/content/sgw-overlay.ts` + Preact Shadow DOM UI (`createShadowRootUi`): receives tap listings, sends `page.listings`/`page.token`, requests `rules.evaluate`, applies decorations through `SgwDom`, renders stubs with rule name, the "N hidden · show" bar, Why? popover, undo (local re-show + optional "disable rule"), quick actions (hide seller, hide keyword, favorite if enabled, track; `quick.favorite`/`quick.track` render in a closed shadow root and fire only on `event.isTrusted` clicks), dual-time badge; tap messages are untrusted and schema-validated; reports card-selector health with `page.domHealth`; a card-badge registry (the overlay mounts every `src/content/ui/badges/*.tsx` by `import.meta.glob`, so later cards add one badge file only); reacts to `wxt:locationchange` and a debounced `MutationObserver`; shows the "SGW layout changed, filters paused" banner when zero cards parse on a `search` page.
+Owns: `src/content/sgw-overlay.ts`, `src/content/ui/**` (except `stub.ts` and the badge files later cards add under `src/content/ui/badges/`), `src/entrypoints/sgw.content.ts` (replaces T-01 placeholder — T-01 is complete before this starts), `test/dom/overlay.test.ts`.
+Deps: T-27, T-31, T-35, T-20.
+Tests first (dom tests against fixtures with a fake messaging client): idempotent under three re-renders; a synthetic (`isTrusted: false`) click on quick favorite or track sends nothing; hidden count matches; Why? text equals `MatchReason.detail`; no `innerHTML` (lint); keyboard: stubs and bar operable with Tab/Enter; a `text/html` title with `<script>` renders as text.
 Gate: `pnpm test:dom -- overlay`.
 
 **T-33 · Storage repo and migrations** (M · H)
@@ -985,7 +1016,7 @@ Goal: typed `Repo` over `StorageAreas` with zod validation, quarantine, `migrate
 Owns: `src/domain/storage/{repo,migrations}.ts`, `test/unit/domain/storage/*.test.ts`.
 Deps: T-02, T-03.
 Tests first: invalid record is quarantined and defaults returned; migration framework runs 0→1 on empty storage and is idempotent; a crash flag triggers re-run; audit ring wraps at 20 chunks.
-Gate: `pnpm test:unit -- src/domain/storage`.
+Gate: `pnpm test:unit -- domain/storage`.
 
 **T-34 · Browser port adapters** (M · I)
 Goal: `src/adapters/browser/*`: `Clock` (Date/performance/setTimeout), `Http` (fetch with AbortController timeout, header capture, timing), `StorageAreas`, `Alarms` (floor clamp; `persistAcrossSessions` feature-detected), `Notifier` (Firefox basic-only), `Permissions`, `KeepAwake` (Chrome `power`, no-op elsewhere), `KeepAlive` (`runtime.getPlatformInfo` ticker).
@@ -999,26 +1030,26 @@ Goal: `src/messaging/client.ts` (typed `send`, port helpers) and `src/background
 Owns: `src/messaging/client.ts`, `src/background/router.ts`, `test/unit/background/router.test.ts`.
 Deps: T-02.
 Tests first: wrong `sender.id` dropped; `snipe.arm` from a tab sender rejected; `quick.favorite` rejected when setting off; malformed payload → error envelope, handler not called; `rules.evaluate` from a `https://shopgoodwill.com/...` tab accepted; from `https://evil.example` rejected.
-Gate: `pnpm test:unit -- src/background/router`.
+Gate: `pnpm test:unit -- background/router`.
 
 **T-36 · Background composition root and GlobalSwitches** (M · J, after T-35)
-Goal: `src/background/main.ts` wiring all adapters, `migrate()`, `GlobalSwitches`, health gating, `rules.*`/`settings.*`/`page.*`/`quick.*`/`kill.set`/`health.get` handlers, `switches.changed` broadcast, kill-switch `commands` listener.
-Owns: `src/background/main.ts`, `src/background/switches.ts`, `src/background/handlers/{rules,settings,page,quick,health}.ts`, `entrypoints/background.ts` (replaces T-01 placeholder), `test/integration/background-main.test.ts`.
+Goal: `src/background/main.ts` wiring all adapters into a `BackgroundContext`, `migrate()`, `GlobalSwitches`, health gating, `rules.*`/`settings.*`/`page.*`/`quick.*`/`kill.set`/`health.get` handlers, `switches.changed` broadcast, kill-switch `commands` listener (suggested key `Alt+Shift+K`; the only owner of `kill.set` and the shortcut). Self-registration (I-01): `src/background/handlers/index.ts` and `src/background/jobs/index.ts` load `import.meta.glob('./*.ts', { eager: true })` and call each module's `register(ctx: BackgroundContext)`; an interceptor hook on `settings.set` (used by T-102's live gate); under `SBW_TEST` only, `main.ts` calls T-12's `installTestHooks()`. `main.ts` is frozen after T-36.
+Owns: `src/background/main.ts`, `src/background/context.ts` (`BackgroundContext`), `src/background/switches.ts`, `src/background/handlers/{index,rules,settings,page,quick,health,kill}.ts`, `src/background/jobs/index.ts`, `src/entrypoints/background.ts` (replaces T-01 placeholder), `test/integration/background-main.test.ts`.
 Deps: T-26, T-28, T-29, T-30, T-33, T-34, T-35, T-23, T-41.
-Tests first (fakeBrowser): startup runs migrate then registers listeners; `page.token` reaches `SessionAdapter.observe`; `kill.set` flips `writesAllowed` for all features and audits; `quick.hideSeller` creates a rule and broadcasts `rules.changed`.
+Tests first (fakeBrowser): startup runs migrate then registers listeners; a module added under `handlers/` with `register(ctx)` is picked up without editing `main.ts`; a `settings.set` interceptor can veto the write; `page.token` reaches `SessionAdapter.observe`; `kill.set` flips `writesAllowed` for all features and audits; `writesAllowed` is false after a failed `HealthReport` (moved from T-30); `quick.hideSeller` creates a rule and broadcasts `rules.changed`.
 Gate: `pnpm test:integration -- background-main`.
 
 **T-37 · Options page: rule editor, settings** (L · K)
-Goal: Preact options app: rule list, editor for every `Condition.kind` with plain-English summary, live preview ("matches 7 of 40 on this page" using the last `page.listings` of the active SGW tab, via `rules.preview`), settings (home ZIP, run time, overlay style, dry-run switches, considerate mode, feature switches), accessibility (labels, focus order, no color-only cues).
-Owns: `src/entrypoints/options/**`, `src/ui/{time,money,components}/**`, `test/dom/options.test.ts`.
-Deps: T-02, T-35.
+Goal: Preact options app: rule list, editor for every `Condition.kind` with plain-English summary, live preview ("matches 7 of 40 on this page" via `rules.preview {rule, tabId?}`; the background supplies the tab's last `page.listings`), settings (home ZIP, run time, overlay style, dry-run switches, considerate mode, feature switches), accessibility (labels, focus order, no color-only cues); a section registry: the shell loads `import.meta.glob('./sections/*/index.tsx')`, so later cards add one folder under `src/entrypoints/options/sections/` (I-06).
+Owns: `src/entrypoints/options/**` (shell, registry and its own sections; later cards own their folders under `sections/`), `src/ui/components/**`, `test/dom/options.test.ts`.
+Deps: T-02, T-35, T-20, T-21.
 Tests first (Preact testing library + fake messaging): saving a rule sends `rules.save` with a schema-valid payload; regex validation error shown; preview count renders from reply; dry-run toggles persist via `settings.set`.
 Gate: `pnpm test:dom -- options`.
 
 **T-38 · Popup** (S · L)
-Goal: status (session ok/expiring/logged-out, health, dry-run badges), kill switch, overlay on/off, "Open dashboard", "Open options".
-Owns: `src/entrypoints/popup/**`, `test/dom/popup.test.ts`.
-Deps: T-35.
+Goal: status (session ok/expiring/logged-out, health, dry-run badges), kill switch, overlay on/off, "Open dashboard", "Open options"; uses only `src/ui/{time,money}`; a section registry (`import.meta.glob('./sections/*/index.tsx')`), so later cards add one folder under `src/entrypoints/popup/sections/` (I-06).
+Owns: `src/entrypoints/popup/**` (shell, registry and its own sections; later cards own their folders under `sections/`), `test/dom/popup.test.ts`.
+Deps: T-35, T-20, T-21.
 Tests first: kill toggle sends `kill.set`; badge text reflects `switches.changed`.
 Gate: `pnpm test:dom -- popup`.
 
@@ -1026,95 +1057,95 @@ Gate: `pnpm test:dom -- popup`.
 Goal: `AuditLog` over chunked storage; redaction (`bearer`, `token`, `refresh`, `password` keys dropped; strings > 2 kB truncated; HTML tags stripped); export.
 Owns: `src/domain/audit/log.ts`, `test/unit/domain/audit/log.test.ts`.
 Deps: T-33.
-Tests first: entries get monotonically increasing `seq`; a details object containing `bearer` is redacted; ring eviction keeps the newest 10,000; export is valid JSON.
-Gate: `pnpm test:unit -- src/domain/audit`.
+Tests first: entries get monotonically increasing `seq`; a details object containing `bearer` is redacted; export is valid JSON. (Ring wrap and eviction belong to T-33 and are not re-implemented or re-tested here.)
+Gate: `pnpm test:unit -- domain/audit`.
 
 **T-39 · Chromium E2E: overlay** (L · M)
 Goal: Playwright (`launchPersistentContext`, `channel:'chromium'`, headless) loads the **test build** (`SBW_TEST=1`, base URL override to the fake servers, localhost host permission) and runs: rules created in options → fake SGW search page (served by the fake server on `127.0.0.1:8789` with hostname override `sgw.test` via Playwright `route`) → highlights, stubs, hidden bar, Why?, undo, SPA page change → still correct, kill switch → decorations cleared.
-Owns: `test/e2e/chromium/{fixtures.ts,overlay.spec.ts}`, `playwright.config.ts` (T-01 created it; T-39 is the first and only Phase 1 editor), `scripts/serve-fake-site.ts` (serves sanitized HTML fixtures with the real Angular replaced by a minimal script that performs the same XHR to the fake buyerapi, so the tap path is exercised).
+Owns: `test/e2e/chromium/{fixtures.ts,overlay.spec.ts}`, `playwright.config.ts` (T-01 created it; T-39 is the first and only Phase 1 editor), `scripts/serve-fake-site.ts` (serves sanitized HTML fixtures with the real Angular replaced by a minimal script that performs the same XHR to the fake buyerapi, so the tap path is exercised), `src/test-hooks/base-url.ts` (`sbw:test:baseUrl`), the test-vs-prod manifest step in `.github/workflows/ci.yml` (T-06's file; T-39 is its only Phase 1 editor), `docs/ACCEPTANCE.md` A-1 section (T-73 consolidates it later).
 Deps: T-32, T-36, T-37, T-38, T-04.
 Tests first: the spec itself; a CI job proves the test build contains `127.0.0.1` and the prod build does not.
 Gate: `pnpm test:e2e:chromium -- overlay`.
 
 **T-40 · Firefox smoke: overlay** (M · N)
-Goal: extend the S-6 harness to assert highlights and stubs on the fake site.
+Goal: extend the S-6 harness to assert highlights and stubs on the fake site. Does not touch `ci.yml`.
 Owns: `test/e2e/firefox/overlay_test.py`.
-Deps: T-12, T-32, T-36.
+Deps: T-12, T-32, T-36, T-39.
 Gate: `pnpm test:e2e:firefox`.
 
 ### Phase 2 — Watches, daily job, favorites, dashboard
 
 **T-50 · Watch schema and search-URL mapping** (M · A)
-Goal: `searchQueryFromUrl` / `searchQueryToUrl` (param map per S-1: `st, c, s, lp, hp, spo, snpo, socs, sd, sca, col, p, ps, desc, layout`), `Watch` helpers (`nextRunAtFor(settings, now, tz)`, `seen` ring).
-Owns: `src/domain/watches/query-url.ts`, `src/domain/watches/helpers.ts`, `test/unit/domain/watches/*.test.ts`.
+Goal: `searchQueryFromUrl` / `searchQueryToUrl` (param map per S-1: `st, c, s, lp, hp, spo, snpo, socs, sd, sca, col, p, ps, desc, layout`) in the site adapter `src/adapters/sgw/query-url.ts`, so the domain `Watch` carries no SGW param names (I-26); `Watch` helpers (`nextRunAtFor(settings, now, tz)`, `seen` ring).
+Owns: `src/adapters/sgw/query-url.ts`, `src/domain/watches/helpers.ts`, `test/unit/adapters/sgw/query-url.test.ts`, `test/unit/domain/watches/*.test.ts`.
 Deps: T-02, T-07.
 Tests first: round-trip of the observed URL from S-1; unknown params preserved in `extra`; quotes stripped; `nextRunAtFor("07:00", America/New_York)` across DST yields the correct UTC instants.
-Gate: `pnpm test:unit -- src/domain/watches`.
+Gate: `pnpm test:unit -- domain/watches adapters/sgw/query-url`.
 
 **T-51 · DailyJob state machine** (L · A, after T-50)
-Goal: §3.6 `plan/next/apply`: per watch `maxPages` search steps, de-dup by `seenItemIds`, rule evaluation (via injected `evaluateBatch`), new matches → `detail` steps (only when favoriting or calendar needs the detail value) → `favorite` steps per `favoriteMode` (`sgw-late` schedules a deferred step with `notBefore`), `calendarUpsert` steps when `watch.calendar`, `notifyDigest` last; errors recorded, run never aborts on one failed step; `paused` when scheduler pauses.
+Goal: §3.6 `plan/next/apply`: per watch `maxPages` search steps, de-dup by `seenItemIds`, rule evaluation (via injected `evaluateBatch`), new matches → `detail` steps (only when favoriting or calendar needs the detail value) → `favorite` steps per `favoriteMode` (`sgw-late` schedules a deferred step with `notBefore`), `quote` steps when a rule uses `landedCost` (quotes only for items that passed all other conditions; moved from T-57, I-07), `calendarUpsert` steps when `watch.calendar`, `notifyDigest` last; errors recorded, run never aborts on one failed step; `paused` when scheduler pauses.
 Owns: `src/domain/jobs/daily-job.ts`, `test/unit/domain/jobs/daily-job.test.ts`.
 Deps: T-50, T-23.
-Tests first: a plan for 3 watches × 2 pages yields 6 search steps then 1 favoritesList; a search outcome with 2 new matches appends 2 detail steps; `local` mode never adds a favorite step; `sgw-late` adds a step with `notBefore = end − N h`; applying an outcome to a finished run is a no-op; property: `cursor` never exceeds `steps.length`.
-Gate: `pnpm test:unit -- src/domain/jobs`.
+Tests first: a plan for 3 watches × 2 pages yields 6 search steps then 1 favoritesList; a search outcome with 2 new matches appends 2 detail steps; `local` mode never adds a favorite step; `sgw-late` adds a step with `notBefore = end − N h`; a `landedCost` rule adds one `quote` step per new match that passed every other condition; applying an outcome to a finished run is a no-op; property: `cursor` never exceeds `steps.length`.
+Gate: `pnpm test:unit -- domain/jobs`.
 
 **T-52 · Scheduler, reconcile and runner wiring** (L · B)
-Goal: `src/background/jobs/scheduler.ts` (`sbw:tick` alarm, `reconcile()` on start/onStartup/onInstalled/tick, due-watch detection with catch-up), `daily-job-runner.ts` (loads the active `JobRun`, executes exactly one step per tick through `SgwApi` lane `background`, or drains at lane `interactive` on `job.runNow`), permission check `permissions.contains` before each run, `job.*`/`watches.*`/`tracked.*` handlers, `sbw:job-progress` port.
-Owns: `src/background/jobs/{scheduler,daily-job-runner}.ts`, `src/background/handlers/{job,watches,tracked}.ts`, `test/integration/daily-job-runner.test.ts`.
+Goal: `src/background/jobs/scheduler.ts` (`sbw:tick` alarm, `reconcile()` on start/onStartup/onInstalled/tick, due-watch detection with catch-up), `daily-job-runner.ts` (loads the active `JobRun`, executes exactly one step per tick through `SgwApi` lane `background`, or drains at lane `interactive` on `job.runNow`), permission check `permissions.contains` before each run, `job.*`/`watches.*`/`tracked.*` handlers (incl. `watches.importSaved`, I-33), `sbw:job-progress` port. A `StepExecutor` registry (I-07): `src/background/jobs/steps/index.ts` loads `./*.ts` by `import.meta.glob`; T-52 adds the `search`, `favoritesList` and `detail` executors, and any kind without a module runs a no-op executor that audits the skip (T-53, T-56, T-57, T-67 and T-103 each add one executor file). An `onTick(cb)` hook on the scheduler for other jobs (T-83's heartbeat, T-103's post-end steps). All modules register through T-36's `register(ctx)`.
+Owns: `src/background/jobs/{scheduler,daily-job-runner}.ts`, `src/background/jobs/steps/{index,search,favorites-list,detail}.ts`, `src/background/handlers/{job,watches,tracked}.ts`, `test/integration/daily-job-runner.test.ts`.
 Deps: T-51, T-36, T-34.
 Tests first (fakeBrowser + FakeAlarms + FakeHttp): a watch due 3 days ago runs once (catch-up), not three times; browser restart mid-run resumes at `cursor`; each tick issues at most one SGW request; `runNow` completes a 10-step run in < 15 s fake time; revoked host permission → run skipped, notification, audit.
 Gate: `pnpm test:integration -- daily-job-runner`.
 
 **T-53 · Favorites reconciler** (M · C)
-Goal: §3.7 `desired()`, favorite job step execution (`addFavorite` gated by dry-run and health), `favorites.sync` handler (one list read, lane interactive), `TrackedItem.favoriteState` updates, undo refs.
-Owns: `src/domain/favorites/reconcile.ts`, `src/background/handlers/favorites.ts`, `test/unit/domain/favorites/*.test.ts`.
+Goal: §3.7 `desired()`, the `favorite` step executor `src/background/jobs/steps/favorite.ts` (`addFavorite` gated by dry-run and health; I-07), `favorites.sync` handler (one list read, lane interactive), `TrackedItem.favoriteState` updates, undo refs.
+Owns: `src/domain/favorites/reconcile.ts`, `src/background/jobs/steps/favorite.ts`, `src/background/handlers/favorites.ts`, `test/unit/domain/favorites/*.test.ts`.
 Deps: T-26, T-51 (interface only), T-41.
 Tests first: already-favorited (cache) → `none`; `failed` retries once per run; dry-run → audit entry `favorite.add {dryRun:true}` and no call; undo entry references `removeFavorite`.
-Gate: `pnpm test:unit -- src/domain/favorites`.
+Gate: `pnpm test:unit -- domain/favorites`.
 
 **T-54 · Dashboard (side panel / sidebar)** (L · D)
-Goal: one Preact app at `src/entrypoints/sidepanel/` (Chrome) and `src/entrypoints/sidebar/` (Firefox) sharing `src/ui/dashboard/**`: Watches (last run, next run, new matches, Run now), Matches and Favorites, Calendar sync status (placeholder until Phase 3), Health (session, Google, drift, budget), Activity log with undo; dual time everywhere; keyboard-operable.
-Owns: `src/entrypoints/sidepanel/**`, `src/entrypoints/sidebar/**`, `src/ui/dashboard/**`, `test/dom/dashboard.test.ts`.
-Deps: T-35, T-52 (message types only).
-Tests first: renders a `JobRun` progress from the port; Run now sends `job.runNow`; undo sends `audit.undo` and disables the button once `done`.
+Goal: one Preact app at `src/entrypoints/sidepanel/` (Chrome) and `src/entrypoints/sidebar/` (Firefox) sharing `src/ui/dashboard/**`: Watches (last run, next run, new matches, Run now), Matches and Favorites, Health (session, Google, drift, budget), Activity log (mounts T-58's `src/ui/activity/**`, I-11); the Calendar sync status section is T-67's (I-10); dual time everywhere; keyboard-operable. A section registry: the shell loads `import.meta.glob('./sections/*/index.tsx')`, so later cards add one folder under `src/ui/dashboard/sections/` (I-06).
+Owns: `src/entrypoints/sidepanel/**`, `src/entrypoints/sidebar/**`, `src/ui/dashboard/**` (shell, registry and its own sections; later cards own their folders under `sections/`), `test/dom/dashboard.test.ts`.
+Deps: T-35, T-52 (message types only), T-58.
+Tests first: renders a `JobRun` progress from the port; Run now sends `job.runNow`; a folder added under `sections/` is rendered without editing the shell; the Activity section mounts T-58's component.
 Gate: `pnpm test:dom -- dashboard`.
 
 **T-55 · Watches editor and SGW saved-search import** (M · E)
-Goal: options section: create a watch from the current SGW tab URL (`searchQueryFromUrl`), choose rules, `favoriteMode` with the explanatory copy about the favoriting anecdote, calendar toggle, pages; import SGW saved searches (`savedSearches`, lane interactive, user-triggered).
-Owns: `src/entrypoints/options/watches/**`, `test/dom/options-watches.test.ts`.
-Deps: T-37, T-50.
+Goal: options section: create a watch from the current SGW tab URL (`searchQueryFromUrl`), choose rules, `favoriteMode` (new watches take the schema default `sgw`, §15 Q5) with the explanatory copy about the favoriting anecdote, calendar toggle, pages; import SGW saved searches via `watches.importSaved` (T-52's handler; lane interactive, user-triggered).
+Owns: `src/entrypoints/options/sections/watches/**`, `test/dom/options-watches.test.ts`.
+Deps: T-37, T-50, T-52.
 Tests first: the form produces a schema-valid `Watch`; import maps saved searches to watches without duplicates by `query` hash.
 Gate: `pnpm test:dom -- options-watches`.
 
 **T-56 · Notifications, digest, quiet hours** (M · F)
-Goal: `src/background/jobs/notify.ts`: per-run digest ("3 new matches in Pyrex"), immediate late-add alert (< 60 min to end), quiet hours deferral, Firefox basic-only variant with click-to-open-dashboard; `notifications` optional permission request from options (gesture).
-Owns: `src/background/jobs/notify.ts`, `src/background/handlers/permissions.ts`, `test/unit/background/notify.test.ts`.
-Deps: T-34, T-36.
+Goal: `src/background/jobs/notify.ts`: per-run digest ("3 new matches in Pyrex"; the `notifyDigest` step executor `src/background/jobs/steps/notify-digest.ts`, I-07), immediate late-add alert (< 60 min to end; `isLateAdd` in `src/domain/notify/late-add.ts` is the only late-add rule, reused by T-66 and T-67, I-18), quiet hours deferral, Firefox basic-only variant with click-to-open-dashboard; `notifications` optional permission requested from an options section's click handler through the shared `src/ui/permissions.ts` (UI pages call `browser.permissions.request` directly; no background permission handler, I-21).
+Owns: `src/background/jobs/notify.ts`, `src/background/jobs/steps/notify-digest.ts`, `src/domain/notify/late-add.ts`, `src/ui/permissions.ts`, `src/entrypoints/options/sections/notifications/**`, `test/unit/background/notify.test.ts`.
+Deps: T-34, T-36, T-52.
 Tests first: during quiet hours a digest is deferred to the end of quiet hours; late-add bypasses quiet hours; no notification when permission absent (audit only).
-Gate: `pnpm test:unit -- src/background/notify`.
+Gate: `pnpm test:unit -- background/notify`.
 
 **T-57 · Landed cost** (M · G)
-Goal: `landedCost.get` handler: shipping quote via `SgwApi.shippingQuote` (lane interactive, cache 24 h, max 40 per page view, only when `features.landedCost`), badge in overlay (reads `landedCost.get` lazily for visible cards via `IntersectionObserver`), `landedCost` rule condition wiring in the job (quotes only for items that passed all other conditions).
-Owns: `src/background/handlers/landed-cost.ts`, `src/content/ui/landed-cost-badge.tsx`, `test/unit/background/landed-cost.test.ts`.
-Deps: T-26, T-32, T-23.
+Goal: `landedCost.get` handler: shipping quote via `SgwApi.shippingQuote` (lane interactive, cache 24 h, max 40 per page view, only when `features.landedCost`), badge in overlay (`src/content/ui/badges/landed-cost.tsx`; reads `landedCost.get` lazily for visible cards via `IntersectionObserver`), the `quote` step executor `src/background/jobs/steps/quote.ts` (T-51 plans the quote steps, I-07).
+Owns: `src/background/handlers/landed-cost.ts`, `src/background/jobs/steps/quote.ts`, `src/content/ui/badges/landed-cost.tsx`, `test/unit/background/landed-cost.test.ts`.
+Deps: T-26, T-32, T-23, T-52.
 Tests first: 41st request on a page is refused with `budget`; cached quote not re-fetched; feature switch off → `null` for all; pickup-only items return `shipping:0` with a `pickup` flag.
-Gate: `pnpm test:unit -- src/background/landed-cost`.
+Gate: `pnpm test:unit -- background/landed-cost`.
 
 **T-58 · Audit undo and activity UI** (M · C, after T-53)
-Goal: `audit.undo` handler for `unfavorite`, `disableRule`, `deleteEvent` (Phase 3 fills), `disarm`; activity list component used by dashboard and options.
-Owns: `src/background/handlers/audit.ts`, `src/ui/activity/**`, `test/unit/background/audit-undo.test.ts`.
+Goal: `audit.list` and `audit.undo` handlers (undo for `unfavorite`, `disableRule`, `deleteEvent` (Phase 3 fills), `disarm`); the one activity list component `src/ui/activity/**`, mounted by the dashboard (T-54) and by an options section (I-11).
+Owns: `src/background/handlers/audit.ts`, `src/ui/activity/**`, `src/entrypoints/options/sections/activity/**`, `test/unit/background/audit-undo.test.ts`, `test/dom/activity.test.ts`.
 Deps: T-41, T-53.
-Tests first: undo of a dry-run entry is refused; undo marks `done` and appends an `undo` audit entry; double undo is a no-op.
-Gate: `pnpm test:unit -- src/background/audit-undo`.
+Tests first: undo of a dry-run entry is refused; undo marks `done` and appends an `undo` audit entry; double undo is a no-op; `audit.list` pages with `before`; the component's undo sends `audit.undo` and disables the button once `done`.
+Gate: `pnpm test:unit -- background/audit-undo && pnpm test:dom -- activity`.
 
 **T-59 · Chromium E2E: daily job** (L · H)
 Goal: specs: create watch → trigger `sbw:tick` via test hook → one request per tick observed on the fake server with ≥120 s fake spacing (fake server records timestamps; the test build exposes a `sbw:test:advance` hook that fast-forwards the Clock port and fires alarms); browser context restart mid-run → resume; catch-up after a 3-day gap; dry-run favoriting produces audit entries and zero `AddToFavorite` calls; live favoriting (against the fake) produces exactly one call per item.
-Owns: `test/e2e/chromium/daily-job.spec.ts`, `src/test-hooks/**` (compiled only when `SBW_TEST`), `test/e2e/chromium/helpers/time.ts`.
+Owns: `test/e2e/chromium/daily-job.spec.ts`, `src/test-hooks/{advance,fire-alarm}.ts` (compiled only when `SBW_TEST`; registered through T-12's `installTestHooks`), the time-travel seam in `src/adapters/browser/{clock,alarms}.ts` (T-34's files), `test/e2e/chromium/helpers/time.ts`, `docs/ACCEPTANCE.md` A-2 section (T-73 consolidates it later). Spacing is read from T-04's `/__log` with the `x-sbw-fake-now` header.
 Deps: T-52, T-53, T-39.
 Gate: `pnpm test:e2e:chromium -- daily-job && pnpm check:prod-bundle`.
 
 **T-60 · Live canary workflow** (M · I)
-Goal: `scripts/canary.ts` (anonymous: one `ItemListing`, one `ItemDetail` of a result, one rendered search page via Playwright; validates schemas and selectors; 120 s between requests; budget 4/day) and `.github/workflows/canary.yml` (nightly, `workflow_dispatch`, opens/updates a GitHub issue "SGW drift detected" on failure, never on success).
+Goal: `scripts/canary.ts` (anonymous, API-only reads: one `ItemListing`, one `ItemDetail` of a result, plus one rendered `/item/` page via Playwright to check item-page selectors; never a search page, which robots.txt disallows; card selectors are covered by the fixture-based DOM tests; validates schemas and selectors; 120 s between requests; budget 4/day) and `.github/workflows/canary.yml` (nightly, `workflow_dispatch`, opens/updates a GitHub issue "SGW drift detected" on failure, never on success).
 Owns: `scripts/canary.ts`, `.github/workflows/canary.yml`, `test/unit/scripts/canary.test.ts` (against the fake server).
 Deps: T-24, T-27.
 Tests first: canary passes on fixtures; fails and reports the path on a renamed field; refuses to run twice within 12 h (lock file in the workflow cache).
@@ -1122,74 +1153,74 @@ Gate: `pnpm test:unit -- scripts/canary`.
 
 **T-61 · Firefox smoke: daily job** (S · J)
 Goal: run one tick and assert an audit entry via the test page.
-Owns: `test/e2e/firefox/daily_job_test.py`. Deps: T-12, T-52. Gate: `pnpm test:e2e:firefox`.
+Owns: `test/e2e/firefox/daily_job_test.py`. Deps: T-12, T-52, T-59. Gate: `pnpm test:e2e:firefox`.
 
 ### Phase 3 — Google Calendar, onboarding, release
 
 **T-62 · PkceRefreshProvider** (L · A)
 Goal: `GoogleAuthProvider` via `identity.launchWebAuthFlow`: S256 PKCE, `access_type=offline`, `prompt=consent`, state check, redirect per browser (chromiumapp.org vs loopback), token exchange with optional secret (per S-4), refresh with `interactive:false`, `invalid_grant` → status `needsInteraction` + badge, revoke on disconnect, scope check, tokens in `storage.session` (access) and `storage.local` (refresh).
-Owns: `src/adapters/google/auth-pkce.ts`, `src/adapters/google/pkce.ts`, `test/unit/adapters/google/auth-pkce.test.ts`, `test/integration/google-auth.test.ts` (MSW).
+Owns: `src/adapters/google/auth-pkce.ts`, `src/adapters/google/pkce.ts`, `src/adapters/google/token-schemas.ts` (token-response schemas; T-64 keeps `schemas.ts` for Calendar), `test/unit/adapters/google/auth-pkce.test.ts`, `test/integration/google-auth.test.ts` (MSW).
 Deps: T-10, T-02, T-34.
 Tests first: RFC 7636 Appendix B vector; `state` mismatch rejected; `interactive:false` never calls `launchWebAuthFlow`; `invalid_grant` clears nothing but sets status; 401 → one refresh then surface; revoke endpoint called on disconnect then storage cleared; error taxonomy mapping table for 400/401/403/429/network.
-Gate: `pnpm test:unit -- src/adapters/google/auth-pkce && pnpm test:integration -- google-auth`.
+Gate: `pnpm test:unit -- adapters/google/auth-pkce && pnpm test:integration -- google-auth`.
 
 **T-63 · ChromeIdentityProvider** (M · A, after T-62; **only if S-4 decision selects it**)
-Goal: `getAuthToken({interactive})`, 401 → `removeCachedAuthToken` + retry once, `clearAllCachedAuthTokens` on disconnect, manifest `oauth2` block injected from env at build.
+Goal: `getAuthToken({interactive})`, 401 → `removeCachedAuthToken` + retry once, `clearAllCachedAuthTokens` on disconnect; owns the manifest `oauth2` block from here on and completes T-01's env-injection scaffold rather than adding a second one (I-18). T-63 is the only `wxt.config.ts` editor after Phase 1 (I-31).
 Owns: `src/adapters/google/auth-chrome-identity.ts`, `test/unit/adapters/google/auth-chrome-identity.test.ts`, `wxt.config.ts` oauth2 section (coordinate: T-01 complete).
 Deps: T-62 (shared types), T-10.
-Gate: `pnpm test:unit -- src/adapters/google/auth-chrome-identity`.
+Gate: `pnpm test:unit -- adapters/google/auth-chrome-identity`.
 
 **T-64 · CalendarApi adapter and schemas** (M · B)
 Goal: §3.8 `CalendarApi` with zod on every response, `CalendarApiError` mapping (409 conflict, 404/410 not-found, 401 auth, 403 insufficient scope vs rate limit by `reason`, 429), exponential backoff on 429/5xx, offline detection.
 Owns: `src/adapters/google/{calendar-api,schemas}.ts`, `test/unit/adapters/google/calendar-api.test.ts`, `test/contract/google/*.test.ts`.
 Deps: T-02, T-05.
 Tests first: each fake-server response validates; 409 → `conflict`; `forbidden/insufficientPermissions` → `insufficient-scope`; `rateLimitExceeded` → `rate-limited` with backoff.
-Gate: `pnpm test:unit -- src/adapters/google/calendar-api && pnpm test:contract -- test/contract/google`.
+Gate: `pnpm test:unit -- adapters/google/calendar-api && pnpm test:contract -- test/contract/google`.
 
 **T-65 · Event builder and event id** (S · C)
 Goal: `eventIdFor` (`/^[a-v0-9]{5,1024}$/`), `buildDesiredEvent(tracked, listing/detail, settings)` with RFC 3339 UTC `dateTime` + `timeZone: 'UTC'`, ≤5 reminders, description with dual time and link, title ≤ 200 chars, `hash(desired)` for change detection.
 Owns: `src/domain/calendar/{event-id,event-builder}.ts`, `test/unit/domain/calendar/event-*.test.ts`.
 Deps: T-02, T-20.
 Tests first: id regex property test over 10k ids; 6 reminders rejected; start equals auction end; hash changes only when content changes.
-Gate: `pnpm test:unit -- src/domain/calendar/event`.
+Gate: `pnpm test:unit -- domain/calendar/event`.
 
 **T-66 · Calendar reconciler (domain)** (M · C, after T-65)
-Goal: pure `reconcile(desired[], links[], now)` → ops `insert | patch | delete | noop | recreate`, handling: end-time change → patch; item no longer desired → delete; link `error` → retry with backoff count; outcome stamping ops; late-add flag (`startUtc − now < 60 min`).
+Goal: pure `reconcile(desired[], links[], now)` → ops `insert | patch | delete | noop | recreate`, handling: end-time change → patch; item no longer desired → delete; link `error` → retry with backoff count; outcome stamping ops; late-add flag via T-56's `isLateAdd` (`src/domain/notify/late-add.ts`; not re-implemented, I-18).
 Owns: `src/domain/calendar/reconciler.ts`, `test/unit/domain/calendar/reconciler.test.ts`.
-Deps: T-65.
+Deps: T-65, T-11.
 Tests first: 25-case table; idempotent (running twice yields noops); a cancelled-link recreate bumps generation only when strategy = `bump-generation` (per S-5).
-Gate: `pnpm test:unit -- src/domain/calendar/reconciler`.
+Gate: `pnpm test:unit -- domain/calendar/reconciler`.
 
 **T-67 · CalendarSink and sync job** (L · D)
-Goal: `CalendarSink` over `CalendarApi` + `GoogleAuthProvider` (ensureCalendar, upsert with 409 path per S-5, remove, stamp), `src/background/jobs/calendar-sync.ts` (runs after each job run and on `calendar.syncNow`, on `tracked` changes debounced 60 s, uses lane-less Google calls with their own 1 r/s limiter), queueing when disconnected (`links.status='pending'`), `deleteEvent` undo, `calendar.*` handlers, late-add → immediate local notification.
-Owns: `src/adapters/google/calendar-sink.ts`, `src/background/jobs/calendar-sync.ts`, `src/background/handlers/calendar.ts`, `test/integration/calendar-sync.test.ts`.
-Deps: T-62, T-64, T-66, T-36, T-56.
+Goal: `CalendarSink` over `CalendarApi` + `GoogleAuthProvider` (ensureCalendar, upsert with 409 path per S-5, remove, stamp), `src/background/jobs/calendar-sync.ts` (runs after each job run and on `calendar.syncNow`, on `tracked` changes debounced 60 s, uses lane-less Google calls with their own 1 r/s limiter), queueing when disconnected (`links.status='pending'`), `deleteEvent` undo, `calendar.*` handlers (incl. `calendar.ics`, which calls T-68's `buildIcs`, I-10), the `calendarUpsert` step executor `src/background/jobs/steps/calendar-upsert.ts` (I-07), the dashboard calendar section `src/ui/dashboard/sections/calendar/**` with the .ics download button (I-10), late-add → immediate local notification via T-56's `isLateAdd` (I-18), and reminders sent to every `ReminderSink` registered through `registerReminderSink` (T-69's ntfy sink registers there, I-34).
+Owns: `src/adapters/google/calendar-sink.ts`, `src/background/jobs/calendar-sync.ts`, `src/background/jobs/steps/calendar-upsert.ts`, `src/background/handlers/calendar.ts`, `src/ui/dashboard/sections/calendar/**`, `test/integration/calendar-sync.test.ts`.
+Deps: T-62, T-64, T-66, T-36, T-56, T-68, T-11.
 Tests first (fake Google server): first sync creates the calendar once; an end-time change patches; unwatch deletes; 409 on insert → get → revive or bump; disconnected → pending links, no calls, badge; `invalid_grant` → notification once per day, not per item; dry-run calendar → audit only.
 Gate: `pnpm test:integration -- calendar-sync`.
 
 **T-68 · .ics and Add-to-Calendar fallback** (S · E)
-Goal: `buildIcs(desired[])` with three `VALARM`s, `calendar.ics` handler, download button in dashboard, Google "Add to calendar" template link per item.
+Goal: `buildIcs(desired[])` with three `VALARM`s and the Google "Add to calendar" template link per item (`src/ui/calendar-fallback/**`). The `calendar.ics` handler and the dashboard download button belong to T-67 (I-10).
 Owns: `src/domain/calendar/ics.ts`, `src/ui/calendar-fallback/**`, `test/unit/domain/calendar/ics.test.ts`.
 Deps: T-65.
 Tests first: output parses with a minimal ICS parser in the test; `DTSTART` in UTC with `Z`; three `TRIGGER:-PT60M/-PT15M/-PT5M`; text escaping of commas/semicolons/newlines.
-Gate: `pnpm test:unit -- src/domain/calendar/ics`.
+Gate: `pnpm test:unit -- domain/calendar/ics`.
 
 **T-69 · ntfy sink (opt-in)** (M · F)
-Goal: `src/adapters/ntfy/ntfy-sink.ts`: scheduled messages via `X-Delay` (≤3 days; later ones scheduled by the daily job), update/cancel by sequence id, unguessable topic generator (128-bit), optional host permission request from options, Firefox data-collection declaration note.
-Owns: `src/adapters/ntfy/**`, `src/entrypoints/options/ntfy/**`, `test/unit/adapters/ntfy/*.test.ts`.
-Deps: T-34, T-37.
+Goal: `src/adapters/ntfy/ntfy-sink.ts`: scheduled messages via `X-Delay` (≤3 days; later ones scheduled by the daily job), update/cancel by sequence id, unguessable topic generator (128-bit), optional host permission request from options, Firefox data-collection declaration note; does not edit `wxt.config.ts` (T-01 already declares the ntfy optional host and `data_collection_permissions`, I-31); registers the sink with T-67's `registerReminderSink` from `src/background/jobs/ntfy-reminders.ts` (I-01 pattern, I-34).
+Owns: `src/adapters/ntfy/**`, `src/entrypoints/options/sections/ntfy/**`, `src/background/jobs/ntfy-reminders.ts`, `test/unit/adapters/ntfy/*.test.ts`.
+Deps: T-34, T-37, T-67.
 Tests first (MSW): message for an auction 5 days out is not sent now and is marked `deferred`; cancel sends DELETE with the stored seq; disabled → no network.
-Gate: `pnpm test:unit -- src/adapters/ntfy`.
+Gate: `pnpm test:unit -- adapters/ntfy`.
 
 **T-70 · Options: Google connect and health panel** (M · E, after T-68)
 Goal: paste client id (+ secret), Connect (gesture → `calendar.connect`), status (account, scopes, refresh-token age, last error with fix hint), Disconnect (revokes), calendar mode (dedicated/primary → scope choice), reminders editor (≤5), health panel (session, Google, drift, budget usage, considerate mode).
-Owns: `src/entrypoints/options/google/**`, `src/entrypoints/options/health/**`, `test/dom/options-google.test.ts`.
+Owns: `src/entrypoints/options/sections/google/**`, `src/entrypoints/options/sections/health/**`, `test/dom/options-google.test.ts`.
 Deps: T-37, T-62.
 Tests first: Connect disabled until client id present; `needsInteraction` renders the reconnect CTA; disconnect confirms before revoking.
 Gate: `pnpm test:dom -- options-google`.
 
 **T-71 · Onboarding** (M · G)
-Goal: `src/entrypoints/onboarding/`: five steps (detect SGW login via `SgwSession.state`, home ZIP, connect Google or skip with .ics note, create first watch from current search or template, dry-run it now), ToS/risk disclosure copy, notification permission request, < 3 minutes.
+Goal: `src/entrypoints/onboarding/`: five steps (detect SGW login via `health.get`'s `sessionState`, home ZIP, connect Google or skip with .ics note, create first watch from current search or template with the schema default `favoriteMode: 'sgw'` (§15 Q5), dry-run it now), ToS/risk disclosure copy, notification permission request in the click handler through T-56's `src/ui/permissions.ts` (I-21), < 3 minutes.
 Owns: `src/entrypoints/onboarding/**`, `test/dom/onboarding.test.ts`.
 Deps: T-70, T-55, T-56.
 Tests first: skip path leaves calendar disabled and `icsFallback` on; completing creates one watch and triggers `job.runNow` with dry-run on.
@@ -1197,134 +1228,142 @@ Gate: `pnpm test:dom -- onboarding`.
 
 **T-72 · Chromium E2E: calendar** (L · H)
 Goal: with the test-only `GoogleAuthProvider` stub (`src/test-hooks/google-auth-stub.ts`, compiled only in test builds) pointed at the fake Google server: connect → sync → events with 60/15/5 → end-time change → patch → unwatch → delete → `invalid_grant` scenario → badge and pending links → reconnect → drain.
-Owns: `test/e2e/chromium/calendar.spec.ts`, `src/test-hooks/google-auth-stub.ts`.
+Owns: `test/e2e/chromium/calendar.spec.ts`, `src/test-hooks/google-auth-stub.ts`, `docs/ACCEPTANCE.md` A-3 section (T-73 consolidates it later).
 Deps: T-67, T-59.
 Gate: `pnpm test:e2e:chromium -- calendar && pnpm check:prod-bundle`.
 
 **T-73 · Setup guides** (M · I)
-Goal: `docs/SETUP-GOOGLE.md` (§10 outline expanded with screenshots-as-text), `docs/SETUP-CHROME.md`, `docs/SETUP-FIREFOX.md`, `docs/ACCEPTANCE.md` (A-1…A-6 checklists from §7.6), `docs/CONSIDERATE-USE.md` (§9).
-Owns: those files. Deps: T-10, T-62. Gate: a second worker follows SETUP-GOOGLE against the fake server build and reports no missing step (review checklist pasted).
+Goal: `docs/SETUP-GOOGLE.md` (§10 outline expanded with screenshots-as-text), `docs/SETUP-CHROME.md`, `docs/SETUP-FIREFOX.md`, `docs/ACCEPTANCE.md` (consolidates A-1, A-2 and A-3, written by T-39, T-59 and T-72, and adds the A-4 and A-6 checklists from §7.6; owns the file afterwards, except T-105's A-5 section), `docs/CONSIDERATE-USE.md` (§9).
+Owns: those files. Deps: T-10, T-62, T-72. Gate: a second worker follows SETUP-GOOGLE against the fake server build and reports no missing step (review checklist pasted).
 
 **T-74 · Release pipeline** (M · J)
-Goal: `.github/workflows/release.yml` on tag: build both, `web-ext lint --warnings-as-errors --self-hosted`, zip Chrome, `web-ext sign --channel unlisted --upload-source-code` (AMO keys as repo secrets, run only if present), attach artifacts and SHA256 to a GitHub release; `scripts/release.ts` version bump; `CHANGELOG.md`.
-Owns: `.github/workflows/release.yml`, `scripts/release.ts`, `CHANGELOG.md`.
+Goal: `.github/workflows/release.yml` on tag: build both, `pnpm lint:webext` (T-06's wrapper, with `--self-hosted`), zip Chrome, `web-ext sign --channel unlisted --upload-source-code` via `scripts/sign-firefox.ts` (AMO keys as repo secrets, run only if present), attach artifacts and SHA256 to a GitHub release; `scripts/release.ts` version bump; `CHANGELOG.md`; the `README.md#reproducible-build` section (§11). Does not edit `wxt.config.ts` (T-01 already reads the version from `package.json`, I-31).
+Owns: `.github/workflows/release.yml`, `scripts/release.ts`, `scripts/sign-firefox.ts` (replaces T-01's stub), `CHANGELOG.md`, `README.md` `#reproducible-build` section.
 Deps: T-06.
-Gate: a `v0.0.1-rc` tag on a branch produces artifacts (dry run without AMO secrets).
+Gate: `release.yml` run with `act` (or by `workflow_dispatch` on a fork) produces the artifacts, with the GitHub release created as a **draft** only and no tag pushed to this repository; the AMO step is skipped without secrets.
 
 ### Phase 4 — Snipe engine, dry-run
 
 **T-80 · Snipe state machine** (L · A)
-Goal: §3.9 `reduce` with every transition, effects list, `history`, caps integration, `ASSUME_EXTENSION_MS` per S-3, dry-run branch (identical path, `placeBid` effect replaced by `audit` + measured timing).
+Goal: §3.9 `reduce` with every transition, effects list, `history`, caps integration through a precomputed `CapsResult` (I-08), `ASSUME_EXTENSION_MS` per S-3, dry-run branch (identical path, `placeBid` effect replaced by `audit` + measured timing). Outcome resolution uses T-87's `classifyOutcome` and the fallback uses T-83's `fallbackDecision`; neither is re-implemented here (I-18).
 Owns: `src/domain/snipe/state-machine.ts`, `test/unit/domain/snipe/state-machine.test.ts`.
-Deps: T-02, T-82.
-Tests first: exhaustive transition table (state × event → next or rejected); `sent` is terminal for sending (a second `fire` is rejected); `ambiguous` → `post-read` → resolves `won|outbid|network` by rules in §3.9; `verify-failed:extended` → `extended` outcome and re-arm proposal effect; `disarm` from any pre-`sent` state → `killed`; property: no path produces two `placeBid` effects.
-Gate: `pnpm test:unit -- src/domain/snipe/state-machine`.
+Deps: T-02, T-82, T-87, T-83, T-09.
+Tests first: exhaustive transition table (state × event → next or rejected); `sent` is terminal for sending (a second `fire` is rejected); `ambiguous` → `post-read` → resolves `won|outbid|network` through `classifyOutcome` per §3.9; `verify-failed:extended` → `extended` outcome and re-arm proposal effect; `disarm` from any pre-`sent` state → `killed`; property: no path produces two `placeBid` effects.
+Gate: `pnpm test:unit -- domain/snipe/state-machine`.
 
 **T-81 · Timing** (M · B)
 Goal: `computeFireAt`, sampling policy (3 samples at wake, 20 s apart, lowest RTT), latency bounds (abort if rtt > 2 s or confidence `none`), `clockSanity(offset)` (abort if |offset| > 5 min).
 Owns: `src/domain/snipe/timing.ts`, `test/unit/domain/snipe/timing.test.ts`.
 Deps: T-29.
 Tests first: `fireAt = end − lead − rtt/2`; skew +1.3 s produces fire 1.3 s later on the local clock; property: fireAt < end − lead always.
-Gate: `pnpm test:unit -- src/domain/snipe/timing`.
+Gate: `pnpm test:unit -- domain/snipe/timing`.
 
 **T-82 · Caps, typo guard, exposure** (M · B)
-Goal: `checkCaps`, `exposure(snipes)` (sum of armed maxes + estimated shipping/handling), `exceedsTypo`, per-day spent accumulation from outcomes.
+Goal: `checkCaps` (returns `CapsResult`), `exposure(snipes)` (sum of armed maxes + estimated shipping/handling), the typo guard through T-21's `exceedsTypo` (not re-implemented, I-18), per-day spent accumulation from outcomes (the only implementation; T-103 reuses it). Caps defaults (5000/10000/20000) come from T-02's `defaults.ts`, which T-82 reads and does not edit (I-09).
 Owns: `src/domain/snipe/caps.ts`, `test/unit/domain/snipe/caps.test.ts`.
 Deps: T-21.
 Tests first: exposure counts every armed snipe as a potential win; per-item cap uses `detail.minimumBid` not search `minimumBid`; typo guard at 3× current or absolute threshold; property: `checkCaps` is monotone in `maxBid`.
-Gate: `pnpm test:unit -- src/domain/snipe/caps`.
+Gate: `pnpm test:unit -- domain/snipe/caps`.
 
 **T-83 · Preflight, fallback policy, awake history** (M · C)
-Goal: `preflight(snipe, ctx)` at T−15 min (session, token, clock, keep-awake held, price < max, caps), `fallbackDecision` applied automatically on failure, `awake-history.ts` (heartbeat every 5 min via the tick; `likelihoodAwakeAt(hour)` over 14 days), arm-time advice ("your browser was running at 7:42 PM on 3 of the last 14 days").
-Owns: `src/domain/snipe/{preflight,awake-history}.ts`, `src/background/jobs/heartbeat.ts`, `test/unit/domain/snipe/preflight.test.ts`.
+Goal: `preflight(snipe, ctx)` at T−15 min (session, token, clock, keep-awake held, price < max, caps), `fallbackDecision` applied automatically on failure (the only fallback rule; T-80 uses it, I-18), `awake-history.ts` (heartbeat every 5 min registered on T-52's `onTick` hook, I-07; `likelihoodAwakeAt(hour)` over 14 days), arm-time advice ("your browser was running at 7:42 PM on 3 of the last 14 days").
+Owns: `src/domain/snipe/{preflight,awake-history}.ts`, `src/background/jobs/heartbeat.ts`, `test/unit/domain/snipe/{preflight,awake-history}.test.ts`.
 Deps: T-82, T-28, T-29.
 Tests first: preflight failure with `fallback:'early-proxy'` produces `applyFallbackProxy` effect (dry-run: audit only); `skip` produces `skipped`; likelihood computed from heartbeat gaps; no heartbeat in the hour → 0.
-Gate: `pnpm test:unit -- src/domain/snipe`.
+Gate: `pnpm test:unit -- domain/snipe/preflight domain/snipe/awake-history`.
 
 **T-84 · Snipe runner (background)** (L · D)
-Goal: `src/background/jobs/snipe-runner.ts`: per-snipe alarms (`:health24`, `:health1`, `:preflight`, `:wake`), `KeepAlive`, `KeepAwake` hold from arm (if T1 enabled) to end, `SnipeHost.acquire`, effect executor (readDetail via lane `snipe`, sampleClock, tight timer, placeBid (dry-run: `audit` + a harmless `itemDetail` read at fire time to measure real latency), post-read, notify, stamp), restart recovery (reads `attempt` from storage; re-schedules alarms on `reconcile()`), auto-kill on anomalies (auth, clock, latency, repeated errors, schema drift) → `disarm(anomaly)` + fallback.
+Goal: `src/background/jobs/snipe-runner.ts`: per-snipe alarms (`:health24`, `:health1`, `:preflight`, `:wake`), `KeepAlive`, `KeepAwake` hold from arm (if T1 enabled) to end, `SnipeHost.acquire`, effect executor (readDetail via lane `snipe`, sampleClock, tight timer, placeBid (dry-run: `audit` + a harmless `itemDetail` read at fire time to measure real latency), post-read, notify, stamp), restart recovery (reads `attempt` from storage; re-schedules alarms on `reconcile()`), auto-kill on anomalies (auth, clock, latency, repeated errors, schema drift) → `disarm(anomaly)` + fallback. Lanes (I-39): `:health24`/`:health1` call the `AuthHealth` port (cached session state, 0 SGW requests); `:preflight` reads on lane `background`; lane `snipe` is used only from the T−5 min wake onward. Seams, so later cards add files and never edit `snipe-runner.ts` (I-12): a `SendStrategy` (T-101 implements it), an `AuthHealth` port with a no-op default (T-91 implements it), a `SnipeHost` factory keyed by the S-7 verdict that loads registered implementations (the background host here; T-116 adds the runner page), an `ArmHooks` registry (T-111 and T-112 register hooks), a dry-run completion event (T-90 counts it), and the `sbw:snipe-countdown` port producer (§3.12).
 Owns: `src/background/jobs/snipe-runner.ts`, `src/background/handlers/snipe.ts`, `src/adapters/browser/snipe-host.ts`, `test/integration/snipe-runner.test.ts`.
-Deps: T-80, T-81, T-83, T-36, T-34.
+Deps: T-80, T-81, T-83, T-36, T-34, T-87.
 Tests first (fakeBrowser, FakeAlarms with +45 s delay, FakeClock): wake alarm delayed 45 s still fires on time (margin is 5 min); worker restart between `wake` and `fire` resumes and fires once; restart after `sent` never sends again; `KeepAlive` tick count ≥ 1 per 25 s during the window; health failure during the window → killed + fallback; kill switch mid-window → no bid.
 Gate: `pnpm test:integration -- snipe-runner`.
 
 **T-85 · Arming UI** (L · E)
-Goal: dashboard Snipes section: prepare (`snipe.prepare` → detail, next acceptable bid, est. all-in), arm form (max or all-in max, lead, fallback, dry-run badge, typed confirmation when typo guard trips, dual time, exposure meter after arming), countdown via port, disarm, outcome list; item-page and card "Snipe…" deep link that opens the dashboard prefilled (no arming from content).
-Owns: `src/ui/dashboard/snipes/**`, `src/content/ui/snipe-link.tsx`, `test/dom/dashboard-snipes.test.ts`.
+Goal: dashboard Snipes section: prepare (`snipe.prepare` → detail, next acceptable bid, est. all-in), arm form (max or all-in max, lead, fallback, dry-run badge, typed confirmation when typo guard trips, dual time, exposure meter after arming), countdown via port, disarm, outcome list; item-page and card "Snipe…" deep link that sends `ui.openSnipe` to open the dashboard prefilled (no arming from content). Builds the one exposure meter component `src/ui/exposure/**`, which T-102 mounts (I-18).
+Owns: `src/ui/dashboard/sections/snipes/**`, `src/ui/exposure/**`, `src/content/ui/badges/snipe-link.tsx`, `test/dom/dashboard-snipes.test.ts`.
 Deps: T-54, T-84 (types).
 Tests first: cannot submit above per-item cap; typo guard requires retyped amount equal to max; confirmation shows both times; dry-run state visibly labelled.
 Gate: `pnpm test:dom -- dashboard-snipes`.
 
 **T-86 · Kill switch command, badge, auto-kill wiring** (S · F)
-Goal: `commands` shortcut (`Ctrl+Shift+K` default) → `kill.set true`; action badge shows armed count or `KILL`; `switches.changed` broadcast; auto-kill reasons surfaced in popup.
-Owns: `src/background/handlers/kill.ts`, `src/background/badge.ts`, `test/integration/kill.test.ts`.
+Goal: a disarm-all subscriber to T-36's kill switch (T-36 owns `kill.set` and the `commands` listener, suggested key `Alt+Shift+K`; I-18); action badge shows armed count or `KILL`; auto-kill reasons surfaced in a popup section (I-06).
+Owns: `src/background/jobs/kill-disarm.ts`, `src/background/badge.ts`, `src/entrypoints/popup/sections/kill/**`, `test/integration/kill.test.ts`.
 Deps: T-36, T-84.
-Tests first: command disarms all snipes within one tick and audits each; badge text updates; killed snipes cannot be re-armed without an explicit user action.
+Tests first: kill on (via `kill.set` or the shortcut) disarms all snipes within one tick and audits each; badge text updates; killed snipes cannot be re-armed without an explicit user action.
 Gate: `pnpm test:integration -- kill`.
 
-**T-87 · Outcome classifier and report** (M · C, after T-83)
-Goal: `classifyOutcome(snipe, bidResult|null, postDetail)` → `SnipeOutcome` + detail (margin lost by, final price, measured timing), notification copy, calendar stamp request, post-auction report entry.
+**T-87 · Outcome classifier and report** (M · C)
+Goal: pure `classifyOutcome(snipe, bidResult|null, postDetail)` → `SnipeOutcome` + detail (margin lost by, final price, measured timing), notification copy, calendar stamp request, post-auction report entry. The only outcome rule: T-80 and T-84 depend on it (I-12, I-18).
 Owns: `src/domain/snipe/outcome.ts`, `test/unit/domain/snipe/outcome.test.ts`.
-Deps: T-80.
+Deps: T-02.
 Tests first: table for every outcome; `late` when fire occurred after `endTime`; `extended` when post-read `endTime` > armed `endTime`.
-Gate: `pnpm test:unit -- src/domain/snipe/outcome`.
+Gate: `pnpm test:unit -- domain/snipe/outcome`.
 
 **T-88 · Fake SGW server: bidding and timing scenarios** (M · G)
 Goal: `ShowBidModal`, `PlaceBid` (proxy semantics: hidden maxes, increments, `result` codes from the Phase 5 catalogue or placeholders `-3` closed, `-4/-5` too low ⚠, `-110` auth ⚠), `Bid` cookie 403, soft-close extension scenario, stalled-response scenario (≥ 25 s), token-expiry mid-window, high-bidder flag in detail.
-Owns: `test/fakes/fake-sgw-server/bidding/**`. Deps: T-04. Tests first: proxy resolution table; a bid after close returns `-3`. Gate: `pnpm test:unit -- test/fakes/fake-sgw-server`.
+Owns: `test/fakes/fake-sgw-server/bidding/**`, with the result codes in `bidding/result-codes.ts` (T-100 takes that file over, I-19). Deps: T-04. Tests first: proxy resolution table; a bid after close returns `-3`. Gate: `pnpm test:unit -- test/fakes/fake-sgw-server`.
 
 **T-89 · Chromium E2E: snipe scenarios (dry-run)** (L · H)
-Goal: packed test build (so alarm floors apply), fake server with 150 ms latency and +1.3 s skew: on-time dry-run fire (measured error logged); restart mid-wake; stalled fetch → ambiguous → post-read; extended end → `extended`; ended early → `ended`; kill mid-window; preflight failure → fallback audit; Firefox host per S-7.
+Goal: unpacked test build (Playwright cannot load a packed extension; the 30 s alarm floor is asserted through the `Alarms` port and FakeAlarms, and checked manually on a packed build in S-7 and A-4, I-28), fake server with 150 ms latency and +1.3 s skew: on-time dry-run fire (measured error logged); restart mid-wake; stalled fetch → ambiguous → post-read; extended end → `extended`; ended early → `ended`; kill mid-window; preflight failure → fallback audit; Firefox host per S-7 (the T-116 runner page when the verdict is runner-page).
 Owns: `test/e2e/chromium/snipe.spec.ts`, `test/e2e/firefox/snipe_test.py`.
-Deps: T-84, T-85, T-88, T-72.
+Deps: T-84, T-85, T-88, T-72, T-116 (when the S-7 verdict is runner-page).
 Gate: `pnpm test:e2e:chromium -- snipe && pnpm test:e2e:firefox`.
 
 **T-90 · Dry-run soak tooling and timing diagnostics** (M · I)
-Goal: dashboard "Timing" page: per-snipe measured offset/RTT/fire error/alarm delay, awake-history chart (text-based), soak summary (fires attempted, on-time %, p50/p95/p99 latency), export JSON; the rule that sets `defaultLeadMs` from the soak; `completedDryRuns` counter.
-Owns: `src/ui/dashboard/timing/**`, `src/domain/snipe/soak.ts`, `test/unit/domain/snipe/soak.test.ts`.
+Goal: dashboard "Timing" page: per-snipe measured offset/RTT/fire error/alarm delay, awake-history chart (text-based), soak summary (fires attempted, on-time %, p50/p95/p99 latency), export JSON; the rule that sets `defaultLeadMs` from the soak; the `completedDryRuns` counter, incremented by `src/background/jobs/dry-run-counter.ts` on T-84's dry-run completion event (I-12).
+Owns: `src/ui/dashboard/sections/timing/**`, `src/domain/snipe/soak.ts`, `src/background/jobs/dry-run-counter.ts`, `test/unit/domain/snipe/soak.test.ts`.
 Deps: T-84, T-54.
 Tests first: p99 computed correctly; lead rule clamps to [6 s, 15 s]; on-time = |error| ≤ 1 s.
-Gate: `pnpm test:unit -- src/domain/snipe/soak`.
+Gate: `pnpm test:unit -- domain/snipe/soak`.
 
 **T-91 · Auth-health checks and T1 settings** (M · F, after T-86)
-Goal: `src/background/jobs/auth-health.ts` (24 h and 1 h before any armed snipe: session state, Google state, health report, keep-awake availability; notification with fix action while the user is likely awake), snipe settings UI (enable, tier, `background`/`power` permission requests from gesture, OS power guidance link, caps, lead, fallback default).
-Owns: `src/background/jobs/auth-health.ts`, `src/entrypoints/options/snipe/**`, `test/unit/background/auth-health.test.ts`.
+Goal: `src/background/jobs/auth-health.ts`, implementing T-84's `AuthHealth` port (I-12): 24 h and 1 h before any armed snipe, from cached session state with 0 SGW requests (I-39): session state, Google state, health report, keep-awake availability; notification with fix action while the user is likely awake. Snipe settings UI (enable, tier, `background`/`power` permission requests in the click handler through T-56's `src/ui/permissions.ts` (I-21), OS power guidance link, caps, lead, fallback default).
+Owns: `src/background/jobs/auth-health.ts`, `src/entrypoints/options/sections/snipe/**`, `test/unit/background/auth-health.test.ts`.
 Deps: T-84, T-37.
 Tests first: a session expiring in 20 h triggers the 24 h warning; permissions requested only from the options click handler; Firefox hides T1 controls.
-Gate: `pnpm test:unit -- src/background/auth-health`.
+Gate: `pnpm test:unit -- background/auth-health`.
+
+**T-116 · Firefox runner-page SnipeHost** (M · J, **required when the S-7 verdict is runner-page**)
+Goal: the §1.3 fallback host for Firefox: a small unfocused extension window (`windows.create({type:'popup', focused:false})`) holding a `runtime.connect` port open through the snipe window, added as a `SnipeHost` implementation in T-84's factory (keyed by the S-7 verdict). Does not edit `snipe-runner.ts` or `main.ts` (I-12). Moved from Phase 6 per §15 Q2 (I-04).
+Owns: `src/entrypoints/snipe-runner/**`, `src/adapters/browser/snipe-host-page.ts`, `test/integration/snipe-host-page.test.ts`, `test/e2e/firefox/snipe_host_page_test.py`.
+Deps: T-13, T-84.
+Tests first: `acquire` opens one unfocused window and holds the port; `release` closes it; a second `acquire` for the same snipe is a no-op; the factory selects this host on Firefox only under the runner-page verdict.
+Gate: `pnpm test:integration -- snipe-host-page && pnpm test:e2e:firefox`.
 
 ### Phase 5 — Live bidding with caps
 
 **T-100 · PlaceBid live adapter and response catalogue** (M · A)
 Goal: `SgwApi.placeBid` live path: `showBidModal` → `placeBid` with `bidAmount` two-decimal string, `credentials:'omit'`, 20 s timeout, zod schema of `{status, result, message}` from the USER STEP catalogue (one cheap item the user wants; the user bids through the site with DevTools open and exports the response; a second deliberate too-low bid attempt through the site's own UI if the site allows the user to see the rejection), `messageText` stripping, result-code map with `unknown` default.
-Owns: `src/adapters/sgw/bid.ts` (imported by `api-adapter.ts`, which T-26 wrote with a seam `bidImpl`), `test/contract/sgw/bid.test.ts`, `docs/USER-STEPS/P5-catalogue.md`, `test/fixtures/sgw/json/placebid-*.json`.
+Owns: `src/adapters/sgw/bid.ts` (replaces T-26's stub, which `api-adapter.ts` already imports), `test/contract/sgw/bid.test.ts`, `docs/USER-STEPS/P5-catalogue.md`, `test/fixtures/sgw/json/placebid-*.json` and their appended entries in `test/fixtures/sgw/manifest.json`, `test/fakes/fake-sgw-server/bidding/result-codes.ts` (taken over from T-88 and updated to the real catalogue, I-19).
 Deps: T-26, T-88.
 Tests first: every catalogue fixture maps to a `BidResultKind`; unknown code → `rejected-unknown` and never `accepted`.
 Gate: `pnpm test:contract -- test/contract/sgw/bid`.
 
 **T-101 · Idempotent send and ambiguous resolution** (M · A, after T-100)
-Goal: `attempt.idempotencyKey` persisted before the request leaves; ambiguous handling per §3.9 with the proof conditions; the single-retry path.
+Goal: implements T-84's `SendStrategy` in `snipe-send.ts` and does not edit `snipe-runner.ts` (I-12): `attempt.idempotencyKey` persisted before the request leaves; ambiguous handling per §3.9 with the proof conditions; the single-retry path.
 Owns: `src/background/jobs/snipe-send.ts`, `test/integration/snipe-send.test.ts`.
 Deps: T-100, T-84.
 Tests first: a timeout followed by a post-read showing our bid present → `accepted`, no resend; post-read showing nothing changed with 2 s left → one resend; with 1 s left → no resend, outcome `network`; worker death simulated between persist and send → resend allowed exactly once.
 Gate: `pnpm test:integration -- snipe-send`.
 
 **T-102 · Live gating and exposure meter** (S · B)
-Goal: `dryRun.bidding` may be turned off only when `completedDryRuns ≥ requiredDryRuns` (default 5) and on-time ≥ 95%; confirmation copy; exposure meter in popup and dashboard; "first live snipe" guided checklist link.
-Owns: `src/background/handlers/live-gate.ts`, `src/ui/exposure/**`, `test/unit/background/live-gate.test.ts`.
+Goal: `dryRun.bidding` may be turned off only when `completedDryRuns ≥ requiredDryRuns` (default 5); an on-time rate below 95% shows a warning the user can override with typed confirmation, which is audited (I-25); the gate hooks `settings.set` through T-36's interceptor (I-01); confirmation copy; mounts T-85's exposure meter (`src/ui/exposure/**`, I-18) in popup and dashboard sections (I-06); "first live snipe" guided checklist link.
+Owns: `src/background/handlers/live-gate.ts`, `src/entrypoints/popup/sections/exposure/**`, `src/ui/dashboard/sections/exposure/**`, `test/unit/background/live-gate.test.ts`.
 Deps: T-90, T-85.
-Gate: `pnpm test:unit -- src/background/live-gate`.
+Tests first: turning `dryRun.bidding` off is refused below `requiredDryRuns`; with on-time < 95% it needs the typed confirmation and writes an audit entry; at ≥ 95% no confirmation is asked.
+Gate: `pnpm test:unit -- background/live-gate`.
 
 **T-103 · Outcome detection and calendar stamping** (M · C)
-Goal: post-end job step (lane background, one detail read ≥ 2 min after end for every tracked item with a snipe or calendar event): `won|lost|ended-early`, `stamp` on calendar, notification, tracked outcome, spent-today accumulation.
-Owns: `src/background/jobs/outcomes.ts`, `test/integration/outcomes.test.ts`.
+Goal: post-end job step (`postEnd` kind, enqueued from `outcomes.ts` on T-52's `onTick` hook and executed by `src/background/jobs/steps/post-end.ts`, I-07; lane background, one detail read ≥ 2 min after end for every tracked item with a snipe or calendar event): `won|lost|ended-early`, `stamp` on calendar (skipping items the T-84 snipe path already stamped), notification, tracked outcome; spent-today comes from T-82's accumulation, not a second one (I-18).
+Owns: `src/background/jobs/outcomes.ts`, `src/background/jobs/steps/post-end.ts`, `test/integration/outcomes.test.ts`.
 Deps: T-67, T-87, T-52.
 Tests first: won → event title prefixed `WON $x`, reminders cleared; lost → `LOST`; ended-early → `ENDED EARLY` and snipe `ended`.
 Gate: `pnpm test:integration -- outcomes`.
 
 **T-104 · Chromium E2E: money paths** (M · D)
-Goal: against the fake server with proxy semantics: live snipe wins; outbid by a higher hidden max; below-minimum; cap-blocked; `Bid` cookie scenario cannot trigger because `credentials:'omit'` (assert no cookie header).
-Owns: `test/e2e/chromium/live-bid.spec.ts`. Deps: T-101, T-103, T-89. Gate: `pnpm test:e2e:chromium -- live-bid`.
+Goal: against the fake server with proxy semantics: live snipe wins; outbid by a higher hidden max; below-minimum; cap-blocked; `Bid` cookie scenario cannot trigger because `credentials:'omit'` (assert no cookie header). Before the live specs, the test completes `requiredDryRuns` dry-run snipes against the fake (fast-forwarded with `sbw:test:advance`), so T-102's live gate opens (I-42).
+Owns: `test/e2e/chromium/live-bid.spec.ts`. Deps: T-101, T-103, T-89, T-102. Gate: `pnpm test:e2e:chromium -- live-bid`.
 
 **T-105 · First real snipe acceptance script** (S · E)
 Goal: `docs/ACCEPTANCE.md#A-5`: user-approved cheap item, caps set to its max, dry-run off for that one snipe, timing report captured, calendar stamp verified; explicit approval text the user signs.
@@ -1334,27 +1373,26 @@ Owns: `docs/ACCEPTANCE.md` A-5 section. Deps: T-102. Gate: reviewed by a second 
 
 **T-110 · Windows wake-and-launch companion** (L · A)
 Goal: `companion/windows/`: native-messaging host (PowerShell or a tiny Node script registered via `HKCU\Software\Google\Chrome\NativeMessagingHosts` and `HKCU\Software\Mozilla\NativeMessagingHosts`), protocol `{op:'schedule'|'cancel'|'list', snipeId, wakeAtUtc, browser, profile}` → `schtasks` with `-WakeToRun`, launch command for the browser with the user's profile; installer `install.ps1`, uninstaller, `docs/COMPANION.md` with power-plan settings per S-8.
-Owns: `companion/**`, `docs/COMPANION.md`. Deps: T-14. Tests first: Pester tests for task XML generation; a protocol round-trip test in Node. Gate: `pnpm test:unit -- companion && powershell -File companion/windows/tests/run.ps1`.
+Owns: `companion/**`, `docs/COMPANION.md`, `.github/workflows/companion.yml` (runs the Pester and Node tests on `windows-latest`; Vitest already includes `companion/**`). Deps: T-14. Tests first: Pester tests for task XML generation; a protocol round-trip test in Node. Gate: `pnpm test:unit -- companion && powershell -File companion/windows/tests/run.ps1`.
 
 **T-111 · Extension side of T2** (M · B)
-Goal: `nativeMessaging` optional permission, `CompanionPort` adapter, schedule/cancel on arm/disarm when tier T2, preflight checks the companion is reachable, awake-history ignores companion-caused wakes for advice.
+Goal: `nativeMessaging` optional permission, `CompanionPort` adapter, `ArmHooks` registered from `companion-sync.ts` (T-84's registry; does not edit `snipe-runner.ts`, I-12) to schedule/cancel on arm/disarm when tier T2 and to check at preflight that the companion is reachable, awake-history ignores companion-caused wakes for advice. Contract additions go through the Phase 6 contract-change PR (I-08).
 Owns: `src/adapters/browser/companion.ts`, `src/background/jobs/companion-sync.ts`, `test/integration/companion.test.ts`. Deps: T-110, T-84. Gate: `pnpm test:integration -- companion`.
 
 **T-112 · Bid groups** (L · C)
-Goal: `groupId`, "win at most N", spacing validation (≥ 2 min between ends), edit freeze at T−2 min, cancellation only after a confirmed `won` post-read, UI.
-Owns: `src/domain/snipe/groups.ts`, `src/ui/dashboard/groups/**`, `test/unit/domain/snipe/groups.test.ts`, `test/e2e/chromium/groups.spec.ts`. Deps: T-103, T-85. Gate: `pnpm test:unit -- src/domain/snipe/groups && pnpm test:e2e:chromium -- groups`.
+Goal: `groupId`, "win at most N", spacing validation (≥ 2 min between ends), edit freeze at T−2 min, cancellation only after a confirmed `won` post-read, UI. Enforced through `ArmHooks` registered from `src/background/jobs/snipe-groups.ts` (no edits to `snipe-runner.ts`, `handlers/snipe.ts` or `state-machine.ts`, I-12); contract additions go through the Phase 6 contract-change PR (I-08).
+Owns: `src/domain/snipe/groups.ts`, `src/background/jobs/snipe-groups.ts`, `src/ui/dashboard/sections/groups/**`, `test/unit/domain/snipe/groups.test.ts`, `test/e2e/chromium/groups.spec.ts`. Deps: T-103, T-85. Gate: `pnpm test:unit -- domain/snipe/groups && pnpm test:e2e:chromium -- groups`.
 
 **T-113 · Relist detector** (M · D)
-Goal: fingerprint (normalized title + sellerId + image basename), "seen before at $X" badge, `relistId` use when present. Owns: `src/domain/relist/**`, `src/content/ui/relist-badge.tsx`, tests. Deps: T-32. Gate: `pnpm test:unit -- src/domain/relist`.
+Goal: fingerprint (normalized title + sellerId + image basename), "seen before at $X" badge, `relistId` use when present. Owns: `src/domain/relist/**`, `src/content/ui/badges/relist.tsx`, `test/unit/domain/relist/*.test.ts`. Deps: T-32. Gate: `pnpm test:unit -- domain/relist`.
 
 **T-114 · Rules import/export and templates** (S · E)
-Owns: `src/domain/rules/io.ts`, `src/entrypoints/options/io/**`, tests. Deps: T-37. Gate: `pnpm test:unit -- src/domain/rules/io`.
+Owns: `src/domain/rules/io.ts`, `src/entrypoints/options/sections/io/**`, `test/unit/domain/rules/io.test.ts`. Deps: T-37. Gate: `pnpm test:unit -- domain/rules/io`.
 
 **T-115 · Comps link-out, combined-shipping hint, pickup distance** (M · F)
-Owns: `src/content/ui/{comps,combined,pickup}.tsx`, `src/domain/geo/zip-distance.ts` (offline ZIP centroid table), tests. Deps: T-32, T-57. Gate: `pnpm test:unit -- src/domain/geo && pnpm test:dom -- comps`.
+Owns: `src/content/ui/badges/{comps,combined,pickup}.tsx`, `src/domain/geo/zip-distance.ts` (offline ZIP centroid table), `test/unit/domain/geo/*.test.ts`, `test/dom/comps.test.ts`. Deps: T-32, T-57. Gate: `pnpm test:unit -- domain/geo && pnpm test:dom -- comps`.
 
-**T-116 · Firefox runner-page SnipeHost** (M · G, **only if S-7 requires**)
-Owns: `src/entrypoints/snipe-runner/**`, `src/adapters/browser/snipe-host-page.ts`, tests. Deps: T-13, T-84. Gate: `pnpm test:e2e:firefox`.
+(T-116 moved to Phase 4, lane J: see §5 and I-04.)
 
 ---
 
@@ -1369,7 +1407,7 @@ Owns: `src/entrypoints/snipe-runner/**`, `src/adapters/browser/snipe-host-page.t
 | Contract | zod over sanitized fixtures | every fixture, every endpoint | schema drift is caught before runtime; the same schema fails closed at runtime |
 | Integration | WXT `fakeBrowser` + fake ports + MSW (`msw/node`) | all background jobs | alarm loss, restart, missed runs, permission revocation, token expiry |
 | DOM | happy-dom over rendered fixtures | overlay, options, dashboard | idempotent injection under re-render, keyboard operability, text-only rendering |
-| E2E Chromium | Playwright `launchPersistentContext`, `channel:'chromium'`, headless, test build, fake servers | overlay, daily job, calendar, snipe, money | real extension lifecycle incl. packed alarm floors (snipe specs run the packed build) |
+| E2E Chromium | Playwright `launchPersistentContext`, `channel:'chromium'`, headless, test build, fake servers | overlay, daily job, calendar, snipe, money | real extension lifecycle on the unpacked test build (Playwright cannot load packed builds); the 30 s alarm floor is asserted through the `Alarms` port and FakeAlarms and checked manually on a packed build (S-7, A-4) |
 | E2E Firefox | Selenium/geckodriver (or BiDi) temporary install; `web-ext run` smoke fallback | overlay, daily job, snipe host | Firefox event-page behaviour, MV3 manifest validity |
 | Canary | nightly GitHub Action, anonymous, read-only, ≤ 4 requests | schemas + selectors | drift detection with an issue, never a write |
 | Manual | `docs/ACCEPTANCE.md` A-1…A-6 | one per phase | real account, real calendar, real phone, first real snipe |
@@ -1387,7 +1425,7 @@ Owns: `src/entrypoints/snipe-runner/**`, `src/adapters/browser/snipe-host-page.t
 
 ### 7.3 GitHub Actions workflow
 
-`ci.yml` (on PR and push to `main`): `static` (lint, typecheck, build both, web-ext lint, permissions snapshot, prod-bundle check) → `unit` (Vitest unit + dom, coverage upload) → `contract` → `integration` → `e2e-chromium` (fake servers as background steps, Playwright headless `chromium`, packed build for `snipe.spec.ts`, artifacts: traces on failure) → `e2e-firefox` (Python 3.x + geckodriver, Firefox stable, temporary install; required after S-6). `canary.yml`: nightly at 03:17 UTC with `workflow_dispatch`, concurrency group `canary`, 12 h lock, opens/updates one issue on failure. `release.yml`: on `v*` tags (§11).
+`ci.yml` (on PR and push to `main`): `static` (lint, typecheck, build both, web-ext lint, permissions snapshot, prod-bundle check) → `unit` (Vitest unit + dom, coverage upload) → `contract` → `integration` → `e2e-chromium` (fake servers as background steps, Playwright headless `chromium`, unpacked test build for every spec incl. `snipe.spec.ts`, artifacts: traces on failure) → `e2e-firefox` (Python 3.x + geckodriver, Firefox stable, temporary install; required after S-6). `canary.yml`: nightly at 03:17 UTC with `workflow_dispatch`, concurrency group `canary`, 12 h lock, opens/updates one issue on failure. `release.yml`: on `v*` tags (§11).
 
 ### 7.4 Flake policy
 
@@ -1405,7 +1443,7 @@ Owns: `src/entrypoints/snipe-runner/**`, `src/adapters/browser/snipe-host-page.t
 - **A-1 Overlay (Phase 1):** on a real search page, a highlight rule and a hide rule behave as previewed; hidden bar count; Why?; undo; SPA paging keeps decorations; kill switch clears; no console errors from the extension; request log shows zero extension buyerapi calls on page view.
 - **A-2 Daily job (Phase 2):** a watch runs overnight in dry-run with the browser open; the log shows the plan; catch-up after a closed-browser day; one real favorite on a user-chosen item with dry-run off, then undo via the log; request spacing ≥ 120 s in the health panel.
 - **A-3 Calendar (Phase 3):** connect with the user's own project (Chrome and Firefox); the dedicated calendar appears; an event with 60/15/5 popups; **"the 60/15/5 popups arrive on the phone with the PC off"** (dedicated calendar synced in the phone app, notifications on); end-time change patches; unwatch deletes; the disconnect revokes (Google account permissions page shows removal).
-- **A-4 Dry-run snipes (Phase 4):** ≥ 5 dry-run snipes over ≥ 3 evenings; timing page shows on-time ≥ 95%; preflight notification at T−15; a deliberately failed preflight (log out of SGW) applies the fallback and reports; kill switch via keyboard; awake-history advice shown.
+- **A-4 Dry-run snipes (Phase 4):** on **both** Chrome and Firefox (§15 Q2): ≥ 5 dry-run snipes over ≥ 3 evenings; timing page shows on-time ≥ 95%; the 30 s alarm floor observed on a packed build; preflight notification at T−15; a deliberately failed preflight (log out of SGW) applies the fallback and reports; kill switch via keyboard; awake-history advice shown.
 - **A-5 First real snipe (Phase 5):** user-signed approval naming the item and max; caps set; one bid sent; outcome notification; calendar stamped; audit log complete; the SGW bid history shows exactly one bid from the account.
 - **A-6 Companion (Phase 6):** PC put to sleep 20 min before a dry-run snipe; wake timer fires; browser launches; fire on time; log shows the chain.
 
@@ -1415,7 +1453,7 @@ Owns: `src/entrypoints/snipe-runner/**`, `src/adapters/browser/snipe-host-page.t
 
 | Asset | Threat | Control | Test that proves it |
 |---|---|---|---|
-| SGW bearer token | exfiltration by page scripts | token captured in MAIN world is sent only via nonce-gated `postMessage` to our isolated script and never written to the DOM; stored in `storage.local` (extension-only); never logged | `api-tap.test.ts` nonce check; `session-adapter.test.ts` no-log spy; `audit/log.test.ts` redaction |
+| SGW bearer token | exfiltration or substitution by page scripts | tap data is untrusted: every relayed message is schema-validated, and a token change is accepted only if it is JWT-shaped and its `buyerId` matches the stored session (unless logged out); the `postMessage` nonce is anti-collision only, not authentication (page scripts can read it); the overlay's `quick.favorite`/`quick.track` UI is in a closed shadow root and acts only on `event.isTrusted` clicks; the token is never written to the DOM; stored in `storage.local` (extension-only); never logged | `api-tap.test.ts` schema and JWT-shape drop; `session-adapter.test.ts` `buyerId` check and no-log spy; `overlay.test.ts` untrusted-click check; `audit/log.test.ts` redaction |
 | SGW bearer token | leaked in audit/export | redaction of key names and JWT-shaped strings | `log.test.ts` JWT regex redaction |
 | SGW token | theft at rest | `storage.local` is per-profile; no sync; documented residual risk | permissions snapshot (no `storage.sync` usage: lint rule banning `storage.sync`) |
 | User's money | double bid after worker restart | idempotency key persisted before send; `sent` terminal | `snipe-send.test.ts`, `state-machine.test.ts` property "≤1 placeBid" |
@@ -1424,7 +1462,7 @@ Owns: `src/entrypoints/snipe-runner/**`, `src/adapters/browser/snipe-host-page.t
 | User's money | accidental live bid during testing | dry-run default; live gate; no live writes in CI (fake servers only, prod URLs absent from test build) | `live-gate.test.ts`; CI never has credentials; `check-prod-bundle` |
 | SGW account | suspension from heavy traffic | lanes, budgets, 120 s background spacing, backoff, pause on 403s | `request-scheduler.test.ts`; E2E server timestamps |
 | SGW account | evasion-like behaviour | no CAPTCHA, UA or IP manipulation anywhere | grep test for `User-Agent` header set in `src/` (must be absent) |
-| User's browser | XSS from listing text/API HTML | no `innerHTML`; Preact text nodes; `messageText` stripped | ESLint `no-unsanitized`; `overlay.test.ts` script-in-title; `bid.test.ts` |
+| User's browser | XSS from listing text/API HTML | no `innerHTML` or `dangerouslySetInnerHTML` in first-party code; Preact text nodes; `messageText` stripped; the only `innerHTML` in the bundle is Preact's own, allowlisted once | ESLint `no-unsanitized` and `dangerouslySetInnerHTML` ban; `check-prod-bundle` and `lint-webext` single Preact allowlist; `overlay.test.ts` script-in-title; `bid.test.ts` |
 | Extension privileges | hostile message from a web page | sender validation; content-script allow-list; UI-only types | `router.test.ts` |
 | Google refresh token | leaked | `storage.local` only; revoke on disconnect; redaction | `auth-pkce.test.ts` revoke; `log.test.ts` |
 | Google account | over-broad scope | single scope `calendar.app.created`; granted scopes checked | `auth-pkce.test.ts` scope check; fake Google scope enforcement |
@@ -1451,7 +1489,7 @@ Assumptions: 5 watches, 2 pages each, ~10 new matches/day, user views ~10 search
 | Run now (manual) | same count, 1/s | 60 | interactive | — |
 | Calendar sync | 0 SGW (Google only) | — | — | `calendar.enabled` |
 | Outcome detection | 1 detail per tracked item after end (~5) | 0.5 | background | `calendar.enabled`/snipes |
-| Snipe (per armed item) | 24 h check 1 · 1 h check 1 · preflight 1 · wake samples 3 · T−60 verify 1 · ShowBidModal 1 · PlaceBid 1 · post-read 1 ≈ **10** | ≤ 6 in the final 5 min (≥ 20 s apart except modal+bid at fire) | snipe | `snipe.enabled`; per-day budget 80 |
+| Snipe (per armed item) | preflight 1 (background lane) · wake samples 3 · T−60 verify 1 · ShowBidModal 1 · PlaceBid 1 · post-read 1 ≈ **8**; the 24 h and 1 h checks use cached session state (0 SGW, see Auth health) | ≤ 6 in the final 5 min (≥ 20 s apart except modal+bid at fire) | snipe from the T−5 min wake onward; background before it | `snipe.enabled`; per-day budget 80 |
 | Canary (CI) | 2–3 | 0.5 | canary | workflow toggle |
 | Auth health | 0 SGW (uses cached session state) | — | — | — |
 | **Total typical day** | **≈ 60–90**, hard cap 300 interactive + 120 background + 80 snipe | | | `considerateMode: tight` halves all budgets and doubles intervals; kill switch stops all writes |
@@ -1483,7 +1521,7 @@ Justified exception to the 120 s rule: the snipe window (≤ 6 reads for one ite
 
 - **Versioning:** semver; `wxt.config.ts` reads `package.json` version; `CHANGELOG.md` keep-a-changelog.
 - **Chrome:** no store listing planned (**ASSUMPTION**, open question Q6). Distribution is `Load unpacked` from a GitHub release zip or the repo. If a store listing is ever wanted: the single-purpose and data-disclosure policies (July 2026 update) require a privacy policy; the extension collects nothing, which simplifies it.
-- **Firefox:** signed unlisted builds. `release.yml` runs `web-ext lint --warnings-as-errors --self-hosted`, then `web-ext sign --channel unlisted --upload-source-code` with the source zip produced by `scripts/release.ts` (clean clone + build instructions in `README.md#reproducible-build`), and attaches the signed `.xpi`. AMO keys are repository secrets; the job is skipped when absent so forks still build.
+- **Firefox:** signed unlisted builds. `release.yml` runs `pnpm lint:webext` (the `web-ext lint` wrapper: warnings are errors except the single Preact allowlist entry; `--self-hosted`), then `web-ext sign --channel unlisted --upload-source-code` with the source zip produced by `scripts/release.ts` (clean clone + build instructions in `README.md#reproducible-build`), and attaches the signed `.xpi`. AMO keys are repository secrets; the job is skipped when absent so forks still build.
 - **Artifacts per release:** `shopbadwill-chrome-mv3-vX.Y.Z.zip`, `shopbadwill-firefox-vX.Y.Z.xpi`, `source-vX.Y.Z.zip`, `SHA256SUMS`.
 - **Companion:** separate zip `companion-windows-vX.Y.Z.zip` with `install.ps1` and a signed-hash manifest; no `curl | bash`.
 - **Updates:** manual (`git pull`/download). Firefox unlisted builds can use `update_url` in `browser_specific_settings` pointing at a GitHub-hosted `updates.json` (stretch).
@@ -1557,3 +1595,61 @@ Only items that block or materially change the plan. The ToS decision and the fi
 | 9 Companion | Not yet asked; ask after the Phase 4 dry-run soak. | — |
 | 10 ntfy | Default off (opt-in). | As planned. |
 | — Git | Work on branch `dev`; per-task branches merged into `dev` after review; push; PR `dev → main` for CI. **Never merge to `main` without the user's approval.** | — |
+
+---
+
+## 16. Plan v1.1 amendments (pre-flight scan, 2026-10-07)
+
+Source: `.superpowers/sdd/PLAN/preflight-scan.md` §6 (I-01…I-42, all accepted; I-15 as adjusted by the controller) plus the T-01 implementation findings (A-1…A-7). No ruling contradicts §15: I-04 and I-41 implement §15 Q2, and I-09 implements Q3, Q5 and Q7. Cards were not renumbered.
+
+| Issue | Summary | Cards and sections changed |
+|---|---|---|
+| I-01 | `main.ts` is frozen after T-36. Handlers and jobs self-register through glob registries and `register(ctx: BackgroundContext)`. T-36 adds a `settings.set` interceptor. Test hooks register the same way under `SBW_TEST`. | T-36, T-102; §6 standing rules |
+| I-02 | T-01 installs `zod`, `fast-check`, `msw`, `happy-dom`, `@testing-library/preact` and `tsx`, and declares every script. Only T-01 edits `package.json`. A later dependency is a request to the orchestrator, who regenerates the lockfile on `dev`. | T-01; §6 script list and standing rules |
+| I-03 | Removed the leading `src/` from all 37 Vitest gate filters. T-01 sets `passWithNoTests: false` and shows that a filter runs only the matched files. T-03 and T-83 gates narrowed; test files named in T-07, T-32, T-113, T-114 and T-115, so each filter hits the card's own tests. | T-01, T-03, T-07, T-20–T-23, T-25, T-26, T-28–T-30, T-32, T-33, T-35, T-41, T-50, T-51, T-53, T-56–T-58, T-62–T-66, T-68, T-69, T-80–T-83, T-87, T-90, T-91, T-102, T-112–T-115; §6 standing rules |
+| I-04 | T-116 moves to Phase 4, lane J, "required when the S-7 verdict is runner-page"; deps T-13 and T-84; Goal and Tests first added. T-89 deps T-116 (conditional). Firefox sniping is first-class. | T-116, T-89; §1.4, §2.6, §5 (Phase 4 row, task counts) |
+| I-05 | Test-hook files are split: T-12 owns `index`/`state` (and serves its own fixture page; dep T-04), T-39 owns `base-url`, and T-59 owns `advance`/`fire-alarm` plus the Clock/Alarms seam. T-72 keeps `google-auth-stub`. T-61 deps T-59. | T-12, T-39, T-59, T-61; §4 S-6 (fixture page) |
+| I-06 | Options, dashboard and popup load `./sections/*/index.tsx`; the overlay loads `src/content/ui/badges/*.tsx`. Later cards own one folder or one badge file. | T-32, T-37, T-38, T-54; paths in T-55–T-58, T-67, T-69, T-70, T-85, T-86, T-90, T-91, T-102, T-112–T-115; §6 standing rules |
+| I-07 | The contract gains `notBefore`, the `quote` and `postEnd` kinds, and `StepOutcome`. T-52 owns the `StepExecutor` registry (a no-op for unbuilt kinds) and an `onTick` hook. Each executor is one file. T-51 plans quote steps. | T-02, T-51, T-52, T-53, T-56, T-57, T-67, T-83, T-103; §3.6 |
+| I-08 | §3 can now be encoded. Defined `Effect`, `StepOutcome`, `GcalEvent(Body)`, `CapsResult`, `SearchQuery.extra` and `Listing.sellerState`. Renamed the record to `SgwSessionRecord`. `health.get` returns `sessionState` and `ReturnType<…stats>`; `reduce` takes a `CapsResult`; `writesAllowed` accepts `expiring`. New messages: `page.domHealth`, `ui.openSnipe` and `rules.preview {rule, tabId?}`. Functions are exported as types only; examples go in `test/contract/types/examples/**`; one contract-change PR per phase. | T-02 (consequential text: T-32, T-37, T-71, T-80, T-85, T-111, T-112); §2.3, §2.4 (content may send `ui.openSnipe`), §3 intro, §3.1, §3.3, §3.8, §3.9, §3.11, §3.12 |
+| I-09 | T-02 encodes the §15 defaults: caps 5000/10000/20000, `requiredDryRuns` 5 and `favoriteMode: 'sgw'`. T-82 reads them only. The dual-time label is "PT · ET". | T-02, T-20, T-55, T-71, T-82; §1.8, §3.8 example |
+| I-10 | T-67 owns the `calendar.ics` handler (it calls `buildIcs`) and the dashboard calendar section with the .ics button. T-67 deps T-68. T-68 drops the handler and the dashboard items. | T-67, T-68 |
+| I-11 | T-58 owns `src/ui/activity/**` and the `audit.list` and `audit.undo` handlers. T-54 deps T-58 and mounts the component. | T-54, T-58 |
+| I-12 | T-84 exposes `SendStrategy`, the `AuthHealth` port, a `SnipeHost` factory, the `ArmHooks` registry, a dry-run completion event and the countdown port. T-87 is pure (deps T-02); T-80 and T-84 dep T-87. | T-80, T-84, T-87, T-90, T-91, T-101, T-111, T-112, T-116 |
+| I-13 | T-62 owns `src/adapters/google/token-schemas.ts`; T-64 keeps `schemas.ts`. | T-62 |
+| I-14 | `src/ui/time/**` moves to T-20 and `src/ui/money/**` to T-21; T-37 keeps `components`. T-32 deps T-20; T-37 and T-38 dep T-20 and T-21. | T-20, T-21, T-32, T-37, T-38 |
+| I-15 | T-01 commits stub check scripts and one smoke test per suite. Per the controller's adjustment, T-01 keeps `manifest-permissions.test.ts` and T-06 then edits it, rewires it to the snapshot JSONs and owns it. T-07's gate becomes the sanitizer and fixture-manifest tests; schema validation moves to T-24. | T-01, T-06, T-07, T-24 |
+| I-16 | T-06 deps T-04 and T-05. It adds an `integration` job, runs dom in the unit job and allows zero-spec E2E jobs; the bundle grep adds `new Function`; the unit test is gated. T-39 owns the test-vs-prod CI step; T-40 does not touch `ci.yml`. | T-06, T-39, T-40 |
+| I-17 | Every entrypoint lives under `src/entrypoints/**`, with `srcDir: 'src'`. | T-01, T-31, T-32, T-36 |
+| I-18 | One owner each: `exceedsTypo` (T-21); kill (T-36; T-86 adds the badge and a disarm subscriber); late-add (T-56's `isLateAdd`, put in `src/domain/notify/late-add.ts` so domain T-66 may import it); spent-today (T-82); stamping dedup (T-103); outcomes (T-87); fallback (T-83); ring (T-33); snapshot (T-06); `oauth2` (T-63); exposure meter (T-85); `eventIdFor` (T-65); no messaging adapter. **Partly applied:** T-01's `oauth2` env injection is unchanged because T-01 is in flight without I-18; T-63 takes over that block instead of adding a second one. | T-02, T-21, T-36, T-41, T-56, T-63, T-66, T-67, T-80, T-82, T-83, T-85, T-86, T-87, T-102, T-103; §2.1 |
+| I-19 | T-26 adds a `bid.ts` stub; T-88 adds `bidding/result-codes.ts`. T-100 takes over both, updates them to the catalogue and appends to `manifest.json`. | T-26, T-88, T-100 |
+| I-20 | Added deps: T-24→T-04, T-28/T-29→T-03, T-32→T-20, T-37→T-20/T-21, T-38→T-20/T-21 (the I-14 route), T-40→T-39, T-61→T-59, T-55/T-56/T-57→T-52, T-54→T-58, T-66/T-67→T-11, T-67→T-68, T-80→T-09, T-84→T-87, T-89→T-116, T-12→T-04, T-104→T-102. | those cards |
+| I-21 | Removed `permissions.request` and the background handler. UI pages request permissions in click handlers through `src/ui/permissions.ts` (T-56). | T-02, T-56, T-71, T-91; §3.12 |
+| I-22 | The `writesAllowed` test moves from T-30 to T-36; T-30 asserts only `HealthReport.ok`. | T-30, T-36 |
+| I-23 | T-39, T-59 and T-72 write A-1, A-2 and A-3. T-73 consolidates them (dep T-72) and owns `ACCEPTANCE.md` afterwards. | T-39, T-59, T-72, T-73 |
+| I-24 | The canary drops the robots-disallowed search page. It checks the `/item/` page plus fixture DOM tests and stays API-only within 4 requests a day. | T-60 |
+| I-25 | `requiredDryRuns` stays a hard gate. An on-time rate below 95% is a warning the user can override with typed confirmation, which is audited. Tests first added. | T-102; §1.8 |
+| I-26 | `query-url.ts` moves to `src/adapters/sgw/`. | T-50; §2.1, §3.3 |
+| I-27 | Tap data is untrusted. A token change needs JWT shape plus a matching `buyerId`. The nonce is anti-collision only. Quick actions check `isTrusted` and use a closed shadow root. | T-31, T-32, T-28 (owner of the `buyerId` test); §8 |
+| I-28 | T-89 runs unpacked and asserts the alarm floor through the `Alarms` port. The packed-build check stays manual (S-7, A-4). | T-89; §7.1, §7.3, §7.6 |
+| I-29 | `config.ts` is read-only after T-07; `SBW_SESSION_REFRESH` lives in `session-adapter.ts`. | T-27, T-28 |
+| I-30 | T-03 adds six shared fakes. MSW uses `onUnhandledRequest: 'bypass'` for 127.0.0.1. | T-03 |
+| I-31 | T-01 encodes all of §2.5, the test-build matches and the version read. T-31 owns the conditional `webRequest` change. T-63 is the only later editor; T-69 and T-74 do not edit `wxt.config.ts`. | T-01, T-31, T-63, T-69, T-74 |
+| I-32 | ESLint rules for `Date.parse`, `innerHTML`, `eval` and `storage.sync`; probe ignores; Vitest include `test/**`, `scripts/**`, `companion/**`. | T-01 |
+| I-33 | Adds the `watches.importSaved` message; T-52 owns its handler; T-55 deps T-52. | T-02 (§3.12), T-52, T-55 |
+| I-34 | T-67 sends reminders to every registered `ReminderSink`. T-69 registers ntfy from its own job module; the scan's alternative "T-69 deps T-67" was chosen. | T-67, T-69 |
+| I-35 | T-74's gate runs through `act` or a fork with a draft release and pushes no tag. T-74 owns `README.md#reproducible-build`. | T-74 |
+| I-36 | The §3.1 example uses `search-grid-p1`. T-04's text now says T-07 owns `test/fixtures/sgw/**`. T-03's loader reads T-07's `manifest.json` through T-03's schema. | T-03, T-04; §3.1 |
+| I-37 | T-04 adds a seed loader and `/__log` with the `x-sbw-fake-now` header, used by T-59. | T-04, T-59 |
+| I-38 | T-110 owns `.github/workflows/companion.yml` on `windows-latest`. | T-110 |
+| I-39 | The 24 h and 1 h checks use cached session state (0 SGW requests); preflight uses lane `background`; lane `snipe` runs only from T−5 min. | T-84, T-91; §9 |
+| I-40 | The critical path now marks phase-gate edges with ⇒ (including T-89 ⇒ T-101). | §5 |
+| I-41 | The Phase 4 gate and A-4 require the soak on both Chrome and Firefox. | §5, §7.6 |
+| I-42 | T-104 deps T-102 and completes `requiredDryRuns` dry runs before its live specs. | T-104 |
+| A-1 | `identity` is required on Firefox and optional on Chrome. | §2.5, §2.6 |
+| A-2 | Firefox minimum is `strict_min_version 140.0` (needed for `data_collection_permissions`), plus `gecko_android` 142.0. MAIN-world support (128+) is unchanged. | §1.1, §2.5, §2.6, T-01 |
+| A-3 | Preact is wired through `@preact/preset-vite`, not `@wxt-dev/module-preact`. | §1.1, T-01 |
+| A-4 | T-06 owns `scripts/lint-webext.ts`, which `pnpm lint:webext` runs. It fails on any warning except one allowlisted Preact-vendor `innerHTML` entry. `check-prod-bundle` uses the same single allowlist. First-party code bans `dangerouslySetInnerHTML` through ESLint in T-01's config. The release workflow also uses the wrapper. | T-01, T-06, T-74; §6 script list, §8, §11 |
+| A-5 | `sidePanel` is required on Chrome (WXT adds it for the sidepanel entrypoint; there is no install warning). | §2.5 |
+| A-6 | The kill-switch shortcut's suggested key is `Alt+Shift+K`, because `Ctrl+Shift+K` is Firefox's Web Console. | §2.5, T-01, T-36, T-86 |
+| A-7 | T-74 owns `scripts/sign-firefox.ts` and replaces T-01's stub. | T-74, T-01 (stub noted) |
