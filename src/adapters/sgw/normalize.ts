@@ -335,7 +335,7 @@ export function normalizeSellerInfo(raw: unknown): { sellerId: number; name: str
 
 // ── Endpoints without a fixture yet (provisional schemas) ───────────────────
 
-/** `nowMs` decides open/closed per row: the response carries no status. */
+/** Open/closed comes from each row's `type` ("Open"/"Close"); `nowMs` is the fallback when `type` is missing or unknown. */
 export function normalizeFavorites(raw: unknown, nowMs: EpochMs): Favorite[] {
   checkEnvelope(raw, 'favorites');
   const r = parseSgw(FavoritesResponseSchema, raw, 'favorites');
@@ -347,7 +347,9 @@ export function normalizeFavorites(raw: unknown, nowMs: EpochMs): Favorite[] {
       notes: f.notes ?? '',
       endTime: iso(endMs),
       sellerId: f.sellerId,
-      status: endMs <= nowMs ? 'closed' : 'open',
+      // The row's own `type` wins; endTime vs the clock only when it is missing or unknown.
+      status:
+        f.type === SGW_FIELDS.favoriteRow.statusClosed ? 'closed' : f.type === SGW_FIELDS.favoriteRow.statusOpen ? 'open' : endMs <= nowMs ? 'closed' : 'open',
     };
   });
 }

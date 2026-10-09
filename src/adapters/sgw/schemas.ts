@@ -215,6 +215,8 @@ export const FavoriteRowSchema = z.looseObject({
   notes: z.string().nullable().optional(),
   endTime: Pacific,
   sellerId: Id,
+  /** "Open" | "Close" (observed, T-07 stage 2): the row's own status. Other values are ignored. */
+  type: z.string().nullable().optional(),
 });
 export type FavoriteRow = z.infer<typeof FavoriteRowSchema>;
 export const FavoritesResponseSchema = envelope(z.array(FavoriteRowSchema));

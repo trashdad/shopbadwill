@@ -1,6 +1,6 @@
 // T-24b: normalizers on the real logged-in fixtures (shipping quote is an HTML string; saved searches have no name).
 import { describe, expect, it } from 'vitest';
-import { normalizeSavedSearches, normalizeShippingQuote } from '../../../src/adapters/sgw/normalize';
+import { normalizeFavorites, normalizeSavedSearches, normalizeShippingQuote } from '../../../src/adapters/sgw/normalize';
 import { loadFixture } from './fixtures';
 
 const quote = (html: string): unknown => html;
@@ -95,5 +95,30 @@ describe('savedSearches synthetic', () => {
   });
   it('a row with no id is a schema error', () => {
     expect(() => normalizeSavedSearches(env({ searchText: 'x' }))).toThrow(expect.objectContaining({ kind: 'schema' }));
+  });
+});
+
+describe('favorites status comes from the row type', () => {
+  const NOW = Date.parse('2026-10-08T12:00:00Z');
+  it('matches `type` on every row of the real fixture', () => {
+    const raw = loadFixture<{ data: Array<{ type: string }> }>('favorites-all');
+    const out = normalizeFavorites(raw, NOW);
+    expect(out.length).toBe(raw.data.length);
+    out.forEach((f, i) => {
+      expect(f.status).toBe(raw.data[i]?.type === 'Close' ? 'closed' : 'open');
+    });
+  });
+  const row = (extra: object): unknown => ({
+    status: true,
+    data: [{ itemId: 1, watchlistId: 7, notes: '', endTime: '2030-01-01T20:00:00', sellerId: 3, ...extra }],
+  });
+  it('type "Close" with a future endTime is closed; "Open" with a past endTime is open', () => {
+    expect(normalizeFavorites(row({ type: 'Close' }), NOW)[0]?.status).toBe('closed');
+    expect(normalizeFavorites(row({ type: 'Open', endTime: '2020-01-01T20:00:00' }), NOW)[0]?.status).toBe('open');
+  });
+  it('a missing or invalid type falls back to endTime', () => {
+    expect(normalizeFavorites(row({}), NOW)[0]?.status).toBe('open');
+    expect(normalizeFavorites(row({ type: 'weird', endTime: '2020-01-01T20:00:00' }), NOW)[0]?.status).toBe('closed');
+    expect(normalizeFavorites(row({ type: null }), NOW)[0]?.status).toBe('open');
   });
 });
