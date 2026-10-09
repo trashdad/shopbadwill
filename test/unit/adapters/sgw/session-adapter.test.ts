@@ -57,7 +57,10 @@ function setup(opts: { refresh?: boolean; refresher?: () => Promise<string | nul
     seenBearers.add(bearer);
     return session.observe({ bearer, capturedAt: clock.now(), source });
   };
-  return { clock, storage, repo, audit, session, observe };
+  /** SGW refused `bearer` (default: the token the session holds now). */
+  const reject = async (bearer?: string) =>
+    session.reportRejected(bearer ?? (await repo.find(STORAGE_KEYS.sgwSession))?.bearer ?? 'none');
+  return { clock, storage, repo, audit, session, observe, reject };
 }
 
 describe('constants', () => {
@@ -97,22 +100,26 @@ describe('observe: stores, validates', () => {
     expect(await t.session.current()).toMatchObject({ bearer: raw, buyerId: '987654' });
   });
 
+  const goodPayload = b64u({ BuyerId: 'B', exp: expSec(T0 + DAY) });
   it.each([
-    ['two parts', 'abc.def'],
-    ['four parts', 'a.b.c.d'],
-    ['empty string', ''],
-    ['non-base64url chars', 'a b.c$d.e!f'],
-    ['payload not JSON', `${b64u({ alg: 'x' })}.${b64u('not json')}.sig`],
-    ['payload is an array', `${b64u({})}.${b64u('[1,2]')}.sig`],
-    ['missing exp', jwt({ BuyerId: 'B' })],
-    ['string exp', jwt({ BuyerId: 'B', exp: '1999999999' })],
-    ['null exp', jwt({ BuyerId: 'B', exp: null })],
-    ['exp in ms units', jwt({ BuyerId: 'B', exp: T0 + 30 * DAY })],
-    ['missing BuyerId', jwt({ exp: expSec(T0 + DAY) })],
-    ['blank BuyerId', jwt({ BuyerId: '  ', exp: expSec(T0 + DAY) })],
-    ['already expired', jwt({ BuyerId: 'B', exp: expSec(T0 - 1000) })],
-    ['oversized', `${'a'.repeat(9000)}.b.c`],
-  ])('rejects %s silently, with a non-secret audit reason', async (_n, bearer) => {
+    ['two parts', 'abc.def', 'not-three-parts'],
+    ['four parts', 'a.b.c.d', 'not-three-parts'],
+    ['empty string', '', 'empty'],
+    ['non-base64url chars', 'a b.c$d.e!f', 'not-base64url'],
+    ['valid payload, bad header characters', `he$der.${goodPayload}.sig`, 'not-base64url'],
+    ['valid payload, bad signature characters', `${b64u({ alg: 'x' })}.${goodPayload}.si+g=`, 'not-base64url'],
+    ['valid payload, empty signature', `${b64u({ alg: 'x' })}.${goodPayload}.`, 'not-base64url'],
+    ['payload not JSON', `${b64u({ alg: 'x' })}.${b64u('not json')}.sig`, 'payload-not-json-object'],
+    ['payload is an array', `${b64u({})}.${b64u('[1,2]')}.sig`, 'payload-not-json-object'],
+    ['missing exp', jwt({ BuyerId: 'B' }), 'bad-exp'],
+    ['string exp', jwt({ BuyerId: 'B', exp: '1999999999' }), 'bad-exp'],
+    ['null exp', jwt({ BuyerId: 'B', exp: null }), 'bad-exp'],
+    ['exp in ms units', jwt({ BuyerId: 'B', exp: T0 + 30 * DAY }), 'bad-exp'],
+    ['missing BuyerId', jwt({ exp: expSec(T0 + DAY) }), 'bad-buyer-id'],
+    ['blank BuyerId', jwt({ BuyerId: '  ', exp: expSec(T0 + DAY) }), 'bad-buyer-id'],
+    ['already expired', jwt({ BuyerId: 'B', exp: expSec(T0 - 1000) }), 'already-expired'],
+    ['oversized', `${'a'.repeat(9000)}.b.c`, 'too-long'],
+  ])('rejects %s silently, with a non-secret audit reason', async (_n, bearer, reason) => {
     const t = setup();
     await expect(t.observe(bearer)).resolves.toBeUndefined();
     expect(await t.session.current()).toBeNull();
@@ -120,7 +127,7 @@ describe('observe: stores, validates', () => {
     expect(await t.storage.get(STORAGE_KEYS.sgwSession)).toBeUndefined();
     const e = t.audit.entries.filter((x) => x.kind === 'session.token-rejected');
     expect(e).toHaveLength(1);
-    expect(typeof e[0]?.details.reason).toBe('string');
+    expect(e[0]?.details.reason).toBe(reason);
   });
 
   it('a bad token never displaces a good stored one', async () => {
@@ -183,7 +190,7 @@ describe('BuyerId rule (tap data is untrusted)', () => {
   it('still rejects a different BuyerId when the held session is rejected or expired', async () => {
     const t = setup();
     await t.observe(mint('B-1', 10 * DAY));
-    await t.session.reportRejected();
+    await t.reject();
     await t.observe(mint('B-2', 30 * DAY));
     expect(await t.session.state()).toBe('expired');
     t.clock.advance(11 * DAY);
@@ -243,7 +250,7 @@ describe('reportRejected (R2, R3)', () => {
   it('401 -> reportRejected -> expired, not cleared: record and BuyerId kept, current() null', async () => {
     const t = setup();
     await t.observe(mint('B-1', 20 * DAY));
-    await t.session.reportRejected();
+    await t.reject();
     expect(await t.session.state()).toBe('expired');
     expect(await t.session.current()).toBeNull();
     expect(await t.storage.get<{ buyerId: string }>(STORAGE_KEYS.sgwSession)).toMatchObject({ buyerId: 'B-1' });
@@ -254,7 +261,7 @@ describe('reportRejected (R2, R3)', () => {
     const t = setup();
     const b = mint('B-1', 20 * DAY);
     await t.observe(b);
-    await t.session.reportRejected();
+    await t.reject();
     await t.observe(b);
     expect(await t.session.state()).toBe('expired');
   });
@@ -263,7 +270,7 @@ describe('reportRejected (R2, R3)', () => {
     const t = setup();
     const b = jwt({ BuyerId: 'B-1', exp: expSec(T0 + 20 * DAY) });
     await t.observe(b);
-    await t.session.reportRejected();
+    await t.reject();
     await t.observe(b);
     expect(await t.session.state()).toBe('expired');
     // same exp, different signature = a different token
@@ -274,12 +281,12 @@ describe('reportRejected (R2, R3)', () => {
   it('a different valid token for the same BuyerId restores ok; a later rejection is tracked afresh', async () => {
     const t = setup();
     await t.observe(mint('B-1', 20 * DAY));
-    await t.session.reportRejected();
+    await t.reject();
     const fresh = mint('B-1', 30 * DAY);
     await t.observe(fresh);
     expect(await t.session.state()).toBe('ok');
     expect((await t.session.current())?.bearer).toBe(fresh);
-    await t.session.reportRejected();
+    await t.reject();
     await t.observe(fresh);
     expect(await t.session.state()).toBe('expired');
   });
@@ -288,20 +295,116 @@ describe('reportRejected (R2, R3)', () => {
     const t = setup();
     const b = mint('B-1', 20 * DAY);
     await t.observe(b);
-    await t.session.reportRejected();
+    await t.reject();
     const again = new SgwSessionAdapter({ repo: t.repo, clock: t.clock, audit: t.audit });
     expect(await again.state()).toBe('expired');
     await again.observe({ bearer: b, capturedAt: T0, source: 'tap' });
     expect(await again.state()).toBe('expired');
   });
 
-  it('stores the rejection under the schema key, validated, as {id, at}', async () => {
+  it('stores the rejection under the schema key, validated, as {ids, at}', async () => {
     const t = setup();
     await t.observe(mint('B-1', 20 * DAY));
-    await t.session.reportRejected();
+    await t.reject();
     const rec = await t.repo.find(STORAGE_KEYS.sgwSessionRejection);
-    expect(rec?.id).toMatch(/^jti:[0-9a-f]{64}$/);
+    expect(rec?.ids).toHaveLength(1);
+    expect(rec?.ids[0]).toMatch(/^jti:[0-9a-f]{64}$/);
     expect(rec?.at).toBe(T0);
+  });
+
+  it('F1: a late 401 for an older token does not poison the newer one', async () => {
+    const t = setup();
+    const a = mint('B-1', 20 * DAY);
+    const b = mint('B-1', 30 * DAY);
+    await t.observe(a);
+    await t.observe(b);
+    await t.session.reportRejected(a); // the 401 for A arrives after B was captured
+    expect(await t.session.state()).toBe('ok');
+    expect((await t.session.current())?.bearer).toBe(b);
+    expect(await t.repo.find(STORAGE_KEYS.sgwSessionRejection)).toBeUndefined();
+  });
+
+  it('F1: reportRejected ignores a bearer that is unknown, malformed or empty', async () => {
+    const t = setup();
+    await t.observe(mint('B-1', 20 * DAY));
+    for (const junk of ['', 'garbage', mint('B-1', 20 * DAY), mint('B-2', 20 * DAY)]) await t.session.reportRejected(junk);
+    expect(await t.session.state()).toBe('ok');
+  });
+
+  it('F1: matches by identity, so a "Bearer " prefix on the reported value is fine', async () => {
+    const t = setup();
+    const a = mint('B-1', 20 * DAY);
+    await t.observe(a);
+    await t.session.reportRejected(`Bearer ${a}`);
+    expect(await t.session.state()).toBe('expired');
+  });
+
+  it('F3: a rejected token never comes back: A rejected, B accepted, stale A re-observed -> B stays ok', async () => {
+    const t = setup();
+    const a = mint('B-1', 20 * DAY);
+    const b = mint('B-1', 30 * DAY);
+    await t.observe(a);
+    await t.reject(a);
+    await t.observe(b);
+    expect(await t.session.state()).toBe('ok');
+    await t.observe(a);
+    expect(await t.session.state()).toBe('ok');
+    expect((await t.session.current())?.bearer).toBe(b);
+    expect(t.audit.entries.some((e) => e.details.reason === 'previously-rejected')).toBe(true);
+  });
+
+  it('F3: the rejection history is kept (bounded to 8) when a token is accepted', async () => {
+    const t = setup();
+    const tokens: string[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      const tok = mint('B-1', (20 + i) * DAY);
+      tokens.push(tok);
+      await t.observe(tok);
+      await t.reject(tok);
+    }
+    const rec = await t.repo.find(STORAGE_KEYS.sgwSessionRejection);
+    expect(rec?.ids).toHaveLength(8);
+    const latest = mint('B-1', 40 * DAY);
+    await t.observe(latest);
+    expect((await t.repo.find(STORAGE_KEYS.sgwSessionRejection))?.ids).toHaveLength(8); // not erased
+    await t.observe(tokens[9] as string); // a recent rejected one is still refused
+    expect((await t.session.current())?.bearer).toBe(latest);
+  });
+
+  it('F3: an older-exp token never replaces a newer valid one', async () => {
+    const t = setup();
+    const newer = mint('B-1', 30 * DAY);
+    await t.observe(newer);
+    await t.observe(mint('B-1', 20 * DAY));
+    expect((await t.session.current())?.bearer).toBe(newer);
+    expect(t.audit.entries.some((e) => e.details.reason === 'older-exp')).toBe(true);
+  });
+
+  it('F3: an older-exp token may replace a held token that is rejected or expired', async () => {
+    const t = setup();
+    await t.observe(mint('B-1', 30 * DAY));
+    await t.reject();
+    const older = mint('B-1', 20 * DAY);
+    await t.observe(older);
+    expect((await t.session.current())?.bearer).toBe(older);
+
+    const u = setup();
+    await u.observe(mint('B-1', 1 * DAY));
+    u.clock.advance(2 * DAY);
+    const fresh = jwt({ jti: 'j-x', BuyerId: 'B-1', exp: expSec(u.clock.now() + 3 * H) });
+    await u.observe(fresh);
+    expect((await u.session.current())?.bearer).toBe(fresh);
+  });
+
+  it('F-minor: capturedAt must be a non-negative integer; otherwise dropped silently, never a ZodError', async () => {
+    const t = setup();
+    const tok = mint('B-1', 20 * DAY);
+    seenBearers.add(tok);
+    for (const capturedAt of [-1, Number.NaN, 1.5, Number.POSITIVE_INFINITY]) {
+      await expect(t.session.observe({ bearer: tok, capturedAt, source: 'tap' })).resolves.toBeUndefined();
+    }
+    expect(await t.session.current()).toBeNull();
+    expect(t.audit.entries.some((e) => e.details.reason === 'bad-captured-at')).toBe(true);
   });
 
   it('a corrupt rejection record is quarantined by the repo and read as not rejected', async () => {
@@ -316,7 +419,7 @@ describe('reportRejected (R2, R3)', () => {
     const t = setup();
     const b = mint('B-1', 20 * DAY);
     await t.observe(b);
-    await t.session.reportRejected();
+    await t.reject();
     const others = Object.entries(t.storage.dump()).filter(([k]) => k !== STORAGE_KEYS.sgwSession);
     expect(others.length).toBeGreaterThan(0);
     const text = JSON.stringify(others);
@@ -326,11 +429,11 @@ describe('reportRejected (R2, R3)', () => {
 
   it('is a no-op without a session, and idempotent', async () => {
     const t = setup();
-    await t.session.reportRejected();
+    await t.reject();
     expect(await t.session.state()).toBe('logged-out');
     await t.observe(mint('B-1', 20 * DAY));
-    await t.session.reportRejected();
-    await t.session.reportRejected();
+    await t.reject();
+    await t.reject();
     expect(t.audit.kinds.filter((k) => k === 'session.rejected')).toHaveLength(1);
   });
 
@@ -338,23 +441,25 @@ describe('reportRejected (R2, R3)', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
     const t = setup();
     await t.observe(mint('B-1', 20 * DAY));
-    await t.session.reportRejected();
+    await t.reject();
     expect(fetchSpy).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
   });
 });
 
 describe('clear()', () => {
-  it('is the explicit logout: logged-out, record and rejection removed', async () => {
+  it('is the explicit logout: logged-out, record removed; rejected-token history is kept', async () => {
     const t = setup();
     const b = mint('B-1', 20 * DAY);
     await t.observe(b);
-    await t.session.reportRejected();
+    await t.reject();
     await t.session.clear();
     expect(await t.session.state()).toBe('logged-out');
     expect(await t.session.current()).toBeNull();
-    expect(Object.keys(t.storage.dump()).filter((k) => k.startsWith('sbw:sgwSession'))).toEqual([]);
-    await t.observe(b); // a fresh observation now
+    expect(await t.repo.find(STORAGE_KEYS.sgwSession)).toBeUndefined();
+    await t.observe(b); // the rejected token is still refused
+    expect(await t.session.state()).toBe('logged-out');
+    await t.observe(mint('B-2', 20 * DAY)); // logged-out admits another account
     expect(await t.session.state()).toBe('ok');
     expect(t.audit.kinds).toContain('session.cleared');
   });
@@ -364,7 +469,7 @@ describe('concurrency', () => {
   it('serializes overlapping observe/reportRejected calls', async () => {
     const t = setup();
     const a = mint('B-1', 20 * DAY);
-    await Promise.all([t.observe(a), t.session.reportRejected(), t.observe(a)]);
+    await Promise.all([t.observe(a), t.session.reportRejected(a), t.observe(a)]);
     expect(await t.session.state()).toBe('expired');
   });
 });
@@ -418,7 +523,7 @@ describe('R6: the bearer never leaks', () => {
     await t.observe('x.y.z');
     await t.observe(jwt({ BuyerId: '', exp: 1 }));
     await t.session.refresh();
-    await t.session.reportRejected();
+    await t.reject();
     await t.observe(good);
     await t.observe(mint('B-1', 30 * DAY));
     await t.session.clear();

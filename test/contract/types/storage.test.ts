@@ -66,7 +66,7 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:snipes': { 'snp-1': example('Snipe') },
   'sbw:auditMeta': example('AuditMeta'),
   'sbw:sgwSession': example('SgwSessionRecord'),
-  'sbw:sgwSessionRejection': { id: 'jti:' + 'a'.repeat(64), at: 1791400000000 },
+  'sbw:sgwSessionRejection': { ids: ['jti:' + 'a'.repeat(64)], at: 1791400000000 },
   'sbw:google': example('GoogleCredentials'),
   'sbw:requestBudget': example('RequestBudget'),
   'sbw:requestSchedulerState': example('RequestSchedulerState'),

@@ -266,6 +266,8 @@ interface RunOptions {
   priority?: number;
   /** Runs inside build(), right before the request leaves; may throw to stop it (nothing is sent). */
   beforeSend?: () => void;
+  /** Called from build() once the request is committed to leave, with the bearer it carries (if any). */
+  onSent?: (bearer: string | undefined) => void;
 }
 
 /** A writesAllowed answer and when it was asked (monotonic clock). */
@@ -452,16 +454,23 @@ export class SgwApiAdapter implements SgwApi {
     const target = { itemId: req.itemId };
     const verdict = await this.ask('bidding');
     if (!verdict.ok) throw await this.refuse('bid.place', target, verdict.why);
+    let sentBearer: string | undefined; // the bearer PlaceBid actually left with
     const ctx: BidContext = {
       clock: this.deps.clock,
       showBidModal: (itemId) => this.showBidModal(itemId),
       prepare: (endpoint, init) => this.prepare(endpoint, init),
-      sendWrite: (endpoint, init, parse) => this.guardedRun('bidding', 'bid.place', target, endpoint, 'snipe', init, parse),
+      sendWrite: (endpoint, init, parse) =>
+        this.guardedRun('bidding', 'bid.place', target, endpoint, 'snipe', init, parse, (bearer) => {
+          sentBearer = bearer;
+        }),
       flagSchemaFailure: (endpoint, error) => {
         this.flagSchemaFailure(endpoint, error);
       },
     };
-    return placeBidPath(ctx, req, opts);
+    const result = await placeBidPath(ctx, req, opts);
+    // bid.ts returns isUnauthorized as a result instead of throwing, so run() never saw it.
+    if (result.kind === 'auth' && sentBearer !== undefined) await this.reportRejected(sentBearer);
+    return result;
   }
 
   /**
@@ -484,6 +493,7 @@ export class SgwApiAdapter implements SgwApi {
     lane: Lane,
     init: SgwRequestInit,
     parse: (res: HttpResponse, raw: unknown) => T,
+    onSent?: (bearer: string | undefined) => void,
   ): Promise<T> {
     const { clock } = this.deps;
     let verdict = await this.ask(feature); // when the write is requested
@@ -513,6 +523,7 @@ export class SgwApiAdapter implements SgwApi {
               if (!verdict.ok) throw new RefusedWrite(verdict.why);
               if (clock.monotonic() - verdict.at > WRITE_GATE_MAX_AGE_MS) throw new StaleWriteGate();
             },
+            ...(onSent === undefined ? {} : { onSent }),
           });
         } catch (e) {
           if (e instanceof RefusedWrite) throw await this.refuse(kind, target, e.why);
@@ -696,11 +707,15 @@ export class SgwApiAdapter implements SgwApi {
     parse: (res: HttpResponse, raw: unknown) => T,
     opts: RunOptions = {},
   ): Promise<T> {
+    const flight = { sent: false }; // only a request that actually left can say anything about the bearer
+    const bearer = bearerOf(request);
     const scheduled: ScheduledRequest<T> = {
       lane,
       endpoint,
       build: () => {
         opts.beforeSend?.();
+        flight.sent = true;
+        opts.onSent?.(bearer);
         return { ...request, headers: { ...request.headers } };
       },
       parse: (res) => parse(res, decode(endpoint, res)),
@@ -710,17 +725,16 @@ export class SgwApiAdapter implements SgwApi {
       return await this.deps.scheduler.run(scheduled);
     } catch (e) {
       if (e instanceof SgwApiError && e.kind === 'schema') this.flagSchemaFailure(endpoint, e);
-      if (e instanceof SgwApiError && e.kind === 'auth' && request.headers?.Authorization !== undefined) {
-        await this.reportRejected();
-      }
+      // A request that was only queued behind another request's 401 never left, so it reports nothing.
+      if (e instanceof SgwApiError && e.kind === 'auth' && flight.sent && bearer !== undefined) await this.reportRejected(bearer);
       throw e;
     }
   }
 
   /** The bearer was refused (401 / isUnauthorized): tell the session once. A failing session must not hide the auth error. */
-  private async reportRejected(): Promise<void> {
+  private async reportRejected(bearer: string): Promise<void> {
     try {
-      await this.deps.session.reportRejected();
+      await this.deps.session.reportRejected(bearer);
     } catch {
       // ignored on purpose
     }
@@ -736,6 +750,12 @@ export class SgwApiAdapter implements SgwApi {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/** The bearer a prepared request carries, or undefined for an anonymous one. */
+function bearerOf(request: HttpRequest): string | undefined {
+  const value = request.headers?.Authorization;
+  return value === undefined ? undefined : value.replace(/^Bearer /, '');
+}
 
 function isPositiveInt(n: number): boolean {
   return Number.isSafeInteger(n) && n > 0;

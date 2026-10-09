@@ -201,13 +201,14 @@ export type QuarantineRecord = z.infer<typeof QuarantineRecordSchema>;
 export type StorageArea = 'local' | 'session';
 
 /**
- * Stored at `sbw:sgwSessionRejection` (T-28). Absent means "not rejected" (no
- * migration needed). `id` is a SHA-256 based identity of the token SGW refused
- * (`jti:<hash of jti>` or `exp:<exp ms>:<hash of token>`); the raw token and
- * the raw jti are never stored.
+ * Stored at `sbw:sgwSessionRejection` (T-28). Absent means "nothing rejected"
+ * (no migration needed). `ids` holds the most recent identities (at most 8) of
+ * tokens SGW refused: `jti:<hash of jti>` or `exp:<exp ms>:<hash of token>`.
+ * The raw token and the raw jti are never stored. `at` is when the last one was
+ * added. Module-private: an exported *Schema would join the locked list in
+ * test/contract/types/examples.test.ts.
  */
-/** Module-private: an exported *Schema would join the locked list in test/contract/types/examples.test.ts. */
-const SgwSessionRejectionSchema = z.object({ id: z.string().min(1), at: EpochMsSchema });
+const SgwSessionRejectionSchema = z.object({ ids: z.array(z.string().min(1)).max(8), at: EpochMsSchema });
 export type SgwSessionRejection = z.infer<typeof SgwSessionRejectionSchema>;
 
 export const STORAGE_RECORDS = {

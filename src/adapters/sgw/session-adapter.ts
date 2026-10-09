@@ -4,19 +4,26 @@
 // Rules (S-2, controller rulings):
 //   - Tap data is untrusted. observe() accepts only a well-formed JWT (three
 //     base64url parts, JSON-object payload, numeric `exp` in seconds, non-empty
-//     `BuyerId`) and reads nothing else from it. `expiresAt` comes from `exp`
+//     `BuyerId`) and reads only BuyerId, exp and jti (hashed) from it. `expiresAt` comes from `exp`
 //     alone; SGW tokens have no `iat`.
 //   - A token for a different BuyerId than the held session is refused unless
 //     the session is logged-out (no record).
 //   - `expiring` = less than SESSION_EXPIRING_MS left. Writes stay allowed.
-//   - reportRejected() (SGW answered 401/isUnauthorized to a call that carried
-//     the bearer) sets `expired` and KEEPS the record, so the BuyerId rule still
-//     applies. It remembers a SHA-256 of the rejected token's identity (never
-//     the token), so observing that same token again cannot flip back to `ok`;
-//     a different valid token for the same BuyerId does. clear() is the
-//     explicit logout path and sets `logged-out`.
+//   - reportRejected(bearer) (SGW answered 401/isUnauthorized to a request that
+//     was sent with that bearer) is ignored unless the bearer is the held
+//     token, so a late 401 for an old token cannot poison a newer one. Else it
+//     sets `expired` and KEEPS the record (the BuyerId rule still applies). The
+//     identities (SHA-256 of jti, else exp + hash of the token) of the last 8
+//     rejected tokens are kept in `sbw:sgwSessionRejection`, never the tokens:
+//     a rejected token is never accepted again, even after a newer token
+//     replaced it or after clear(). A token with an earlier `exp` does not
+//     replace a newer valid one. clear() is the explicit logout path
+//     (`logged-out`).
 //   - S-2 found no refresh: refresh() resolves false without calling anything
 //     unless SBW_SESSION_REFRESH is switched on and a refresher is injected.
+//   - Single instance: the adapter serializes its own calls but assumes it is
+//     the only writer of its two storage records (one per background context).
+//     Two instances over the same storage could interleave read-modify-write.
 //   - The bearer is a secret: never logged, audited or put in an error. Audit
 //     entries carry fixed, non-secret reason codes only.
 import type { AuditLog } from '../../domain/audit/types';
@@ -39,6 +46,8 @@ const MAX_EXP_SECONDS = 100_000_000_000;
 const INVALID_AUDIT_WINDOW_MS = 10 * 60_000;
 
 const B64URL = /^[A-Za-z0-9_-]+$/;
+/** How many rejected-token identities are remembered. */
+const REJECTED_KEPT = 8;
 
 type Parsed = { ok: true; token: string; buyerId: string; expiresAt: EpochMs; jti: string | undefined } | { ok: false; reason: string };
 
@@ -108,6 +117,11 @@ async function identityOf(p: { token: string; expiresAt: EpochMs; jti: string | 
   return p.jti === undefined ? `exp:${String(p.expiresAt)}:${await sha256Hex(p.token)}` : `jti:${await sha256Hex(p.jti)}`;
 }
 
+async function identityOfBearer(bearer: string): Promise<string | undefined> {
+  const p = parseToken(bearer, 0);
+  return p.ok ? identityOf(p) : undefined;
+}
+
 export class SgwSessionAdapter implements SgwSession {
   private readonly refreshEnabled: boolean;
   private tail: Promise<unknown> = Promise.resolve();
@@ -154,22 +168,25 @@ export class SgwSessionAdapter implements SgwSession {
   clear(): Promise<void> {
     return this.serial(async () => {
       const had = await this.load();
-      await this.deps.repo.remove(STORAGE_KEYS.sgwSession);
-      await this.deps.repo.remove(STORAGE_KEYS.sgwSessionRejection);
+      await this.deps.repo.remove(STORAGE_KEYS.sgwSession); // the rejected-token history stays
       if (had !== undefined) await this.record('session.cleared', {});
     });
   }
 
-  reportRejected(): Promise<void> {
+  reportRejected(bearer: string): Promise<void> {
     return this.serial(async () => {
       const rec = await this.load();
       if (rec === undefined) return;
-      if ((await this.rejectedIdentity()) !== undefined) return; // already rejected: one report, no churn
-      const parsed = parseToken(rec.bearer, 0);
-      const id = parsed.ok
-        ? await identityOf(parsed)
-        : `exp:${String(rec.expiresAt)}:${await sha256Hex(rec.bearer)}`;
-      await this.deps.repo.set(STORAGE_KEYS.sgwSessionRejection, { id, at: this.deps.clock.now() });
+      const reported = parseToken(bearer, 0); // 0: an expired token can still be reported
+      if (!reported.ok) return;
+      const heldId = await identityOfBearer(rec.bearer);
+      if (heldId === undefined || heldId !== (await identityOf(reported))) return; // not the held token: a late 401
+      const ids = await this.rejectedIds();
+      if (ids.includes(heldId)) return; // already rejected: one report, no churn
+      await this.deps.repo.set(STORAGE_KEYS.sgwSessionRejection, {
+        ids: [...ids, heldId].slice(-REJECTED_KEPT),
+        at: this.deps.clock.now(),
+      });
       await this.record('session.rejected', { expiresAt: rec.expiresAt });
     });
   }
@@ -185,34 +202,43 @@ export class SgwSessionAdapter implements SgwSession {
 
   private async doObserve(token: { bearer: string; capturedAt: EpochMs; source: 'tap' | 'webRequest' }): Promise<void> {
     const now = this.deps.clock.now();
+    if (!Number.isSafeInteger(token.capturedAt) || token.capturedAt < 0) {
+      await this.recordInvalid('bad-captured-at', now);
+      return;
+    }
     const parsed = parseToken(token.bearer, now);
     if (!parsed.ok) {
       await this.recordInvalid(parsed.reason, now);
       return;
     }
     const held = await this.load();
-    if (held !== undefined) {
-      if (held.buyerId !== parsed.buyerId) {
-        await this.recordInvalid('buyer-mismatch', now);
+    if (held !== undefined && held.buyerId !== parsed.buyerId) {
+      await this.recordInvalid('buyer-mismatch', now);
+      return;
+    }
+    // The page re-sends the same bearer on every request: nothing changes.
+    if (held !== undefined && held.bearer === parsed.token) return;
+    const ids = await this.rejectedIds();
+    const id = await identityOf(parsed);
+    if (ids.includes(id)) {
+      await this.recordInvalid('previously-rejected', now);
+      return;
+    }
+    if (held !== undefined && parsed.expiresAt < held.expiresAt && held.expiresAt > now) {
+      const heldId = await identityOfBearer(held.bearer);
+      if (heldId === undefined || !ids.includes(heldId)) {
+        await this.recordInvalid('older-exp', now); // an older token never replaces a newer valid one
         return;
       }
-      if (held.bearer === parsed.token) {
-        // The page re-sends the same bearer on every request. Nothing changes,
-        // and a rejected token stays rejected.
-        return;
-      }
-      const rejected = await this.rejectedIdentity();
-      if (rejected !== undefined && rejected === (await identityOf(parsed))) return;
     }
     const record: SgwSessionRecord = {
       bearer: parsed.token,
-      capturedAt: Number.isFinite(token.capturedAt) ? token.capturedAt : now,
+      capturedAt: token.capturedAt,
       expiresAt: parsed.expiresAt,
       buyerId: parsed.buyerId,
       source: token.source,
     };
-    await this.deps.repo.set(STORAGE_KEYS.sgwSession, record);
-    await this.deps.repo.remove(STORAGE_KEYS.sgwSessionRejection);
+    await this.deps.repo.set(STORAGE_KEYS.sgwSession, record); // the rejection history is kept
     await this.record('session.captured', { source: token.source, expiresAt: parsed.expiresAt, replaced: held !== undefined });
   }
 
@@ -220,13 +246,14 @@ export class SgwSessionAdapter implements SgwSession {
     return this.deps.repo.find(STORAGE_KEYS.sgwSession); // invalid is quarantined by the repo
   }
 
-  private async rejectedIdentity(): Promise<string | undefined> {
-    return (await this.deps.repo.find(STORAGE_KEYS.sgwSessionRejection))?.id;
+  private async rejectedIds(): Promise<readonly string[]> {
+    return (await this.deps.repo.find(STORAGE_KEYS.sgwSessionRejection))?.ids ?? [];
   }
 
   private async stateOf(rec: SgwSessionRecord | undefined): Promise<SgwSessionState> {
     if (rec === undefined) return 'logged-out';
-    if ((await this.rejectedIdentity()) !== undefined) return 'expired';
+    const heldId = await identityOfBearer(rec.bearer);
+    if (heldId !== undefined && (await this.rejectedIds()).includes(heldId)) return 'expired';
     const left = rec.expiresAt - this.deps.clock.now();
     if (left <= 0) return 'expired';
     return left < SESSION_EXPIRING_MS ? 'expiring' : 'ok';
