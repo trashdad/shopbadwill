@@ -11,7 +11,8 @@
 // origin, and is never logged; the receiver treats every message as untrusted
 // (`parseTapMessage`); the per-page nonce only avoids collisions, it is NOT
 // authentication.
-import { z } from 'zod';
+// This module is bundled into the page at document_start on every SGW page:
+// keep it tiny and never import zod here (receiver schema: ./tap-message.ts).
 
 export const TAP_SOURCE = 'sbw-api-tap';
 /** Attribute the isolated script sets on <html> before the tap runs. */
@@ -19,27 +20,10 @@ export const NONCE_ATTR = 'data-sbw-nonce';
 export const MAX_BODY_CHARS = 2 * 1024 * 1024;
 const BUYERAPI_HOST = 'buyerapi.shopgoodwill.com';
 const MARK = Symbol.for('sbw.apiTap.installed');
+export const MAX_BUFFER_MESSAGES = 50;
+export const MAX_BUFFER_CHARS = 1024 * 1024;
+export const BUFFER_GIVE_UP_MS = 15_000;
 const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
-
-/** Response body: parsed JSON, raw text, or `{ tooLarge: true }` over 2 MB. */
-export const TapMessageSchema = z.discriminatedUnion('kind', [
-  z.object({
-    source: z.literal(TAP_SOURCE),
-    nonce: z.string().min(1),
-    kind: z.literal('response'),
-    url: z.string(),
-    status: z.number().int(),
-    body: z.unknown(),
-  }),
-  z.object({
-    source: z.literal(TAP_SOURCE),
-    nonce: z.string().min(1),
-    kind: z.literal('token'),
-    /** Bare JWT, no "Bearer " prefix. */
-    bearer: z.string().regex(JWT_RE),
-  }),
-]);
-export type TapMessage = z.infer<typeof TapMessageSchema>;
 
 export function isBuyerApiUrl(url: string, base = 'https://shopgoodwill.com/'): boolean {
   try {
@@ -48,18 +32,6 @@ export function isBuyerApiUrl(url: string, base = 'https://shopgoodwill.com/'): 
   } catch {
     return false;
   }
-}
-
-/**
- * Receiver-side validation (for the isolated script, T-32). Returns null for
- * anything malformed, carrying the wrong nonce, a non-buyerapi response URL or
- * a token that is not JWT-shaped.
- */
-export function parseTapMessage(data: unknown, nonce: string): TapMessage | null {
-  const r = TapMessageSchema.safeParse(data);
-  if (!r.success || r.data.nonce !== nonce) return null;
-  if (r.data.kind === 'response' && !isBuyerApiUrl(r.data.url)) return null;
-  return r.data;
 }
 
 /** `Bearer <jwt>` -> bare jwt, else null. */
@@ -97,16 +69,97 @@ export interface TapTarget {
   XMLHttpRequest?: { prototype: object };
   fetch?: unknown;
   postMessage(msg: unknown, targetOrigin: string): void;
+  MutationObserver?: new (cb: () => void) => { observe(n: never, o: never): void; disconnect(): void };
   location: { href: string; origin: string };
   document: { documentElement: { getAttribute(n: string): string | null } };
 }
 
 export function installApiTap(win: TapTarget): void {
+  // Messages produced before the isolated script has set the nonce are held
+  // (bounded: 50 msgs / 1 MB, oldest dropped, abandoned after 15 s) and
+  // flushed in order once the attribute appears.
+  let buffer: { msg: Record<string, unknown>; size: number }[] = [];
+  let bufferChars = 0;
+  let gaveUp = false;
+  let observer: { disconnect(): void } | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const readNonce = (): string | null => {
+    try {
+      const n = win.document.documentElement.getAttribute(NONCE_ATTR);
+      return n === null || n === '' ? null : n;
+    } catch {
+      return null;
+    }
+  };
+  const send = (nonce: string, msg: Record<string, unknown>): void => {
+    try {
+      win.postMessage({ source: TAP_SOURCE, nonce, ...msg }, win.location.origin);
+    } catch {
+      /* observation must never break the page */
+    }
+  };
+  const stopWaiting = (): void => {
+    observer?.disconnect();
+    observer = undefined;
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  const flush = (nonce: string): void => {
+    const pending = buffer;
+    buffer = [];
+    bufferChars = 0;
+    stopWaiting();
+    for (const p of pending) send(nonce, p.msg);
+  };
+  const startWaiting = (): void => {
+    if (observer !== undefined || timer !== undefined) return;
+    try {
+      if (win.MutationObserver) {
+        const o = new win.MutationObserver(() => {
+          const n = readNonce();
+          if (n !== null) flush(n);
+        });
+        o.observe(win.document.documentElement as never, { attributes: true, attributeFilter: [NONCE_ATTR] } as never);
+        observer = o;
+      }
+    } catch {
+      /* lazy flush on the next message still works */
+    }
+    timer = setTimeout(() => {
+      gaveUp = true;
+      buffer = [];
+      bufferChars = 0;
+      stopWaiting();
+    }, BUFFER_GIVE_UP_MS);
+  };
+  const sizeOf = (msg: Record<string, unknown>): number => {
+    const b = msg.body;
+    if (typeof b === 'string') return b.length + 200;
+    if (b === undefined || b === null) return 200;
+    try {
+      return JSON.stringify(b).length + 200;
+    } catch {
+      return MAX_BUFFER_CHARS;
+    }
+  };
   const post = (msg: Record<string, unknown>): void => {
     try {
-      const nonce = win.document.documentElement.getAttribute(NONCE_ATTR);
-      if (nonce === null || nonce === '') return; // no receiver yet: drop
-      win.postMessage({ source: TAP_SOURCE, nonce, ...msg }, win.location.origin);
+      const nonce = readNonce();
+      if (nonce !== null) {
+        flush(nonce);
+        send(nonce, msg);
+        return;
+      }
+      if (gaveUp) return;
+      const size = sizeOf(msg);
+      if (size > MAX_BUFFER_CHARS) return;
+      buffer.push({ msg, size });
+      bufferChars += size;
+      while (buffer.length > MAX_BUFFER_MESSAGES || bufferChars > MAX_BUFFER_CHARS) {
+        const dropped = buffer.shift();
+        bufferChars -= dropped?.size ?? 0;
+      }
+      startWaiting();
     } catch {
       /* observation must never break the page */
     }

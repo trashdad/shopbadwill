@@ -1,12 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  BUFFER_GIVE_UP_MS,
   installApiTap,
   MAX_BODY_CHARS,
-  parseTapMessage,
+  MAX_BUFFER_MESSAGES,
   TAP_SOURCE,
   type TapTarget,
 } from '../../src/content/api-tap.main';
+import { parseTapMessage } from '../../src/content/tap-message';
 
 const NONCE = 'n-123';
 const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJCdXllcklkIjoxfQ.c2ln';
@@ -41,12 +43,25 @@ class FakeXhr {
   }
 }
 
+class FakeObserver {
+  static instances: FakeObserver[] = [];
+  disconnected = false;
+  constructor(public cb: () => void) {
+    FakeObserver.instances.push(this);
+  }
+  observe() {}
+  disconnect() {
+    this.disconnected = true;
+  }
+}
+
 function makeWin(fetchImpl?: (...a: unknown[]) => unknown) {
   const posted: { msg: Record<string, unknown>; origin: string }[] = [];
   const attrs: Record<string, string> = { 'data-sbw-nonce': NONCE };
   const win = {
     XMLHttpRequest: class extends FakeXhr {} as unknown as { prototype: object },
     fetch: fetchImpl,
+    MutationObserver: FakeObserver,
     postMessage: (msg: unknown, origin: string) => posted.push({ msg: msg as Record<string, unknown>, origin }),
     location: { href: 'https://shopgoodwill.com/home', origin: 'https://shopgoodwill.com' },
     document: { documentElement: { getAttribute: (n: string) => attrs[n] ?? null } },
@@ -236,4 +251,106 @@ describe('parseTapMessage (untrusted receiver)', () => {
       expect(parseTapMessage({ ...tok, bearer }, NONCE)).toBeNull();
     }
   });
+});
+
+describe('api-tap early-request buffering', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    FakeObserver.instances = [];
+  });
+  const run = (win: TapTarget, url: string, text: string) => {
+    const x = freshXhr(win, url);
+    x.send();
+    x.responseText = text;
+    x.finish();
+  };
+  const ns = (posted: { msg: Record<string, unknown> }[]) => posted.map((p) => (p.msg.body as { n: number }).n);
+
+  it('nonce set before the first request: relayed immediately', () => {
+    const { win, posted } = makeWin();
+    installApiTap(win);
+    run(win, LISTING, '{"n":1}');
+    expect(posted).toHaveLength(1);
+  });
+
+  it('nonce set after two requests: both flushed in order via the observer', () => {
+    const { win, posted, attrs } = makeWin();
+    delete attrs['data-sbw-nonce'];
+    installApiTap(win);
+    run(win, LISTING, '{"n":1}');
+    run(win, LISTING, '{"n":2}');
+    expect(posted).toHaveLength(0);
+    attrs['data-sbw-nonce'] = NONCE;
+    FakeObserver.instances[0]?.cb();
+    expect(ns(posted)).toEqual([1, 2]);
+    expect(posted.every((p) => p.msg.nonce === NONCE)).toBe(true);
+    expect(FakeObserver.instances[0]?.disconnected).toBe(true);
+    run(win, LISTING, '{"n":3}');
+    expect(posted).toHaveLength(3);
+  });
+
+  it('flushes lazily, in order, before the next message when no observer fires', () => {
+    const { win, posted, attrs } = makeWin();
+    delete attrs['data-sbw-nonce'];
+    installApiTap(win);
+    run(win, LISTING, '{"n":1}');
+    attrs['data-sbw-nonce'] = NONCE;
+    run(win, LISTING, '{"n":2}');
+    expect(ns(posted)).toEqual([1, 2]);
+  });
+
+  it('keeps at most 50 messages, dropping the oldest', () => {
+    const { win, posted, attrs } = makeWin();
+    delete attrs['data-sbw-nonce'];
+    installApiTap(win);
+    for (let i = 0; i < MAX_BUFFER_MESSAGES + 5; i++) run(win, LISTING, `{"n":${String(i)}}`);
+    attrs['data-sbw-nonce'] = NONCE;
+    FakeObserver.instances[0]?.cb();
+    expect(posted).toHaveLength(MAX_BUFFER_MESSAGES);
+    expect(ns(posted)[0]).toBe(5);
+  });
+
+  it('caps the buffer at 1 MB total, dropping the oldest', () => {
+    const { win, posted, attrs } = makeWin();
+    delete attrs['data-sbw-nonce'];
+    installApiTap(win);
+    const chunk = 'y'.repeat(400_000);
+    for (let i = 0; i < 4; i++) run(win, LISTING, chunk + String(i));
+    attrs['data-sbw-nonce'] = NONCE;
+    FakeObserver.instances[0]?.cb();
+    expect(posted).toHaveLength(2);
+    expect((posted[1]?.msg.body as string).endsWith('3')).toBe(true);
+  });
+
+  it('gives up after 15 s: buffer discarded, later messages dropped', () => {
+    vi.useFakeTimers();
+    const { win, posted, attrs } = makeWin();
+    delete attrs['data-sbw-nonce'];
+    installApiTap(win);
+    run(win, LISTING, '{"n":1}');
+    vi.advanceTimersByTime(BUFFER_GIVE_UP_MS + 1);
+    attrs['data-sbw-nonce'] = NONCE;
+    FakeObserver.instances[0]?.cb();
+    expect(posted).toHaveLength(0);
+  });
+});
+
+describe('api-tap bundle', () => {
+  it('stays tiny and contains no zod', async () => {
+    const { build } = await import('vite');
+    const out = (await build({
+      logLevel: 'silent',
+      configFile: false,
+      build: {
+        write: false,
+        minify: true,
+        lib: { entry: 'src/entrypoints/api-tap.content.ts', formats: ['iife'], name: 'tap' },
+        rollupOptions: { external: ['wxt/utils/define-content-script'], output: { globals: { 'wxt/utils/define-content-script': 'wxt' } } },
+      },
+    })) as unknown as { output: { type: string; code?: string }[] }[];
+    const code = out.flatMap((o) => o.output).map((c) => c.code ?? '').join('');
+    expect(code.length).toBeGreaterThan(500);
+    expect(code.length).toBeLessThan(10 * 1024);
+    expect(code).not.toMatch(/zod/i);
+  }, 30_000);
 });

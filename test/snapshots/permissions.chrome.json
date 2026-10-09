@@ -24,6 +24,9 @@
   "content_script_matches": [
     [
       "https://shopgoodwill.com/*"
+    ],
+    [
+      "https://shopgoodwill.com/*"
     ]
   ],
   "web_accessible_resources": null,
