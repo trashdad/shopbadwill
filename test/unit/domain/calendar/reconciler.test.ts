@@ -302,12 +302,77 @@ describe('reconcile rules', () => {
   });
 });
 
+describe('fix round 1', () => {
+  const at = (end: string): DesiredEvent => desired(101, { end });
+  it('same instant in three formats is a noop', () => {
+    const link = synced(a);
+    for (const end of ['2026-10-08T04:30:00Z', '2026-10-08T04:30:00.000Z', '2026-10-08T04:30:00+00:00']) {
+      expect(only(reconcile([at(end)], [link], NOW, opts()).ops).op).toBe('noop');
+    }
+  });
+  it('+1 s patches; a sub-second difference is a noop', () => {
+    expect(only(reconcile([at('2026-10-08T04:30:01.000Z')], [synced(a)], NOW, opts()).ops).op).toBe('patch');
+    expect(only(reconcile([at('2026-10-08T04:30:00.400Z')], [synced(a)], NOW, opts()).ops).op).toBe('noop');
+  });
+  it('patch/insert bodies carry the canonical start', () => {
+    const op = only(reconcile([at('2026-10-08T04:30:00+00:00')], [], NOW, opts()).ops);
+    if (op.op !== 'insert') throw new Error('expected insert');
+    expect(op.event.startUtc).toBe(END);
+  });
+  it('delete of an errored, no-longer-desired link bypasses the cap and backoff', () => {
+    const link = synced(a, { status: 'error' });
+    const capped = only(
+      reconcile([], [link], NOW, opts({ retries: { 101: { count: MAX_RETRIES, lastAttemptAt: NOW } } })).ops,
+    );
+    expect(capped).toMatchObject({ op: 'delete', eventId: 'sbv101g0', retry: MAX_RETRIES + 1 });
+    const backoff = only(reconcile([], [link], NOW, opts({ retries: { 101: { count: 2, lastAttemptAt: NOW } } })).ops);
+    expect(backoff.op).toBe('delete');
+  });
+  it('normal insert has lateAdd false', () => {
+    expect(only(reconcile([a], [], NOW, opts()).ops)).toMatchObject({ op: 'insert', lateAdd: false });
+  });
+  it('isLateAdd receives {itemId, endTime} and now', () => {
+    const calls: unknown[][] = [];
+    const isLateAdd = (item: { itemId: number; endTime: string }, now: number): boolean => {
+      calls.push([item, now]);
+      return false;
+    };
+    reconcile([a], [], NOW, opts({ isLateAdd }));
+    expect(calls).toEqual([[{ itemId: 101, endTime: a.startUtc }, NOW]]);
+  });
+  it('recreate flags lateAdd and passes the same arguments', () => {
+    const calls: unknown[][] = [];
+    const isLateAdd = (item: { itemId: number; endTime: string }, now: number): boolean => {
+      calls.push([item, now]);
+      return true;
+    };
+    const op = only(reconcile([a], [synced(a, { status: 'deleted' })], NOW, opts({ isLateAdd })).ops);
+    expect(op).toMatchObject({ op: 'recreate', lateAdd: true });
+    expect(calls).toEqual([[{ itemId: 101, endTime: a.startUtc }, NOW]]);
+  });
+  it('deletes stale lower live generations (ours only) alongside the current one', () => {
+    const g0 = synced(desired(101, { gen: 0 }));
+    const g1 = synced(desired(101, { gen: 1 }));
+    const g0done = synced(desired(101, { gen: 0 }), { status: 'deleted' });
+    const foreign = synced(desired(101, { gen: 0 }), { eventId: 'sbv101g9x', generation: 0 });
+    const ops = reconcile([desired(101, { gen: 1 })], [g0, g1, foreign], NOW, opts()).ops;
+    expect(ops.map((o) => [o.op, 'eventId' in o ? o.eventId : ''])).toEqual(
+      expect.arrayContaining([
+        ['noop', ''],
+        ['delete', 'sbv101g0'],
+      ]),
+    );
+    expect(ops.filter((o) => o.op === 'delete')).toHaveLength(1);
+    expect(reconcile([desired(101, { gen: 1 })], [g0done, g1], NOW, opts()).ops.map((o) => o.op)).toEqual(['noop']);
+  });
+});
+
 describe('idempotence', () => {
   it('running twice yields only noops', () => {
     for (const row of rows) {
       const o = opts(row.options);
       const first = reconcile(row.desired, row.links, NOW, o);
-      const next = applyOps(row.links, first.ops, row.desired, CAL);
+      const next = applyOps(row.links, first.ops, CAL);
       const second = reconcile(row.desired, next, NOW, o);
       for (const op of second.ops) expect(op.op, row.name).toBe('noop');
     }
@@ -322,6 +387,9 @@ describe('idempotence', () => {
       linkEnd: fc.constantFrom(END, END2),
       end: fc.constantFrom(END, END2),
       state: fc.constantFrom<SbwState>('open', 'won', 'lost', 'ended-early'),
+      retryCount: fc.option(fc.integer({ min: 0, max: MAX_RETRIES + 1 }), { nil: undefined }),
+      recent: fc.boolean(),
+      extraGen: fc.boolean(),
     });
     fc.assert(
       fc.property(
@@ -330,7 +398,15 @@ describe('idempotence', () => {
         (items, strategy) => {
           const want: DesiredEvent[] = [];
           const links: CalendarLink[] = [];
+          const retries: Record<number, { count: number; lastAttemptAt: number }> = {};
           for (const i of items) {
+            if (i.retryCount !== undefined) {
+              retries[i.id] = { count: i.retryCount, lastAttemptAt: i.recent ? NOW - 1000 : NOW - RETRY_BACKOFF_CAP_MS };
+            }
+            if (i.hasLink && i.extraGen) {
+              const older = desired(i.id, { gen: i.linkGen + 1 });
+              links.push(synced(older));
+            }
             if (i.wanted) want.push(desired(i.id, { end: i.end, state: i.state, gen: i.linkGen }));
             if (i.hasLink) {
               const old = desired(i.id, { gen: i.linkGen, end: i.linkEnd });
@@ -339,9 +415,9 @@ describe('idempotence', () => {
               );
             }
           }
-          const o = opts({ strategy });
+          const o = opts({ strategy, retries });
           const first = reconcile(want, links, NOW, o);
-          const next = applyOps(links, first.ops, want, CAL);
+          const next = applyOps(links, first.ops, CAL);
           const second = reconcile(want, next, NOW, o);
           for (const op of second.ops) expect(op.op).toBe('noop');
         },

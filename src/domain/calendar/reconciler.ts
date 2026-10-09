@@ -26,8 +26,7 @@ export const RETRY_BACKOFF_CAP_MS = 30 * 60_000;
 
 /** Wait before retry number `count + 1`: base * 2^count, capped. */
 export function retryBackoffMs(count: number): number {
-  const exp = Math.min(Math.max(0, Math.floor(count)), 30);
-  return Math.min(RETRY_BACKOFF_BASE_MS * 2 ** exp, RETRY_BACKOFF_CAP_MS);
+  return Math.min(RETRY_BACKOFF_BASE_MS * 2 ** Math.max(0, Math.floor(count)), RETRY_BACKOFF_CAP_MS);
 }
 
 /**
@@ -94,9 +93,20 @@ function isOurs(link: CalendarLink, calendarId: string): boolean {
   return link.calendarId === calendarId && link.eventId === eventIdFor(link.itemId, link.generation);
 }
 
-function withGeneration(d: DesiredEvent, generation: number): DesiredEvent {
-  if (d.generation === generation && d.privateProps.sbwGen === String(generation)) return d;
-  return { ...d, generation, privateProps: { ...d.privateProps, sbwGen: String(generation) } };
+/** Same instant, same string: whole seconds, `.000Z`. Unparseable input is left as is. */
+function canonicalInstant(iso: string): string {
+  const ms = new Date(iso).getTime();
+  return Number.isNaN(ms) ? iso : new Date(Math.floor(ms / 1000) * 1000).toISOString();
+}
+
+/** The event as it is hashed and sent: canonical start, at the given generation. */
+function normalize(d: DesiredEvent, generation: number): DesiredEvent {
+  return {
+    ...d,
+    generation,
+    startUtc: canonicalInstant(d.startUtc),
+    privateProps: { ...d.privateProps, sbwGen: String(generation) },
+  };
 }
 
 function outcomeOf(d: DesiredEvent): Outcome | undefined {
@@ -114,10 +124,18 @@ export function reconcile(
   const ignored: CalendarLink[] = [];
   const foreignHere: CalendarLink[] = [];
   const ours = new Map<ItemId, CalendarLink>();
+  const stale: CalendarLink[] = [];
   for (const link of links) {
     if (isOurs(link, options.calendarId)) {
       const cur = ours.get(link.itemId);
-      if (cur === undefined || link.generation > cur.generation) ours.set(link.itemId, link);
+      if (cur === undefined) {
+        ours.set(link.itemId, link);
+      } else if (link.generation > cur.generation) {
+        stale.push(cur);
+        ours.set(link.itemId, link);
+      } else if (link.generation < cur.generation) {
+        stale.push(link);
+      }
     } else {
       ignored.push(link);
       if (link.calendarId === options.calendarId) foreignHere.push(link);
@@ -133,11 +151,28 @@ export function reconcile(
     const d = want.get(itemId);
     const link = ours.get(itemId);
 
+    const st = options.retries?.[itemId];
+    const count = st?.count ?? 0;
+
+    // No longer desired: decided before retry gating, so deleting always works.
+    if (d === undefined) {
+      if (link === undefined) continue;
+      if (link.status === 'deleted') {
+        ops.push({ op: 'noop', itemId, reason: 'already-deleted' });
+      } else {
+        ops.push({
+          op: 'delete',
+          itemId,
+          eventId: link.eventId,
+          ...(link.status === 'error' ? { retry: count + 1 } : {}),
+        });
+      }
+      continue;
+    }
+
     // Retry gating for errored links.
     let retry: number | undefined;
     if (link?.status === 'error') {
-      const st = options.retries?.[itemId];
-      const count = st?.count ?? 0;
       if (count >= MAX_RETRIES) {
         ops.push({ op: 'noop', itemId, reason: 'retry-cap' });
         continue;
@@ -150,13 +185,6 @@ export function reconcile(
     }
     const r = retry === undefined ? {} : { retry };
 
-    if (d === undefined) {
-      if (link === undefined) continue;
-      if (link.status === 'deleted') ops.push({ op: 'noop', itemId, reason: 'already-deleted' });
-      else ops.push({ op: 'delete', itemId, eventId: link.eventId, ...r });
-      continue;
-    }
-
     const outcome = outcomeOf(d);
 
     if (link === undefined || (link.status === 'deleted' && d.generation > link.generation)) {
@@ -164,13 +192,14 @@ export function reconcile(
         ops.push({ op: 'noop', itemId, reason: 'resolved-without-event' });
         continue;
       }
+      const nd = normalize(d, d.generation);
       const lateAdd = options.isLateAdd({ itemId, endTime: d.startUtc }, now);
       ops.push({
         op: 'insert',
         itemId,
         eventId: eventIdFor(itemId, d.generation),
-        event: d,
-        hash: hashDesired(d),
+        event: nd,
+        hash: hashDesired(nd),
         lateAdd,
       });
       continue;
@@ -182,7 +211,7 @@ export function reconcile(
         continue;
       }
       const generation = strategy === 'bump-generation' ? Math.max(link.generation, d.generation) + 1 : link.generation;
-      const event = withGeneration(d, generation);
+      const event = normalize(d, generation);
       ops.push({
         op: 'recreate',
         itemId,
@@ -197,7 +226,7 @@ export function reconcile(
       continue;
     }
 
-    const event = withGeneration(d, link.generation);
+    const event = normalize(d, link.generation);
     const hash = hashDesired(event);
     const base = { itemId, eventId: link.eventId, event, hash, ...r };
 
@@ -215,6 +244,11 @@ export function reconcile(
       continue;
     }
     ops.push(outcome === undefined ? { op: 'patch', ...base } : { op: 'stamp', ...base, outcome });
+  }
+
+  // Lower live generations of an item are stale duplicates of ours: delete them.
+  for (const l of stale) {
+    if (l.status !== 'deleted') ops.push({ op: 'delete', itemId: l.itemId, eventId: l.eventId });
   }
 
   // A same-calendar link with a foreign id is reported, never touched.
@@ -236,7 +270,6 @@ export function reconcile(
 export function applyOps(
   links: readonly CalendarLink[],
   ops: readonly ReconcileOp[],
-  _desired: readonly DesiredEvent[],
   calendarId: string,
 ): CalendarLink[] {
   const out = new Map<string, CalendarLink>();
