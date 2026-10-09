@@ -41,11 +41,11 @@ You only copy **response bodies**, from the **Response** tab, exactly as below. 
 
 ## 3. Let the bid through (S-1's safety net)
 
-S-1 step 0.5 set up DevTools **request blocking** with four patterns. One of them, `*ItemBid/PlaceBid*`, blocks every bid made from a tab while DevTools is open there, including the one you are about to place.
-
+S-1 step 0.5 set up DevTools **request blocking** with four patterns. One of them, `*://*/api/ItemBid/PlaceBid`, blocks every bid made from a tab while DevTools is open there, including the one you are about to place.
+    
 4. On the item's tab, press F12 to open DevTools. Press Ctrl+Shift+P, type `blocking`, and open **Network request blocking** (newer Chrome calls it **Request conditions**).
 5. Look at the list:
-   - If `*ItemBid/PlaceBid*` is there, remove **only that one pattern**: hover over it and click the **×** at its right, or right-click it and choose **Remove**. Leave `*Favorite/Save*`, `*AddToFavorite*` and `*RemoveItemFromFavoriteList*`, and the **Enable** tick, exactly as they are. You put it back in step 16.
+   - If `*://*/api/ItemBid/PlaceBid` is there, remove **only that one pattern**: hover over it and click the **×** at its right, or right-click it and choose **Remove**. Leave `*://*/api/Favorite/Save`, `*://*/api/Favorite/AddToFavorite` and `*://*/api/Favorite/RemoveItemFromFavoriteList`, and the **Enable blocking and throttling** tick, exactly as they are. You put it back in step 16.
    - If the list is empty (you cleaned up in S-1 step 13), there is nothing to remove.
 
    Note which case it was, for `notes-p5.txt`.
@@ -86,7 +86,7 @@ This step is optional. Do it only through the site's own popup, and only if the 
     too-low attempt:                    skipped / site refused without a request: "its words" / sent: status ..., page said "..."
     blocking pattern in step 5:         removed / was not there
     ```
-16. **Put the safety net back.** If you removed `*ItemBid/PlaceBid*` in step 5, open the blocking panel again (step 4), click **+**, type `*ItemBid/PlaceBid*` and press Enter. Leave **Enable** as it was before step 5. The patterns act only in a tab while DevTools is open there.
+16. **Put the safety net back.** If you removed `*://*/api/ItemBid/PlaceBid` in step 5, open the blocking panel again (step 4), click **+**, type `*://*/api/ItemBid/PlaceBid` and press Enter. Leave **Enable blocking and throttling** as it was before step 5. The patterns act only in a tab while DevTools is open there.
 17. Check the files: run `Get-ChildItem $U | Select-Object Name, Length`. Expect `redact.txt`, `notes-p5.txt`, `showbidmodal-p5.json`, `placebid-1.json`, and `placebid-too-low.json` if step 14 sent a request. Other files from S-1 may be there too, if that worktree folder was reused.
 
 ## Reply with
