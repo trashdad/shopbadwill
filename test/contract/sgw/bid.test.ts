@@ -149,7 +149,7 @@ function setup(opts: SetupOpts = {}) {
   const api = new SgwApiAdapter({
     scheduler,
     clock,
-    session: { current: () => Promise.resolve(session) },
+    session: { current: () => Promise.resolve(session), reportRejected: () => Promise.resolve() },
     switches,
     audit,
     health: {
