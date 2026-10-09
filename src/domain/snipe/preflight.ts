@@ -10,9 +10,9 @@
 //   passing `checkCaps` for that amount (which fails closed with no fresh
 //   ItemDetail), in a dry run (an audit entry only), or once the snipe has left
 //   the pre-fire states (a bid may already be out).
-// - "Nothing to win" (the price is at or above the max, or the auction is
-//   closed) never applies the fallback.
-import { formatMoney } from '../money';
+// - "Nothing to win" (the next acceptable bid is above the max, or the auction
+//   is closed) never applies the fallback.
+import { formatMoney, nextAcceptable } from '../money';
 import { formatDual, relative } from '../time/pacific';
 import type { Cents, EpochMs, ItemDetail, SgwSessionState } from '../types';
 import { checkCaps } from './caps';
@@ -37,7 +37,7 @@ export interface PreflightFailure {
   /**
    * Machine-readable sub-cause: auth 'logged-out' | 'expired' | 'no-token' |
    * 'expires-before-end'; clock: T-81's ClockAbortReason; price
-   * 'at-or-above-max' | 'minimum-above-max'; ended 'closed'; keep-awake
+   * 'next-bid-above-max' | 'invalid-amount'; ended 'closed'; keep-awake
    * 'not-held'; cap: the violated kinds, comma-separated ('per-day,exposure').
    */
   cause: string;
@@ -136,23 +136,36 @@ const CLOCK_TEXT: Readonly<Record<ClockAbortReason, string>> = {
   'clock-skew': "This computer's clock is more than 5 minutes off ShopGoodwill's.",
 };
 
+/**
+ * The lowest bid SGW will accept now, in integer cents; null when the detail's
+ * amounts are not whole cents. With no bids yet it is the item's minimum bid
+ * (the starting price); once there are bids it is the current price plus one
+ * increment, through T-21's `nextAcceptable` (increments are not re-implemented).
+ */
+function nextAcceptableBid(d: ItemDetail): Cents | null {
+  if (d.numBids === 0) return Number.isSafeInteger(d.minimumBid) && d.minimumBid >= 0 ? d.minimumBid : null;
+  try {
+    return nextAcceptable(d.currentPrice, d.bidIncrement);
+  } catch {
+    return null; // RangeError: malformed cents
+  }
+}
+
 function auctionFailure(s: Snipe, d: ItemDetail): PreflightFailure | null {
   if (d.isClosed) {
     return { reason: 'ended', cause: 'closed', detail: 'The auction has already closed (ended early or withdrawn).' };
   }
-  // Integer cents; written so a malformed (NaN) amount also counts as nothing to win.
-  if (!(d.currentPrice < s.maxBid)) {
-    return {
-      reason: 'price',
-      cause: 'at-or-above-max',
-      detail: `The price ${money(d.currentPrice)} is already at or above your max ${money(s.maxBid)}: nothing to win.`,
-    };
+  // R2 (corrected): price fails only when the next acceptable bid is above the max.
+  const next = nextAcceptableBid(d);
+  if (next === null) {
+    return { reason: 'price', cause: 'invalid-amount', detail: 'The item price could not be read as whole cents.' };
   }
-  if (!(d.minimumBid <= s.maxBid)) {
+  // Written so a malformed (NaN) max also counts as nothing to win.
+  if (!(next <= s.maxBid)) {
     return {
       reason: 'price',
-      cause: 'minimum-above-max',
-      detail: `The next acceptable bid ${money(d.minimumBid)} is above your max ${money(s.maxBid)}: nothing to win.`,
+      cause: 'next-bid-above-max',
+      detail: `The next acceptable bid ${money(next)} is above your max ${money(s.maxBid)}: nothing to win.`,
     };
   }
   return null;
@@ -268,7 +281,7 @@ function decide(snipe: Snipe, input: FallbackInput): FallbackDecision {
 
 /**
  * The T-15 min preflight: can this snipe still fire safely? Checks, in
- * priority order: auction still open and price below the max (R2), session and
+ * priority order: auction still open and next acceptable bid within the max (R2), session and
  * token (R1), clock (R3), keep-awake held, caps. On failure the fallback is
  * applied (R4) unless there is nothing to win. Pure (R6): the result lists the
  * effects for the runner; it does not perform them.

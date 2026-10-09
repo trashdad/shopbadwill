@@ -212,12 +212,28 @@ describe('R1: session at T-15', () => {
 
 // ── R2: price ──────────────────────────────────────────────────────────────
 
-describe('R2: price check (integer cents)', () => {
-  it('currentPrice equal to maxBid fails as price and does NOT apply the fallback', () => {
-    // minimumBid == currentPrice (a no-bid item): R2 alone decides, as the controller ruled.
-    const d = detail({ currentPrice: 1000, minimumBid: 1000, numBids: 0 });
-    const r = failed(preflight(snipe({ maxBid: 1000 }), ctx({ detail: d })));
-    expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'at-or-above-max' });
+/** A detail with `numBids` bids: the price, the increment, and SGW's own minimumBid set apart. */
+const withBids = (currentPrice: number, bidIncrement: number) =>
+  detail({ numBids: 3, currentPrice, bidIncrement, minimumBid: currentPrice + 1 });
+const noBids = (minimumBid: number) =>
+  detail({ numBids: 0, currentPrice: minimumBid, startingMinimumBid: minimumBid, minimumBid, bidHistory: [] });
+
+describe('R2 (corrected): price fails only when the next acceptable bid is above maxBid', () => {
+  it('no-bid item, max equal to the minimum bid: passes', () => {
+    expect(preflight(snipe({ maxBid: 1000 }), ctx({ detail: noBids(1000) })).ok).toBe(true);
+  });
+
+  it('no-bid item, max one cent below the minimum bid: fails as price, no fallback', () => {
+    const r = failed(preflight(snipe({ maxBid: 999 }), ctx({ detail: noBids(1000) })));
+    expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'next-bid-above-max' });
+    expect(r.fallback).toBeNull();
+    expect(bids(r.effects)).toEqual([]);
+  });
+
+  it('with bids, current price equal to max: next acceptable is current + one increment, above max, so it fails', () => {
+    const r = failed(preflight(snipe({ maxBid: 1000 }), ctx({ detail: withBids(1000, 100) })));
+    expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'next-bid-above-max' });
+    expect(r.detail).toMatch(/next acceptable bid \$11\.00 is above your max \$10\.00/);
     expect(r.reason).toBe('price');
     expect(r.fallback).toBeNull();
     expect(bids(r.effects)).toEqual([]);
@@ -225,29 +241,23 @@ describe('R2: price check (integer cents)', () => {
     expect(r.state).toBe('resolved');
   });
 
-  it('currentPrice above maxBid fails as price', () => {
-    const r = failed(preflight(snipe({ maxBid: 999 }), ctx({ detail: detail({ currentPrice: 1000 }) })));
-    expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'at-or-above-max' });
-    expect(r.fallback).toBeNull();
+  it('next acceptable bid exactly equal to max: passes', () => {
+    expect(preflight(snipe({ maxBid: 1250 }), ctx({ detail: withBids(1000, 250) })).ok).toBe(true);
   });
 
-  it('one cent below maxBid passes', () => {
-    const r = preflight(snipe({ maxBid: 1001 }), ctx({ detail: detail({ currentPrice: 1000, minimumBid: 1001 }) }));
-    expect(r.ok).toBe(true);
+  it('the increment comes from the detail (nextAcceptable), not a re-implemented table', () => {
+    const r = failed(preflight(snipe({ maxBid: 1249 }), ctx({ detail: withBids(1000, 250) })));
+    expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'next-bid-above-max' });
   });
 
-  it('a next acceptable bid above maxBid is also nothing to win', () => {
-    const r = failed(preflight(snipe({ maxBid: 1050 }), ctx({ detail: detail({ currentPrice: 1000, minimumBid: 1100 }) })));
-    expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'minimum-above-max' });
-    expect(r.fallback).toBeNull();
+  it('current price above max fails as price', () => {
+    const r = failed(preflight(snipe({ maxBid: 999 }), ctx({ detail: withBids(1000, 100) })));
+    expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'next-bid-above-max' });
   });
 
   it('price wins over fallback-applying failures: still no fallback', () => {
     const r = failed(
-      preflight(
-        snipe({ maxBid: 1000 }),
-        ctx({ detail: detail({ currentPrice: 1500 }), clockOffset: null, keepAwake: 'not-held' }),
-      ),
+      preflight(snipe({ maxBid: 1000 }), ctx({ detail: withBids(1500, 100), clockOffset: null, keepAwake: 'not-held' })),
     );
     expect(r.reason).toBe('price');
     expect(r.failures.map((f) => f.reason)).toEqual(['price', 'clock', 'keep-awake']);
@@ -255,23 +265,45 @@ describe('R2: price check (integer cents)', () => {
     expect(bids(r.effects)).toEqual([]);
   });
 
-  it('property: price >= max never yields a bid effect, whatever else fails', () => {
+  /** Next acceptable bid `next` with or without bids, and an increment. */
+  const priced = (next: number, hasBids: boolean, inc: number): ItemDetail =>
+    hasBids && next >= inc ? withBids(next - inc, inc) : noBids(next);
+
+  it('property: next acceptable > max never yields a bid effect, whatever else fails', () => {
     fc.assert(
       fc.property(
         fc.integer({ min: 0, max: 100_000 }),
-        fc.integer({ min: 0, max: 100_000 }),
+        fc.integer({ min: 1, max: 100_000 }),
+        fc.integer({ min: 1, max: 10_000 }),
         fc.boolean(),
-        fc.constantFrom('early-proxy', 'skip' as const),
-        (max, extra, clockBad, fallback) => {
+        fc.boolean(),
+        fc.constantFrom<Snipe['fallback']>('early-proxy', 'skip'),
+        (max, over, inc, hasBids, clockBad, fallback) => {
           const r = failed(
             preflight(
               snipe({ maxBid: max, fallback }),
-              ctx({ detail: detail({ currentPrice: max + extra, minimumBid: max + extra }), clockOffset: clockBad ? null : ctx().clockOffset }),
+              ctx({ detail: priced(max + over, hasBids, inc), clockOffset: clockBad ? null : ctx().clockOffset }),
             ),
           );
           expect(r.reason).toBe('price');
           expect(r.fallback).toBeNull();
           expect(bids(r.effects)).toEqual([]);
+        },
+      ),
+    );
+  });
+
+  it('property: next acceptable <= max never fails the price check', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 5000 }),
+        fc.integer({ min: 0, max: 5000 }),
+        fc.integer({ min: 1, max: 1000 }),
+        fc.boolean(),
+        (max, under, inc, hasBids) => {
+          const next = Math.max(0, max - under);
+          const r = preflight(snipe({ maxBid: max }), ctx({ detail: priced(next, hasBids, inc) }));
+          expect(r.ok || r.reason !== 'price').toBe(true);
         },
       ),
     );
@@ -316,7 +348,7 @@ describe('R4: the early proxy amount is exactly maxBid and must pass the caps', 
     fc.assert(
       fc.property(fc.integer({ min: 1, max: 5000 }), (max) => {
         const r = failed(
-          preflight(snipe({ maxBid: max }), ctx({ clockOffset: null, detail: detail({ currentPrice: 0, minimumBid: 0 }) })),
+          preflight(snipe({ maxBid: max }), ctx({ clockOffset: null, detail: noBids(1) })),
         );
         expect(proxies(r.effects)).toEqual([{ kind: 'applyFallbackProxy', snipeId: 's1', amount: max }]);
       }),
@@ -489,11 +521,14 @@ describe('R6: preflight is pure and deterministic', () => {
           clockBad: fc.boolean(),
           keepAwake: fc.constantFrom('held', 'not-held', 'not-required' as const),
           readable: fc.boolean(),
+          hasBids: fc.boolean(),
+          inc: fc.integer({ min: 1, max: 1000 }),
           spent: fc.integer({ min: 0, max: 20_000 }),
         }),
         (p) => {
           const s = snipe({ fallback: p.fallback, dryRun: p.dryRun, maxBid: p.maxBid });
-          const d = p.readable ? detail({ currentPrice: p.price, minimumBid: p.price }) : null;
+          const d = p.readable ? (p.hasBids ? withBids(p.price, p.inc) : noBids(p.price)) : null;
+          const nextBid = p.hasBids ? p.price + p.inc : p.price;
           const r = preflight(
             s,
             ctx({
@@ -514,7 +549,7 @@ describe('R6: preflight is pure and deterministic', () => {
             expect(p.session === 'ok' || p.session === 'expiring').toBe(true);
             expect(p.token).toBe(true);
             expect(d).not.toBeNull();
-            expect(p.price).toBeLessThan(p.maxBid);
+            expect(nextBid).toBeLessThanOrEqual(p.maxBid);
             expect(p.maxBid).toBeLessThanOrEqual(DEFAULT_CAPS.perItemMax);
           }
         },
