@@ -11,6 +11,7 @@ import { parseCents } from '../../domain/money';
 import { parsePacific, parsePacificDetailed } from '../../domain/time/pacific';
 import type { Cents, EpochMs, Favorite, ItemDetail, Listing, SearchQuery } from '../../domain/types';
 import { SgwApiError } from '../../ports/errors';
+import { SGW_FIELDS, SGW_SEARCH_URL_PARAMS } from './config';
 import {
   CurrentTimeResponseSchema,
   FavoritesResponseSchema,
@@ -364,12 +365,30 @@ function priceCents(v: string | number | null | undefined): Cents | undefined {
   return typeof v === 'number' ? dollarsToCents(v) : (parseCents(v) ?? undefined);
 }
 
+/** Row fields with a URL param but no SearchQuery field: kept in `extra` when non-empty. */
+const SAVED_EXTRA_FIELDS = ['selectedGroup', 'searchBuyNowOnly'] as const;
+/** Same, but only meaningful for closed-auction searches. */
+const SAVED_CLOSED_EXTRA_FIELDS = ['closedAuctionDaysBack', 'closedAuctionEndingDate'] as const;
+
+/** Body field name -> URL param key, read from SGW_SEARCH_URL_PARAMS (the map the URL parser uses). */
+function urlKeyOf(field: string): string | undefined {
+  return Object.entries(SGW_SEARCH_URL_PARAMS).find(([, f]) => f === field)?.[0];
+}
+
+/**
+ * SGW's saved-search rows carry NO name. The port's `name` is derived from
+ * `searchText` (trimmed), falling back to `Search #<id>`; a legacy `searchName`
+ * (T-24's old guess) wins when present. Filter fields map to SearchQuery the
+ * way the URL parser does (booleans as-is, prices to cents through parseCents);
+ * fields with a URL param but no SearchQuery field go to `extra`.
+ */
 export function normalizeSavedSearches(raw: unknown): Array<{ id: number; name: string; query: SearchQuery }> {
   checkEnvelope(raw, 'savedSearches');
   const r = parseSgw(SavedSearchesResponseSchema, raw, 'savedSearches');
   return r.data.map((s) => {
+    const id = (s.savedSearchId ?? s.saveSearchId) as number;
     const query: SearchQuery = {
-      searchText: s.searchText ?? '',
+      searchText: (s.searchText ?? '').replaceAll('"', '').trim(),
       categoryIds: idList(s.selectedCategoryIds),
       sellerIds: idList(s.selectedSellerIds),
       page: 1,
@@ -378,14 +397,73 @@ export function normalizeSavedSearches(raw: unknown): Array<{ id: number; name: 
     const hi = priceCents(s.highPrice);
     if (lo !== undefined) query.lowPrice = lo;
     if (hi !== undefined) query.highPrice = hi;
-    return { id: s.saveSearchId, name: s.searchName, query };
+    if (typeof s.searchPickupOnly === 'boolean') query.pickupOnly = s.searchPickupOnly;
+    if (typeof s.searchNoPickupOnly === 'boolean') query.excludePickupOnly = s.searchNoPickupOnly;
+    if (typeof s.searchOneCentShippingOnly === 'boolean') query.oneCentShippingOnly = s.searchOneCentShippingOnly;
+    if (typeof s.searchClosedAuctions === 'boolean') query.closedAuctions = s.searchClosedAuctions;
+    if (typeof s.sortColumn === 'number') query.sortColumn = s.sortColumn;
+    if (typeof s.sortDescending === 'boolean') query.sortDescending = s.sortDescending;
+    if (s.layout === 'grid' || s.layout === 'list') query.layout = s.layout;
+
+    const extra: Record<string, string> = {};
+    const fields = query.closedAuctions === true ? [...SAVED_EXTRA_FIELDS, ...SAVED_CLOSED_EXTRA_FIELDS] : SAVED_EXTRA_FIELDS;
+    for (const f of fields) {
+      const v = (s as Record<string, unknown>)[f];
+      const key = urlKeyOf(f);
+      if (key !== undefined && (typeof v === 'string' || typeof v === 'number') && String(v) !== '') extra[key] = String(v);
+    }
+    if (Object.keys(extra).length > 0) query.extra = extra;
+
+    const name = (s.searchName ?? '').trim() || query.searchText || `Search #${String(id)}`;
+    return { id, name, query };
   });
 }
 
-/** `null` when SGW returned no quote (neither amount present). */
+// Labels come from SGW_FIELDS.shippingQuote (config.ts).
+const SQ = SGW_FIELDS.shippingQuote;
+
+/**
+ * "¤11.04 (GROUND_HOME_DELIVERY)" / "$3.00" -> cents. Any 1-3 char currency sign
+ * is allowed (the fixture shows the generic ¤); the "(SERVICE_LEVEL)" suffix is
+ * ignored. null for anything that is not exactly one amount of at most 2 decimals.
+ */
+function quoteAmountCents(text: string): Cents | null {
+  const m = /^[^\d\s-]{0,3}\s*(\d[\d,]*(?:\.\d+)?)(?:\s*\(.*\))?$/.exec(text.trim());
+  return m?.[1] === undefined ? null : parseCents(m[1]);
+}
+
+/** The text after `label` on the first line that starts with it. */
+function quoteLine(lines: string[], label: string): string | undefined {
+  const line = lines.find((l) => l.startsWith(label));
+  return line?.slice(label.length);
+}
+
+/**
+ * `null` = no usable quote. The reply is a JSON string of HTML
+ * (SGW_FIELDS.shippingQuote): Shipping and Handling are read by label from the
+ * text form, as integer cents; Total, when present, must equal their sum. A
+ * missing or unparseable amount or a Total mismatch gives null, never a guess.
+ * The address and carrier lines are never read. The object forms (T-24's old
+ * guess) still work.
+ */
 export function normalizeShippingQuote(raw: unknown): { shipping: Cents; handling: Cents } | null {
   checkEnvelope(raw, 'shippingQuote', true);
   const q = parseSgw(ShippingQuoteResponseSchema, raw, 'shippingQuote');
+  if (typeof q === 'string') {
+    const lines = htmlToText(q).split('\n');
+    const shipText = quoteLine(lines, SQ.shippingLabel);
+    const handText = quoteLine(lines, SQ.handlingLabel);
+    if (shipText === undefined || handText === undefined) return null;
+    const shipping = quoteAmountCents(shipText);
+    const handling = quoteAmountCents(handText);
+    if (shipping === null || handling === null) return null;
+    const totalText = quoteLine(lines, SQ.totalLabel);
+    if (totalText !== undefined) {
+      const total = quoteAmountCents(totalText);
+      if (total === null || total !== shipping + handling) return null;
+    }
+    return { shipping, handling };
+  }
   // No shipping amount means no quote, even if a handling fee is present.
   if (q.shippingPrice == null) return null;
   return { shipping: dollarsToCents(q.shippingPrice), handling: dollarsToCents(q.handlingPrice ?? 0) };
