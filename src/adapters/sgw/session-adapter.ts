@@ -20,20 +20,16 @@
 //   - The bearer is a secret: never logged, audited or put in an error. Audit
 //     entries carry fixed, non-secret reason codes only.
 import type { AuditLog } from '../../domain/audit/types';
-import { STORAGE_KEYS } from '../../domain/storage/schema';
-import { SgwSessionRecordSchema, type EpochMs, type SgwSessionRecord, type SgwSessionState } from '../../domain/types';
+import { STORAGE_KEYS, type StorageValue } from '../../domain/storage/schema';
+import type { EpochMs, SgwSessionRecord, SgwSessionState } from '../../domain/types';
 import type { Clock } from '../../ports/clock';
 import type { SgwSession } from '../../ports/sgw-session';
-import type { Storage } from '../../ports/storage';
 
 /** `expiring` = less than this much time left (S-2 recommendation 2). */
 export const SESSION_EXPIRING_MS = 72 * 3_600_000;
 
 /** S-2 verdict: no unattended refresh was observed or proven, so this is false. */
 export const SBW_SESSION_REFRESH = false;
-
-/** Own key (not a record the repo validates): the identity hash of the token SGW rejected. */
-export const SESSION_REJECTION_KEY = `${STORAGE_KEYS.sgwSession}Rejection`;
 
 /** A JWT longer than this is not an SGW bearer. */
 const MAX_TOKEN_CHARS = 8192;
@@ -46,9 +42,18 @@ const B64URL = /^[A-Za-z0-9_-]+$/;
 
 type Parsed = { ok: true; token: string; buyerId: string; expiresAt: EpochMs; jti: string | undefined } | { ok: false; reason: string };
 
+type SessionKey = typeof STORAGE_KEYS.sgwSession | typeof STORAGE_KEYS.sgwSessionRejection;
+
+/** The slice of the domain Repo used here (adapters may not import the Repo class, PLAN §2.1). */
+export interface SessionRepo {
+  find<K extends SessionKey>(key: K): Promise<StorageValue<K> | undefined>;
+  set<K extends SessionKey>(key: K, value: StorageValue<K>): Promise<void>;
+  remove(key: SessionKey): Promise<void>;
+}
+
 export interface SessionAdapterDeps {
-  /** The `local` storage area. */
-  storage: Pick<Storage, 'get' | 'set' | 'remove'>;
+  /** Validated storage (records `sbw:sgwSession` and `sbw:sgwSessionRejection`). */
+  repo: SessionRepo;
   clock: Pick<Clock, 'now'>;
   audit?: Pick<AuditLog, 'append'>;
   /** Defaults to SBW_SESSION_REFRESH. Tests flip it to cover both S-2 verdicts. */
@@ -149,7 +154,8 @@ export class SgwSessionAdapter implements SgwSession {
   clear(): Promise<void> {
     return this.serial(async () => {
       const had = await this.load();
-      await this.deps.storage.remove([STORAGE_KEYS.sgwSession, SESSION_REJECTION_KEY]);
+      await this.deps.repo.remove(STORAGE_KEYS.sgwSession);
+      await this.deps.repo.remove(STORAGE_KEYS.sgwSessionRejection);
       if (had !== undefined) await this.record('session.cleared', {});
     });
   }
@@ -163,7 +169,7 @@ export class SgwSessionAdapter implements SgwSession {
       const id = parsed.ok
         ? await identityOf(parsed)
         : `exp:${String(rec.expiresAt)}:${await sha256Hex(rec.bearer)}`;
-      await this.deps.storage.set({ [SESSION_REJECTION_KEY]: { id, at: this.deps.clock.now() } });
+      await this.deps.repo.set(STORAGE_KEYS.sgwSessionRejection, { id, at: this.deps.clock.now() });
       await this.record('session.rejected', { expiresAt: rec.expiresAt });
     });
   }
@@ -205,21 +211,17 @@ export class SgwSessionAdapter implements SgwSession {
       buyerId: parsed.buyerId,
       source: token.source,
     };
-    await this.deps.storage.set({ [STORAGE_KEYS.sgwSession]: record });
-    await this.deps.storage.remove([SESSION_REJECTION_KEY]);
+    await this.deps.repo.set(STORAGE_KEYS.sgwSession, record);
+    await this.deps.repo.remove(STORAGE_KEYS.sgwSessionRejection);
     await this.record('session.captured', { source: token.source, expiresAt: parsed.expiresAt, replaced: held !== undefined });
   }
 
   private async load(): Promise<SgwSessionRecord | undefined> {
-    const raw = await this.deps.storage.get<unknown>(STORAGE_KEYS.sgwSession);
-    if (raw === undefined) return undefined;
-    const parsed = SgwSessionRecordSchema.safeParse(raw);
-    return parsed.success ? parsed.data : undefined;
+    return this.deps.repo.find(STORAGE_KEYS.sgwSession); // invalid is quarantined by the repo
   }
 
   private async rejectedIdentity(): Promise<string | undefined> {
-    const raw = await this.deps.storage.get<{ id?: unknown }>(SESSION_REJECTION_KEY);
-    return typeof raw?.id === 'string' ? raw.id : undefined;
+    return (await this.deps.repo.find(STORAGE_KEYS.sgwSessionRejection))?.id;
   }
 
   private async stateOf(rec: SgwSessionRecord | undefined): Promise<SgwSessionState> {

@@ -1034,7 +1034,7 @@ describe('schema failure → SgwApiError(schema) and health flagged', () => {
     const api = new SgwApiAdapter({
       scheduler,
       clock,
-      session: { current: () => Promise.resolve(null) },
+      session: { current: () => Promise.resolve(null), reportRejected: () => Promise.resolve() },
       switches: new FakeSwitches(),
       audit: new FakeAuditLog(clock),
       health: {

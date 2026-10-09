@@ -8,6 +8,7 @@ import {
   SESSION_EXPIRING_MS,
   SgwSessionAdapter,
 } from '../../../../src/adapters/sgw/session-adapter';
+import { Repo } from '../../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../../src/domain/storage/schema';
 import { FakeAuditLog } from '../../../fakes/ports/fake-audit-log';
 import { FakeClock } from '../../../fakes/ports/fake-clock';
@@ -42,10 +43,11 @@ const audits: FakeAuditLog[] = [];
 function setup(opts: { refresh?: boolean; refresher?: () => Promise<string | null> } = {}) {
   const clock = new FakeClock(T0);
   const storage = new FakeStorage();
+  const repo = new Repo({ local: storage, session: new FakeStorage() }, clock);
   const audit = new FakeAuditLog(clock);
   audits.push(audit);
   const session = new SgwSessionAdapter({
-    storage,
+    repo,
     clock,
     audit,
     ...(opts.refresh === undefined ? {} : { refreshEnabled: opts.refresh }),
@@ -55,7 +57,7 @@ function setup(opts: { refresh?: boolean; refresher?: () => Promise<string | nul
     seenBearers.add(bearer);
     return session.observe({ bearer, capturedAt: clock.now(), source });
   };
-  return { clock, storage, audit, session, observe };
+  return { clock, storage, repo, audit, session, observe };
 }
 
 describe('constants', () => {
@@ -154,7 +156,7 @@ describe('observe: stores, validates', () => {
     const t = setup();
     const b = mint('B-1', 10 * DAY);
     await t.observe(b);
-    const again = new SgwSessionAdapter({ storage: t.storage, clock: t.clock, audit: t.audit });
+    const again = new SgwSessionAdapter({ repo: t.repo, clock: t.clock, audit: t.audit });
     expect((await again.current())?.bearer).toBe(b);
     expect(await again.state()).toBe('ok');
   });
@@ -164,6 +166,7 @@ describe('observe: stores, validates', () => {
     t.storage.seed({ [STORAGE_KEYS.sgwSession]: { bearer: 5 } });
     expect(await t.session.current()).toBeNull();
     expect(await t.session.state()).toBe('logged-out');
+    expect(Object.keys(t.storage.dump()).some((k) => k.startsWith('sbw:quarantine:'))).toBe(true); // via the repo
   });
 });
 
@@ -286,10 +289,27 @@ describe('reportRejected (R2, R3)', () => {
     const b = mint('B-1', 20 * DAY);
     await t.observe(b);
     await t.session.reportRejected();
-    const again = new SgwSessionAdapter({ storage: t.storage, clock: t.clock, audit: t.audit });
+    const again = new SgwSessionAdapter({ repo: t.repo, clock: t.clock, audit: t.audit });
     expect(await again.state()).toBe('expired');
     await again.observe({ bearer: b, capturedAt: T0, source: 'tap' });
     expect(await again.state()).toBe('expired');
+  });
+
+  it('stores the rejection under the schema key, validated, as {id, at}', async () => {
+    const t = setup();
+    await t.observe(mint('B-1', 20 * DAY));
+    await t.session.reportRejected();
+    const rec = await t.repo.find(STORAGE_KEYS.sgwSessionRejection);
+    expect(rec?.id).toMatch(/^jti:[0-9a-f]{64}$/);
+    expect(rec?.at).toBe(T0);
+  });
+
+  it('a corrupt rejection record is quarantined by the repo and read as not rejected', async () => {
+    const t = setup();
+    await t.observe(mint('B-1', 20 * DAY));
+    t.storage.seed({ [STORAGE_KEYS.sgwSessionRejection]: { id: 7 } });
+    expect(await t.session.state()).toBe('ok');
+    expect(Object.keys(t.storage.dump()).some((k) => k.startsWith('sbw:quarantine:'))).toBe(true);
   });
 
   it('never stores the raw rejected token or its jti outside the session record', async () => {

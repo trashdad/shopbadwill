@@ -47,6 +47,7 @@ export const STORAGE_KEYS = {
   snipes: 'sbw:snipes',
   auditMeta: 'sbw:auditMeta',
   sgwSession: 'sbw:sgwSession',
+  sgwSessionRejection: 'sbw:sgwSessionRejection',
   google: 'sbw:google',
   requestBudget: 'sbw:requestBudget',
   requestSchedulerState: 'sbw:requestSchedulerState',
@@ -199,6 +200,16 @@ export type QuarantineRecord = z.infer<typeof QuarantineRecordSchema>;
 
 export type StorageArea = 'local' | 'session';
 
+/**
+ * Stored at `sbw:sgwSessionRejection` (T-28). Absent means "not rejected" (no
+ * migration needed). `id` is a SHA-256 based identity of the token SGW refused
+ * (`jti:<hash of jti>` or `exp:<exp ms>:<hash of token>`); the raw token and
+ * the raw jti are never stored.
+ */
+/** Module-private: an exported *Schema would join the locked list in test/contract/types/examples.test.ts. */
+const SgwSessionRejectionSchema = z.object({ id: z.string().min(1), at: EpochMsSchema });
+export type SgwSessionRejection = z.infer<typeof SgwSessionRejectionSchema>;
+
 export const STORAGE_RECORDS = {
   [STORAGE_KEYS.meta]: { area: 'local', schema: StorageMetaSchema },
   [STORAGE_KEYS.settings]: { area: 'local', schema: SettingsSchema },
@@ -214,6 +225,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.snipes]: { area: 'local', schema: z.record(SnipeIdSchema, SnipeSchema) },
   [STORAGE_KEYS.auditMeta]: { area: 'local', schema: AuditMetaSchema },
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },
+  [STORAGE_KEYS.sgwSessionRejection]: { area: 'local', schema: SgwSessionRejectionSchema },
   [STORAGE_KEYS.google]: { area: 'local', schema: GoogleCredentialsSchema },
   [STORAGE_KEYS.requestBudget]: { area: 'local', schema: RequestBudgetSchema },
   [STORAGE_KEYS.requestSchedulerState]: { area: 'local', schema: RequestSchedulerStateSchema },

@@ -64,7 +64,10 @@ function setup(start = T0, lanes: Record<Lane, LaneConfig> = FAST_LANES) {
   const api = new SgwApiAdapter({
     scheduler,
     clock,
-    session: { current: () => Promise.resolve({ bearer: BEARER, expiresAt: start + 86_400_000, buyerId: '42' }) },
+    session: {
+      current: () => Promise.resolve({ bearer: BEARER, expiresAt: start + 86_400_000, buyerId: '42' }),
+      reportRejected: () => Promise.resolve(),
+    },
     switches,
     audit,
     health: {
