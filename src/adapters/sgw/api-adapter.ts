@@ -175,8 +175,12 @@ export interface SgwHealthFlag {
 export interface ApiAdapterDeps {
   scheduler: RequestScheduler;
   clock: Clock;
-  /** Bearer source (T-28). */
-  session: Pick<SgwSession, 'current'>;
+  /**
+   * Bearer source (T-28). `reportRejected` is called once when a request that
+   * carried the bearer comes back unauthorized (T-28 contract change). It is
+   * optional only so callers that never see a live session can omit it.
+   */
+  session: Pick<SgwSession, 'current'> & Partial<Pick<SgwSession, 'reportRejected'>>;
   /** The frozen port, asked before every write (ruling C1). */
   switches: GlobalSwitches;
   /** Records refused-write intents (T-35/T-41). */
@@ -706,7 +710,19 @@ export class SgwApiAdapter implements SgwApi {
       return await this.deps.scheduler.run(scheduled);
     } catch (e) {
       if (e instanceof SgwApiError && e.kind === 'schema') this.flagSchemaFailure(endpoint, e);
+      if (e instanceof SgwApiError && e.kind === 'auth' && request.headers?.Authorization !== undefined) {
+        await this.reportRejected();
+      }
       throw e;
+    }
+  }
+
+  /** The bearer was refused (401 / isUnauthorized): tell the session once. A failing session must not hide the auth error. */
+  private async reportRejected(): Promise<void> {
+    try {
+      await this.deps.session.reportRejected?.();
+    } catch {
+      // ignored on purpose
     }
   }
 

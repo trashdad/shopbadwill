@@ -324,3 +324,16 @@ The frozen `JobRun` had no field for any of this. `Repo.set` parses before writi
 ## T-58: disableRule undo ref = rule id
 
 An audit entry with `undo: { kind: 'disableRule', ref }` carries the disabled rule's id in `ref`. `createUndoExecutors` (`src/background/handlers/audit.ts`) re-enables that rule. No card writes such an entry yet; the writer must use this format. Audit entries cannot be updated in place, so an undo is recorded as a new `undo` entry (`details.undoneSeq`), and `audit.list` reports `undo.done` from those.
+
+## T-28 contract change: SgwSession `expiring` is 72 h, and `reportRejected()` is new
+
+Source: S-2 (`docs/spikes/S-2.md`) and the controller's T-28 rulings.
+
+1. **R1: `expiring` means less than 72 h left**, not 12 h. `src/adapters/sgw/session-adapter.ts` exports `SESSION_EXPIRING_MS = 72 * 3_600_000`. The comments in `src/ports/sgw-session.ts` and on `SgwSessionStateSchema` (`src/domain/types.ts`) say 72 h. No type changes. `expiring` still allows writes (I-08). Why: SGW has no refresh (S-2), so only the user can renew, and 12 h is too late to ask.
+2. **R2: new port method `reportRejected(): Promise<void>`.**
+   - It sets state `expired` with no network call and **keeps the record** (R3), so the BuyerId rule still applies. `current()` returns `null` while expired. `clear()` stays the explicit logout path (`logged-out`).
+   - It remembers the rejected token's identity as a SHA-256 hash (of the `jti`, or `exp` plus a hash of the token), under `sbw:sgwSessionRejection`. The raw token is never stored there. A later `observe()` of the identical bearer does not restore `ok`; a different valid token for the same `BuyerId` does.
+   - `SgwApiAdapter` (T-26) calls it once when a request that carried the bearer ends in an `auth` error (HTTP 401 or `isUnauthorized`). `ApiAdapterDeps.session` types it as optional (`Partial<Pick<SgwSession, 'reportRejected'>>`), so existing test doubles that only provide `current` still compile.
+3. **R4/R5:** `SBW_SESSION_REFRESH = false`, so `refresh()` resolves `false` with no call. Only `BuyerId` and `exp` are read from the token.
+
+**Follow-up for the next PLAN edit.** Add `reportRejected()` and the 72 h threshold to PLAN §3.3 and contracts.md.

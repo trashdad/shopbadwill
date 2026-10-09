@@ -146,13 +146,20 @@ function setup(opts: SetupOpts = {}) {
   const audit = new FakeAuditLog(clock);
   const switches = new DelayedSwitches(clock);
   const failures: SchemaFailure[] = [];
+  const rejections = { count: 0 };
   const sessionBox = {
     value: opts.session === undefined ? { bearer: BEARER, expiresAt: T0 + 24 * 60 * MIN, buyerId: '42' } : opts.session,
   };
   const api = new SgwApiAdapter({
     scheduler,
     clock,
-    session: { current: () => Promise.resolve(sessionBox.value) },
+    session: {
+      current: () => Promise.resolve(sessionBox.value),
+      reportRejected: () => {
+        rejections.count += 1;
+        return Promise.resolve();
+      },
+    },
     switches,
     audit,
     health: {
@@ -162,7 +169,7 @@ function setup(opts: SetupOpts = {}) {
     },
     sgwClock: opts.sgwClock ?? new SgwClockAdapter(clock),
   });
-  return { clock, http, inner, scheduler, audit, switches, failures, sessionBox, api };
+  return { clock, http, inner, scheduler, audit, switches, failures, rejections, sessionBox, api };
 }
 
 type Setup = ReturnType<typeof setup>;
@@ -531,6 +538,61 @@ describe("R3: credentials 'omit' on every request, bearer only on auth endpoints
     t.http.on(`${BASE}Favorite/GetAllFavoriteItemsByType`, json({ ...ENVELOPE, status: false, isUnauthorized: true, data: null }));
     await rejectsWith(t.api.favorites('all', 'interactive'), 'auth');
     expect(t.failures).toHaveLength(0);
+  });
+});
+
+// ── T-28 R2: an unauthorized reply to a bearer-carrying request reports the rejection ─
+
+describe('T-28 R2: session.reportRejected on unauthorized replies', () => {
+  it('a 401 on an auth read reports the rejection exactly once', async () => {
+    const t = setup();
+    t.http.on(`${BASE}Favorite/GetAllFavoriteItemsByType`, { status: 401, bodyText: '' });
+    await rejectsWith(t.api.favorites('all', 'interactive'), 'auth');
+    expect(t.rejections.count).toBe(1);
+  });
+
+  it('isUnauthorized in a read reply reports once', async () => {
+    const t = setup();
+    t.http.on(`${BASE}Favorite/GetAllFavoriteItemsByType`, json({ ...ENVELOPE, status: false, isUnauthorized: true, data: null }));
+    await rejectsWith(t.api.favorites('all', 'interactive'), 'auth');
+    expect(t.rejections.count).toBe(1);
+  });
+
+  it('isUnauthorized in a write ack reports once', async () => {
+    const t = setup();
+    t.http.on(`${BASE}Favorite/RemoveItemFromFavoriteList`, json({ ...ACK, status: false, isUnauthorized: true }));
+    await rejectsWith(t.api.removeFavorite(ITEM), 'auth');
+    expect(t.rejections.count).toBe(1);
+  });
+
+  it('no session / expired session: auth error before anything is sent, nothing reported', async () => {
+    for (const session of [null, { bearer: BEARER, expiresAt: T0 - 1, buyerId: '42' }]) {
+      const t = setup({ session });
+      await rejectsWith(t.api.favorites('all', 'interactive'), 'auth');
+      expect(t.rejections.count).toBe(0);
+    }
+  });
+
+  it('an anonymous request that gets a 401 (no bearer sent) does not report', async () => {
+    const t = setup();
+    t.http.on(`${BASE}ItemDetail/`, { status: 401, bodyText: '' });
+    await rejectsWith(t.api.itemDetail(ITEM, 'interactive'), 'auth');
+    expect(t.rejections.count).toBe(0);
+  });
+
+  it('other failures (500, schema) do not report', async () => {
+    const t = setup();
+    t.http.on(`${BASE}Favorite/GetAllFavoriteItemsByType`, { status: 400, bodyText: '{}' });
+    await rejectsWith(t.api.favorites('all', 'interactive'), 'server');
+    expect(t.rejections.count).toBe(0);
+  });
+
+  it('a reportRejected that throws does not hide the auth error', async () => {
+    const t = setup();
+    (t.api as unknown as { deps: { session: { reportRejected: () => Promise<void> } } }).deps.session.reportRejected = () =>
+      Promise.reject(new Error('storage down'));
+    t.http.on(`${BASE}Favorite/GetAllFavoriteItemsByType`, { status: 401, bodyText: '' });
+    await rejectsWith(t.api.favorites('all', 'interactive'), 'auth');
   });
 });
 
