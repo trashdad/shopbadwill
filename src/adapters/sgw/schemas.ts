@@ -193,6 +193,8 @@ export type SellerInfoResponse = z.infer<typeof SellerInfoResponseSchema>;
 // fragment (SGW_FIELDS.shippingQuote); normalizeShippingQuote parses it. The
 // object forms T-04/T-24 guessed ({shippingPrice, handlingPrice}, bare or
 // enveloped) are still accepted, but SGW has not been seen to send them.
+// TEMPORARY: remove the object forms once the fake server and the api-adapter
+// unit tests use the real HTML-string shape.
 export const ShippingQuoteResponseSchema = z.union([
   z.string(),
   flatOrEnvelope(
@@ -232,6 +234,8 @@ export type AckResponse = z.infer<typeof AckResponseSchema>;
 // Observed (USER STEP S-1, T-24b). Auth. Enveloped, `data` is the list. The real
 // id key is `savedSearchId`; there is NO name field (the normalizer derives one).
 // The old guessed keys (`saveSearchId`, `searchName`) are still accepted.
+// TEMPORARY: remove them (and the refine) once the fake server and the
+// api-adapter unit tests use the real `savedSearchId` rows.
 export const SavedSearchRowSchema = z
   .looseObject({
     savedSearchId: Id.optional(),

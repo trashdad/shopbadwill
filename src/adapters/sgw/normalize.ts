@@ -441,7 +441,7 @@ function quoteLine(lines: string[], label: string): string | undefined {
 /**
  * `null` = no usable quote. The reply is a JSON string of HTML
  * (SGW_FIELDS.shippingQuote): Shipping and Handling are read by label from the
- * text form, as integer cents; Total, when present, must equal their sum. A
+ * text form, as integer cents; Total is required and must equal their sum. A
  * missing or unparseable amount or a Total mismatch gives null, never a guess.
  * The address and carrier lines are never read. The object forms (T-24's old
  * guess) still work.
@@ -457,13 +457,15 @@ export function normalizeShippingQuote(raw: unknown): { shipping: Cents; handlin
     const shipping = quoteAmountCents(shipText);
     const handling = quoteAmountCents(handText);
     if (shipping === null || handling === null) return null;
+    // The Total line is required: it is the cross-check on the two amounts.
     const totalText = quoteLine(lines, SQ.totalLabel);
-    if (totalText !== undefined) {
-      const total = quoteAmountCents(totalText);
-      if (total === null || total !== shipping + handling) return null;
-    }
+    if (totalText === undefined) return null;
+    const total = quoteAmountCents(totalText);
+    if (total === null || total !== shipping + handling) return null;
     return { shipping, handling };
   }
+  // TEMPORARY legacy object form (T-24's guess): remove once the fake server and
+  // the api-adapter unit tests use the real HTML-string shape.
   // No shipping amount means no quote, even if a handling fee is present.
   if (q.shippingPrice == null) return null;
   return { shipping: dollarsToCents(q.shippingPrice), handling: dollarsToCents(q.handlingPrice ?? 0) };

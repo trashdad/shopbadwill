@@ -29,6 +29,9 @@ describe('shippingQuote edge cases (synthetic)', () => {
     expect(normalizeShippingQuote(quote(page('$5.50 (GROUND)', 'TBD', '$5.50')))).toBeNull();
     expect(normalizeShippingQuote(quote(page('call us', '$1.00')))).toBeNull();
   });
+  it('a quote with no Total line gives null', () => {
+    expect(normalizeShippingQuote(quote(page('$5.50 (GROUND)', '$1.25')))).toBeNull();
+  });
   it('a Total mismatch gives null', () => {
     expect(normalizeShippingQuote(quote(page('$5.50 (GROUND)', '$1.25', '$7.00')))).toBeNull();
   });
@@ -80,6 +83,15 @@ describe('savedSearches synthetic', () => {
     const q = normalizeSavedSearches(env({ savedSearchId: 9, searchText: ' pyrex ', selectedGroup: 'g1', searchBuyNowOnly: '' }))[0];
     expect(q?.name).toBe('pyrex');
     expect(q?.query.extra).toEqual({ sg: 'g1' });
+  });
+  it('caed and cadb reach extra only when closedAuctions is true', () => {
+    const row = { savedSearchId: 9, searchText: 'x', closedAuctionDaysBack: 7, closedAuctionEndingDate: '2026-06-13T00:00:00' };
+    const on = normalizeSavedSearches(env({ ...row, searchClosedAuctions: true }))[0];
+    expect(on?.query.extra).toEqual({ cadb: '7', caed: '2026-06-13T00:00:00' });
+    const off = normalizeSavedSearches(env({ ...row, searchClosedAuctions: false }))[0];
+    expect(off?.query.extra).toBeUndefined();
+    const unset = normalizeSavedSearches(env(row))[0];
+    expect(unset?.query.extra).toBeUndefined();
   });
   it('a row with no id is a schema error', () => {
     expect(() => normalizeSavedSearches(env({ searchText: 'x' }))).toThrow(expect.objectContaining({ kind: 'schema' }));
