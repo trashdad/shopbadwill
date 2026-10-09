@@ -432,6 +432,8 @@ describe('connect()', () => {
       'https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/',
       'http://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org/',
       'https://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org.evil.example/',
+      'https://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org.evil.com/',
+      'https://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org:8443/',
       'https://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org@evil.example/',
     ];
     for (const base of elsewhere) {
@@ -455,6 +457,21 @@ describe('connect()', () => {
     w.identity.respond = (u) => `http://127.0.0.1/mozoauth2/${'0'.repeat(40)}?state=${u.searchParams.get('state') ?? ''}&code=c`;
     expect((await fails(w.provider.connect())).code).toBe('unauthorized');
     expect(w.http.requests).toHaveLength(0);
+  });
+
+  it('Firefox: the loopback matches on a path boundary, so `<hash>evil` is another address', async () => {
+    const w = world({ redirect: FF_ALLIZOM });
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh() }));
+    for (const suffix of ['evil', '0', '.evil', '-x']) {
+      w.identity.respond = (u) => `${FF_LOOPBACK}${suffix}?state=${u.searchParams.get('state') ?? ''}&code=c`;
+      const e = await fails(w.provider.connect());
+      expect(e.code, suffix).toBe('unauthorized');
+      expect(e.message).toMatch(/address/);
+    }
+    expect(w.http.requests).toHaveLength(0);
+    // A sub-path of the loopback is still the loopback.
+    w.identity.respond = (u) => `${FF_LOOPBACK}/?state=${u.searchParams.get('state') ?? ''}&code=${encodeURIComponent(newCode())}`;
+    expect((await w.provider.connect()).connected).toBe(true);
   });
 
   it('reads code and state from the query only, never from the fragment', async () => {
