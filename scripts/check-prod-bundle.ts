@@ -2,7 +2,14 @@
 // .output/firefox-mv3) for tokens that must never ship, and fails on any hit:
 //   127.0.0.1  localhost  SBW_TEST  __scenario  sbw:test  innerHTML  eval(  new Function
 //
-// Single allowlist entry: Preact's own `dangerouslySetInnerHTML` handling in the
+// Two allowlist entries, nothing else:
+//
+// 1. 127.0.0.1 only as the exact prefix `http://127.0.0.1/mozoauth2/` (T-62,
+//    controller ruling): Firefox's OAuth loopback redirect, which the Google
+//    provider must build at runtime. Any other 127.0.0.1 string still fails,
+//    including the same text glued to a longer scheme (`xhttp://...`).
+//
+// 2. Preact's own `dangerouslySetInnerHTML` handling in the
 // chunk that contains the Preact runtime. Nothing else is exempt, and the same
 // token in a first-party chunk (even one that also bundles Preact) fails.
 //
@@ -45,6 +52,17 @@ export interface Finding {
   snippet: string;
 }
 
+/** The one 127.0.0.1 text production may contain (Firefox's OAuth loopback redirect). */
+export const ALLOWED_LOOPBACK_PREFIX = 'http://127.0.0.1/mozoauth2/';
+const LOOPBACK_SCHEME = 'http://';
+
+/** Whether the 127.0.0.1 at `offset` starts the allowed prefix, with no scheme character glued in front. */
+export function isAllowedLoopback(text: string, offset: number): boolean {
+  const start = offset - LOOPBACK_SCHEME.length;
+  if (start < 0 || !text.startsWith(ALLOWED_LOOPBACK_PREFIX, start)) return false;
+  return !/[A-Za-z0-9+.-]/.test(text.charAt(start - 1));
+}
+
 const PREACT_MARKERS = ['dangerouslySetInnerHTML', '__html', '__k'] as const;
 export const ALLOWED_CONTEXT = 200;
 export const MAX_PREACT_INNERHTML = 3;
@@ -79,6 +97,7 @@ export function scanText(file: string, text: string): Finding[] {
   for (const { name, pattern } of FORBIDDEN) {
     for (const match of text.matchAll(pattern)) {
       if (name === 'innerHTML' && allowed.has(match.index)) continue;
+      if (name === '127.0.0.1' && isAllowedLoopback(text, match.index)) continue;
       const { line, column } = positionOf(text, match.index);
       const start = Math.max(0, match.index - 30);
       findings.push({

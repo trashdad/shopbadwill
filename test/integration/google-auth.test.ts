@@ -149,6 +149,14 @@ const local = async () => browser.storage.local.get(null);
 const session = async () => browser.storage.session.get(null);
 const tokenPosts = () => (fake?.state.requests ?? []).filter((r) => r.method === 'POST' && r.path === '/token');
 
+/** Ruling 5: after a disconnect, sbw:google holds the client config and no grant data. */
+async function expectOnlyConfigLeft(): Promise<void> {
+  const rec = (await local())[STORAGE_KEYS.google] as Record<string, unknown> | undefined;
+  expect(rec).toMatchObject({ provider: 'pkce', clientId: CLIENT_ID, grantedScopes: [] });
+  expect(rec).not.toHaveProperty('refreshToken');
+  expect(await session()).not.toHaveProperty(STORAGE_KEYS.googleAccess);
+}
+
 describe('against the fake Google server', () => {
   it('Chrome: consent → exchange → Calendar → expired token refreshes once → revoke on disconnect', async () => {
     fake = await startFakeGoogle({ port: 0, scenario: { clientId: CLIENT_ID } });
@@ -192,15 +200,18 @@ describe('against the fake Google server', () => {
     expect(tokenPosts()).toHaveLength(3);
     expect(fake.state.requests.filter((q) => q.status === 401)).toHaveLength(before401s);
 
-    // Disconnect revokes at Google, then clears both areas.
+    // Disconnect revokes at Google, then clears the tokens and keeps the client config.
     await r.provider.disconnect();
     expect(fake.state.revokedCount).toBe(1);
-    expect(await local()).not.toHaveProperty(STORAGE_KEYS.google);
-    expect(await session()).not.toHaveProperty(STORAGE_KEYS.googleAccess);
-    expect(await r.provider.status()).toMatchObject({ connected: false, provider: 'none' });
+    await expectOnlyConfigLeft();
+    expect(await r.provider.status()).toMatchObject({ connected: false, provider: 'none', configured: true });
     expect(r.audit.kinds).toEqual(['google.connect', 'google.disconnect']);
     expect((await fails(r.provider.getAccessToken({ interactive: false }))).code).toBe('needs_interaction');
     expect(r.identity.launches).toHaveLength(1);
+
+    // Reconnect with the same client config, nothing re-entered.
+    await r.provider.connect();
+    expect(await r.calendar.calendarListGet(id)).toEqual({ id });
   });
 
   it('Firefox: the loopback redirect works end to end', async () => {
@@ -219,7 +230,7 @@ describe('against the fake Google server', () => {
 
     r.config.value = { clientId: CLIENT_ID, clientSecret: SECRET };
     await r.provider.connect();
-    // The refresh grant reuses the stored secret.
+    // The refresh grant sends the configured secret too.
     r.clock.offset = 2 * HOUR;
     fake.advanceClock(2 * HOUR);
     await r.calendar.calendarsInsert('ShopGoodwill Auctions', 'UTC');
@@ -237,16 +248,28 @@ describe('against the fake Google server', () => {
     expect(await local()).toEqual({});
   });
 
+  it('an answer delivered to another address is rejected before any exchange', async () => {
+    fake = await startFakeGoogle({ port: 0 });
+    const r = rig({ base: fake.url });
+    r.identity.tamper = (back) => {
+      back.host = 'evil.example';
+    };
+    expect((await fails(r.provider.connect())).code).toBe('unauthorized');
+    expect(tokenPosts()).toHaveLength(0);
+    expect(await local()).toEqual({});
+  });
+
   it('declined consent is user_cancelled', async () => {
     fake = await startFakeGoogle({ port: 0, scenario: { denyConsent: true } });
     const r = rig({ base: fake.url });
     expect((await fails(r.provider.connect())).code).toBe('user_cancelled');
   });
 
-  it('scope check: a consent screen that withholds the calendar scope stores nothing', async () => {
+  it('scope check: a consent screen that withholds the calendar scope is revoked and stores nothing', async () => {
     fake = await startFakeGoogle({ port: 0, scenario: { grantedScopes: [] } });
     const r = rig({ base: fake.url });
     expect((await fails(r.provider.connect())).code).toBe('insufficient_scope');
+    expect(fake.state.revokedCount).toBe(1);
     expect(await local()).toEqual({});
     expect(await session()).toEqual({});
   });
@@ -336,8 +359,7 @@ describe('against MSW on Google production hostnames', () => {
     const e = await fails(r.provider.disconnect());
     expect(e.code).toBe('offline');
     expect(e.message).toContain('myaccount.google.com');
-    expect(await local()).not.toHaveProperty(STORAGE_KEYS.google);
-    expect(await session()).not.toHaveProperty(STORAGE_KEYS.googleAccess);
+    await expectOnlyConfigLeft();
     expect(await r.provider.status()).toMatchObject({ connected: false, lastError: 'offline' });
     expect(r.audit.entries.map((x) => x.details)).toEqual([{ revoked: false, revokeError: 'offline' }]);
   });
@@ -354,7 +376,7 @@ describe('against MSW on Google production hostnames', () => {
     await seedConnected(r, r.clock.now() + HOUR);
     await r.provider.disconnect();
     expect(seen).toEqual(['application/x-www-form-urlencoded', 'token=1%2F%2F0msw-refresh-token']);
-    expect(await local()).toEqual({});
+    await expectOnlyConfigLeft();
   });
 
   const TABLE: Array<{ name: string; respond: () => Response; code: GoogleAuthErrorCode }> = [

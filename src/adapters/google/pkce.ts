@@ -1,10 +1,12 @@
 // T-62: PKCE (RFC 7636) and OAuth `state` helpers. Pure apart from WebCrypto:
 // randomness comes from crypto.getRandomValues, the challenge from SHA-256.
+// The random source is deliberately not a parameter: nothing (a test, the
+// composition root) can swap in weaker randomness. Tests stub
+// crypto.getRandomValues itself if they must.
 
-/** Fills `length` bytes from a cryptographically secure source. */
-export type RandomBytes = (length: number) => Uint8Array;
-
-export const cryptoRandomBytes: RandomBytes = (length) => crypto.getRandomValues(new Uint8Array(length));
+function randomBytes(length: number): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(length));
+}
 
 /** RFC 7636 §4.1: 43 to 128 characters from the unreserved set. */
 const VERIFIER_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
@@ -33,8 +35,8 @@ export function verifierFromBytes(bytes: Uint8Array): string {
   return base64UrlEncode(bytes);
 }
 
-export function createVerifier(random: RandomBytes = cryptoRandomBytes): string {
-  return verifierFromBytes(random(VERIFIER_BYTES));
+export function createVerifier(): string {
+  return verifierFromBytes(randomBytes(VERIFIER_BYTES));
 }
 
 /** code_challenge = BASE64URL(SHA256(ASCII(code_verifier))) (RFC 7636 §4.2, S256). */
@@ -45,6 +47,6 @@ export async function challengeS256(verifier: string): Promise<string> {
 }
 
 /** Opaque, unguessable anti-CSRF `state`, bound to one authorization request. */
-export function createState(random: RandomBytes = cryptoRandomBytes): string {
-  return base64UrlEncode(random(STATE_BYTES));
+export function createState(): string {
+  return base64UrlEncode(randomBytes(STATE_BYTES));
 }

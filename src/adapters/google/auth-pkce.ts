@@ -2,24 +2,36 @@
 // (PLAN §1.6, §3.8). `identity.launchWebAuthFlow` + authorization code + S256
 // PKCE + a refresh token, so the background can get access tokens unattended.
 //
+// Client config (controller ruling 2): the OAuth client id and secret come
+// ONLY from the injected `clientConfig()`, read on every connect and refresh.
+// T-70 supplies it from the settings the user saved; nothing here reads
+// wxt.config or build-time env, and the copy kept in `sbw:google` is never
+// used to authenticate. A config change lifts a remembered token-endpoint
+// refusal; a grant made with another client id needs a reconnect.
+//
 // Storage (ruling R1): the refresh token lives in storage.local (`sbw:google`,
 // GoogleCredentials) and the access token in storage.session only
-// (`sbw:googleAccess`). No token, code, verifier or secret is ever logged, put
-// in an audit entry, or put in an error message: errors carry an HTTP status
-// and Google's short error code at most, and a `cause` only for transport
-// errors (which never contain request bodies).
+// (`sbw:googleAccess`). disconnect() clears the tokens, the granted scopes and
+// the access expiry, and keeps the client config (ruling 5). No token, code,
+// verifier or secret is ever logged, put in an audit entry, or put in an error
+// message: errors carry an HTTP status and Google's short error code at most,
+// and a `cause` only for transport errors (which never contain request bodies).
+//
+// Grants are exact: the granted scope set must be {calendar.app.created}. A
+// grant refused at connect (no refresh token, scope missing, scope broader) is
+// revoked, best effort; a broader grant found on refresh is revoked too.
 //
 // Choices that wait on spike S-4 (not yet run) are marked `S-4 pending:`.
 import type { AuditEntry, AuditLog } from '../../domain/audit/types';
 import type { AuthStatus, GoogleAuthErrorCode } from '../../domain/calendar/types';
 import { GoogleAccessSchema, STORAGE_KEYS, type GoogleAccess } from '../../domain/storage/schema';
-import { GoogleCredentialsSchema, type GoogleCredentials } from '../../domain/types';
+import { GoogleCredentialsSchema, type EpochMs, type GoogleCredentials } from '../../domain/types';
 import type { Clock } from '../../ports/clock';
 import { GoogleAuthError, HttpNetworkError, HttpTimeoutError } from '../../ports/errors';
 import type { GoogleAuthProvider } from '../../ports/google-auth';
 import type { Http, HttpResponse } from '../../ports/http';
 import type { StorageAreas } from '../../ports/storage';
-import { challengeS256, createState, createVerifier, cryptoRandomBytes, type RandomBytes } from './pkce';
+import { challengeS256, createState, createVerifier } from './pkce';
 import { RawGoogleErrorSchema } from './schemas';
 import { OAuthErrorSchema, TokenResponseSchema, type TokenResponse } from './token-schemas';
 
@@ -36,8 +48,8 @@ export interface GoogleClientConfig {
   clientId: string;
   /**
    * S-4 pending: sent to the token endpoint only when set. A Web application
-   * client may require it even with PKCE; it is non-confidential (it ships in
-   * the build) and never enters the repo (PLAN §1.6).
+   * client may require it even with PKCE; it is non-confidential and never
+   * enters the repo (PLAN §1.6).
    */
   clientSecret?: string;
 }
@@ -58,16 +70,30 @@ export interface PkceRefreshProviderDeps {
   http: Http;
   clock: Clock;
   identity: WebAuthFlow;
-  /** The OAuth client for this browser's build; undefined (or a blank id) = not configured. */
+  /** The only source of the OAuth client (ruling 2); undefined (or a blank id) = not configured. */
   clientConfig: () => GoogleClientConfig | undefined | Promise<GoogleClientConfig | undefined>;
   badge: NeedsInteractionBadge;
   /** Connect, disconnect and needs-interaction events (codes and booleans only). */
   audit?: Pick<AuditLog, 'append'>;
   /** Tests point these at the fake Google server. */
   endpoints?: Partial<{ authorize: string; token: string; revoke: string }>;
-  random?: RandomBytes;
   requestTimeoutMs?: number;
 }
+
+/**
+ * What status() and connect() return: the port's AuthStatus, plus the refresh
+ * token's expiry when Google states one (`refresh_token_expires_in`). The
+ * frozen AuthStatusSchema has no such field and strips it in messages; it is
+ * kept in memory and re-learned on the next refresh after a worker restart.
+ */
+export type PkceAuthStatus = AuthStatus & {
+  /**
+   * S-4 pending: an app left in "Testing" gets refresh tokens that die 7 days
+   * after consent; S-4 checks whether Google states that here, so the UI can
+   * warn before the daily sync starts failing with invalid_grant.
+   */
+  refreshTokenExpiresAt?: EpochMs;
+};
 
 const DAY_MS = 86_400_000;
 /** An access token this close to expiry is refreshed first. */
@@ -86,8 +112,11 @@ const ALLIZOM_RE = /^https:\/\/([0-9a-f]{8,64})\.extensions\.allizom\.org\/$/;
 // loaded.") is treated as offline. S-4 records the real texts.
 const CANCELLED_RE = /did not approve|cancel|denied|closed/i;
 const REVOKE_HINT = 'remove ShopBadwill at https://myaccount.google.com/connections';
+const BROADER_MESSAGE = 'Google granted more than the calendar.app.created scope, so the grant was revoked';
 
 type PkceCredentials = GoogleCredentials & { refreshToken: string };
+/** A token-endpoint refusal that retrying with the same client cannot fix. */
+type Refusal = { code: 'unauthorized' | 'not_configured'; config: GoogleClientConfig };
 
 /**
  * The redirect URI for this browser, from `identity.getRedirectURL()`.
@@ -164,15 +193,28 @@ function launchFailure(e: unknown): GoogleAuthError {
     : new GoogleAuthError('offline', 'the Google sign-in window could not complete');
 }
 
-/** The authorization code from the redirect, after the state check. */
-function readRedirect(responseUrl: string, expectedState: string): { code: string; scope?: string } {
-  let params: URLSearchParams;
+/** Whether the answer came back to one of `accepted`, judged on origin + path only. */
+function deliveredTo(url: URL, accepted: readonly string[]): boolean {
+  const at = `${url.origin}${url.pathname}`;
+  return accepted.some((p) => at === p || at.startsWith(p.endsWith('/') ? p : `${p}/`));
+}
+
+/**
+ * The authorization code from the redirect. In order: the answer must come
+ * back to an accepted address, then carry this request's state; only then is
+ * anything else read, and only from the query (never the fragment).
+ */
+function readRedirect(responseUrl: string, expectedState: string, accepted: readonly string[]): { code: string; scope?: string } {
+  let url: URL;
   try {
-    params = new URL(responseUrl).searchParams;
+    url = new URL(responseUrl);
   } catch {
     throw new GoogleAuthError('unauthorized', 'the sign-in redirect was malformed');
   }
-  // First: an answer not bound to this request is rejected, whatever it says.
+  if (!deliveredTo(url, accepted)) {
+    throw new GoogleAuthError('unauthorized', 'the sign-in answer came back to an unexpected address');
+  }
+  const params = url.searchParams;
   if (params.get('state') !== expectedState) {
     throw new GoogleAuthError('unauthorized', 'OAuth state mismatch: the sign-in answer was not for this request');
   }
@@ -187,7 +229,17 @@ function readRedirect(responseUrl: string, expectedState: string): { code: strin
   return scope === null ? { code } : { code, scope };
 }
 
-const splitScopes = (scope: string): string[] => scope.split(' ').filter((s) => s !== '');
+/** The distinct granted scopes. */
+const splitScopes = (scope: string): string[] => [...new Set(scope.split(' ').filter((s) => s !== ''))];
+
+/** 'exact' = {calendar.app.created}; 'broader' = anything else is in it; 'missing' = empty. */
+function scopeVerdict(scopes: readonly string[]): 'exact' | 'broader' | 'missing' {
+  if (scopes.some((s) => s !== CALENDAR_SCOPE)) return 'broader';
+  return scopes.includes(CALENDAR_SCOPE) ? 'exact' : 'missing';
+}
+
+const sameClient = (a: GoogleClientConfig, b: GoogleClientConfig): boolean =>
+  a.clientId === b.clientId && a.clientSecret === b.clientSecret;
 
 export class PkceRefreshProvider implements GoogleAuthProvider {
   private readonly storage: StorageAreas;
@@ -198,16 +250,19 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
   private readonly badge: NeedsInteractionBadge;
   private readonly audit: Pick<AuditLog, 'append'> | undefined;
   private readonly endpoints: { authorize: string; token: string; revoke: string };
-  private readonly random: RandomBytes;
   private readonly timeoutMs: number;
 
   /**
-   * Set by invalid_grant (or a lost scope) on refresh, cleared by connect or
-   * disconnect. In memory: after a worker restart the next refresh finds the
-   * same answer and sets it again.
+   * Set by invalid_grant (or a wrong scope) on refresh, cleared by connect or
+   * disconnect. In memory (ruling 4): after a worker restart the next refresh
+   * finds the same answer and sets it again.
    */
   private needsInteraction = false;
+  /** A 401 or setup refusal from the token endpoint, kept like needsInteraction until connect or a config change. */
+  private refusal: Refusal | undefined;
   private lastError: GoogleAuthErrorCode | undefined;
+  /** From `refresh_token_expires_in`, when Google states one. */
+  private refreshTokenExpiresAt: EpochMs | undefined;
   /** Bumped when connect writes and when disconnect clears: a refresh begun before cannot write after. */
   private epoch = 0;
   private refreshing: Promise<string> | undefined;
@@ -224,7 +279,6 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
     this.badge = deps.badge;
     this.audit = deps.audit;
     this.endpoints = { ...GOOGLE_OAUTH_ENDPOINTS, ...deps.endpoints };
-    this.random = deps.random ?? cryptoRandomBytes;
     this.timeoutMs = deps.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
@@ -236,19 +290,31 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
     if (cached !== undefined && cached.expiresAt - EXPIRY_SKEW_MS > this.clock.now()) return cached.token;
 
     const creds = await this.readCredentials();
+    const config = await this.config();
     if (creds === undefined) {
       if (opts.interactive) return this.authorize();
-      const configured = (await this.config()) !== undefined;
-      throw new GoogleAuthError(configured ? 'needs_interaction' : 'not_configured', 'Google is not connected');
+      throw new GoogleAuthError(config === undefined ? 'not_configured' : 'needs_interaction', 'Google is not connected');
     }
     if (this.needsInteraction) {
       if (opts.interactive) return this.authorize();
       throw new GoogleAuthError('needs_interaction', 'Google needs the user to reconnect');
     }
+    if (config === undefined) throw new GoogleAuthError('not_configured', 'no Google OAuth client is configured');
+    if (config.clientId !== creds.clientId) {
+      // The refresh token is bound to the client that obtained it.
+      if (opts.interactive) return this.authorize();
+      throw new GoogleAuthError('needs_interaction', 'the Google grant belongs to another OAuth client; reconnect');
+    }
+    if (this.refusal !== undefined) {
+      if (!sameClient(this.refusal.config, config)) this.refusal = undefined;
+      else if (!opts.interactive) {
+        throw new GoogleAuthError(this.refusal.code, 'Google refused this OAuth client; fix the client settings or reconnect');
+      }
+    }
     try {
-      return await this.refresh(creds, epoch);
+      return await this.refresh(creds, config, epoch);
     } catch (e) {
-      // A dead or narrowed grant: a user gesture may fix it right now.
+      // A dead or wrong grant: a user gesture may fix it right now.
       if (opts.interactive && e instanceof GoogleAuthError && (e.code === 'invalid_grant' || e.code === 'insufficient_scope')) {
         return this.authorize();
       }
@@ -257,15 +323,16 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
   }
 
   /** User gesture only: opens Google's consent window. */
-  async connect(): Promise<AuthStatus> {
+  async connect(): Promise<PkceAuthStatus> {
     await this.authorize();
     return this.status();
   }
 
   /**
-   * Revokes the refresh token at Google, then clears both storage areas. If
-   * the revoke fails, storage is still cleared and the failure is thrown
-   * afterwards (and kept as `lastError`), so the user can remove the grant by hand.
+   * Revokes the refresh token at Google, then clears the tokens, granted scopes
+   * and expiry, keeping the client config (ruling 5). If the revoke fails, the
+   * tokens are still cleared and the failure is thrown afterwards (and kept as
+   * `lastError`), so the user can remove the grant by hand.
    */
   async disconnect(): Promise<void> {
     const creds = await this.readCredentials();
@@ -279,10 +346,14 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
     }
     await this.withLock(async () => {
       this.epoch += 1;
-      await this.storage.local.remove([STORAGE_KEYS.google]);
       await this.storage.session.remove([STORAGE_KEYS.googleAccess]);
+      const kept = configOnly(await this.storage.local.get<unknown>(STORAGE_KEYS.google));
+      if (kept === undefined) await this.storage.local.remove([STORAGE_KEYS.google]);
+      else await this.storage.local.set({ [STORAGE_KEYS.google]: kept });
     });
     this.needsInteraction = false;
+    this.refusal = undefined;
+    this.refreshTokenExpiresAt = undefined;
     this.lastError = revokeError?.code;
     await this.setBadge(false);
     if (creds !== undefined) {
@@ -301,9 +372,9 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
     }
   }
 
-  async status(): Promise<AuthStatus> {
+  async status(): Promise<PkceAuthStatus> {
     const creds = await this.readCredentials();
-    const configured = creds !== undefined || (await this.config()) !== undefined;
+    const configured = (await this.config()) !== undefined;
     const common = {
       needsInteraction: creds !== undefined && this.needsInteraction,
       configured,
@@ -316,6 +387,7 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
       ...(creds.account === undefined ? {} : { account: creds.account }),
       grantedScopes: [...creds.grantedScopes],
       refreshTokenAgeDays: Math.max(0, Math.floor((this.clock.now() - creds.connectedAt) / DAY_MS)),
+      ...(this.refreshTokenExpiresAt === undefined ? {} : { refreshTokenExpiresAt: this.refreshTokenExpiresAt }),
       ...common,
     };
   }
@@ -378,15 +450,21 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
   private async consent(): Promise<string> {
     const config = await this.config();
     if (config === undefined) throw new GoogleAuthError('not_configured', 'no Google OAuth client id is configured');
+    let browserRedirect: string;
     let redirectUri: string;
     try {
-      redirectUri = redirectUriFor(this.identity.getRedirectURL());
+      browserRedirect = this.identity.getRedirectURL();
+      redirectUri = redirectUriFor(browserRedirect);
     } catch (e) {
       throw e instanceof GoogleAuthError ? e : new GoogleAuthError('not_configured', 'the identity API is unavailable');
     }
+    // S-4 pending: which URL Firefox's launchWebAuthFlow hands back for the
+    // loopback flow (the loopback itself, or getRedirectURL()) is unconfirmed,
+    // so both are accepted. On Chrome the two are the same URL.
+    const accepted = [redirectUri, browserRedirect];
 
-    const verifier = createVerifier(this.random);
-    const state = createState(this.random);
+    const verifier = createVerifier();
+    const state = createState();
     const url = new URL(this.endpoints.authorize);
     url.search = new URLSearchParams({
       client_id: config.clientId,
@@ -407,7 +485,7 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
       throw launchFailure(e);
     }
     if (responseUrl === undefined || responseUrl === '') throw new GoogleAuthError('user_cancelled', 'the Google sign-in window was closed');
-    const { code, scope: redirectScope } = readRedirect(responseUrl, state);
+    const { code, scope: redirectScope } = readRedirect(responseUrl, state, accepted);
 
     const form: Record<string, string> = {
       grant_type: 'authorization_code',
@@ -420,19 +498,26 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
     if (config.clientSecret !== undefined) form['client_secret'] = config.clientSecret;
     const token = await this.tokenRequest(form);
 
-    if (token.refresh_token === undefined) {
-      throw new GoogleAuthError('needs_interaction', 'Google returned no refresh token, so background refresh is impossible');
+    const refreshToken = token.refresh_token;
+    if (refreshToken === undefined) {
+      throw await this.refuseGrant(
+        token,
+        new GoogleAuthError('needs_interaction', 'Google returned no refresh token, so background refresh is impossible'),
+      );
     }
     const grantedScopes = splitScopes(token.scope ?? redirectScope ?? '');
-    if (!grantedScopes.includes(CALENDAR_SCOPE)) {
-      throw new GoogleAuthError('insufficient_scope', 'the calendar permission was not granted');
+    const verdict = scopeVerdict(grantedScopes);
+    if (verdict === 'missing') {
+      throw await this.refuseGrant(token, new GoogleAuthError('insufficient_scope', 'the calendar permission was not granted'));
     }
+    if (verdict === 'broader') throw await this.refuseGrant(token, new GoogleAuthError('insufficient_scope', BROADER_MESSAGE));
+
     const creds: PkceCredentials = {
       provider: 'pkce',
       clientId: config.clientId,
-      // S-4 pending: kept only when configured, for the refresh grant.
+      // Kept beside the client id as the user's saved config; never read back to authenticate (ruling 2).
       ...(config.clientSecret === undefined ? {} : { clientSecret: config.clientSecret }),
-      refreshToken: token.refresh_token,
+      refreshToken,
       grantedScopes,
       connectedAt: this.clock.now(),
     };
@@ -442,40 +527,58 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
       await this.writeAccess(token);
     });
     this.needsInteraction = false;
+    this.refusal = undefined;
     this.lastError = undefined;
+    this.refreshTokenExpiresAt = this.refreshExpiry(token);
     await this.setBadge(false);
     await this.record({ actor: 'user', kind: 'google.connect', details: { provider: 'pkce', scopes: grantedScopes.join(' ') } });
     return token.access_token;
   }
 
+  /** Revokes a grant refused at connect (best effort) and hands back the error to throw. */
+  private async refuseGrant(token: TokenResponse, err: GoogleAuthError): Promise<GoogleAuthError> {
+    await this.revokeQuietly(token.refresh_token ?? token.access_token);
+    return err;
+  }
+
   // ── refresh ──────────────────────────────────────────────────────────────
 
   /** One refresh at a time; concurrent callers share it. */
-  private refresh(creds: PkceCredentials, epoch: number): Promise<string> {
-    this.refreshing ??= this.runRefresh(creds, epoch).finally(() => {
+  private refresh(creds: PkceCredentials, config: GoogleClientConfig, epoch: number): Promise<string> {
+    this.refreshing ??= this.runRefresh(creds, config, epoch).finally(() => {
       this.refreshing = undefined;
     });
     return this.refreshing;
   }
 
-  private async runRefresh(creds: PkceCredentials, epoch: number): Promise<string> {
+  private async runRefresh(creds: PkceCredentials, config: GoogleClientConfig, epoch: number): Promise<string> {
     const form: Record<string, string> = {
       grant_type: 'refresh_token',
       refresh_token: creds.refreshToken,
-      client_id: creds.clientId,
+      client_id: config.clientId,
     };
-    // S-4 pending: the secret goes with the refresh grant only if one was configured at connect.
-    if (creds.clientSecret !== undefined && creds.clientSecret !== '') form['client_secret'] = creds.clientSecret;
+    // S-4 pending: the secret goes with the refresh grant only when one is configured.
+    if (config.clientSecret !== undefined) form['client_secret'] = config.clientSecret;
 
     let token: TokenResponse;
     try {
       token = await this.tokenRequest(form);
     } catch (e) {
-      throw await this.refreshFailure(toAuthError(e), epoch);
+      throw await this.refreshFailure(toAuthError(e), epoch, config);
     }
     const grantedScopes = token.scope === undefined ? creds.grantedScopes : splitScopes(token.scope);
-    if (!grantedScopes.includes(CALENDAR_SCOPE)) {
-      throw await this.refreshFailure(new GoogleAuthError('insufficient_scope', 'the Google grant no longer includes the calendar scope'), epoch);
+    const verdict = scopeVerdict(grantedScopes);
+    if (verdict === 'broader') {
+      // More than this app may hold: revoke the whole grant (best effort) and store nothing.
+      await this.revokeQuietly(creds.refreshToken);
+      throw await this.refreshFailure(new GoogleAuthError('insufficient_scope', BROADER_MESSAGE), epoch, config);
+    }
+    if (verdict === 'missing') {
+      throw await this.refreshFailure(
+        new GoogleAuthError('insufficient_scope', 'the Google grant no longer includes the calendar scope'),
+        epoch,
+        config,
+      );
     }
 
     const rotated = token.refresh_token !== undefined && token.refresh_token !== creds.refreshToken;
@@ -490,22 +593,32 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
       return token.access_token;
     });
     this.lastError = undefined;
+    this.refusal = undefined;
+    this.refreshTokenExpiresAt = this.refreshExpiry(token) ?? this.refreshTokenExpiresAt;
     return accessToken;
   }
 
   /**
-   * Records a refresh failure. invalid_grant and a lost scope need the user:
-   * the flag and the badge go up, and nothing is cleared (the brief).
+   * Records a refresh failure. invalid_grant and a wrong scope need the user:
+   * the flag and the badge go up, and nothing is cleared (the brief). A 401 or
+   * a setup refusal is remembered for this client config, so background calls
+   * stop asking until connect or a config change.
    */
-  private async refreshFailure(err: GoogleAuthError, epoch: number): Promise<GoogleAuthError> {
+  private async refreshFailure(err: GoogleAuthError, epoch: number, config: GoogleClientConfig): Promise<GoogleAuthError> {
     if (epoch !== this.epoch) return err;
     this.lastError = err.code;
+    if (err.code === 'unauthorized' || err.code === 'not_configured') this.refusal = { code: err.code, config };
     if ((err.code === 'invalid_grant' || err.code === 'insufficient_scope') && !this.needsInteraction) {
       this.needsInteraction = true;
       await this.setBadge(true);
       await this.record({ actor: 'calendar', kind: 'google.needsInteraction', details: { error: err.code } });
     }
     return err;
+  }
+
+  private refreshExpiry(token: TokenResponse): EpochMs | undefined {
+    const seconds = token.refresh_token_expires_in;
+    return seconds === undefined ? undefined : this.clock.now() + Math.round(seconds * 1000);
   }
 
   // ── HTTP ─────────────────────────────────────────────────────────────────
@@ -530,6 +643,14 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
     // Already expired or revoked at Google: nothing is left to revoke.
     if (res.status === 400 && errorBody(res.bodyText).error === 'invalid_token') return;
     throw httpFailure('revoke endpoint', res);
+  }
+
+  private async revokeQuietly(token: string): Promise<void> {
+    try {
+      await this.revoke(token);
+    } catch {
+      // Best effort: the grant is refused either way.
+    }
   }
 
   private async postForm(url: string, form: Record<string, string>): Promise<HttpResponse> {
@@ -602,4 +723,16 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
       // Audit is best effort here.
     }
   }
+}
+
+/**
+ * What disconnect() leaves of `sbw:google` (ruling 5): the client config only.
+ * The refresh token, granted scopes and account go; `connectedAt` stays
+ * because the frozen schema requires it. An invalid record is dropped whole.
+ */
+function configOnly(raw: unknown): GoogleCredentials | undefined {
+  const parsed = GoogleCredentialsSchema.safeParse(raw);
+  if (!parsed.success) return undefined;
+  const { provider, clientId, clientSecret, connectedAt } = parsed.data;
+  return { provider, clientId, ...(clientSecret === undefined ? {} : { clientSecret }), grantedScopes: [], connectedAt };
 }

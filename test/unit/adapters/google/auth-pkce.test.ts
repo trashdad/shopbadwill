@@ -4,7 +4,7 @@
 // and the last test checks that none of them (or anything shaped like a Google
 // token) reached an error, an audit entry or the console (ruling R1).
 import fc from 'fast-check';
-import { afterAll, beforeAll, describe, expect, it, vi, type MockInstance } from 'vitest';
+import { afterAll, beforeAll, describe, expect, expectTypeOf, it, vi, type MockInstance } from 'vitest';
 
 import {
   CALENDAR_SCOPE,
@@ -13,6 +13,7 @@ import {
   classifyTokenFailure,
   redirectUriFor,
   type GoogleClientConfig,
+  type PkceRefreshProviderDeps,
   type WebAuthFlow,
 } from '../../../../src/adapters/google/auth-pkce';
 import { GoogleCalendarApi } from '../../../../src/adapters/google/calendar-api';
@@ -109,7 +110,9 @@ interface World {
 const worlds: World[] = [];
 const produced: unknown[] = [];
 
-function world(opts: { config?: GoogleClientConfig | null; redirect?: string } = {}): World {
+function world(
+  opts: { config?: GoogleClientConfig | null; redirect?: string; configFromStorage?: boolean; extraDeps?: Record<string, unknown> } = {},
+): World {
   const clock = new FakeClock(T0);
   const http = new FakeHttp(clock);
   const storage = new FakeStorageAreas();
@@ -118,14 +121,21 @@ function world(opts: { config?: GoogleClientConfig | null; redirect?: string } =
   const audit = new FakeAuditLog(clock);
   const badge = new FakeBadge();
   const config = { value: opts.config === null ? undefined : (opts.config ?? { clientId: CLIENT_ID }) };
+  // T-70's shape (controller ruling 2): the client id and secret the user saved, read back from storage.
+  const fromStorage = async (): Promise<GoogleClientConfig | undefined> => {
+    const rec = await storage.local.get<{ clientId?: string; clientSecret?: string }>(STORAGE_KEYS.google);
+    if (rec?.clientId === undefined) return undefined;
+    return rec.clientSecret === undefined ? { clientId: rec.clientId } : { clientId: rec.clientId, clientSecret: rec.clientSecret };
+  };
   const provider = new PkceRefreshProvider({
     storage,
     http,
     clock,
     identity,
-    clientConfig: () => config.value,
+    clientConfig: opts.configFromStorage === true ? fromStorage : () => config.value,
     badge,
     audit,
+    ...(opts.extraDeps as unknown as Partial<PkceRefreshProviderDeps> | undefined),
   });
   const w = { clock, http, storage, identity, audit, badge, config, provider };
   worlds.push(w);
@@ -150,12 +160,15 @@ const oauthErr = (status: number, error: string, description?: string): HttpStep
 const googleErr = (status: number, reason: string): HttpStep =>
   json({ error: { code: status, message: 'm', errors: [{ message: 'm', domain: 'usageLimits', reason }] } }, status);
 
-function tokenOk(over: { access?: string; refresh?: string | null; scope?: string | null; expiresIn?: number } = {}): HttpStep {
+function tokenOk(
+  over: { access?: string; refresh?: string | null; scope?: string | null; expiresIn?: number; refreshExpiresIn?: number } = {},
+): HttpStep {
   const body: Record<string, unknown> = {
     access_token: over.access ?? newAccess(),
     expires_in: over.expiresIn ?? 3599,
     token_type: 'Bearer',
   };
+  if (over.refreshExpiresIn !== undefined) body['refresh_token_expires_in'] = over.refreshExpiresIn;
   if (over.scope !== null) body['scope'] = over.scope ?? SCOPE;
   if (over.refresh !== null && over.refresh !== undefined) body['refresh_token'] = over.refresh;
   return json(body);
@@ -184,6 +197,20 @@ function seedConnected(w: World, over: { refresh?: string; access?: { token: str
 
 /** Everything both storage areas hold. */
 const snapshot = (w: World) => ({ local: w.storage.local.dump(), session: w.storage.session.dump() });
+
+/** After a disconnect (ruling 5): no token, scope or expiry anywhere; the client config kept. */
+function expectTokensCleared(w: World, secret?: string): void {
+  expect(w.storage.session.dump()).toEqual({});
+  expect(w.storage.local.dump()).toEqual({
+    [STORAGE_KEYS.google]: {
+      provider: 'pkce',
+      clientId: CLIENT_ID,
+      ...(secret === undefined ? {} : { clientSecret: secret }),
+      grantedScopes: [],
+      connectedAt: T0 - 3 * DAY,
+    },
+  });
+}
 
 // ── console spies (R1: the provider never logs a token) ────────────────────
 
@@ -237,6 +264,12 @@ describe('PKCE helpers (RFC 7636)', () => {
     expect(isValidVerifier('a'.repeat(129))).toBe(false);
     expect(isValidVerifier(`${'a'.repeat(42)}+`)).toBe(false);
     await expect(challengeS256('short')).rejects.toThrow(RangeError);
+  });
+
+  it('takes no random source: crypto.getRandomValues only (type-level, checked by tsc)', () => {
+    expectTypeOf(createVerifier).parameters.toEqualTypeOf<[]>();
+    expectTypeOf(createState).parameters.toEqualTypeOf<[]>();
+    expectTypeOf<PkceRefreshProviderDeps>().not.toHaveProperty('random');
   });
 
   it('draws state from crypto.getRandomValues (at least 128 bits, URL-safe, never repeated)', () => {
@@ -391,6 +424,67 @@ describe('connect()', () => {
     expect((await w.provider.status()).lastError).toBe('unauthorized');
   });
 
+  it('rejects an answer that came back to any other address, before reading its code', async () => {
+    const w = world();
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh() }));
+    const elsewhere = [
+      'https://evil.example/cb',
+      'https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/',
+      'http://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org/',
+      'https://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org.evil.example/',
+      'https://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org@evil.example/',
+    ];
+    for (const base of elsewhere) {
+      w.identity.respond = (u) => `${base}?state=${u.searchParams.get('state') ?? ''}&code=c`;
+      const e = await fails(w.provider.connect());
+      expect(e.code, base).toBe('unauthorized');
+      expect(e.message).toMatch(/address/);
+    }
+    expect(w.http.requests).toHaveLength(0);
+    expect(snapshot(w)).toEqual({ local: {}, session: {} });
+  });
+
+  it('Firefox: accepts the answer at the loopback or at getRedirectURL(), nowhere else', async () => {
+    for (const base of [FF_LOOPBACK, FF_ALLIZOM]) {
+      const w = world({ redirect: FF_ALLIZOM });
+      w.http.on(TOKEN, tokenOk({ refresh: newRefresh() }));
+      w.identity.respond = (u) => `${base}?state=${u.searchParams.get('state') ?? ''}&code=${encodeURIComponent(newCode())}`;
+      expect((await w.provider.connect()).connected).toBe(true);
+    }
+    const w = world({ redirect: FF_ALLIZOM });
+    w.identity.respond = (u) => `http://127.0.0.1/mozoauth2/${'0'.repeat(40)}?state=${u.searchParams.get('state') ?? ''}&code=c`;
+    expect((await fails(w.provider.connect())).code).toBe('unauthorized');
+    expect(w.http.requests).toHaveLength(0);
+  });
+
+  it('reads code and state from the query only, never from the fragment', async () => {
+    const w = world();
+    const real = newCode();
+    const planted = newCode();
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh() }));
+    w.identity.respond = (u) => `${CHROME_REDIRECT}?state=${u.searchParams.get('state') ?? ''}#code=${encodeURIComponent(planted)}`;
+    expect((await fails(w.provider.connect())).code).toBe('unauthorized');
+    w.identity.respond = (u) => `${CHROME_REDIRECT}#state=${u.searchParams.get('state') ?? ''}&code=${encodeURIComponent(planted)}`;
+    expect((await fails(w.provider.connect())).code).toBe('unauthorized');
+    expect(w.http.requests).toHaveLength(0);
+    w.identity.respond = (u) =>
+      `${CHROME_REDIRECT}?state=${u.searchParams.get('state') ?? ''}&code=${encodeURIComponent(real)}#code=${encodeURIComponent(planted)}`;
+    await w.provider.connect();
+    expect(forms(w, TOKEN).map((f) => f['code'])).toEqual([real]);
+  });
+
+  it('randomness is not injectable: a random source passed in deps is ignored', async () => {
+    const w = world({ extraDeps: { random: (n: number) => new Uint8Array(n) } });
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh() }));
+    const spy = vi.spyOn(globalThis.crypto, 'getRandomValues');
+    await w.provider.connect();
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
+    const zeros = base64UrlEncode(new Uint8Array(32));
+    expect(new URL(w.identity.calls[0]?.url ?? '').searchParams.get('state')).not.toBe(zeros);
+    expect(forms(w, TOKEN)[0]?.['code_verifier']).not.toBe(zeros);
+  });
+
   it('uses a fresh state and verifier for every attempt', async () => {
     const w = world();
     w.http.on(TOKEN, tokenOk({ refresh: newRefresh() }));
@@ -428,13 +522,47 @@ describe('connect()', () => {
     expect(w.http.requests).toHaveLength(0);
   });
 
-  it('scope check: a grant without calendar.app.created is insufficient_scope and stores nothing', async () => {
+  it('scope check: a grant without calendar.app.created is insufficient_scope, revoked, and stores nothing', async () => {
     const w = world();
-    w.http.on(TOKEN, tokenOk({ refresh: newRefresh(), scope: 'openid' }));
+    const refresh = newRefresh();
+    w.http.on(TOKEN, tokenOk({ refresh, scope: '' }));
+    w.http.on(REVOKE, json({}));
     const e = await fails(w.provider.connect());
     expect(e.code).toBe('insufficient_scope');
+    expect(forms(w, REVOKE)).toEqual([{ token: refresh }]);
     expect(snapshot(w)).toEqual({ local: {}, session: {} });
     expect(await w.provider.status()).toMatchObject({ connected: false, lastError: 'insufficient_scope' });
+  });
+
+  it('exact scope: a broader grant is revoked and refused, and nothing is stored', async () => {
+    const broader = [
+      `${SCOPE} https://www.googleapis.com/auth/calendar`,
+      `openid ${SCOPE}`,
+      'https://www.googleapis.com/auth/calendar',
+    ];
+    for (const scope of broader) {
+      const w = world();
+      const refresh = newRefresh();
+      w.http.on(TOKEN, tokenOk({ refresh, scope }));
+      w.http.on(REVOKE, json({}));
+      const e = await fails(w.provider.connect());
+      expect(e.code, scope).toBe('insufficient_scope');
+      expect(forms(w, REVOKE)).toEqual([{ token: refresh }]);
+      expect(snapshot(w)).toEqual({ local: {}, session: {} });
+    }
+    // The same scope listed twice is still exactly the one scope.
+    const w = world();
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh(), scope: `${SCOPE} ${SCOPE}` }));
+    expect((await w.provider.connect()).connected).toBe(true);
+  });
+
+  it('the revoke of a refused grant is best effort: its failure does not change the error', async () => {
+    const w = world();
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh(), scope: `${SCOPE} openid` }));
+    w.http.on(REVOKE, { error: new HttpNetworkError('Failed to fetch') });
+    expect((await fails(w.provider.connect())).code).toBe('insufficient_scope');
+    expect(forms(w, REVOKE)).toHaveLength(1);
+    expect(snapshot(w)).toEqual({ local: {}, session: {} });
   });
 
   it('scope check: falls back to the redirect scope when the token response has none', async () => {
@@ -443,10 +571,13 @@ describe('connect()', () => {
     expect((await w.provider.connect()).grantedScopes).toEqual([SCOPE]);
   });
 
-  it('a token response without a refresh token is refused (unattended refresh would be impossible)', async () => {
+  it('a token response without a refresh token is refused and its access token revoked', async () => {
     const w = world();
-    w.http.on(TOKEN, tokenOk({ refresh: null }));
+    const access = newAccess();
+    w.http.on(TOKEN, tokenOk({ access, refresh: null }));
+    w.http.on(REVOKE, json({}));
     expect((await fails(w.provider.connect())).code).toBe('needs_interaction');
+    expect(forms(w, REVOKE)).toEqual([{ token: access }]);
     expect(snapshot(w)).toEqual({ local: {}, session: {} });
   });
 
@@ -496,12 +627,74 @@ describe('getAccessToken()', () => {
     expect(w.identity.calls).toHaveLength(0);
   });
 
-  it('sends the stored client secret with the refresh grant', async () => {
-    const w = world();
-    seedConnected(w, { secret: SECRET });
+  it('the refresh grant takes the client id and secret from clientConfig, not from a stored copy', async () => {
+    const w = world({ config: { clientId: CLIENT_ID, clientSecret: SECRET } });
+    seedConnected(w, { secret: 'GOCSPX-stale-stored-copy' });
     w.http.on(TOKEN, tokenOk());
     await w.provider.getAccessToken({ interactive: false });
-    expect(forms(w, TOKEN)[0]?.['client_secret']).toBe(SECRET);
+    expect(forms(w, TOKEN)[0]).toMatchObject({ client_id: CLIENT_ID, client_secret: SECRET });
+
+    const plain = world();
+    seedConnected(plain, { secret: 'GOCSPX-stale-stored-copy' });
+    plain.http.on(TOKEN, tokenOk());
+    await plain.provider.getAccessToken({ interactive: false });
+    expect(forms(plain, TOKEN)[0]).not.toHaveProperty('client_secret');
+  });
+
+  it('with no client config, a stored grant cannot refresh: not_configured, no request', async () => {
+    const w = world({ config: null });
+    seedConnected(w);
+    expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe('not_configured');
+    expect(w.http.requests).toHaveLength(0);
+  });
+
+  it('a grant made with another client id needs a reconnect, with no request', async () => {
+    const w = world({ config: { clientId: 'other-client.apps.googleusercontent.com' } });
+    seedConnected(w);
+    expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe('needs_interaction');
+    expect(w.http.requests).toHaveLength(0);
+  });
+
+  it('a 401 or setup error from the token endpoint is remembered until the config changes', async () => {
+    const cases: Array<[HttpStep, GoogleAuthErrorCode]> = [
+      [oauthErr(401, 'invalid_client'), 'unauthorized'],
+      [oauthErr(400, 'invalid_request', 'client_secret is missing.'), 'not_configured'],
+    ];
+    for (const [step, code] of cases) {
+      const w = world();
+      seedConnected(w);
+      w.http.on(TOKEN, step);
+      expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe(code);
+      expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe(code);
+      expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe(code);
+      expect(forms(w, TOKEN)).toHaveLength(1);
+      expect(w.identity.calls).toHaveLength(0);
+      // The user fixes the client secret: the next background call tries again.
+      w.config.value = { clientId: CLIENT_ID, clientSecret: SECRET };
+      w.http.on(TOKEN, tokenOk());
+      await w.provider.getAccessToken({ interactive: false });
+      expect(forms(w, TOKEN)).toHaveLength(2);
+    }
+  });
+
+  it('connect lifts a remembered token-endpoint refusal', async () => {
+    const w = world();
+    seedConnected(w);
+    w.http.on(TOKEN, oauthErr(401, 'invalid_client'), tokenOk({ refresh: newRefresh() }), tokenOk());
+    await fails(w.provider.getAccessToken({ interactive: false }));
+    await w.provider.connect();
+    w.clock.advance(2 * 3_600_000);
+    await w.provider.getAccessToken({ interactive: false });
+    expect(forms(w, TOKEN).map((f) => f['grant_type'])).toEqual(['refresh_token', 'authorization_code', 'refresh_token']);
+  });
+
+  it('transient failures are not remembered', async () => {
+    const w = world();
+    seedConnected(w);
+    w.http.on(TOKEN, { error: new HttpNetworkError('Failed to fetch') }, googleErr(429, 'rateLimitExceeded'), { status: 503, bodyText: '' }, tokenOk());
+    for (let i = 0; i < 3; i++) await fails(w.provider.getAccessToken({ interactive: false }));
+    await w.provider.getAccessToken({ interactive: false });
+    expect(forms(w, TOKEN)).toHaveLength(4);
   });
 
   it('stores a rotated refresh token in storage.local', async () => {
@@ -608,10 +801,24 @@ describe('getAccessToken()', () => {
     const w = world();
     seedConnected(w);
     const before = snapshot(w);
-    w.http.on(TOKEN, tokenOk({ scope: 'openid' }));
+    w.http.on(TOKEN, tokenOk({ scope: '' }));
     expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe('insufficient_scope');
     expect(snapshot(w)).toEqual(before);
+    expect(forms(w, REVOKE)).toHaveLength(0);
     expect(await w.provider.status()).toMatchObject({ needsInteraction: true, lastError: 'insufficient_scope' });
+  });
+
+  it('exact scope on refresh: a broader grant is revoked and refused, and nothing is stored', async () => {
+    const w = world();
+    const refresh = seedConnected(w);
+    const before = snapshot(w);
+    w.http.on(TOKEN, tokenOk({ scope: `${SCOPE} https://www.googleapis.com/auth/calendar`, refresh: newRefresh() }));
+    w.http.on(REVOKE, json({}));
+    expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe('insufficient_scope');
+    expect(forms(w, REVOKE)).toEqual([{ token: refresh }]);
+    expect(snapshot(w)).toEqual(before);
+    expect(await w.provider.status()).toMatchObject({ needsInteraction: true, lastError: 'insufficient_scope' });
+    expect(w.identity.calls).toHaveLength(0);
   });
 
   it('a credentials record of another provider is not a PKCE connection', async () => {
@@ -716,7 +923,7 @@ describe('disconnect()', () => {
     expect(req?.headers?.['content-type']).toBe('application/x-www-form-urlencoded');
     expect(forms(w, REVOKE)).toEqual([{ token: refresh }]);
     expect(heldAtRevoke).toMatchObject({ refreshToken: refresh });
-    expect(snapshot(w)).toEqual({ local: {}, session: {} });
+    expectTokensCleared(w);
     expect(AuthStatusSchema.parse(await w.provider.status())).toEqual({
       connected: false,
       provider: 'none',
@@ -732,7 +939,7 @@ describe('disconnect()', () => {
     seedConnected(w);
     w.http.on(REVOKE, oauthErr(400, 'invalid_token', 'Token expired or revoked'));
     await w.provider.disconnect();
-    expect(snapshot(w)).toEqual({ local: {}, session: {} });
+    expectTokensCleared(w);
     expect((await w.provider.status()).lastError).toBeUndefined();
   });
 
@@ -744,7 +951,7 @@ describe('disconnect()', () => {
     const e = await fails(w.provider.disconnect());
     expect(e.code).toBe('offline');
     expect(e.message).toMatch(/myaccount\.google\.com/);
-    expect(snapshot(w)).toEqual({ local: {}, session: {} });
+    expectTokensCleared(w);
     expect(await w.provider.status()).toMatchObject({ connected: false, lastError: 'offline' });
     expect(w.audit.entries.map((x) => [x.kind, x.details])).toEqual([['google.disconnect', { revoked: false, revokeError: 'offline' }]]);
   });
@@ -778,7 +985,44 @@ describe('disconnect()', () => {
     await w.provider.disconnect();
     w.clock.advance(100);
     expect((await fails(pending)).code).toBe('needs_interaction');
-    expect(snapshot(w)).toEqual({ local: {}, session: {} });
+    expectTokensCleared(w);
+  });
+
+  it('keeps the client config (T-70 stored settings): a reconnect works without re-entering it', async () => {
+    const w = world({ configFromStorage: true });
+    seedConnected(w, { secret: SECRET, access: { token: newAccess(), expiresAt: T0 + 60 * 60_000 } });
+    w.http.on(REVOKE, json({}));
+    await w.provider.disconnect();
+    expectTokensCleared(w, SECRET);
+    expect(await w.provider.status()).toMatchObject({ connected: false, configured: true, grantedScopes: [] });
+
+    const refresh = newRefresh();
+    w.http.on(TOKEN, tokenOk({ refresh }));
+    expect(await w.provider.connect()).toMatchObject({ connected: true, grantedScopes: [SCOPE] });
+    expect(forms(w, TOKEN)[0]).toMatchObject({ grant_type: 'authorization_code', client_id: CLIENT_ID, client_secret: SECRET });
+    expect(w.storage.local.dump()[STORAGE_KEYS.google]).toMatchObject({ clientId: CLIENT_ID, clientSecret: SECRET, refreshToken: refresh });
+  });
+
+  it('drops grant data that is not client config (account), and an invalid record entirely', async () => {
+    const w = world();
+    w.storage.local.seed({
+      [STORAGE_KEYS.google]: {
+        provider: 'pkce',
+        clientId: CLIENT_ID,
+        refreshToken: newRefresh(),
+        grantedScopes: [SCOPE],
+        connectedAt: T0 - 3 * DAY,
+        account: 'someone@example.test',
+      },
+    });
+    w.http.on(REVOKE, json({}));
+    await w.provider.disconnect();
+    expectTokensCleared(w);
+
+    const bad = world();
+    bad.storage.local.seed({ [STORAGE_KEYS.google]: { provider: 'pkce', refreshToken: newRefresh() } });
+    await bad.provider.disconnect();
+    expect(snapshot(bad)).toEqual({ local: {}, session: {} });
   });
 });
 
@@ -873,10 +1117,31 @@ describe('status()', () => {
     });
   });
 
-  it('a stored connection counts as configured even if the build has no client id', async () => {
+  it('configured follows clientConfig only (ruling 2), even with a stored connection', async () => {
     const w = world({ config: null });
     seedConnected(w);
-    expect(await w.provider.status()).toMatchObject({ connected: true, configured: true });
+    expect(await w.provider.status()).toMatchObject({ connected: true, configured: false });
+  });
+
+  it('surfaces refresh_token_expires_in as refreshTokenExpiresAt (connect and refresh)', async () => {
+    const w = world();
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh(), refreshExpiresIn: 604_799 }), tokenOk({ refreshExpiresIn: 518_400 }));
+    expect(await w.provider.connect()).toMatchObject({ refreshTokenExpiresAt: T0 + 604_799_000 });
+    w.clock.advance(DAY);
+    expect(await w.provider.status()).toMatchObject({ refreshTokenExpiresAt: T0 + 604_799_000 });
+    await w.provider.getAccessToken({ interactive: false });
+    expect(forms(w, TOKEN)).toHaveLength(2);
+    expect(await w.provider.status()).toMatchObject({ refreshTokenExpiresAt: T0 + DAY + 518_400_000 });
+
+    w.http.on(REVOKE, json({}));
+    await w.provider.disconnect();
+    expect(await w.provider.status()).not.toHaveProperty('refreshTokenExpiresAt');
+  });
+
+  it('without refresh_token_expires_in, status() has no expiry', async () => {
+    const w = world();
+    w.http.on(TOKEN, tokenOk({ refresh: newRefresh() }));
+    expect(await w.provider.connect()).not.toHaveProperty('refreshTokenExpiresAt');
   });
 
   it('an invalid stored record is ignored (not connected), never thrown', async () => {
