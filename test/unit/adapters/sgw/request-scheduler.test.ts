@@ -10,6 +10,7 @@ import {
   MAX_RESTORED_WAIT_MS,
   PAUSE_NOTIFICATION_ID,
   STATE_READ_RETRY_MS,
+  STATE_READ_TIMEOUT_MS,
   SgwRequestScheduler,
   localDay,
   parseRetryAfter,
@@ -1314,5 +1315,73 @@ describe('RequestScheduler: hardening (review fix round 1)', () => {
       { type: 'budget-exhausted', lane: 'canary', day: '2026-10-07', budget: 2 },
       { type: 'budget-exhausted', lane: 'canary', day: '2026-10-07', budget: 4 },
     ]);
+  });
+});
+
+// T-36 R5 (carried from T-25 review): a storage read that never settles must
+// fail closed instead of hanging every lane, and dispose() must settle the queue.
+describe('RequestScheduler: T-36 hardening (read timeout, dispose)', () => {
+  const never = (): Promise<never> => new Promise<never>(() => undefined);
+
+  it('a storage get() that never settles fails closed after STATE_READ_TIMEOUT_MS: run() refuses `paused`, nothing is sent', async () => {
+    const storage = new FakeStorage();
+    const realGet = storage.get.bind(storage);
+    storage.get = never;
+    const h = setup({ storage });
+
+    const loaded = track(h.sched.load());
+    const snipe = track(h.sched.run(req('snipe')));
+    await flush();
+    expect(loaded.done).toBe(false);
+    expect(snipe.done).toBe(false);
+
+    await h.advance(STATE_READ_TIMEOUT_MS - 1);
+    expect(snipe.done).toBe(false);
+    await h.advance(1);
+    expect(loaded.value).toBe(false);
+    expect(snipe.error).toBeInstanceOf(SgwApiError);
+    expect((snipe.error as SgwApiError).kind).toBe('paused');
+    expect((snipe.error as SgwApiError).retryAfterMs).toBe(STATE_READ_RETRY_MS);
+    expect(h.sent).toHaveLength(0);
+    expect(h.events).toContainEqual({
+      type: 'state-read-failed',
+      error: `storage did not answer within ${String(STATE_READ_TIMEOUT_MS)} ms`,
+    });
+
+    // Storage recovers: the next request re-reads it and goes out.
+    storage.get = realGet;
+    await expect(h.sched.run(req('snipe'))).resolves.toBe('ok');
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('a read that answers in time leaves no timer behind', async () => {
+    const h = setup();
+    expect(await h.sched.load()).toBe(true);
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  it('dispose() rejects every queued request with `paused` and refuses new ones; the in-flight one still settles', async () => {
+    const h = setup();
+    await h.sched.load();
+    h.reply({ status: 200, bodyText: 'ok', latencyMs: 500 });
+    const first = track(h.sched.run(req('background')));
+    const queued = [track(h.sched.run(req('background'))), track(h.sched.run(req('background')))];
+    await flush();
+    expect(h.sent).toHaveLength(1);
+
+    h.sched.dispose();
+    await flush();
+    for (const q of queued) {
+      expect(q.error).toBeInstanceOf(SgwApiError);
+      expect((q.error as SgwApiError).kind).toBe('paused');
+    }
+    const late = await failure(h.sched.run(req('interactive')));
+    expect(late.kind).toBe('paused');
+
+    await h.advance(500);
+    expect(first.value).toBe('ok');
+    await h.advance(10 * MIN, MIN);
+    expect(h.sent).toHaveLength(1);
+    expect(h.clock.pendingTimers).toBe(0);
   });
 });

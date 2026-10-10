@@ -29,7 +29,9 @@
 //   asked again right before the send: a write that waited in its lane's
 //   queue is re-checked before it goes (see WRITE_GATE_MAX_AGE_MS).
 // - A reply that fails its schema throws SgwApiError('schema') and is
-//   reported to health (`flagSchemaFailure`), so writes can fail closed.
+//   reported to health (`flagSchemaFailure`), so writes can fail closed. A
+//   reply that passes it is reported too (`onSchemaOk`, T-36/T-30): health
+//   keeps a schema failure per endpoint until that endpoint answers validly.
 import type { AuditLog } from '../../domain/audit/types';
 import { formatCents } from '../../domain/money';
 import { formatPacificNaive, parsePacific } from '../../domain/time/pacific';
@@ -170,6 +172,14 @@ export interface SchemaFailure {
  */
 export interface SgwHealthFlag {
   flagSchemaFailure(f: SchemaFailure): void;
+  /**
+   * T-36 (carried from T-30): a reply from `endpoint` came back 2xx and passed
+   * its schema. Health keeps schema failures per endpoint and clears one only
+   * when the same endpoint answers validly again; without this a single failure
+   * on a write endpoint would block writes for good. Optional. It must not
+   * throw; if it does, the reply is still returned.
+   */
+  onSchemaOk?(endpoint: SgwEndpointKey): void;
 }
 
 export interface ApiAdapterDeps {
@@ -183,6 +193,13 @@ export interface ApiAdapterDeps {
   session: Pick<SgwSession, 'current' | 'reportRejected'>;
   /** The frozen port, asked before every write (ruling C1). */
   switches: GlobalSwitches;
+  /**
+   * T-36 fix round 1: the same verdict, answered synchronously. When given,
+   * build() asks it right before the send, so a kill switch flipped after the
+   * last refresh stops the write with no window (the async verdict can be up to
+   * WRITE_GATE_MAX_AGE_MS / 2 old). A throw refuses the write (fail closed).
+   */
+  writesAllowedNow?: (feature: WriteFeature) => { ok: boolean; why?: string };
   /** Records refused-write intents (T-35/T-41). */
   audit: Pick<AuditLog, 'append'>;
   health: SgwHealthFlag;
@@ -520,6 +537,8 @@ export class SgwApiAdapter implements SgwApi {
         try {
           return await this.run(endpoint, lane, request, parse, {
             beforeSend: () => {
+              const now = this.verdictNow(feature);
+              if (now !== undefined && !now.ok) throw new RefusedWrite(now.why);
               if (!verdict.ok) throw new RefusedWrite(verdict.why);
               if (clock.monotonic() - verdict.at > WRITE_GATE_MAX_AGE_MS) throw new StaleWriteGate();
             },
@@ -536,6 +555,18 @@ export class SgwApiAdapter implements SgwApi {
     } finally {
       settled = true;
       if (timer !== undefined) clock.clearTimeout(timer);
+    }
+  }
+
+  /** The synchronous verdict (writesAllowedNow), or undefined when none is wired. A throw refuses. */
+  private verdictNow(feature: WriteFeature): { ok: true } | { ok: false; why: string } | undefined {
+    const hook = this.deps.writesAllowedNow;
+    if (hook === undefined) return undefined;
+    try {
+      const v = hook(feature);
+      return v.ok ? { ok: true } : { ok: false, why: v.why ?? 'writes are not allowed' };
+    } catch {
+      return { ok: false, why: 'the write gate could not be read' };
     }
   }
 
@@ -722,7 +753,9 @@ export class SgwApiAdapter implements SgwApi {
     };
     if (opts.priority !== undefined) scheduled.priority = opts.priority;
     try {
-      return await this.deps.scheduler.run(scheduled);
+      const value = await this.deps.scheduler.run(scheduled);
+      this.schemaOk(endpoint);
+      return value;
     } catch (e) {
       if (e instanceof SgwApiError && e.kind === 'schema') this.flagSchemaFailure(endpoint, e);
       // A request that was only queued behind another request's 401 never left, so it reports nothing.
@@ -735,6 +768,15 @@ export class SgwApiAdapter implements SgwApi {
   private async reportRejected(bearer: string): Promise<void> {
     try {
       await this.deps.session.reportRejected(bearer);
+    } catch {
+      // ignored on purpose
+    }
+  }
+
+  /** A valid reply from `endpoint` (see SgwHealthFlag.onSchemaOk). A broken sink must not lose the reply. */
+  private schemaOk(endpoint: SgwEndpointKey): void {
+    try {
+      this.deps.health.onSchemaOk?.(endpoint);
     } catch {
       // ignored on purpose
     }

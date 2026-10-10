@@ -347,7 +347,7 @@ Source: S-4 (`docs/USER-STEPS/S-4-results.txt`) and the controller's T-70 ruling
 
 `AuthStatusSchema` (`src/domain/calendar/types.ts`) gains `refreshTokenExpiresAt?: EpochMs`. Google states `refresh_token_expires_in` (about 604800 s) for an app in "Testing" publishing mode, so the refresh token dies 7 days after consent. T-62's provider already keeps the value in memory (`PkceAuthStatus`); with the field in the schema it survives the `calendar.connect`, `calendar.status` and `health.get` replies, and the options page can warn before the daily sync starts failing with `invalid_grant`. Optional, so no migration and no change for providers that cannot state it. `test/contract/types/spec-shapes.test.ts` and `examples/AuthStatus.valid.json` are updated.
 
-**Follow-up for the next PLAN edit.** Add the field to PLAN §3.8 `AuthStatus` and contracts.md.
+**Follow-up for the next PLAN edit.** Add the field to PLAN Â§3.8 `AuthStatus` and contracts.md.
 
 ## T-70 contract change: new optional storage key `sbw:googleClient`
 
@@ -357,10 +357,10 @@ The options page used to write the pasted client into `sbw:google`, where the ba
 
 - The options page is its only writer and validates against the schema before writing. It never touches `sbw:google`.
 - T-36's `clientConfig()` reads `sbw:googleClient` (carried by the controller). T-62's own copy of the client in `sbw:google` is never used to authenticate.
-- The secret is never rendered back beyond "••••" plus the last 4 characters, and is never logged, audited or put in an error.
+- The secret is never rendered back beyond "â€¢â€¢â€¢â€¢" plus the last 4 characters, and is never logged, audited or put in an error.
 - `test/contract/types/storage.test.ts` pins the key and schema; `test/dom/options-google.test.ts` pins that saving leaves `sbw:google` byte-identical.
 
-**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+**Follow-up for the next PLAN edit.** Add the key to PLAN Â§2.3 and contracts.md.
 
 ## T-30 contract change: new optional storage key `sbw:healthReport`
 
@@ -402,3 +402,13 @@ Before this change, the reply could only be held in the runner's memory (the sto
 - `test/unit/domain/snipe/state-machine.test.ts`: covers a restart round trip through `SnipeSchema` (accepted reply, then an anonymous post-read under the max, resolves to Won), one reply per attempt, and the ambiguous-plus-reply record.
 
 **Follow-up for the next PLAN edit.** Add `reply?: BidResult` to `Snipe.attempt` in PLAN Â§3.9 and in `contracts.md`.
+
+## T-36 ruling: calendar writes are not gated by the SGW session (Â§3.3 note)
+
+Source: controller ruling on T-36 concern 2.
+
+Â§3.3's fail-closed rule lists four conditions for `GlobalSwitches.writesAllowed(feature)`. For `feature === 'calendar'`, the SGW-session condition (`SgwSession.state()` neither `'ok'` nor `'expiring'`) does not apply: calendar writes go to Google, not to SGW, so a lapsed SGW sign-in must not stop calendar sync. The other conditions still apply to calendar: the kill switch, `dryRun.calendar`, and a failing SGW HealthReport within 24 h (drifted SGW data could carry wrong end times). The storage-repair block (migrate() meta-corrupt or failed, T-33 carry) applies to every feature. `favorites` and `bidding` keep all four conditions.
+
+The port type (`src/ports/global-switches.ts`) is unchanged. `src/background/switches.ts` implements the rule, and `test/integration/background-main.test.ts` pins it ("calendar is exempt from the SGW session, but not from SGW health, the kill switch or dryRun.calendar").
+
+**Follow-up for the next PLAN edit.** Add the exemption to the fail-closed rule in PLAN Â§3.3 and contracts.md.
