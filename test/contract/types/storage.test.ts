@@ -48,6 +48,8 @@ const LOCAL_KEYS = [
   'sbw:requestBudget',
   'sbw:requestSchedulerState',
   'sbw:awake',
+  'sbw:healthReport',
+  'sbw:healthProbe',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -76,6 +78,13 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:clock': [example('ClockSample')],
   'sbw:googleAccess': example('GoogleAccess'),
   'sbw:runtimeHealth': example('HealthReport'),
+  'sbw:healthReport': example('HealthReport'),
+  'sbw:healthProbe': {
+    probedAt: 1791400000000,
+    firstSeenAt: 1791300000000,
+    lastGoodProbeAt: { search: 1791400000000 },
+    sticky: [{ endpoint: 'favorites', at: 1791400000000, detail: 'bad rows' }],
+  },
 };
 
 describe('storage schema v1', () => {
