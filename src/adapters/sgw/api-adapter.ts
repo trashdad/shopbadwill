@@ -29,7 +29,9 @@
 //   asked again right before the send: a write that waited in its lane's
 //   queue is re-checked before it goes (see WRITE_GATE_MAX_AGE_MS).
 // - A reply that fails its schema throws SgwApiError('schema') and is
-//   reported to health (`flagSchemaFailure`), so writes can fail closed.
+//   reported to health (`flagSchemaFailure`), so writes can fail closed. A
+//   reply that passes it is reported too (`onSchemaOk`, T-36/T-30): health
+//   keeps a schema failure per endpoint until that endpoint answers validly.
 import type { AuditLog } from '../../domain/audit/types';
 import { formatCents } from '../../domain/money';
 import { formatPacificNaive, parsePacific } from '../../domain/time/pacific';
@@ -170,6 +172,14 @@ export interface SchemaFailure {
  */
 export interface SgwHealthFlag {
   flagSchemaFailure(f: SchemaFailure): void;
+  /**
+   * T-36 (carried from T-30): a reply from `endpoint` came back 2xx and passed
+   * its schema. Health keeps schema failures per endpoint and clears one only
+   * when the same endpoint answers validly again; without this a single failure
+   * on a write endpoint would block writes for good. Optional. It must not
+   * throw; if it does, the reply is still returned.
+   */
+  onSchemaOk?(endpoint: SgwEndpointKey): void;
 }
 
 export interface ApiAdapterDeps {
@@ -722,7 +732,9 @@ export class SgwApiAdapter implements SgwApi {
     };
     if (opts.priority !== undefined) scheduled.priority = opts.priority;
     try {
-      return await this.deps.scheduler.run(scheduled);
+      const value = await this.deps.scheduler.run(scheduled);
+      this.schemaOk(endpoint);
+      return value;
     } catch (e) {
       if (e instanceof SgwApiError && e.kind === 'schema') this.flagSchemaFailure(endpoint, e);
       // A request that was only queued behind another request's 401 never left, so it reports nothing.
@@ -735,6 +747,15 @@ export class SgwApiAdapter implements SgwApi {
   private async reportRejected(bearer: string): Promise<void> {
     try {
       await this.deps.session.reportRejected(bearer);
+    } catch {
+      // ignored on purpose
+    }
+  }
+
+  /** A valid reply from `endpoint` (see SgwHealthFlag.onSchemaOk). A broken sink must not lose the reply. */
+  private schemaOk(endpoint: SgwEndpointKey): void {
+    try {
+      this.deps.health.onSchemaOk?.(endpoint);
     } catch {
       // ignored on purpose
     }

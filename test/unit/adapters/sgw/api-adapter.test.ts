@@ -146,6 +146,7 @@ function setup(opts: SetupOpts = {}) {
   const audit = new FakeAuditLog(clock);
   const switches = new DelayedSwitches(clock);
   const failures: SchemaFailure[] = [];
+  const schemaOks: string[] = [];
   const rejections = { count: 0, bearers: [] as string[] };
   const sessionBox = {
     value: opts.session === undefined ? { bearer: BEARER, expiresAt: T0 + 24 * 60 * MIN, buyerId: '42' } : opts.session,
@@ -167,10 +168,13 @@ function setup(opts: SetupOpts = {}) {
       flagSchemaFailure: (f) => {
         failures.push(f);
       },
+      onSchemaOk: (endpoint) => {
+        schemaOks.push(endpoint);
+      },
     },
     sgwClock: opts.sgwClock ?? new SgwClockAdapter(clock),
   });
-  return { clock, http, inner, scheduler, audit, switches, failures, rejections, sessionBox, api };
+  return { clock, http, inner, scheduler, audit, switches, failures, schemaOks, rejections, sessionBox, api };
 }
 
 type Setup = ReturnType<typeof setup>;
@@ -1124,6 +1128,62 @@ describe('schema failure → SgwApiError(schema) and health flagged', () => {
     t.http.on(`${BASE}ItemBid/ShowBidModal`, { status: 403, bodyText: '' });
     await rejectsWith(t.api.showBidModal(ITEM), 'blocked');
     expect(t.failures).toHaveLength(0);
+  });
+});
+
+// T-36 (carried from T-30): health keeps schema failures per endpoint until the
+// same endpoint answers validly again, so a schema-valid reply must say so.
+describe('onSchemaOk: a schema-valid reply reports its endpoint (clears a sticky schema failure)', () => {
+  it('reads and writes report their endpoint once per valid reply', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'interactive');
+    await t.api.itemDetail(ITEM, 'interactive');
+    await t.api.favorites('open', 'interactive');
+    await t.api.addFavorite(ITEM);
+    expect(t.schemaOks).toEqual(['search', 'itemDetail', 'favorites', 'addFavorite']);
+    expect(t.failures).toEqual([]);
+  });
+
+  it('a schema failure, a non-2xx answer or a cache hit reports nothing', async () => {
+    const t = setup();
+    t.http.on(`${BASE}Search/ItemListing`, json({ nope: true }));
+    await rejectsWith(t.api.search(PYREX, 'interactive'), 'schema');
+    t.http.on(`${BASE}ItemDetail/`, { status: 404, bodyText: '' });
+    await rejectsWith(t.api.itemDetail(ITEM, 'interactive'), 'server');
+    expect(t.schemaOks).toEqual([]);
+
+    t.http.on(`${BASE}ItemDetail/`, json(loadFixture('item-detail-open')));
+    await t.api.itemDetail(ITEM, 'interactive');
+    await t.api.itemDetail(ITEM, 'interactive'); // served from the adapter's cache: no reply, nothing to report
+    expect(t.schemaOks).toEqual(['itemDetail']);
+  });
+
+  it('is optional, and a throwing hook never hides the reply', async () => {
+    const clock = new FakeClock(T0);
+    const http = new FakeHttp(clock);
+    const scheduler = new SgwRequestScheduler({ clock, http, storage: new FakeStorage(), lanes: FAST_LANES });
+    const deps = {
+      scheduler,
+      clock,
+      session: { current: () => Promise.resolve(null), reportRejected: () => Promise.resolve() },
+      switches: new FakeSwitches(),
+      audit: new FakeAuditLog(clock),
+      sgwClock: new SgwClockAdapter(clock),
+    };
+    scriptAll(http);
+    const without = new SgwApiAdapter({ ...deps, health: { flagSchemaFailure: () => undefined } });
+    await expect(without.itemDetail(ITEM, 'interactive')).resolves.toMatchObject({ itemId: ITEM });
+    const throwing = new SgwApiAdapter({
+      ...deps,
+      health: {
+        flagSchemaFailure: () => undefined,
+        onSchemaOk: () => {
+          throw new Error('sink broke');
+        },
+      },
+    });
+    await expect(throwing.search(PYREX, 'interactive')).resolves.toMatchObject({ page: 1 });
   });
 });
 
