@@ -19,13 +19,20 @@ import { JOB_MODULES } from '../../src/background/jobs/index';
 import type { BackgroundContext, BackgroundModule, ModuleMap, RuntimePort } from '../../src/background/context';
 import {
   KILL_COMMAND,
+  MIGRATE_TIMEOUT_MS,
   STARTUP_DEADLINE_MS,
   startBackground,
   type BackgroundBrowser,
   type BackgroundHandle,
 } from '../../src/background/main';
 import type { MessageResponse, RouterSender } from '../../src/background/router';
-import { HEALTH_WINDOW_MS, WRITE_FEATURES, type Switches } from '../../src/background/switches';
+import {
+  HEALTH_WINDOW_MS,
+  SWITCHES_LOAD_TIMEOUT_MS,
+  SWITCHES_RETRY_MS,
+  WRITE_FEATURES,
+  type Switches,
+} from '../../src/background/switches';
 import { HEALTH_REPROBE_MIN_MS, UNKNOWN_PREFIX } from '../../src/adapters/sgw/health';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
@@ -552,7 +559,7 @@ describe('GlobalSwitches: an in-memory snapshot (R2)', () => {
   it('fails closed before the snapshot is loaded', () => {
     const h = boot();
     expect(h.handle.switches.loaded).toBe(false);
-    expect(h.handle.switches.verdict('favorites')).toEqual({ ok: false, why: 'starting: the switch state is not loaded yet' });
+    expect(h.handle.switches.verdictNow('favorites')).toEqual({ ok: false, why: 'starting: the switch state is not loaded yet' });
   });
 
   it.each([
@@ -879,7 +886,12 @@ describe('wiring', () => {
     const fetchSpy = vi.fn(() => Promise.reject(new Error('no network in tests')));
     vi.stubGlobal('fetch', fetchSpy);
     const h = boot();
+    // Lifecycle events before ready (replayed) and after.
+    for (const l of h.fb.onInstalled.listeners) l({ reason: 'install' });
+    for (const l of h.fb.onStartup.listeners) l();
     const ctx = await h.handle.ready;
+    for (const l of h.fb.onInstalled.listeners) l({ reason: 'update', previousVersion: '0.0.0' });
+    for (const l of h.fb.onStartup.listeners) l();
     await flush();
     h.clock.advance(10 * MIN);
     await flush();
@@ -1044,5 +1056,271 @@ describe('wiring', () => {
     // Card drift is never a failure (T-30), and the probe found no network: one search attempt in all.
     expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: true });
     expect(h.http.requests).toHaveLength(1);
+  });
+});
+
+// ── Fix round 1 (review) ─────────────────────────────────────────────────────
+
+/** Storage whose `local.get(key)` can be held: `hold(key)` makes the next reads of it wait (stale value captured at the read). */
+function holdableAreas(): {
+  areas: FakeStorageAreas;
+  hold: (key: string) => void;
+  release: () => void;
+  hangForever: (key: string) => void;
+  unhang: (key: string) => void;
+} {
+  const areas = new FakeStorageAreas();
+  const realGet = areas.local.get.bind(areas.local);
+  const held = new Set<string>();
+  const forever = new Set<string>();
+  let gate = deferred();
+  areas.local.get = async <T>(key: string): Promise<T | undefined> => {
+    if (forever.has(key)) return new Promise<T | undefined>(() => undefined);
+    if (!held.has(key)) return realGet<T>(key);
+    const stale = await realGet<T>(key); // what the read saw when it started
+    held.delete(key); // only the first read waits
+    await gate.promise;
+    return stale;
+  };
+  return {
+    areas,
+    hold: (key) => {
+      gate = deferred();
+      held.add(key);
+    },
+    release: () => {
+      gate.resolve();
+    },
+    hangForever: (key) => {
+      forever.add(key);
+    },
+    unhang: (key) => {
+      forever.delete(key);
+    },
+  };
+}
+
+describe('fix round 1: startup timeouts', () => {
+  it('a snapshot load that does not answer fails closed; ready still resolves; the 30 s retry loads it', async () => {
+    const s = holdableAreas();
+    s.hangForever(STORAGE_KEYS.settings);
+    const h = boot({ areas: s.areas });
+    await flush();
+    h.clock.advance(SWITCHES_LOAD_TIMEOUT_MS);
+    const ctx = await h.handle.ready;
+    expect(ctx.switches.loaded).toBe(false);
+    expect(await ctx.switches.writesAllowed('favorites')).toEqual({ ok: false, why: 'starting: the switch state is not loaded yet' });
+
+    // Storage answers again: the retry 30 s later loads the snapshot.
+    s.unhang(STORAGE_KEYS.settings);
+    h.clock.advance(SWITCHES_RETRY_MS - 1);
+    await flush();
+    expect(ctx.switches.loaded).toBe(false);
+    h.clock.advance(1);
+    // The retried load reads the session, which hashes the token (crypto.subtle): wait for the condition.
+    await vi.waitFor(() => {
+      expect(ctx.switches.loaded).toBe(true);
+    });
+    expect(await verdicts(ctx.switches)).toEqual(ALL_OK);
+  });
+
+  it(`a migrate() that does not answer within ${String(MIGRATE_TIMEOUT_MS)} ms fails closed like meta-corrupt; startup continues`, async () => {
+    const s = holdableAreas();
+    s.hangForever(STORAGE_KEYS.meta);
+    const h = boot({ areas: s.areas });
+    await flush();
+    h.clock.advance(MIGRATE_TIMEOUT_MS);
+    const ctx = await h.handle.ready;
+    expect(ctx.startup.migration).toBeNull();
+    expect(ctx.startup.storageProblem).toContain('did not answer');
+    for (const f of WRITE_FEATURES) {
+      const v = await ctx.switches.writesAllowed(f);
+      expect(v.ok, f).toBe(false);
+      expect(v.why, f).toContain('storage needs repair');
+    }
+    const health = (await h.ok('health.get')) as { sgw: HealthReport | null };
+    expect(health.sgw?.ok).toBe(false);
+    // Reads still serve.
+    expect((await h.send('settings.get')).ok).toBe(true);
+  });
+});
+
+describe('fix round 1: startup kill races, each guard on its own', () => {
+  it('a kill persisted while the snapshot load was reading is kept (killWrites guard), even before its onChanged arrives', async () => {
+    const s = holdableAreas();
+    // Deliver no local onChanged event until the end, so only the killWrites guard can keep the kill.
+    const realOnChanged = s.areas.local.onChanged.bind(s.areas.local);
+    const late: Array<() => void> = [];
+    let deferEvents = true;
+    s.areas.local.onChanged = (cb) =>
+      realOnChanged((changes) => {
+        if (deferEvents) {
+          late.push(() => {
+            cb(changes);
+          });
+        } else {
+          cb(changes);
+        }
+      });
+    s.hold(STORAGE_KEYS.settings); // the snapshot read starts, sees killSwitch false, and waits
+    const h = boot({ areas: s.areas });
+    await flush();
+    for (const l of h.fb.onCommand.listeners) l(KILL_COMMAND);
+    await flush(); // the kill is persisted while the load still waits
+    expect((s.areas.local.dump()[STORAGE_KEYS.settings] as Settings).killSwitch).toBe(true);
+    s.release();
+    const ctx = await h.handle.ready;
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: false, why: 'kill switch is on' });
+    deferEvents = false;
+    for (const fire of late.splice(0)) fire();
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: false, why: 'kill switch is on' });
+  });
+
+  it('a kill another context stored while the snapshot load was reading is applied after it (the queued onChanged)', async () => {
+    const s = holdableAreas();
+    s.hold(STORAGE_KEYS.settings); // the snapshot read sees killSwitch false and waits
+    const h = boot({ areas: s.areas });
+    await flush();
+    // Another worker (not this one's setKill, so no killWrites bump) stores the kill.
+    await s.areas.local.set({ [STORAGE_KEYS.settings]: liveSettings({ killSwitch: true }) });
+    s.release();
+    const ctx = await h.handle.ready;
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: false, why: 'kill switch is on' });
+  });
+});
+
+describe('fix round 1: GlobalSwitches details', () => {
+  it('a report older than a flagged schema failure does not clear it; one at or after it does', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    h.clock.advance(MIN);
+    ctx.switches.flagSchemaFailure({ endpoint: 'itemDetail', message: 'drift', at: h.clock.now() });
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: false, why: 'health check failed' });
+    ctx.switches.noteHealthReport(report(true, h.clock.now() - 1));
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: false, why: 'health check failed' });
+    ctx.switches.noteHealthReport(report(true, h.clock.now()));
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: true });
+  });
+
+  it('verdictNow answers synchronously, the same as writesAllowed', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    expect(ctx.switches.verdictNow('bidding')).toEqual({ ok: true });
+    void ctx.switches.setKill(true, 'test');
+    expect(ctx.switches.verdictNow('bidding')).toEqual({ ok: false, why: 'kill switch is on' });
+  });
+
+  it('feeds the one SgwClock: a GetCurrentTime reply sets the offset; re-adding the returned sample is a no-op', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    expect(ctx.sgwClock.offset()).toBeNull();
+    h.http.on(`${API}Dashboard/GetCurrentTime`, { status: 200, bodyText: JSON.stringify(loadFixture('get-current-time')) });
+    const sample = await ctx.api.serverTimeSample();
+    expect(ctx.sgwClock.offset()).toMatchObject({ samples: 1 });
+    ctx.sgwClock.addSample(sample);
+    expect(ctx.sgwClock.offset()).toMatchObject({ samples: 1 });
+    ctx.sgwClock.addSample({ ...sample }); // a different sample object counts
+    expect(ctx.sgwClock.offset()).toMatchObject({ samples: 2 });
+  });
+});
+
+describe('fix round 1: defence in depth for content-only handlers', () => {
+  const detail = {
+    ...listing(5),
+    pickupOnly: false,
+    minimumBid: 1400,
+    bidIncrement: 100,
+    serverTime: new Date(T0).toISOString(),
+    serverTimeRaw: '2026-10-10T08:00:00',
+    isClosed: false,
+    isHighBidder: null,
+    inWatchlist: null,
+    bidHistory: [],
+  };
+  it.each([
+    ['page.listings', { url: 'https://shopgoodwill.com/a', listings: [listing(1)], capturedAt: T0 }],
+    ['page.detail', { detail }],
+    ['page.token', { bearer: BEARER, capturedAt: T0 }],
+    ['page.domHealth', { url: 'https://shopgoodwill.com/a', configVersion: 'v1', pageKind: 'search', cardsFound: 1, fallbackUsed: false }],
+    ['quick.hideSeller', { sellerId: 1, sellerName: 'x' }],
+    ['quick.hideKeyword', { term: 'lot' }],
+    ['quick.favorite', { itemId: 1 }],
+    ['quick.track', { itemId: 1 }],
+  ])('%s from an extension page (UI) is refused by the handler itself', async (type, payload) => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    const observe = vi.spyOn(ctx.session, 'observe');
+    const before = h.areas.local.dump();
+    expect(await h.send(type, payload, UI)).toEqual({
+      ok: false,
+      error: { code: 'handler_error', message: `only a content script may send "${type}"` },
+    });
+    expect(observe).not.toHaveBeenCalled();
+    expect(ctx.pages.listingsFor()).toBeUndefined();
+    expect(ctx.pages.domReport()).toBeNull();
+    expect(h.areas.local.dump()).toEqual(before);
+  });
+});
+
+describe('fix round 1: no post-kill window in the write path (T-26 writesAllowedNow)', () => {
+  it('a kill flipped between enqueue and build: the write never reaches HTTP', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    h.http.on(`${API}Search/ItemListing`, { status: 200, bodyText: JSON.stringify(emptySearch()) });
+    h.http.on(`${API}Favorite/AddToFavorite`, { status: 200, bodyText: JSON.stringify({ message: 'Ok', status: true, type: null, primaryKey: null, isUnauthorized: false }) });
+    await ctx.api.search({ searchText: 'pyrex', categoryIds: [], sellerIds: [], page: 1 }, 'background'); // starts the 120 s gap
+    const write = ctx.api.addFavorite(55).catch((e: unknown) => e);
+    await flush();
+    for (let t = 0; t < 120_000 - 1; t += 250) {
+      h.clock.advance(Math.min(250, 120_000 - 1 - t));
+      await flush(1);
+    }
+    // The last refresh said ok; the kill lands 1 ms before the write's turn.
+    void ctx.switches.setKill(true, 'test');
+    h.clock.advance(1);
+    const err = await write;
+    expect(err).toMatchObject({ kind: 'paused', message: 'kill switch is on' });
+    expect(h.http.requests.map((r) => r.url)).toEqual([`${API}Search/ItemListing`]);
+  });
+});
+
+describe('fix round 1: broadcasts reach content scripts (T-32 carry)', () => {
+  it('rules.changed and switches.changed go to every open SGW tab via tabs.sendMessage; no receiver is fine', async () => {
+    const h = boot();
+    await h.handle.ready;
+    // Tab 9 has no content script: "no receiver". Tab 7 receives.
+    h.fb.tabsSend.mockImplementation((tabId: number) =>
+      tabId === 9 ? Promise.reject(new Error('Could not establish connection. Receiving end does not exist.')) : Promise.resolve(undefined),
+    );
+    await h.ok('quick.hideSeller', { sellerId: 123, sellerName: 'Goodwill of Example' }, CONTENT);
+    await h.ok('kill.set', { on: true });
+    await flush();
+    expect(h.fb.tabsQuery).toHaveBeenCalledWith({ url: ['https://shopgoodwill.com/*'] });
+    const toTab = (tabId: number): string[] =>
+      h.fb.tabsSend.mock.calls.filter(([id]) => id === tabId).map(([, m]) => (m as { type: string }).type);
+    expect(toTab(7)).toEqual(['rules.changed', 'switches.changed']);
+    expect(toTab(9)).toEqual(['rules.changed', 'switches.changed']);
+    expect(h.fb.tabsSend.mock.calls[0]?.[1]).toMatchObject({ v: 1, type: 'rules.changed', reqId: expect.any(String) as unknown });
+
+    // A failing tabs.query (and no page open) never fails the change.
+    h.fb.tabsQuery.mockRejectedValueOnce(new Error('tabs unavailable'));
+    expect(await h.send('kill.set', { on: false })).toEqual({ ok: true });
+  });
+
+  it('quick.hideSeller without a seller name builds the rule from sellerId (the seller condition matches ids)', async () => {
+    const h = boot();
+    await h.handle.ready;
+    await h.ok('quick.hideSeller', { sellerId: 321, sellerName: '' }, CONTENT);
+    expect(h.areas.local.dump()[STORAGE_KEYS.rules]).toEqual([
+      expect.objectContaining({
+        id: 'quick:seller:321',
+        name: 'Hide seller: seller 321',
+        all: [{ kind: 'seller', mode: 'include', sellerIds: [321], sellerNames: [] }],
+      }),
+    ]);
+    const evaluated = (await h.ok('rules.evaluate', { listings: [listing(1, { sellerId: 321 }), listing(2)] }, CONTENT)) as Array<{
+      decision: string;
+    }>;
+    expect(evaluated.map((r) => r.decision)).toEqual(['hide', 'none']);
   });
 });

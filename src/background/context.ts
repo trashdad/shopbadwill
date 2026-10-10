@@ -484,6 +484,15 @@ function last<K, V>(map: Map<K, V>): V | undefined {
   return out;
 }
 
+/**
+ * Defence in depth (T-36 fix round 1): the router lets extension pages send the
+ * content types too, so handlers that act on page data (`page.*`, `quick.*`)
+ * refuse any sender that is not a content script.
+ */
+export function requireContent(type: string, hctx: HandlerContext): void {
+  if (hctx.senderClass !== 'content') throw new Error(`only a content script may send "${type}"`);
+}
+
 /** `sender.tab.id` of a content message, when there is one. */
 export function tabIdOf(sender: { tab?: unknown }): number | undefined {
   const tab = sender.tab;

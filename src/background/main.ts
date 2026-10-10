@@ -13,7 +13,8 @@
 //       actions, permission removals (held and replayed), and the kill-switch
 //       command (Alt+Shift+K), which acts at once;
 //   then, asynchronously (R4):
-//     1. migrate() (meta-corrupt or a failure blocks every write);
+//     1. migrate() (meta-corrupt, a failure, or no answer within
+//        MIGRATE_TIMEOUT_MS blocks every write; startup continues);
 //     2. loads the GlobalSwitches snapshot;
 //     3. builds the single RequestScheduler and awaits scheduler.load();
 //     4. registers every handler and job module (handlers/index.ts, jobs/index.ts);
@@ -64,6 +65,7 @@ import {
   PageStore,
   SettingsSetInterceptors,
   toDiscoveryReport,
+  withTimeout,
   type BackgroundContext,
   type BackgroundHealth,
   type BroadcastPayload,
@@ -84,6 +86,12 @@ export const STARTUP_DEADLINE_MS = 15_000;
 export const STARTING_MESSAGE = 'ShopBadwill is still starting; try again in a moment.';
 /** Most messages held while starting; more are answered "starting" at once. */
 const MAX_HELD_MESSAGES = 100;
+/**
+ * migrate() fails closed when storage has not answered after this long: every
+ * write is blocked (as for meta-corrupt), startup continues, and the next
+ * worker start runs migrate() again.
+ */
+export const MIGRATE_TIMEOUT_MS = 10_000;
 
 // ── The browser slice used directly here ────────────────────────────────────
 
@@ -271,7 +279,7 @@ export function startBackground(opts: StartBackgroundOptions): BackgroundHandle 
     let migration: MigrateResult | null = null;
     let storageProblem: string | null = null;
     try {
-      migration = await migrate(repo);
+      migration = await withTimeout(clock, migrate(repo), MIGRATE_TIMEOUT_MS, 'storage (migrate)');
       if (migration.health === 'meta-corrupt') {
         storageProblem = 'sbw:meta is unreadable and some records are invalid (meta-corrupt)';
         log(`background: ${storageProblem}; every write stays blocked`);
@@ -303,6 +311,8 @@ export function startBackground(opts: StartBackgroundOptions): BackgroundHandle 
       clock,
       session,
       switches,
+      // No window between the last verdict refresh and the send (kill switch, R3).
+      writesAllowedNow: (feature) => switches.verdictNow(feature),
       audit,
       health: {
         // Writes fail closed at once; T-30 stores the sticky per-endpoint failure.

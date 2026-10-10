@@ -14,11 +14,12 @@
 //   reason 'manual'. An item no page reported cannot be tracked (no end time).
 //
 // Seller names and terms are untrusted page text: stored as data, rendered as
-// text only.
+// text only. Every one of them refuses a sender that is not a content script,
+// on top of the router's checks (requireContent).
 import type { Rule } from '../../domain/rules/schema';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import type { ItemId, TrackedItem } from '../../domain/types';
-import type { BackgroundContext } from '../context';
+import { requireContent, type BackgroundContext } from '../context';
 import { unfavoriteRef } from '../jobs/steps/favorite';
 import { saveRule } from './rules';
 
@@ -29,7 +30,8 @@ const NAME_MAX_CHARS = 120;
 export function register(ctx: BackgroundContext): void {
   const { router } = ctx;
 
-  router.register('quick.hideSeller', async ({ sellerId, sellerName }) => {
+  router.register('quick.hideSeller', async ({ sellerId, sellerName }, hctx) => {
+    requireContent('quick.hideSeller', hctx);
     const name = sellerName.trim() === '' ? `seller ${String(sellerId)}` : sellerName.trim();
     await quickHide(ctx, `quick:seller:${String(sellerId)}`, `Hide seller: ${name}`, [
       { kind: 'seller', mode: 'include', sellerIds: [sellerId], sellerNames: [] },
@@ -37,7 +39,8 @@ export function register(ctx: BackgroundContext): void {
     return undefined;
   });
 
-  router.register('quick.hideKeyword', async ({ term }) => {
+  router.register('quick.hideKeyword', async ({ term }, hctx) => {
+    requireContent('quick.hideKeyword', hctx);
     const t = term.trim();
     if (t === '') throw new Error('An empty keyword would hide every listing.');
     if (t.length > QUICK_TERM_MAX_CHARS) throw new Error(`Keywords are limited to ${String(QUICK_TERM_MAX_CHARS)} characters.`);
@@ -47,12 +50,14 @@ export function register(ctx: BackgroundContext): void {
     return undefined;
   });
 
-  router.register('quick.favorite', async ({ itemId }) => {
+  router.register('quick.favorite', async ({ itemId }, hctx) => {
+    requireContent('quick.favorite', hctx);
     await quickFavorite(ctx, itemId);
     return undefined;
   });
 
-  router.register('quick.track', async ({ itemId }) => {
+  router.register('quick.track', async ({ itemId }, hctx) => {
+    requireContent('quick.track', hctx);
     await quickTrack(ctx, itemId);
     return undefined;
   });

@@ -145,11 +145,11 @@ export class Switches implements GlobalSwitches {
 
   /** In memory only: no storage, session or browser call. */
   writesAllowed(feature: WriteFeature): Promise<{ ok: boolean; why?: string }> {
-    return Promise.resolve(this.verdict(feature));
+    return Promise.resolve(this.verdictNow(feature));
   }
 
-  /** The synchronous answer behind writesAllowed. */
-  verdict(feature: WriteFeature): Verdict {
+  /** The synchronous answer behind writesAllowed (T-26's `writesAllowedNow`, asked right before a write is sent). */
+  verdictNow(feature: WriteFeature): Verdict {
     if (!this.isLoaded) return { ok: false, why: WHY.starting };
     if (this.problem !== null) return { ok: false, why: WHY.storage(this.problem.reason) };
     if (this.killSwitchOn()) return { ok: false, why: WHY.kill };
@@ -172,7 +172,7 @@ export class Switches implements GlobalSwitches {
   /** What `switches.changed` broadcasts. */
   view(): SwitchesView {
     const writesAllowed = {} as Record<WriteFeature, boolean>;
-    for (const f of WRITE_FEATURES) writesAllowed[f] = this.verdict(f).ok;
+    for (const f of WRITE_FEATURES) writesAllowed[f] = this.verdictNow(f).ok;
     return { killSwitch: this.killSwitchOn(), writesAllowed };
   }
 

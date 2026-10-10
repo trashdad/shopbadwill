@@ -193,6 +193,13 @@ export interface ApiAdapterDeps {
   session: Pick<SgwSession, 'current' | 'reportRejected'>;
   /** The frozen port, asked before every write (ruling C1). */
   switches: GlobalSwitches;
+  /**
+   * T-36 fix round 1: the same verdict, answered synchronously. When given,
+   * build() asks it right before the send, so a kill switch flipped after the
+   * last refresh stops the write with no window (the async verdict can be up to
+   * WRITE_GATE_MAX_AGE_MS / 2 old). A throw refuses the write (fail closed).
+   */
+  writesAllowedNow?: (feature: WriteFeature) => { ok: boolean; why?: string };
   /** Records refused-write intents (T-35/T-41). */
   audit: Pick<AuditLog, 'append'>;
   health: SgwHealthFlag;
@@ -530,6 +537,8 @@ export class SgwApiAdapter implements SgwApi {
         try {
           return await this.run(endpoint, lane, request, parse, {
             beforeSend: () => {
+              const now = this.verdictNow(feature);
+              if (now !== undefined && !now.ok) throw new RefusedWrite(now.why);
               if (!verdict.ok) throw new RefusedWrite(verdict.why);
               if (clock.monotonic() - verdict.at > WRITE_GATE_MAX_AGE_MS) throw new StaleWriteGate();
             },
@@ -546,6 +555,18 @@ export class SgwApiAdapter implements SgwApi {
     } finally {
       settled = true;
       if (timer !== undefined) clock.clearTimeout(timer);
+    }
+  }
+
+  /** The synchronous verdict (writesAllowedNow), or undefined when none is wired. A throw refuses. */
+  private verdictNow(feature: WriteFeature): { ok: true } | { ok: false; why: string } | undefined {
+    const hook = this.deps.writesAllowedNow;
+    if (hook === undefined) return undefined;
+    try {
+      const v = hook(feature);
+      return v.ok ? { ok: true } : { ok: false, why: v.why ?? 'writes are not allowed' };
+    } catch {
+      return { ok: false, why: 'the write gate could not be read' };
     }
   }
 

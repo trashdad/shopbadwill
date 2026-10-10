@@ -130,6 +130,7 @@ interface SetupOpts {
   lanes?: Record<Lane, LaneConfig>;
   session?: { bearer: string; expiresAt: number; buyerId: string } | null;
   sgwClock?: Pick<SgwClockAdapter, 'sampleFromServerTime' | 'sampleFromGetCurrentTime'>;
+  writesAllowedNow?: (feature: 'favorites' | 'bidding') => { ok: boolean; why?: string };
 }
 
 function setup(opts: SetupOpts = {}) {
@@ -173,6 +174,7 @@ function setup(opts: SetupOpts = {}) {
       },
     },
     sgwClock: opts.sgwClock ?? new SgwClockAdapter(clock),
+    ...(opts.writesAllowedNow === undefined ? {} : { writesAllowedNow: opts.writesAllowedNow }),
   });
   return { clock, http, inner, scheduler, audit, switches, failures, schemaOks, rejections, sessionBox, api };
 }
@@ -1128,6 +1130,68 @@ describe('schema failure → SgwApiError(schema) and health flagged', () => {
     t.http.on(`${BASE}ItemBid/ShowBidModal`, { status: 403, bodyText: '' });
     await rejectsWith(t.api.showBidModal(ITEM), 'blocked');
     expect(t.failures).toHaveLength(0);
+  });
+});
+
+// T-36 fix round 1 (#9): the async verdict a queued write holds can be up to
+// WRITE_GATE_MAX_AGE_MS / 2 old at its turn. When the synchronous
+// `writesAllowedNow` is given, build() asks it right before the send, so a kill
+// switch flipped in between stops the write with no window at all.
+describe('writesAllowedNow: a synchronous verdict asked by build() right before the send', () => {
+  const GAP: LaneConfig = { minIntervalMs: 120 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
+  const BUSY_LANES: Record<Lane, LaneConfig> = { ...FAST_LANES, background: GAP };
+  const ADD_URL = `${BASE}Favorite/AddToFavorite?itemId=${String(ITEM)}`;
+
+  it('a kill flipped after the last refresh and 1 ms before the turn of the write: refused at build, audited, ZERO HTTP for it', async () => {
+    const now: { verdict: { ok: boolean; why?: string } } = { verdict: { ok: true } };
+    const asked: string[] = [];
+    const t = setup({
+      lanes: BUSY_LANES,
+      writesAllowedNow: (feature) => {
+        asked.push(feature);
+        return now.verdict;
+      },
+    });
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'background'); // starts the 120 s gap on the write lane
+    const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
+    await flush();
+    await advance(t.clock, 120 * S - 1); // every async refresh said ok
+    now.verdict = { ok: false, why: 'kill switch is on' }; // the async switches still say ok
+    await advance(t.clock, 1);
+    const err = await pending;
+    expect(err).toBeInstanceOf(SgwApiError);
+    expect((err as SgwApiError).kind).toBe('paused');
+    expect((err as SgwApiError).message).toBe('kill switch is on');
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`]);
+    expect(asked).toEqual(['favorites']);
+    expect(t.audit.entries).toEqual([
+      expect.objectContaining({ kind: 'favorite.add', itemId: ITEM, details: { action: 'add', why: 'kill switch is on' } }),
+    ]);
+    expect(t.inner.stats().lanes.background.usedToday).toBe(1); // the refused turn cost no budget
+  });
+
+  it('an ok synchronous verdict lets the write go', async () => {
+    const t = setup({ lanes: BUSY_LANES, writesAllowedNow: () => ({ ok: true }) });
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'background');
+    const write = t.api.addFavorite(ITEM);
+    await flush();
+    await advance(t.clock, 120 * S);
+    await write;
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`, ADD_URL]);
+  });
+
+  it('a throwing hook refuses the write (fail closed)', async () => {
+    const t = setup({
+      writesAllowedNow: () => {
+        throw new Error('switches unavailable');
+      },
+    });
+    scriptAll(t.http);
+    const err = await rejectsWith(t.api.addFavorite(ITEM), 'paused');
+    expect(err.message).toBe('the write gate could not be read');
+    expect(t.http.requests).toHaveLength(0);
   });
 });
 
