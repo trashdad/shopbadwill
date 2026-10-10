@@ -56,6 +56,8 @@ export const STORAGE_KEYS = {
   clock: 'sbw:clock',
   googleAccess: 'sbw:googleAccess',
   runtimeHealth: 'sbw:runtimeHealth',
+  /** Optional (T-30): the last HealthReport, in local so a failure survives a browser restart. */
+  healthReport: 'sbw:healthReport',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -249,6 +251,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.clock]: { area: 'session', schema: z.array(ClockSampleSchema) },
   [STORAGE_KEYS.googleAccess]: { area: 'session', schema: GoogleAccessSchema },
   [STORAGE_KEYS.runtimeHealth]: { area: 'session', schema: HealthReportSchema },
+  [STORAGE_KEYS.healthReport]: { area: 'local', schema: HealthReportSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

@@ -5,7 +5,8 @@
 // Checks (HealthReport.checks, names frozen by the contract):
 //   search-schema / detail-schema  one search + one item detail on the
 //                                  background lane (at most 2 requests per run)
-//   card-selectors                 the last DomAdapter DiscoveryReport (T-32 sends it)
+//   card-selectors                 the last DomAdapter DiscoveryReport (T-32 sends it);
+//                                  drift or zero cards is UNKNOWN, never a failure
 //   clock                          SgwClock.offset() judged like T-81 clockSanity
 //   session                        'full' mode only: expired / logged-out fails
 //
@@ -56,8 +57,8 @@ const MAX_DETAIL_CHARS = 200;
 /** |offset| above this is an insane clock. Mirrors T-81 clockSanity (MAX_CLOCK_OFFSET_MS); adapters may not import domain/snipe (PLAN 2.1). */
 export const HEALTH_MAX_CLOCK_OFFSET_MS = 300_000;
 
-/** The page-1 browse query used for the one search probe. */
-export const HEALTH_PROBE_QUERY: SearchQuery = { searchText: '', categoryIds: [], sellerIds: [], page: 1 };
+/** The fixed, known-good probe query (S-1-captured request shape): page 1, default page size. */
+export const HEALTH_PROBE_QUERY: SearchQuery = { searchText: 'pyrex', categoryIds: [], sellerIds: [], page: 1 };
 
 type Check = HealthReport['checks'][number];
 type CheckName = Check['name'];
@@ -67,9 +68,10 @@ export function isUnknownCheck(c: { ok: boolean; detail?: string | undefined }):
 }
 
 /** The slice of the domain Repo used here (adapters may not import the Repo class, PLAN §2.1). */
+type HealthKey = typeof STORAGE_KEYS.runtimeHealth | typeof STORAGE_KEYS.healthReport;
 export interface HealthRepo {
-  find(key: typeof STORAGE_KEYS.runtimeHealth): Promise<StorageValue<typeof STORAGE_KEYS.runtimeHealth> | undefined>;
-  set(key: typeof STORAGE_KEYS.runtimeHealth, value: StorageValue<typeof STORAGE_KEYS.runtimeHealth>): Promise<void>;
+  find<K extends HealthKey>(key: K): Promise<StorageValue<K> | undefined>;
+  set<K extends HealthKey>(key: K, value: StorageValue<K>): Promise<void>;
 }
 
 /** The last DomAdapter report as the content script (T-32) forwards it. */
@@ -118,7 +120,12 @@ export class SgwHealthAdapter implements SgwHealth {
   }
 
   async last(): Promise<HealthReport | null> {
-    return (await this.deps.repo.find(STORAGE_KEYS.runtimeHealth)) ?? null;
+    // The local key survives a restart (a failure must keep blocking writes); the session copy is a fallback.
+    return (
+      (await this.deps.repo.find(STORAGE_KEYS.healthReport)) ??
+      (await this.deps.repo.find(STORAGE_KEYS.runtimeHealth)) ??
+      null
+    );
   }
 
   /**
@@ -223,9 +230,11 @@ export class SgwHealthAdapter implements SgwHealth {
       r = null;
     }
     if (r === null) return unknown('card-selectors', 'no content-script report yet');
+    // Never a failure: favorites and bids use the API, and the overlay pauses itself on drift.
     if (r.drifted) {
-      return fail('card-selectors', `drift: fallback rank ${String(r.rank)}, ${String(r.unreadable)} unreadable (config ${r.configVersion})`);
+      return unknown('card-selectors', `selector drift (fallback rank ${String(r.rank)}, ${String(r.unreadable)} unreadable, config ${r.configVersion})`);
     }
+    if (r.count === 0) return unknown('card-selectors', 'no cards parsed on the reported page');
     return pass('card-selectors');
   }
 
@@ -273,6 +282,7 @@ export class SgwHealthAdapter implements SgwHealth {
   }
 
   private async store(prev: HealthReport | null, report: HealthReport): Promise<void> {
+    await this.deps.repo.set(STORAGE_KEYS.healthReport, report);
     await this.deps.repo.set(STORAGE_KEYS.runtimeHealth, report);
     const wasOk = prev?.ok;
     try {

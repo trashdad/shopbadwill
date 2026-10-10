@@ -46,7 +46,7 @@ const detail: ItemDetail = {
 interface Opts {
   offsetMs?: number | null;
   session?: SgwSessionState;
-  dom?: { drifted: boolean; rank?: number | null } | null;
+  dom?: { drifted: boolean; rank?: number | null; count?: number } | null;
   shipping?: unknown;
 }
 
@@ -81,7 +81,7 @@ function setup(o: Opts = {}) {
               configVersion: SGW_CONFIG_VERSION,
               rank: state.dom.rank ?? 0,
               strategy: 'x',
-              count: 40,
+              count: state.dom.count ?? 40,
               unreadable: 0,
               drifted: state.dom.drifted,
             },
@@ -206,11 +206,15 @@ describe('SgwHealth.run', () => {
     expect(isUnknownCheck(must(named(await u.health.run('anonymous'), 'search-schema')))).toBe(true);
   });
 
-  it('card selectors: drift fails, no report is unknown', async () => {
+  it('card selectors: drift or zero cards is unknown and never fails the report; no report is unknown', async () => {
     const drift = setup({ dom: { drifted: true, rank: 2 } });
     const r = await drift.health.run('anonymous');
-    expect(r.ok).toBe(false);
-    expect(named(r, 'card-selectors')?.ok).toBe(false);
+    expect(r.ok).toBe(true);
+    expect(isUnknownCheck(must(named(r, 'card-selectors')))).toBe(true);
+    expect(named(r, 'card-selectors')?.detail).toContain('drift');
+    const empty = await setup({ dom: { drifted: false, count: 0 } }).health.run('anonymous');
+    expect(empty.ok).toBe(true);
+    expect(isUnknownCheck(must(named(empty, 'card-selectors')))).toBe(true);
     const none = setup({ dom: null });
     const r2 = await none.health.run('anonymous');
     expect(r2.ok).toBe(true);
@@ -262,6 +266,31 @@ describe('SgwHealth.run', () => {
     expect(rb.ok).toBe(false);
     expect(named(rb, 'detail-schema')?.ok).toBe(false);
     expect(named(rb, 'detail-schema')?.detail).toContain('shipping-quote');
+  });
+});
+
+describe('persistence and probe query', () => {
+  it('a failing report survives a restart: a fresh adapter over the same storage returns it from last()', async () => {
+    const t = setup({ offsetMs: 999_999 });
+    const r = await t.health.run('anonymous');
+    expect(r.ok).toBe(false);
+    const restarted = new SgwHealthAdapter({
+      repo: t.repo,
+      clock: t.clock,
+      api: t.api,
+      audit: t.audit,
+      sgwClock: { offset: () => null },
+      session: { state: () => Promise.resolve('ok') },
+      domReport: () => Promise.resolve(null),
+    });
+    expect(await restarted.last()).toEqual(r);
+    expect(await t.repo.find(STORAGE_KEYS.healthReport)).toEqual(r);
+  });
+
+  it('the one search uses the fixed known-good query', async () => {
+    const t = setup();
+    await t.health.run('anonymous');
+    expect(t.api.calls[0]?.args[0]).toEqual({ searchText: 'pyrex', categoryIds: [], sellerIds: [], page: 1 });
   });
 });
 
