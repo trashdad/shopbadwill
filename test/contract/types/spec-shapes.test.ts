@@ -362,6 +362,7 @@ interface SpecAuthStatus {
   account?: string;
   grantedScopes: string[];
   refreshTokenAgeDays?: number;
+  refreshTokenExpiresAt?: number;
   lastError?: SpecGoogleAuthErrorCode;
   needsInteraction: boolean;
   configured: boolean;
