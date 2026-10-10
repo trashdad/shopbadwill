@@ -1,5 +1,6 @@
 {
   "probedAt": 1791400000000,
+  "firstSeenAt": 1791300000000,
   "lastGoodProbeAt": {
     "search": 1791400000000
   },

@@ -214,6 +214,8 @@ export type GoogleClient = z.infer<typeof GoogleClientSchema>;
  */
 export const HealthProbeSchema = z.object({
   probedAt: EpochMsSchema.nullable(),
+  /** Set once, at the first run or recorded failure: the clock for escalating a check that was never good. */
+  firstSeenAt: EpochMsSchema.optional(),
   lastGoodProbeAt: z.object({ search: EpochMsSchema.optional(), detail: EpochMsSchema.optional() }),
   sticky: z.array(z.object({ endpoint: z.string().min(1), at: EpochMsSchema, detail: z.string() })),
 });

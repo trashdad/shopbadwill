@@ -185,7 +185,7 @@ export class SgwHealthAdapter implements SgwHealth {
       const sticky = st.sticky.filter((x) => x.endpoint !== f.endpoint);
       sticky.push({ endpoint: f.endpoint, at: now, detail: clip(f.message) });
       // probedAt is only set when never probed, so the next run does not probe at once; it is never refreshed.
-      const next: HealthProbe = { ...st, sticky, probedAt: st.probedAt ?? now };
+      const next: HealthProbe = { ...st, sticky, probedAt: st.probedAt ?? now, firstSeenAt: st.firstSeenAt ?? now };
       await this.deps.repo.set(STORAGE_KEYS.healthProbe, next);
       await this.store(prev, await this.compose(prev, next, now, null, this.localFromPrev(prev)));
     });
@@ -229,6 +229,10 @@ export class SgwHealthAdapter implements SgwHealth {
     const now = deps.clock.now();
     const prev = await this.last();
     let st = await this.loadProbe();
+    if (st.firstSeenAt === undefined) {
+      st = { ...st, firstSeenAt: now };
+      await deps.repo.set(STORAGE_KEYS.healthProbe, st);
+    }
     let probed: ProbeResult | null = null;
     if (this.probeDue(st, now, mode)) {
       probed = await this.probe();
@@ -243,7 +247,7 @@ export class SgwHealthAdapter implements SgwHealth {
             !((x.endpoint === 'search' && good.search === now) || (x.endpoint === 'itemDetail' && good.detail === now)),
         );
       }
-      st = { probedAt: now, lastGoodProbeAt: good, sticky };
+      st = { ...st, probedAt: now, lastGoodProbeAt: good, sticky };
       await deps.repo.set(STORAGE_KEYS.healthProbe, st);
     }
     const local: Check[] = [await this.cardCheck(), this.clockCheck()];
@@ -285,7 +289,11 @@ export class SgwHealthAdapter implements SgwHealth {
     const schema = (['search-schema', 'detail-schema'] as const).map((name): Check => {
       let c = this.baseCheck(name, prev, st, probed);
       const lastGood = st.lastGoodProbeAt[goodKey(name)];
-      if (c.ok && lastGood !== undefined && now - lastGood > STALE_PROBE_MS) c = fail(name, STALE_DETAIL);
+      // Stale: the last good probe, or (never good) the first sighting, is over 24 h old.
+      // A never-good detail check after an empty search (nothing to probe with) is exempt.
+      const since = lastGood ?? st.firstSeenAt;
+      const exempt = lastGood === undefined && c.detail === `${UNKNOWN_PREFIX}no item to probe`;
+      if (c.ok && !exempt && since !== undefined && now - since > STALE_PROBE_MS) c = fail(name, STALE_DETAIL);
       for (const x of st.sticky.filter((y) => checkFor(y.endpoint) === name)) {
         const mark = `${STICKY_MARK}: ${x.endpoint}: ${x.detail}`;
         c = c.ok ? fail(name, mark) : { name, ok: false, detail: `${c.detail ?? 'schema'}; ${mark}` };

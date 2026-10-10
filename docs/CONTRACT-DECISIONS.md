@@ -377,3 +377,5 @@ Source: controller ruling, T-30 fix round 1.
 `STORAGE_KEYS.healthProbe = 'sbw:healthProbe'` (area `local`, `HealthProbeSchema`): `{ probedAt: EpochMs | null; lastGoodProbeAt: { search?, detail? }; sticky: Array<{ endpoint, at, detail }> }`. `probedAt` is the only clock for SgwHealth's 6 h trust and 10 min re-probe rules (a report's `checkedAt` is refreshed by every run and must not be used). `lastGoodProbeAt` drives the 24 h stale escalation. `sticky` holds per-endpoint schema failures that keep the report failing until `recordSchemaSuccess(endpoint)` (or a full run that probes that read endpoint). Optional, no migration, `schemaVersion` stays 1.
 
 **Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
+
+**T-30 round 2 addition.** `HealthProbe` gains optional `firstSeenAt: EpochMs`, set once at the first run or recorded failure. A schema check that has never had a good probe escalates to `stale` (`ok:false`) once `now - firstSeenAt > 24h`, the same fail-closed path as the `lastGoodProbeAt` rule (an empty search, which leaves detail with nothing to probe, is exempt). Optional, backward compatible.

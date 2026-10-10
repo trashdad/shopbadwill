@@ -550,3 +550,45 @@ describe('fix round 1', () => {
     expect((await t.health.run('anonymous')).ok).toBe(true);
   });
 });
+
+describe('fix round 2', () => {
+  it('a schema check that was never good escalates to stale once firstSeenAt is over 24 h old', async () => {
+    const t = setup();
+    t.api.failNext('search', 'paused');
+    t.api.failNext('itemDetail', 'paused');
+    const first = await t.health.run('anonymous');
+    expect(first.ok).toBe(true);
+    expect((await t.repo.find(STORAGE_KEYS.healthProbe))?.firstSeenAt).toBe(T0);
+    t.clock.advance(23 * H);
+    t.api.listings = [];
+    t.api.failNext('search', 'paused');
+    expect((await t.build().run('anonymous')).ok).toBe(true);
+    expect((await t.repo.find(STORAGE_KEYS.healthProbe))?.firstSeenAt).toBe(T0);
+    t.clock.advance(2 * H);
+    t.api.failNext('search', 'paused');
+    const late = await t.build().run('anonymous');
+    expect(late.ok).toBe(false);
+    expect(named(late, 'search-schema')?.detail).toContain('stale: no successful probe in 24h');
+  });
+
+  it('firstSeenAt is also set by recordSchemaFailure', async () => {
+    const t = setup();
+    await t.health.recordSchemaFailure({ endpoint: 'favorites', message: 'x', at: T0 });
+    expect((await t.repo.find(STORAGE_KEYS.healthProbe))?.firstSeenAt).toBe(T0);
+  });
+
+  it('with two sticky endpoints, recordSchemaSuccess clears only the one named', async () => {
+    const t = setup();
+    await t.health.run('anonymous');
+    await t.health.recordSchemaFailure({ endpoint: 'favorites', message: 'a', at: t.clock.now() });
+    await t.health.recordSchemaFailure({ endpoint: 'showBidModal', message: 'b', at: t.clock.now() });
+    await t.health.recordSchemaSuccess('favorites');
+    const mid = must(await t.health.last());
+    expect(mid.ok).toBe(false);
+    expect(named(mid, 'detail-schema')?.detail).toContain('showBidModal');
+    expect(named(mid, 'detail-schema')?.detail).not.toContain('favorites');
+    expect((await t.repo.find(STORAGE_KEYS.healthProbe))?.sticky.map((x) => x.endpoint)).toEqual(['showBidModal']);
+    await t.health.recordSchemaSuccess('showBidModal');
+    expect(must(await t.health.last()).ok).toBe(true);
+  });
+});

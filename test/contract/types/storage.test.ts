@@ -81,6 +81,7 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:healthReport': example('HealthReport'),
   'sbw:healthProbe': {
     probedAt: 1791400000000,
+    firstSeenAt: 1791300000000,
     lastGoodProbeAt: { search: 1791400000000 },
     sticky: [{ endpoint: 'favorites', at: 1791400000000, detail: 'bad rows' }],
   },
