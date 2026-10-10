@@ -15,6 +15,7 @@ import type * as PreflightModule from '../../../../src/domain/snipe/preflight';
 import {
   ASSUME_EXTENSION_MS,
   capsForEvent,
+  FIRE_EARLY_TOLERANCE_MS,
   reduce,
   TRANSITIONS,
   WAKE_BEFORE_FIRE_MS,
@@ -223,6 +224,8 @@ function play(start: Snipe, steps: ReadonlyArray<SnipeEvent | Step>): { results:
 }
 
 const kinds = (effects: readonly Effect[]): string[] => effects.map((x) => x.kind);
+/** Text that says no bid went out: never allowed once a bid may have been sent. */
+const NO_BID_CLAIM = /no bid was placed|not bid|no bid sent|no bid was sent/i;
 const ofKind = <K extends Effect['kind']>(effects: readonly Effect[], kind: K): Extract<Effect, { kind: K }>[] =>
   effects.filter((x): x is Extract<Effect, { kind: K }> => x.kind === kind);
 const money = (effects: readonly Effect[]): Effect[] =>
@@ -258,6 +261,10 @@ describe('constants (pinned)', () => {
 
   it('the wake alarm is 5 min before the fire (PLAN §1.3)', () => {
     expect(WAKE_BEFORE_FIRE_MS).toBe(5 * MIN);
+  });
+
+  it('fire is refused more than 2 s before the planned fire (m2)', () => {
+    expect(FIRE_EARLY_TOLERANCE_MS).toBe(2000);
   });
 
   it('reduce implements the frozen Reduce contract type (I-08)', () => {
@@ -304,7 +311,7 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
   },
   'fallback-applied': {
     arm: '✗ already-armed',
-    disarm: 'killed',
+    disarm: 'killed (guards: fallback-applied)',
     wake: '✗ fallback-applied',
     verified: '✗ fallback-applied',
     'verify-failed': '✗ fallback-applied',
@@ -336,7 +343,7 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     wake: '✗ step-passed',
     verified: '✗ step-passed',
     'verify-failed': 'resolved | fallback-applied',
-    fire: 'firing | resolved',
+    fire: 'firing | resolved (guards: too-early)',
     sent: '✗ not-firing',
     result: '✗ not-sent',
     ambiguous: '✗ not-sent',
@@ -360,13 +367,13 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
   },
   sent: {
     arm: '✗ already-sent',
-    disarm: 'killed (guards: already-sent)',
+    disarm: '✗ already-sent',
     wake: '✗ already-sent',
     verified: '✗ already-sent',
     'verify-failed': '✗ already-sent',
     fire: '✗ already-sent',
     sent: '✗ already-sent',
-    result: 'sent | resolved (guards: dry-run)',
+    result: 'sent | resolved (guards: dry-run, duplicate)',
     ambiguous: 'sent (guards: dry-run, duplicate)',
     'post-read': 'resolved (guards: invalid-event)',
     'preflight-failed': '✗ already-sent',
@@ -450,7 +457,7 @@ describe('live path: draft → armed → waking → verified → firing → sent
     E.fire(),
     E.sent('key-1'),
     E.result(bid('accepted', { isHighBidder: true })),
-    { e: E.postRead(closedDetail({ isHighBidder: true, currentPrice: 1500 })), ctx: { ...CTX, reply: bid('accepted', { isHighBidder: true }) } },
+    E.postRead(closedDetail({ isHighBidder: true, currentPrice: 1500 })),
   ];
 
   it('walks every state once and places exactly one bid, for exactly maxBid', () => {
@@ -525,6 +532,7 @@ describe('live path: draft → armed → waking → verified → firing → sent
     const { results, last } = play(snipe(), steps);
     const afterResult = results[5]?.next;
     expect(afterResult?.state).toBe('sent');
+    expect(afterResult?.attempt.reply).toEqual(bid('accepted', { isHighBidder: true }));
     expect(results[5]?.effects.slice(0, 1)).toEqual([{ kind: 'readDetail', snipeId: 's1', purpose: 'post-read' }]);
     expect(audits(results[5]?.effects ?? [])).toEqual(['bid.result']);
     const final = results[6];
@@ -602,10 +610,10 @@ describe('R3: sent is terminal for sending', () => {
     expect(reduce(s, E.sent('k-new'), CAPS_OK, CTX).rejection?.reason).toBe('already-sent');
   });
 
-  it('after sent, only result, ambiguous, post-read and a user disarm are accepted', () => {
+  it('after sent, only result, ambiguous and post-read are accepted', () => {
     const accepted = EVENT_TYPES.filter((t) => reduce(inState('sent'), CANON[t], CAPS_OK, CTX).rejection === null);
-    expect(accepted.sort()).toEqual(['ambiguous', 'disarm', 'post-read', 'result']);
-    for (const by of ['kill', 'anomaly'] as const) {
+    expect(accepted.sort()).toEqual(['ambiguous', 'post-read', 'result']);
+    for (const by of ['user', 'kill', 'anomaly'] as const) {
       expect(reduce(inState('sent'), E.disarm(by), CAPS_OK, CTX).rejection?.reason).toBe('already-sent');
     }
   });
@@ -640,9 +648,9 @@ describe('ambiguous → post-read → won | outbid | network through classifyOut
   ] as const)('%s', (expected, post) => {
     const s = afterAmbiguous();
     vi.mocked(classifyOutcome).mockClear();
-    const r = reduce(s, E.postRead(post), CAPS_OK, { ...CTX, reply: bid('accepted') });
+    const r = reduce(s, E.postRead(post), CAPS_OK, CTX);
     expect(vi.mocked(classifyOutcome)).toHaveBeenCalledTimes(1);
-    // An ambiguous send has no reply: the reducer passes null even if the runner offers one.
+    // An ambiguous send has no reply: the outcome is judged from the item.
     expect(vi.mocked(classifyOutcome).mock.calls[0]?.[1]).toBeNull();
     const c = classifyOutcome(s, null, post, { userTz: TZ });
     expect(c.outcome).toBe(expected);
@@ -652,12 +660,22 @@ describe('ambiguous → post-read → won | outbid | network through classifyOut
     expect(money(r.effects)).toEqual([]);
   });
 
-  it('an ambiguous after a reply (a resend that timed out) is judged from the item, not from the old reply', () => {
-    const { last } = play(inState('sent'), [E.result(bid('accepted', { isHighBidder: true })), E.ambiguous()]);
-    expect(last.attempt.ambiguous).toBe(true);
-    vi.mocked(classifyOutcome).mockClear();
-    reduce(last, E.postRead(), CAPS_OK, { ...CTX, reply: bid('accepted', { isHighBidder: true }) });
-    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[1]).toBeNull();
+  it('I2: one reply per attempt: an ambiguous or a second result after a result is a duplicate', () => {
+    const replied = deepFreeze(reduce(inState('sent'), E.result(bid('accepted', { isHighBidder: true })), CAPS_OK, CTX).next);
+    expect(reduce(replied, E.ambiguous(), CAPS_OK, CTX)).toMatchObject({ next: replied, effects: [], rejection: { reason: 'duplicate' } });
+    expect(reduce(replied, E.result(bid('outbid')), CAPS_OK, CTX)).toMatchObject({ next: replied, effects: [], rejection: { reason: 'duplicate' } });
+  });
+
+  it('I2: a result after an ambiguous is refused: the ambiguity stays and nothing claims "Not bid"', () => {
+    const s = deepFreeze(afterAmbiguous());
+    for (const kind of BidResultKindSchema.options) {
+      const r = reduce(s, E.result(bid(kind)), CAPS_OK, CTX);
+      expect(r).toMatchObject({ next: s, effects: [], rejection: { reason: 'duplicate' } });
+      expect(r.next.attempt.ambiguous).toBe(true);
+    }
+    const after = reduce(s, E.postRead(closedDetail({ isHighBidder: null, currentPrice: 2000 })), CAPS_OK, CTX);
+    expect(after.next.outcomeDetail).not.toMatch(NO_BID_CLAIM);
+    expect(ofKind(after.effects, 'notify')[0]?.message).not.toMatch(NO_BID_CLAIM);
   });
 
   it('a second ambiguous is a duplicate', () => {
@@ -698,7 +716,8 @@ describe('result: SGW replies', () => {
   it.each(['accepted', 'outbid', 'rejected-unknown'] as const)('%s may have registered: stay sent and post-read', (kind) => {
     const r = reduce(inState('sent'), E.result(bid(kind)), CAPS_OK, CTX);
     expect(r.next.state).toBe('sent');
-    expect(r.next.attempt.ambiguous).toBe(false);
+    expect(r.next.attempt.reply).toEqual(bid(kind));
+    expect(r.next.attempt.ambiguous).toBeUndefined();
     expect(r.next.measured?.responseAt).toBe(RESULT_LOCAL + OFFSET);
     expect(r.effects[0]).toEqual({ kind: 'readDetail', snipeId: 's1', purpose: 'post-read' });
   });
@@ -713,7 +732,7 @@ describe('result: SGW replies', () => {
     const s = reduce(inState('sent'), E.result(reply), CAPS_OK, CTX).next;
     const post = closedDetail({ isHighBidder: true, currentPrice: 1500 });
     vi.mocked(classifyOutcome).mockClear();
-    const r = reduce(s, E.postRead(post), CAPS_OK, { ...CTX, reply });
+    const r = reduce(s, E.postRead(post), CAPS_OK, CTX);
     expect(vi.mocked(classifyOutcome).mock.calls[0]?.[1]).toEqual(reply);
     expect(r.next.outcome).toBe('won');
     const message = ofKind(r.effects, 'notify')[0]?.message ?? '';
@@ -721,18 +740,32 @@ describe('result: SGW replies', () => {
     expect(message).not.toMatch(/Not bid|No bid was placed/);
   });
 
-  it('without the reply (a restart lost it) the post-read is judged as an ambiguous send', () => {
-    const s = reduce(inState('sent'), E.result(bid('accepted')), CAPS_OK, CTX).next;
-    const post = closedDetail({ isHighBidder: null, currentPrice: 1500 });
-    // With SGW's "accepted" a price below the max proves the win; without it, it cannot.
-    expect(reduce(s, E.postRead(post), CAPS_OK, { ...CTX, reply: bid('accepted') }).next.outcome).toBe('won');
-    expect(reduce(s, E.postRead(post), CAPS_OK, CTX).next.outcome).toBe('network');
+  it('contract change: after a restart (reduce from the persisted snipe), accepted + an anonymous post-read under max is Won', () => {
+    const replied = reduce(inState('sent'), E.result(bid('accepted', { isHighBidder: null })), CAPS_OK, CTX).next;
+    // The worker dies: the snipe goes through storage (zod strip mode) and comes back.
+    const persisted = SnipeSchema.parse(JSON.parse(JSON.stringify(replied)));
+    expect(persisted.attempt.reply).toEqual(bid('accepted', { isHighBidder: null }));
+    const r = reduce(persisted, E.postRead(closedDetail({ isHighBidder: null, currentPrice: 1500 })), CAPS_OK, CTX);
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'won' });
+    expect(ofKind(r.effects, 'notify')[0]?.message).not.toContain('Unconfirmed');
   });
 
-  it('a decisive reply offered at post-read is ignored (it would have resolved at result)', () => {
-    const s = reduce(inState('sent'), E.result(bid('accepted')), CAPS_OK, CTX).next;
-    reduce(s, E.postRead(), CAPS_OK, { ...CTX, reply: bid('below-minimum') });
+  it('with no reply recorded (the worker died before it) the post-read is judged as an ambiguous send', () => {
+    const r = reduce(inState('sent'), E.postRead(closedDetail({ isHighBidder: null, currentPrice: 1500 })), CAPS_OK, CTX);
     expect(vi.mocked(classifyOutcome).mock.calls.at(-1)?.[1]).toBeNull();
+    expect(r.next.outcome).toBe('network');
+  });
+
+  it('a stored record with both a reply and the ambiguity (the reducer never writes one) is judged conservatively, as ambiguous', () => {
+    const s = inState('sent', { attempt: { sentAt: FIRE_AT_SERVER + 5, idempotencyKey: 'k1', ambiguous: true, reply: bid('accepted') } });
+    const r = reduce(s, E.postRead(closedDetail({ isHighBidder: null, currentPrice: 1500 })), CAPS_OK, CTX);
+    expect(vi.mocked(classifyOutcome).mock.calls.at(-1)?.[1]).toBeNull();
+    expect(r.next.outcome).toBe('network');
+  });
+
+  it('a decisive reply is recorded on the attempt and resolves at once', () => {
+    const r = reduce(inState('sent'), E.result(bid('below-minimum')), CAPS_OK, CTX);
+    expect(r.next).toMatchObject({ state: 'resolved', attempt: { reply: bid('below-minimum') } });
   });
 });
 
@@ -746,8 +779,8 @@ describe('R4: verify-failed:extended → extended outcome and a re-arm proposal'
     expect(r.effects[1]).toEqual({ kind: 'proposeRearm', snipeId: 's1' });
     expect(money(r.effects)).toEqual([]);
     expect(ofKind(r.effects, 'scheduleWake')).toEqual([]);
-    expect(r.next.outcomeDetail).toContain('No bid was placed');
-    if (dryRun) expect(r.next.outcomeDetail).toMatch(/^Dry run: /);
+    expect(ofKind(r.effects, 'notify')[0]?.message).toContain('No bid was placed');
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'extended' });
     // Never auto-re-arm: the snipe is terminal and an arm is refused.
     expect(reduce(r.next, E.arm(), CAPS_OK, CTX).rejection?.reason).toBe('terminal');
   });
@@ -758,6 +791,9 @@ describe('R4: verify-failed:extended → extended outcome and a re-arm proposal'
     expect(r.next).toMatchObject({ state: 'resolved', outcome: 'extended' });
     expect(ofKind(r.effects, 'proposeRearm')).toHaveLength(1);
     expect(money(r.effects)).toEqual([]);
+    // The read goes to classifyOutcome, so the notice names the new end.
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[2]?.endTime).toBe(iso(later));
+    expect(ofKind(r.effects, 'notify')[0]?.message).toContain('moved to');
   });
 
   it('an unchanged end is not an extension', () => {
@@ -793,12 +829,19 @@ describe('disarm from any pre-sent state → killed', () => {
     expect(reduce(killed, E.sent(), CAPS_OK, CTX).rejection?.reason).toBe('terminal');
   });
 
-  it('a user disarm after sent ends the snipe honestly: the bid may be out, check the item', () => {
-    const r = reduce(inState('sent'), E.disarm('user'), CAPS_OK, CTX);
-    expect(r.next.state).toBe('killed');
-    const message = ofKind(r.effects, 'notify')[0]?.message ?? '';
-    expect(message).toContain('check the item');
-    expect(message).not.toMatch(/No bid was placed|Not bid/);
+  it('I3: every disarm after sent is refused: the bid stays open and the post-read still settles it', () => {
+    const s = deepFreeze(inState('sent'));
+    for (const by of ['user', 'kill', 'anomaly'] as const) {
+      expect(reduce(s, E.disarm(by), CAPS_OK, CTX)).toMatchObject({ next: s, effects: [], rejection: { reason: 'already-sent' } });
+    }
+    expect(reduce(s, E.postRead(closedDetail({ isHighBidder: true, currentPrice: 1500 })), CAPS_OK, CTX).next.outcome).toBe('won');
+  });
+
+  it('m1: fallback-applied refuses a disarm by anomaly (its fallback was already decided); user and kill still kill it', () => {
+    const s = deepFreeze(inState('fallback-applied'));
+    expect(reduce(s, E.disarm('anomaly'), CAPS_OK, CTX)).toMatchObject({ next: s, effects: [], rejection: { reason: 'fallback-applied' } });
+    expect(vi.mocked(fallbackDecision)).not.toHaveBeenCalled();
+    for (const by of ['user', 'kill'] as const) expect(reduce(s, E.disarm(by), CAPS_OK, CTX).next.state).toBe('killed');
   });
 });
 
@@ -876,19 +919,21 @@ describe('C1: caps through the precomputed CapsResult', () => {
     expect(withDetail.ok).toBe(true);
   });
 
-  it('verified with a failing CapsResult never fires: the fallback degrades to skip', () => {
+  it('verified with a failing CapsResult never fires: cap-blocked through classifyOutcome, no fallback', () => {
     const r = reduce(inState('waking'), E.verified(), CAPS_BAD, CTX);
-    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
-    expect(r.next.outcomeDetail).toContain('spending cap');
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'cap-blocked' });
     expect(money(r.effects)).toEqual([]);
-    expect(vi.mocked(fallbackDecision).mock.calls[0]?.[1]).toMatchObject({ reason: 'cap', caps: CAPS_BAD });
+    expect(vi.mocked(fallbackDecision)).not.toHaveBeenCalled();
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'cap' });
+    expect(ofKind(r.effects, 'audit').at(-1)?.entry.details).toMatchObject({ violations: CAPS_BAD.violations.join('; ') });
     expect(reduce(r.next, E.fire(), CAPS_OK, CTX).rejection?.reason).toBe('terminal');
   });
 
-  it('fire with a failing CapsResult places no bid', () => {
+  it('fire with a failing CapsResult places no bid: cap-blocked, no fallback', () => {
     const r = reduce(inState('verified'), E.fire(), CAPS_BAD, CTX);
-    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'cap-blocked' });
     expect(money(r.effects)).toEqual([]);
+    expect(vi.mocked(fallbackDecision)).not.toHaveBeenCalled();
   });
 
   it('arm with a failing CapsResult is rejected', () => {
@@ -923,19 +968,32 @@ describe('verify failures and fallbacks (fallbackDecision, I-18)', () => {
     expect(vi.mocked(fallbackDecision).mock.calls[0]?.[1]).toMatchObject({ reason: 'auth', sessionUsable: false });
   });
 
-  it.each(['network', 'clock', 'cap'] as const)('verify-failed:%s applies the fallback', (reason) => {
-    const caps = reason === 'cap' ? CAPS_BAD : CAPS_OK;
-    const r = reduce(inState('waking'), E.verifyFailed(reason), caps, CTX);
+  it.each(['network', 'clock'] as const)('verify-failed:%s applies the fallback', (reason) => {
+    const r = reduce(inState('waking'), E.verifyFailed(reason), CAPS_OK, CTX);
     expect(vi.mocked(fallbackDecision).mock.calls[0]?.[1]).toMatchObject({ reason });
-    if (reason === 'cap') {
-      expect(r.next.state).toBe('resolved');
-      expect(money(r.effects)).toEqual([]);
-    } else {
-      expect(r.next.state).toBe('fallback-applied');
-      expect(money(r.effects)).toEqual([{ kind: 'applyFallbackProxy', snipeId: 's1', amount: 2000 }]);
-    }
+    expect(r.next.state).toBe('fallback-applied');
+    expect(money(r.effects)).toEqual([{ kind: 'applyFallbackProxy', snipeId: 's1', amount: 2000 }]);
     expect(audits(r.effects)).toEqual(['snipe.fallback', 'snipe.verify-failed']);
     expect(kinds(r.effects)).toContain('notify');
+  });
+
+  describe('I1: a cap failure never triggers the fallback (cap-blocked through classifyOutcome)', () => {
+    const probes: Array<[string, SnipeState, SnipeEvent]> = [
+      ['verify-failed:cap', 'waking', E.verifyFailed('cap')],
+      ['verify-failed:cap after verified', 'verified', E.verifyFailed('cap')],
+      ['preflight-failed:cap', 'armed', E.preflightFailed('cap')],
+    ];
+    for (const [label, state, e] of probes) {
+      for (const [capsLabel, caps] of [['passing', CAPS_OK], ['failing', CAPS_BAD]] as const) {
+        it(`${label} with ${capsLabel} caps: no money effect, cap-blocked`, () => {
+          const r = reduce(inState(state), e, caps, CTX);
+          expect(money(r.effects)).toEqual([]);
+          expect(r.next).toMatchObject({ state: 'resolved', outcome: 'cap-blocked' });
+          expect(vi.mocked(fallbackDecision)).not.toHaveBeenCalled();
+          expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'cap' });
+        });
+      }
+    }
   });
 
   it('verify-failed:ended resolves through classifyOutcome (abort ended), no fallback', () => {
@@ -946,12 +1004,16 @@ describe('verify failures and fallbacks (fallbackDecision, I-18)', () => {
     expect(money(r.effects)).toEqual([]);
   });
 
-  it.each(['price-over-max', 'already-high'] as const)('verify-failed:%s: nothing to win, skipped, no fallback', (reason) => {
+  it.each([
+    ['price-over-max', 'price'],
+    ['already-high', 'already-high'],
+  ] as const)('verify-failed:%s: nothing to win, classifyOutcome abort %s, skipped, no fallback', (reason, abort) => {
     const r = reduce(inState('verified'), E.verifyFailed(reason), CAPS_OK, CTX);
     expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
     expect(vi.mocked(fallbackDecision)).not.toHaveBeenCalled();
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort });
     expect(money(r.effects)).toEqual([]);
-    expect(r.next.outcomeDetail).toContain('No bid was placed');
+    expect(ofKind(r.effects, 'notify')[0]?.message).toContain('No bid was placed');
   });
 
   it('a verify read showing the auction closed resolves as ended', () => {
@@ -975,6 +1037,7 @@ describe('verify failures and fallbacks (fallbackDecision, I-18)', () => {
     ['auth', 'resolved', 'skipped'],
     ['clock', 'fallback-applied', 'fallback-proxy-placed'],
     ['keep-awake', 'fallback-applied', 'fallback-proxy-placed'],
+    ['cap', 'resolved', 'cap-blocked'],
   ] as const)('preflight-failed:%s → %s (%s)', (reason, state, outcome) => {
     const r = reduce(inState('armed'), E.preflightFailed(reason), CAPS_OK, CTX);
     expect(r.next).toMatchObject({ state, outcome });
@@ -1026,7 +1089,7 @@ describe('C5: the early proxy is sent like a normal bid', () => {
       E.preflightFailed('clock'),
       E.sent('proxy-key'),
       E.result(bid('accepted', { isHighBidder: true })),
-      { e: E.postRead(closedDetail({ isHighBidder: true, currentPrice: 1500 })), ctx: { ...CTX, reply: bid('accepted', { isHighBidder: true }) } },
+      E.postRead(closedDetail({ isHighBidder: true, currentPrice: 1500 })),
     ]);
     expect(results.map((r) => r.next.state)).toEqual(['fallback-applied', 'sent', 'sent', 'resolved']);
     expect(results.flatMap((r) => money(r.effects))).toEqual([{ kind: 'applyFallbackProxy', snipeId: 's1', amount: 2000 }]);
@@ -1038,6 +1101,57 @@ describe('C5: the early proxy is sent like a normal bid', () => {
     const s = reduce(inState('verified'), E.applyFallback('early-proxy'), CAPS_OK, CTX).next;
     expect(s.state).toBe('fallback-applied');
     expect(reduce(s, E.fire(), CAPS_OK, CTX).rejection?.reason).toBe('fallback-applied');
+  });
+});
+
+// ── m2: fire timing bounds (event time, server-corrected) ──────────────────
+
+describe('m2: fire is refused more than 2 s early, and resolves missed at or after the end', () => {
+  // inState('verified'): fireAt = FIRE_AT_SERVER (server time), offset OFFSET (server − local).
+  const atServer = (serverMs: number): SnipeEvent => E.fire(serverMs - OFFSET);
+
+  it('2001 ms before fireAt: refused too-early, nothing changes', () => {
+    const s = deepFreeze(inState('verified'));
+    expect(reduce(s, atServer(FIRE_AT_SERVER - 2001), CAPS_OK, CTX)).toMatchObject({
+      next: s,
+      effects: [],
+      rejection: { reason: 'too-early' },
+    });
+  });
+
+  it('exactly 2000 ms before fireAt: fires', () => {
+    const r = reduce(inState('verified'), atServer(FIRE_AT_SERVER - 2000), CAPS_OK, CTX);
+    expect(r.next.state).toBe('firing');
+    expect(money(r.effects)).toEqual([{ kind: 'placeBid', snipeId: 's1', amount: 2000 }]);
+  });
+
+  it('1 ms before the end: still fires', () => {
+    const r = reduce(inState('verified'), atServer(END_MS - 1), CAPS_OK, CTX);
+    expect(r.next.state).toBe('firing');
+    expect(money(r.effects)).toHaveLength(1);
+  });
+
+  it.each([0, 1, 60_000])('%i ms after the end: no bid, resolved through classifyOutcome abort missed', (after) => {
+    const r = reduce(inState('verified'), atServer(END_MS + after), CAPS_OK, CTX);
+    expect(money(r.effects)).toEqual([]);
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'missed' });
+    expect(ofKind(r.effects, 'notify')[0]?.message).toContain('No bid was placed');
+  });
+
+  it('a dry run takes the same path: missed, with no measure read', () => {
+    const r = reduce(inState('verified', { dryRun: true }), atServer(END_MS), CAPS_OK, CTX);
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'missed' });
+    expect(ofKind(r.effects, 'readDetail')).toEqual([]);
+  });
+
+  it('uses the end the verify read set, not the armed one', () => {
+    const earlier = END_MS - 30_000;
+    const s = reduce(inState('waking'), E.verified(detail({ endTime: iso(earlier) })), CAPS_OK, CTX).next;
+    vi.mocked(classifyOutcome).mockClear();
+    expect(money(reduce(s, atServer(earlier), CAPS_OK, CTX).effects)).toEqual([]);
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'missed' });
   });
 });
 
@@ -1142,7 +1256,7 @@ interface PropStep {
   capsOk: boolean;
   sessionUsable: boolean;
   writesAllowed: boolean;
-  withReply: boolean;
+  jitterMs: number;
 }
 
 const arbStep: fc.Arbitrary<PropStep> = fc.record({
@@ -1151,8 +1265,24 @@ const arbStep: fc.Arbitrary<PropStep> = fc.record({
   capsOk: fc.integer({ min: 0, max: 9 }).map((n) => n < 8),
   sessionUsable: fc.boolean(),
   writesAllowed: fc.boolean(),
-  withReply: fc.boolean(),
+  jitterMs: fc.integer({ min: -3000, max: 3000 }),
 });
+
+/** When a runner would send each event (local clock), so the fire-time bounds are exercised. */
+const WHEN: Record<EventType, number> = {
+  arm: ARM_AT,
+  disarm: VERIFY_AT,
+  wake: WAKE_AT,
+  verified: VERIFY_AT,
+  'verify-failed': VERIFY_AT,
+  fire: FIRE_LOCAL,
+  sent: SENT_LOCAL,
+  result: RESULT_LOCAL,
+  ambiguous: RESULT_LOCAL,
+  'post-read': POST_LOCAL,
+  'preflight-failed': PREFLIGHT_AT,
+  'apply-fallback': VERIFY_AT,
+};
 
 /** The event a runner would most likely send next, so random runs reach the deep states. */
 function guidedBody(s: Snipe, step: PropStep): Body {
@@ -1186,16 +1316,11 @@ interface Trace {
 function runProp(start: Snipe, steps: readonly PropStep[]): Trace {
   const trace: Trace = { steps: [] };
   let s = start;
-  steps.forEach((step, i) => {
+  steps.forEach((step) => {
     const body = step.guided ? guidedBody(s, step) : step.body;
-    const e: SnipeEvent = { ...body, now: ARM_AT + i * 1000 };
+    const e: SnipeEvent = { ...body, now: WHEN[body.type] + step.jitterMs };
     const caps = step.capsOk ? CAPS_OK : CAPS_BAD;
-    const ctx: ReduceContext = {
-      timeZone: TZ,
-      sessionUsable: step.sessionUsable,
-      writesAllowed: step.writesAllowed,
-      ...(step.withReply && step.body.type === 'result' ? { reply: step.body.result } : {}),
-    };
+    const ctx: ReduceContext = { timeZone: TZ, sessionUsable: step.sessionUsable, writesAllowed: step.writesAllowed };
     const r = reduce(s, e, caps, ctx);
     trace.steps.push({ before: s, e, caps, ctx, r });
     s = r.next;
@@ -1223,14 +1348,20 @@ const arbAnyState: fc.Arbitrary<Snipe> = fc
     inState(state, { ...over, ...(keyed && state !== 'draft' ? { attempt: { idempotencyKey: 'k0', sentAt: FIRE_AT_SERVER } } : {}) }),
   );
 
-const PROP_RUNS = 600;
-const arbSteps = fc.array(arbStep, { minLength: 1, maxLength: 24 });
+// m3: at least 2,000 runs of 40 to 60 events in the normal suite;
+// SBW_LONG_PROPS=1 runs 10,000 (the T-80 report gives the command).
+const LONG = (process.env.SBW_LONG_PROPS ?? '') !== '';
+const PROP_RUNS = LONG ? 10_000 : 2_000;
+const SIDE_RUNS = LONG ? 2_000 : 300;
+/** Per-test timeout for the property tests (each takes about 1 s in the normal suite). */
+const PROP_TIMEOUT_MS = LONG ? 600_000 : 30_000;
+const arbSteps = fc.array(arbStep, { minLength: 40, maxLength: 60 });
 
 function allEffects(t: Trace): Effect[] {
   return t.steps.flatMap((x) => x.r.effects);
 }
 
-describe('R2: money properties', () => {
+describe('R2: money properties', { timeout: PROP_TIMEOUT_MS }, () => {
   it('the generated runs are not vacuous: they reach every state and both money effects', () => {
     const reached = new Set<string>();
     const samples = fc.sample(fc.tuple(arbDraft, arbSteps), { numRuns: PROP_RUNS, seed: 80 });
@@ -1243,7 +1374,7 @@ describe('R2: money properties', () => {
     }
     for (const state of STATES) expect(reached).toContain(state);
     for (const kind of ['placeBid', 'applyFallbackProxy', 'proposeRearm', 'stampCalendar']) expect(reached).toContain(kind);
-    for (const reason of ['terminal', 'already-sent', 'already-fired', 'dry-run', 'caps', 'invalid-event']) {
+    for (const reason of ['terminal', 'already-sent', 'already-fired', 'dry-run', 'caps', 'invalid-event', 'too-early', 'duplicate']) {
       expect(reached).toContain(`rejected:${reason}`);
     }
   });
@@ -1278,6 +1409,22 @@ describe('R2: money properties', () => {
     );
   });
 
+  it('I2: after an ambiguous, no outcome text claims that no bid was placed', () => {
+    fc.assert(
+      fc.property(fc.oneof(arbDraft, arbAnyState), arbSteps, (start, steps) => {
+        let ambiguous = false;
+        for (const { e, r } of runProp(start, steps).steps) {
+          if (ambiguous) {
+            expect(r.next.outcomeDetail ?? '').not.toMatch(NO_BID_CLAIM);
+            for (const n of ofKind(r.effects, 'notify')) expect(n.message).not.toMatch(NO_BID_CLAIM);
+          }
+          if (e.type === 'ambiguous' && r.rejection === null) ambiguous = true;
+        }
+      }),
+      { numRuns: PROP_RUNS },
+    );
+  });
+
   it('no effect is emitted after a terminal state; terminal snipes never change', () => {
     fc.assert(
       fc.property(fc.oneof(arbDraft, arbAnyState), arbSteps, (start, steps) => {
@@ -1303,6 +1450,10 @@ describe('R2: money properties', () => {
             expect(caps.ok).toBe(true);
             expect(before.dryRun).toBe(false);
             expect(r.next.state).toBe('firing');
+            // m2: never more than 2 s early, never at or after the end (server time).
+            const serverNow = e.now + (before.measured?.offsetMs ?? 0);
+            expect(serverNow).toBeGreaterThanOrEqual((before.fireAt ?? Number.NaN) - 2000);
+            expect(serverNow).toBeLessThan(new Date(before.endTime).getTime());
           }
           if (ofKind(r.effects, 'applyFallbackProxy').length > 0) {
             expect(['armed', 'waking', 'verified']).toContain(before.state);
@@ -1317,7 +1468,7 @@ describe('R2: money properties', () => {
   });
 });
 
-describe('R1 and R5 as properties', () => {
+describe('R1 and R5 as properties', { timeout: PROP_TIMEOUT_MS }, () => {
   it('every step follows the table; a rejection never mutates and emits nothing; history grows by one per accepted event', () => {
     fc.assert(
       fc.property(fc.oneof(arbDraft, arbAnyState), arbSteps, (start, steps) => {
@@ -1350,7 +1501,7 @@ describe('R1 and R5 as properties', () => {
           for (const x of r.effects) expect(EffectSchema.safeParse(x).error).toBeUndefined();
         }
       }),
-      { numRuns: 300 },
+      { numRuns: SIDE_RUNS },
     );
   });
 
@@ -1361,7 +1512,7 @@ describe('R1 and R5 as properties', () => {
         const b = runProp(start, steps).steps.map((x) => x.r);
         expect(a).toEqual(b);
       }),
-      { numRuns: 200 },
+      { numRuns: SIDE_RUNS },
     );
   });
 });

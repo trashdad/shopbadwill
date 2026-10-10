@@ -7,37 +7,39 @@
 //
 // Money rules, in one place (the core of the product):
 // - `placeBid` is emitted only by `fire` in state 'verified', for a live
-//   snipe, with a passing CapsResult; its amount is exactly `Snipe.maxBid`.
-//   `fire` moves the snipe to 'firing' and nothing leads back to 'verified',
-//   so a snipe emits at most one `placeBid` (R2).
+//   snipe, with a passing CapsResult, no more than 2 s before the planned
+//   fire and before the end (server time). Its amount is exactly
+//   `Snipe.maxBid`. `fire` moves the snipe to 'firing' and nothing leads back
+//   to 'verified', so a snipe emits at most one `placeBid` (R2).
 // - `applyFallbackProxy` comes only from T-83's `fallbackDecision` (I-18),
 //   always called on the snipe BEFORE it changes state (C3). It answers null
 //   once the snipe has fired, and a dry run gets an audit entry instead, so a
 //   fallback never adds a second bid and `fire` is refused once a fallback is
-//   applied.
+//   applied. A cap failure never reaches the fallback: an early proxy for the
+//   same amount cannot pass the same caps, so it ends 'cap-blocked'.
 // - 'sent' is terminal for sending (R3). The runner dispatches `sent {key}`
 //   BEFORE any PlaceBid leaves (the snipe's or the early proxy's, C5) and
 //   sends ONLY if the reducer accepted it. A second `sent` or `fire` is
-//   refused, and so is a `sent` for a snipe that already holds a key.
+//   refused, and so is a `sent` for a snipe that already holds a key. After
+//   `sent` nothing stops the snipe: every disarm is refused, so a possibly
+//   live bid stays open (exposure) until the outcome read settles it.
+// - One reply per attempt: `result` records SGW's reply on `attempt.reply`;
+//   a second `result`, or one after `ambiguous` (and vice versa), is refused.
 // - A dry run walks the same states. Its `fire` emits a `measure` read and a
 //   `bid.dry-run` audit entry in place of `placeBid`, and the measure read's
 //   `post-read` resolves it as 'dry-run' (C4).
-// - Outcomes come from T-87's `classifyOutcome` (I-18). The exceptions are
-//   three "no bid was placed" notices that T-87 has no input for (an end that
-//   moved before the bid, a price above the max, already the high bidder);
-//   they are written here and say plainly that nothing was bid.
+// - Every outcome and its copy come from T-87's `classifyOutcome` (I-18),
+//   pre-bid ends included (its `abort` reasons).
 //
 // Every state × event pair is in TRANSITIONS (R1): either the possible next
 // states or a typed rejection. A rejected event returns the very same snipe
 // object and no effects. The table and the handler switch are typed from the
 // contract's zod unions, so a new state or event fails to compile until it is
 // placed in the table.
-import { formatMoney } from '../money';
-import { formatDual } from '../time/pacific';
-import type { BidResult, BidResultKind, EpochMs, ItemDetail } from '../types';
+import type { BidResultKind, EpochMs, ItemDetail } from '../types';
 import { checkCaps, DEFAULT_TIME_ZONE, spentToday } from './caps';
 import { classifyOutcome, type AbortReason, type Classification, type OutcomeContext } from './outcome';
-import { fallbackDecision, type Fallback, type FallbackReason, type PreflightReason } from './preflight';
+import { fallbackDecision, isoMs, type Fallback, type FallbackReason, type PreflightReason } from './preflight';
 import { assessClock, computeFireAt, type ClockAbortReason } from './timing';
 import { LeadMsSchema, type CapsCheck, type CapsResult, type Effect, type Snipe, type SnipeEvent, type SnipeState } from './types';
 
@@ -51,6 +53,9 @@ export const ASSUME_EXTENSION_MS = 0;
 
 /** The wake alarm goes off this long before the planned fire (PLAN §1.3). */
 export const WAKE_BEFORE_FIRE_MS = 5 * 60_000;
+
+/** `fire` is refused when it comes more than this long before the planned fire (server time). */
+export const FIRE_EARLY_TOLERANCE_MS = 2000;
 
 export type SnipeEventType = SnipeEvent['type'];
 
@@ -66,6 +71,8 @@ export type RejectReason =
   | 'not-awake'
   /** `fire` before the T−60 s verify passed. */
   | 'not-verified'
+  /** `fire` more than FIRE_EARLY_TOLERANCE_MS before the planned fire. */
+  | 'too-early'
   /** `sent` before `fire`. */
   | 'not-firing'
   /** A reply or outcome read before anything was sent. */
@@ -76,7 +83,7 @@ export type RejectReason =
   | 'already-fired'
   /** Sending is over for this snipe (R3), or it already holds an idempotency key. */
   | 'already-sent'
-  /** The fallback replaced the snipe: only the early proxy's `sent` or a disarm apply. */
+  /** The fallback replaced the snipe and was decided: only its `sent` or a user/kill disarm apply. */
   | 'fallback-applied'
   /** A dry run never sends anything. */
   | 'dry-run'
@@ -86,7 +93,7 @@ export type RejectReason =
   | 'invalid-snipe'
   /** The event's data is unusable (another item's read, an unknown reason, an empty key). */
   | 'invalid-event'
-  /** The same event twice. */
+  /** The same event twice, or a second reply for one attempt. */
   | 'duplicate';
 
 export interface Rejection {
@@ -131,14 +138,6 @@ export interface ReduceContext {
    * would do (C4). Default false.
    */
   writesAllowed?: boolean;
-  /**
-   * `post-read` only: the SGW reply this read settles, i.e. the BidResult of
-   * the `result` the reducer accepted before it. The Snipe record has no field
-   * for a reply, so the runner keeps it in memory; after a restart it is gone
-   * and the post-read is judged as for an ambiguous send. Ignored after an
-   * `ambiguous` and for a reply that proves no bid registered.
-   */
-  reply?: BidResult;
 }
 
 const accept = (...to: SnipeState[]): TransitionCell => Object.freeze({ to: Object.freeze(to) });
@@ -165,12 +164,6 @@ function rejectAll(reason: RejectReason): { readonly [E in SnipeEventType]: Tran
   };
 }
 
-/**
- * R1: the whole state × event table. `disarm` leads to 'killed', except that a
- * `disarm(anomaly)` whose fallback places a live early proxy leads to
- * 'fallback-applied': that proxy is a real bid, so the snipe stays open for its
- * `sent` (C5) and keeps counting in the caps' exposure.
- */
 type TransitionTable = { readonly [S in SnipeState]: { readonly [E in SnipeEventType]: TransitionCell } };
 
 /** Frozen at load: the table drives the money path, so no importer may change it. */
@@ -179,6 +172,12 @@ function freezeTable(t: TransitionTable): TransitionTable {
   return Object.freeze(t);
 }
 
+/**
+ * R1: the whole state × event table. `disarm` leads to 'killed', except that a
+ * `disarm(anomaly)` whose fallback places a live early proxy leads to
+ * 'fallback-applied': that proxy is a real bid, so the snipe stays open for its
+ * `sent` (C5) and keeps counting in the caps' exposure.
+ */
 export const TRANSITIONS: TransitionTable = freezeTable({
   draft: {
     ...rejectAll('not-armed'),
@@ -202,7 +201,8 @@ export const TRANSITIONS: TransitionTable = freezeTable({
   'fallback-applied': {
     ...rejectAll('fallback-applied'),
     arm: reject('already-armed'),
-    disarm: accept('killed'),
+    // m1: a disarm by anomaly would ask for a fallback that was already decided.
+    disarm: guarded(['killed'], ['fallback-applied']),
     sent: guarded(['sent'], ['dry-run', 'already-sent', 'invalid-event']),
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
@@ -228,8 +228,8 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     wake: reject('step-passed'),
     verified: reject('step-passed'),
     'verify-failed': accept('resolved', 'fallback-applied'),
-    // A failing CapsResult at fire resolves through the fallback, which a cap always degrades to skip.
-    fire: accept('firing', 'resolved'),
+    // Resolves (cap-blocked or missed) instead of firing on a failing CapsResult or at the end.
+    fire: guarded(['firing', 'resolved'], ['too-early']),
     sent: reject('not-firing'),
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
@@ -248,11 +248,10 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     // Only a dry run's measure read: a live firing snipe has sent nothing to settle.
     'post-read': guarded(['resolved'], ['not-sent', 'invalid-event']),
   },
-  // R3: after sent, only the reply, the ambiguity, the outcome read and a user disarm.
+  // R3: after sent, only the reply, the ambiguity and the outcome read. No disarm (I3).
   sent: {
     ...rejectAll('already-sent'),
-    disarm: guarded(['killed'], ['already-sent']),
-    result: guarded(['sent', 'resolved'], ['dry-run']),
+    result: guarded(['sent', 'resolved'], ['dry-run', 'duplicate']),
     ambiguous: guarded(['sent'], ['dry-run', 'duplicate']),
     'post-read': guarded(['resolved'], ['invalid-event']),
   },
@@ -272,17 +271,18 @@ const REJECT_TEXT: Readonly<Record<RejectReason, string>> = {
   'already-armed': 'The snipe is already armed.',
   'not-awake': 'A verify result arrived before the wake.',
   'not-verified': 'The snipe cannot fire before the 60-second verify passed.',
+  'too-early': 'It is more than 2 s before the planned fire.',
   'not-firing': 'Nothing can be sent before the snipe fires.',
   'not-sent': 'Nothing has been sent, so there is no reply or outcome to read.',
   'step-passed': 'The snipe is past the step this event belongs to.',
   'already-fired': 'The snipe has already fired; it fires once.',
   'already-sent': 'The bid may already be out; nothing can be sent or stopped now. The outcome read settles it.',
-  'fallback-applied': 'The fallback replaced this snipe; it will not fire.',
+  'fallback-applied': 'The fallback replaced this snipe and was already decided.',
   'dry-run': 'A dry run never sends anything.',
   caps: 'A spending cap blocks this snipe.',
   'invalid-snipe': 'The snipe cannot be armed as it is.',
   'invalid-event': 'The event data cannot be used.',
-  duplicate: 'The same event arrived twice.',
+  duplicate: 'This attempt already has its reply or its ambiguity recorded.',
 };
 
 /** One audit entry per accepted event; `fire` in a dry run audits as 'bid.dry-run'. */
@@ -336,19 +336,9 @@ type Handled = Accepted | { rejection: Rejection };
 
 // ── Small helpers ───────────────────────────────────────────────────────────
 
-/** IsoUtc (zod-validated) to epoch ms. */
-function isoMs(iso: string): number {
-  return new Date(iso).getTime();
-}
-
 /** A local instant in SGW's time, once the T−60 s verify measured the offset (server − local). */
 function serverTime(s: Snipe, localMs: EpochMs): EpochMs {
   return localMs + (s.measured?.offsetMs ?? 0);
-}
-
-/** Display money without throwing on a malformed amount. */
-function money(cents: number): string {
-  return Number.isSafeInteger(cents) && cents >= 0 ? formatMoney(cents) : String(cents);
 }
 
 function clip(text: string, max = 200): string {
@@ -382,33 +372,32 @@ function outcomeContext(ctx: ReduceContext, abort?: AbortReason): OutcomeContext
 function settled(s: Snipe, e: SnipeEvent, to: 'resolved' | 'killed', c: Classification, why: string): Accepted {
   const effects: Effect[] = [c.notify];
   if (c.stamp !== null) effects.push(c.stamp);
+  // R4: propose, never re-arm by itself.
   if (c.outcome === 'extended') effects.push({ kind: 'proposeRearm', snipeId: s.id });
   return { next: step(s, e, to, why, { outcome: c.outcome, outcomeDetail: c.detail }), effects, details: { final: c.final } };
 }
 
-/** A pre-bid end that T-87 can classify from `abort` alone (ended, killed). */
-function aborted(s: Snipe, e: SnipeEvent, ctx: ReduceContext, to: 'resolved' | 'killed', abort: AbortReason, why: string): Accepted {
-  return settled(s, e, to, classifyOutcome(s, null, null, outcomeContext(ctx, abort)), why);
+/**
+ * A pre-bid end, classified by T-87 from its `abort` reason (killed, ended,
+ * cap, extended, price, already-high, missed). `post` is the read that showed
+ * it, when there is one.
+ */
+function aborted(
+  s: Snipe,
+  e: SnipeEvent,
+  ctx: ReduceContext,
+  to: 'resolved' | 'killed',
+  abort: AbortReason,
+  why: string,
+  post: ItemDetail | null = null,
+): Accepted {
+  return settled(s, e, to, classifyOutcome(s, null, post, outcomeContext(ctx, abort)), why);
 }
 
-/** "No bid was placed" outcomes T-87 has no input for. Never used once anything was sent. */
-function noBid(s: Snipe, e: SnipeEvent, outcome: 'extended' | 'skipped', heading: string, text: string, why: string): Accepted {
-  const dry = s.dryRun ? 'Dry run: ' : '';
-  const rearm = outcome === 'extended' ? ' Re-arm to bid at the new end.' : '';
-  const message = `${dry}${text} No bid was placed (your max ${money(s.maxBid)}).${rearm}`;
-  const effects: Effect[] = [notify(s, heading, message)];
-  if (outcome === 'extended') effects.push({ kind: 'proposeRearm', snipeId: s.id });
-  return { next: step(s, e, 'resolved', why, { outcome, outcomeDetail: message }), effects };
-}
-
-/** R4: the end moved later than planned before the bid. Never re-arms by itself: it proposes. */
-function extendedBeforeBid(s: Snipe, e: SnipeEvent, ctx: ReduceContext, newEnd: string | null): Accepted {
-  const tz = ctx.timeZone ?? DEFAULT_TIME_ZONE;
-  const text =
-    newEnd === null
-      ? 'The auction end moved later before the snipe fired.'
-      : `The auction end moved later, to ${formatDual(isoMs(newEnd), tz)} (was ${formatDual(isoMs(s.endTime), tz)}), before the snipe fired.`;
-  return noBid(s, e, 'extended', 'Extended', text, `${e.type}: extended`);
+/** I1: a cap failure ends the snipe 'cap-blocked'; it never reaches the fallback. */
+function capBlocked(s: Snipe, e: SnipeEvent, ctx: ReduceContext, caps: CapsResult, why: string): Accepted {
+  const done = aborted(s, e, ctx, 'resolved', 'cap', why);
+  return { ...done, details: { ...done.details, violations: caps.violations.join('; ') } };
 }
 
 /**
@@ -420,7 +409,7 @@ function extendedBeforeBid(s: Snipe, e: SnipeEvent, ctx: ReduceContext, newEnd: 
 function fallback(
   s: Snipe,
   e: SnipeEvent,
-  base: FallbackReason,
+  base: Exclude<FallbackReason, 'cap'>,
   cause: string,
   caps: CapsResult,
   ctx: ReduceContext,
@@ -445,7 +434,7 @@ function fallback(
 function preFireFallback(
   s: Snipe,
   e: SnipeEvent,
-  base: FallbackReason,
+  base: Exclude<FallbackReason, 'cap'>,
   cause: string,
   caps: CapsResult,
   ctx: ReduceContext,
@@ -456,10 +445,6 @@ function preFireFallback(
   return r;
 }
 
-function capsCause(caps: CapsResult): string {
-  return `A spending cap blocks this bid: ${caps.violations.join('; ')}.`;
-}
-
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 function invalidSnipe(s: Snipe, now: EpochMs): string | null {
@@ -468,14 +453,14 @@ function invalidSnipe(s: Snipe, now: EpochMs): string | null {
   const endMs = isoMs(s.endTime);
   if (!Number.isFinite(endMs)) return 'The auction end time is not a valid instant.';
   if (now >= endMs) return 'The auction has already ended.';
-  if (s.attempt.sentAt !== undefined || s.attempt.idempotencyKey !== undefined) {
+  if (s.attempt.sentAt !== undefined || s.attempt.idempotencyKey !== undefined || s.attempt.reply !== undefined) {
     return 'A draft must not carry a send attempt (the arm handler resets it).';
   }
   return null;
 }
 
 function onArm(s: Snipe, e: Extract<SnipeEvent, { type: 'arm' }>, caps: CapsResult): Handled {
-  if (!caps.ok) return refuse('caps', capsCause(caps));
+  if (!caps.ok) return refuse('caps', `A spending cap blocks this snipe: ${caps.violations.join('; ')}.`);
   const problem = invalidSnipe(s, e.now);
   if (problem !== null) return refuse('invalid-snipe', problem);
   // Provisional plan (no latency yet); `verified` replaces it with the measured one.
@@ -492,12 +477,9 @@ function onArm(s: Snipe, e: Extract<SnipeEvent, { type: 'arm' }>, caps: CapsResu
 }
 
 function onDisarm(s: Snipe, e: Extract<SnipeEvent, { type: 'disarm' }>, caps: CapsResult, ctx: ReduceContext): Handled {
+  // m1: the early proxy was this snipe's fallback; an anomaly cannot ask for another.
+  if (s.state === 'fallback-applied' && e.by === 'anomaly') return refuse('fallback-applied');
   const details = { by: e.by, why: clip(e.why) };
-  if (s.state === 'sent') {
-    // Only the user may end a snipe whose bid may be out; T-87 says so ("check the item").
-    if (e.by !== 'user') return refuse('already-sent');
-    return { ...aborted(s, e, ctx, 'killed', 'killed', `disarm:${e.by}`), details };
-  }
   if (e.by === 'anomaly' && PRE_FIRE.has(s.state)) {
     // C3: the fallback is decided on the snipe as it is, before the kill.
     const fb = fallback(s, e, 'anomaly', `Stopped automatically: ${clip(e.why)}.`, caps, ctx, 'killed');
@@ -521,14 +503,14 @@ function onVerified(s: Snipe, e: Extract<SnipeEvent, { type: 'verified' }>, caps
   const d: ItemDetail = e.detail;
   if (d.itemId !== s.itemId) return refuse('invalid-event', 'The verify read is for another item.');
   const endMs = isoMs(d.endTime);
-  if (d.isClosed || isoMs(d.serverTime) >= endMs) return aborted(s, e, ctx, 'resolved', 'ended', 'verified: auction closed');
-  if (endMs > isoMs(s.endTime) + ASSUME_EXTENSION_MS) return extendedBeforeBid(s, e, ctx, d.endTime);
+  if (d.isClosed || isoMs(d.serverTime) >= endMs) return aborted(s, e, ctx, 'resolved', 'ended', 'verified: auction closed', d);
+  if (endMs > isoMs(s.endTime) + ASSUME_EXTENSION_MS) return aborted(s, e, ctx, 'resolved', 'extended', 'verified: end moved later', d);
   // The runner sends `verified` only with a usable sample, so the event has no
   // confidence field; 'low' re-checks the rtt and skew bounds (T-81).
   const clock = assessClock({ offsetMs: e.offsetMs, rttMs: e.rttMs, confidence: 'low' });
   if (!clock.ok) return preFireFallback(s, e, 'clock', CLOCK_CAUSE[clock.reason], caps, ctx);
   // C1: the caller ran checkCaps with this read (capsForEvent).
-  if (!caps.ok) return preFireFallback(s, e, 'cap', capsCause(caps), caps, ctx);
+  if (!caps.ok) return capBlocked(s, e, ctx, caps, 'verified: cap');
   const fireAt = computeFireAt(endMs, s.leadMs, clock.oneWayMs);
   return {
     next: step(s, e, 'verified', 'verified', {
@@ -543,40 +525,46 @@ function onVerified(s: Snipe, e: Extract<SnipeEvent, { type: 'verified' }>, caps
 
 function onVerifyFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'verify-failed' }>, caps: CapsResult, ctx: ReduceContext): Handled {
   const details = { reason: e.reason };
+  const why = `verify-failed: ${e.reason}`;
+  let done: Accepted;
   switch (e.reason) {
     case 'ended':
-      return { ...aborted(s, e, ctx, 'resolved', 'ended', 'verify-failed: ended'), details };
+      done = aborted(s, e, ctx, 'resolved', 'ended', why);
+      break;
     case 'extended':
-      return { ...extendedBeforeBid(s, e, ctx, null), details };
+      done = aborted(s, e, ctx, 'resolved', 'extended', why);
+      break;
     case 'price-over-max':
-      return {
-        ...noBid(s, e, 'skipped', 'Snipe skipped', 'The next acceptable bid is above your max: nothing to win.', 'verify-failed: price-over-max'),
-        details,
-      };
+      done = aborted(s, e, ctx, 'resolved', 'price', why);
+      break;
     case 'already-high':
-      return {
-        ...noBid(s, e, 'skipped', 'Snipe skipped', 'You are already the high bidder, so the snipe did not bid.', 'verify-failed: already-high'),
-        details,
-      };
-    case 'cap': {
-      const fb = preFireFallback(s, e, 'cap', capsCause(caps), caps, ctx);
-      return { ...fb, details: { ...details, ...fb.details } };
-    }
+      done = aborted(s, e, ctx, 'resolved', 'already-high', why);
+      break;
+    case 'cap':
+      done = capBlocked(s, e, ctx, caps, why);
+      break;
     case 'auth':
     case 'network':
-    case 'clock': {
-      const fb = preFireFallback(s, e, e.reason, VERIFY_CAUSE[e.reason], caps, ctx);
-      return { ...fb, details: { ...details, ...fb.details } };
-    }
+    case 'clock':
+      done = preFireFallback(s, e, e.reason, VERIFY_CAUSE[e.reason], caps, ctx);
+      break;
   }
+  return { ...done, details: { ...details, ...done.details } };
 }
 
 function onFire(s: Snipe, e: Extract<SnipeEvent, { type: 'fire' }>, caps: CapsResult, ctx: ReduceContext): Handled {
-  // The money transition re-checks the precomputed caps too.
-  if (!caps.ok) return preFireFallback(s, e, 'cap', capsCause(caps), caps, ctx);
   const firedAt = serverTime(s, e.now);
+  const endMs = isoMs(s.endTime);
+  // m2: the window is [fireAt − 2 s, end) in server time, from the event's clock.
+  const plannedAt = s.fireAt ?? computeFireAt(endMs, s.leadMs, 0);
+  if (firedAt < plannedAt - FIRE_EARLY_TOLERANCE_MS) {
+    return refuse('too-early', `The fire came ${String(Math.round(plannedAt - firedAt))} ms before the planned fire.`);
+  }
+  if (firedAt >= endMs) return aborted(s, e, ctx, 'resolved', 'missed', 'fire: after the end');
+  // The money transition re-checks the precomputed caps too.
+  if (!caps.ok) return capBlocked(s, e, ctx, caps, 'fire: cap');
   const next = step(s, e, 'firing', 'fire', { measured: { ...s.measured, firedAt } });
-  const details = { amount: s.maxBid, fireAt: s.fireAt ?? null, firedAt };
+  const details = { amount: s.maxBid, fireAt: plannedAt, firedAt };
   if (s.dryRun) {
     // C4: the same path; a harmless read at fire time measures real latency in place of PlaceBid.
     return { next, effects: [{ kind: 'readDetail', snipeId: s.id, purpose: 'measure' }], details, auditKind: 'bid.dry-run' };
@@ -600,12 +588,18 @@ function onSent(s: Snipe, e: Extract<SnipeEvent, { type: 'sent' }>): Handled {
   };
 }
 
+/** I2: one reply per attempt; T-101's SendStrategy dispatches exactly one `result` or `ambiguous`. */
+function hasAnswer(s: Snipe): boolean {
+  return s.attempt.reply !== undefined || s.attempt.ambiguous === true;
+}
+
 function onResult(s: Snipe, e: Extract<SnipeEvent, { type: 'result' }>, ctx: ReduceContext): Handled {
   if (s.dryRun) return refuse('dry-run');
+  if (hasAnswer(s)) return refuse('duplicate');
   const r = e.result;
   const replied: Snipe = {
     ...s,
-    attempt: { ...s.attempt, ambiguous: false },
+    attempt: { ...s.attempt, reply: r },
     measured: { ...s.measured, responseAt: serverTime(s, e.now) },
   };
   const details: Details = {
@@ -616,12 +610,11 @@ function onResult(s: Snipe, e: Extract<SnipeEvent, { type: 'result' }>, ctx: Red
     message: clip(r.messageText),
   };
   if (NOT_REGISTERED.has(r.kind)) {
-    const c = classifyOutcome(replied, r, null, outcomeContext(ctx));
-    const done = settled(replied, e, 'resolved', c, `result: ${r.kind}`);
+    const done = settled(replied, e, 'resolved', classifyOutcome(replied, r, null, outcomeContext(ctx)), `result: ${r.kind}`);
     return { ...done, details: { ...details, ...done.details } };
   }
   // accepted, outbid, rejected-unknown: the bid registered or may have. The
-  // outcome read settles it; never resend after a reply (bid.ts contract).
+  // outcome read settles it with the recorded reply; never resend (bid.ts contract).
   return {
     next: step(replied, e, 'sent', `result: ${r.kind}; awaiting the outcome read`),
     effects: [{ kind: 'readDetail', snipeId: s.id, purpose: 'post-read' }],
@@ -631,18 +624,11 @@ function onResult(s: Snipe, e: Extract<SnipeEvent, { type: 'result' }>, ctx: Red
 
 function onAmbiguous(s: Snipe, e: Extract<SnipeEvent, { type: 'ambiguous' }>): Handled {
   if (s.dryRun) return refuse('dry-run');
-  if (s.attempt.ambiguous === true) return refuse('duplicate', 'The send is already marked ambiguous.');
+  if (hasAnswer(s)) return refuse('duplicate');
   return {
     next: step(s, e, 'sent', 'ambiguous: post-read first', { attempt: { ...s.attempt, ambiguous: true } }),
     effects: [{ kind: 'readDetail', snipeId: s.id, purpose: 'post-read' }],
   };
-}
-
-/** The reply a post-read settles, if the runner still has it and it fits this snipe's record. */
-function pendingReply(s: Snipe, ctx: ReduceContext): BidResult | null {
-  const r = ctx.reply;
-  if (r === undefined || s.attempt.ambiguous !== false || s.measured?.responseAt === undefined) return null;
-  return NOT_REGISTERED.has(r.kind) ? null : r;
 }
 
 function onPostRead(s: Snipe, e: Extract<SnipeEvent, { type: 'post-read' }>, ctx: ReduceContext): Handled {
@@ -656,7 +642,8 @@ function onPostRead(s: Snipe, e: Extract<SnipeEvent, { type: 'post-read' }>, ctx
     const done = settled(measured, e, 'resolved', classifyOutcome(measured, null, d, outcomeContext(ctx)), 'post-read: dry run measured');
     return { ...done, details: { ...details, ...done.details } };
   }
-  const reply = pendingReply(s, ctx);
+  // The recorded reply (survives a restart); an ambiguous send has none.
+  const reply = s.attempt.ambiguous === true ? null : (s.attempt.reply ?? null);
   const done = settled(s, e, 'resolved', classifyOutcome(s, reply, d, outcomeContext(ctx)), 'post-read');
   return { ...done, details: { ...details, ...done.details } };
 }
@@ -664,26 +651,25 @@ function onPostRead(s: Snipe, e: Extract<SnipeEvent, { type: 'post-read' }>, ctx
 function onPreflightFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'preflight-failed' }>, caps: CapsResult, ctx: ReduceContext): Handled {
   const reason = PREFLIGHT_REASONS.find((r) => r === e.reason);
   if (reason === undefined) return refuse('invalid-event', `Unknown preflight reason '${clip(e.reason, 40)}'.`);
-  const details = { reason };
+  const why = `preflight-failed: ${reason}`;
+  let done: Accepted;
   switch (reason) {
     case 'ended':
-      return { ...aborted(s, e, ctx, 'resolved', 'ended', 'preflight-failed: ended'), details };
+      done = aborted(s, e, ctx, 'resolved', 'ended', why);
+      break;
     case 'price':
-      return {
-        ...noBid(s, e, 'skipped', 'Snipe skipped', 'The next acceptable bid is above your max: nothing to win.', 'preflight-failed: price'),
-        details,
-      };
-    case 'cap': {
-      const fb = preFireFallback(s, e, 'cap', capsCause(caps), caps, ctx);
-      return { ...fb, details: { ...details, ...fb.details } };
-    }
+      done = aborted(s, e, ctx, 'resolved', 'price', why);
+      break;
+    case 'cap':
+      done = capBlocked(s, e, ctx, caps, why);
+      break;
     case 'auth':
     case 'clock':
-    case 'keep-awake': {
-      const fb = preFireFallback(s, e, reason, PREFLIGHT_CAUSE[reason], caps, ctx);
-      return { ...fb, details: { ...details, ...fb.details } };
-    }
+    case 'keep-awake':
+      done = preFireFallback(s, e, reason, PREFLIGHT_CAUSE[reason], caps, ctx);
+      break;
   }
+  return { ...done, details: { reason, ...done.details } };
 }
 
 function onApplyFallback(s: Snipe, e: Extract<SnipeEvent, { type: 'apply-fallback' }>, caps: CapsResult, ctx: ReduceContext): Handled {
