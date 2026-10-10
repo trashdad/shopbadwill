@@ -186,12 +186,12 @@
         },
         {
           "method": "GET",
-          "path": "/api/Seller/GetSellerInfo/135",
+          "path": "/api/Seller/GetSellerInfo/955353",
           "status": 200
         },
         {
           "method": "GET",
-          "path": "/api/Home/GetSellerItems?sellerId=135&categoryId=0",
+          "path": "/api/Home/GetSellerItems?sellerId=955353&categoryId=0",
           "status": 200
         }
       ],

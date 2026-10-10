@@ -172,9 +172,45 @@ describe('fixtures manifest', () => {
     }
   });
 
-  // USER STEP S-1 captures (docs/USER-STEPS/S-1.md); asserted once stage 2 lands them.
-  it.todo('holds the USER STEP fixtures: favorites-open, saved-searches, show-bid-modal, calculate-shipping');
-  it.todo('holds the USER STEP DOM captures: search grid and list, favorites page, logged-in item page');
+  // USER STEP S-1 captures (docs/USER-STEPS/S-1.md), stage 2.
+  const byName = new Map(manifest.fixtures.map((e) => [e.fixture, e]));
+
+  it('holds the USER STEP JSON fixtures, user-sourced and logged in', () => {
+    // favorites-all, not favorites-open: the reply the user copied holds Open AND Close rows (Type=all).
+    const expected: Array<[string, string]> = [
+      ['favorites-all', 'favorites'],
+      ['saved-searches', 'savedSearches'],
+      ['show-bid-modal', 'showBidModal'],
+      ['calculate-shipping', 'shippingQuote'],
+      ['item-detail-logged-in', 'itemDetail'],
+    ];
+    for (const [name, endpoint] of expected) {
+      const e = byName.get(name);
+      expect(e, name).toBeDefined();
+      expect(e, name).toMatchObject({ kind: 'json', endpoint, source: 'user', loggedIn: true, method: 'user-devtools', requestLogSeq: null });
+    }
+  });
+
+  it('holds the USER STEP DOM captures: search grid and list (logged out and in) and the logged-in item page', () => {
+    for (const layout of ['grid', 'list'] as const) {
+      for (const state of ['logged-out', 'logged-in'] as const) {
+        const name = `search-${layout}-${state}`;
+        expect(byName.get(name), name).toMatchObject({ kind: 'html', page: 'search', layout, source: 'user', loggedIn: state === 'logged-in' });
+      }
+    }
+    expect(byName.get('item-page-logged-in')).toMatchObject({ kind: 'html', page: 'item', source: 'user', loggedIn: true });
+    // Its seller can only be scrubbed from the same item's ItemDetail (fix round 2, N1): both are present.
+    expect(byName.get('item-detail-logged-in')).toBeDefined();
+  });
+
+  it('records the user-observed search URL in sources.json (T-50 round-trips it)', () => {
+    const sources = JSON.parse(read('sources.json')) as { observedSearchUrl?: string };
+    expect(sources.observedSearchUrl).toMatch(/^https:\/\/shopgoodwill\.com\/categories\/listing\?st=/);
+    expect(new URL(sources.observedSearchUrl ?? '').searchParams.get('layout')).toBe('grid');
+  });
+
+  // Step 9's copy was the favorites JSON reply (saved as favorites-page.html), not the page DOM.
+  it.todo('holds the favorites page DOM (not captured in USER STEP S-1)');
 });
 
 describe('request log (S-1 exit criterion 5)', () => {

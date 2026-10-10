@@ -110,7 +110,7 @@ describe('other normalizers', () => {
     expect(new Date(normalizeCurrentTime(loadFixture('get-current-time'))).toISOString()).toBe('2026-10-08T03:09:15.000Z');
   });
   it('seller info', () => {
-    expect(normalizeSellerInfo(loadFixture('seller-info'))).toEqual({ sellerId: 135, name: 'Goodwill of O', state: 'IL' });
+    expect(normalizeSellerInfo(loadFixture('seller-info'))).toEqual({ sellerId: 955353, name: 'Goodwill of O', state: 'IL' });
   });
   it('favorites derive status from endTime; notes default to empty', () => {
     const raw = {
