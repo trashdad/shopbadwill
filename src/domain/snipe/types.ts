@@ -85,6 +85,13 @@ export const SnipeSchema = z.object({
     sentAt: EpochMsSchema.optional(),
     idempotencyKey: z.string().optional(),
     ambiguous: z.boolean().optional(),
+    /**
+     * T-80 contract change: SGW's reply to this attempt's PlaceBid, recorded by
+     * the reducer on `result` so the outcome read after it (even after a worker
+     * restart) is judged with the reply (T-87). One reply per attempt: a
+     * second `result`, or a `result` after `ambiguous`, is refused.
+     */
+    reply: BidResultSchema.optional(),
   }),
   measured: z
     .object({

@@ -379,3 +379,26 @@ Source: controller ruling, T-30 fix round 1.
 **Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
 
 **T-30 round 2 addition.** `HealthProbe` gains optional `firstSeenAt: EpochMs`, set once at the first run or recorded failure. A schema check that has never had a good probe escalates to `stale` (`ok:false`) once `now - firstSeenAt > 24h`, the same fail-closed path as the `lastGoodProbeAt` rule (an empty search, which leaves detail with nothing to probe, is exempt). Optional, backward compatible.
+
+## T-80 contract change: `Snipe.attempt.reply`
+
+Approved by the controller in the T-80 review (fix round 1, ruling on concern 1).
+
+**Change.** `Snipe.attempt` gains `reply?: BidResult` (`src/domain/snipe/types.ts`). It holds SGW's reply to the attempt's PlaceBid, and the reducer (`src/domain/snipe/state-machine.ts`) records it on `result`.
+
+**Why.** When a reply might have registered (`accepted`, `outbid`, `rejected-unknown`), the snipe waits for the outcome read. That read must be judged together with the reply: T-87's `classifyOutcome(snipe, reply, postDetail)` needs `rejected-unknown` to give the right copy, and `accepted` to infer a win from the price. The `post-read` event carries only the ItemDetail.
+
+Before this change, the reply could only be held in the runner's memory (the stopgap `ReduceContext.reply`, now removed). After a worker restart the reply was lost, so an accepted bid with an anonymous post-read under the max read "Unconfirmed" instead of "Won".
+
+**Rules.**
+- **One reply per attempt.** A second `result`, an `ambiguous` after a `result`, or a `result` after an `ambiguous` is refused as `duplicate`. T-101's SendStrategy dispatches exactly one of the two.
+- **Ambiguous sends.** After `ambiguous`, the outcome read is judged with no reply. A stored record that has both a reply and the ambiguity flag is judged the same way, conservatively. The reducer never writes such a record.
+- **Re-arming.** The `snipe.arm` handler already resets `attempt` to `{}`, so a re-armed snipe carries no reply. `arm` also refuses a draft that has one.
+
+**Migration.** None. The field is optional, so `sbw:meta.schemaVersion` stays 1, and snipes stored before this change have no reply.
+
+**Tests.**
+- `test/contract/types/spec-shapes.test.ts`: `SpecSnipe.attempt.reply?: SpecBidResult`.
+- `test/unit/domain/snipe/state-machine.test.ts`: covers a restart round trip through `SnipeSchema` (accepted reply, then an anonymous post-read under the max, resolves to Won), one reply per attempt, and the ambiguous-plus-reply record.
+
+**Follow-up for the next PLAN edit.** Add `reply?: BidResult` to `Snipe.attempt` in PLAN §3.9 and in `contracts.md`.
