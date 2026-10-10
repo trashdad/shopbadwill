@@ -4,10 +4,15 @@ import { describe, expect, it } from 'vitest';
 import { invalidSearchParams, searchQueryFromUrl, searchQueryToUrl } from '../../../../src/adapters/sgw/query-url';
 import { SearchQuerySchema, type SearchQuery } from '../../../../src/domain/types';
 
-// Built in the exact format of SGW's buildSearchQueryString (S-1 section 4, config.ts).
-// Repoint this constant at the user-observed URL once T-07 stage 2 delivers it.
+// Built in the exact format of SGW's buildSearchQueryString (S-1 section 4, config.ts); it
+// exercises the params the real URL below leaves empty (c, s, prices, booleans set to true).
 const OBSERVED_URL =
   'https://shopgoodwill.com/categories/listing?st=vintage%20lamp&sg=&c=12,34&s=7&lp=5&hp=50.5&sbn=&spo=false&snpo=true&socs=false&sd=true&sca=false&caed=10/8/2026&cadb=7&scs=false&sis=false&col=1&p=2&ps=40&desc=false&ss=0&UseBuyerPrefs=true&sus=false&cln=1&catIds=&pn=&wc=false&mci=false&hmt=false&layout=grid&ihp=';
+
+// The search URL the user's own browser showed in USER STEP S-1 (docs/USER-STEPS/S-1.md step 1;
+// test/fixtures/sgw/sources.json observedSearchUrl), verbatim.
+const S1_OBSERVED_URL =
+  'https://shopgoodwill.com/categories/listing?st=pyrex&sg=&c=&s=&lp=0&hp=999999&sbn=&spo=false&snpo=false&socs=false&sd=false&sca=false&caed=10%2F8%2F2026&cadb=7&scs=false&sis=false&col=1&p=1&ps=40&desc=false&ss=0&UseBuyerPrefs=true&sus=false&cln=1&catIds=&pn=&wc=false&mci=false&hmt=false&layout=grid&ihp=true';
 
 function parse(url: string): SearchQuery {
   const q = searchQueryFromUrl(url);
@@ -77,7 +82,40 @@ describe('searchQueryFromUrl', () => {
     expect(searchQueryFromUrl('https://shopgoodwill.com/item/123')).toBeNull();
   });
 
-  it.todo('round-trips the user-observed S-1 URL (T-07 stage 2)');
+  it('round-trips the user-observed S-1 URL (T-07 stage 2)', () => {
+    const q = parse(S1_OBSERVED_URL);
+    expect(q).toMatchObject({
+      searchText: 'pyrex',
+      categoryIds: [],
+      sellerIds: [],
+      lowPrice: 0,
+      highPrice: 99_999_900,
+      pickupOnly: false,
+      excludePickupOnly: false,
+      oneCentShippingOnly: false,
+      searchDescriptions: false,
+      closedAuctions: false,
+      sortColumn: 1,
+      sortDescending: false,
+      page: 1,
+      layout: 'grid',
+    });
+    expect(SearchQuerySchema.safeParse(q).success).toBe(true);
+    expect(invalidSearchParams(q)).toEqual([]);
+    // The 17 params without a SearchQuery field survive verbatim (caed decoded from %2F).
+    expect(q.extra).toEqual({
+      sg: '', sbn: '', caed: '10/8/2026', cadb: '7', scs: 'false', sis: 'false', ps: '40', ss: '0', UseBuyerPrefs: 'true',
+      sus: 'false', cln: '1', catIds: '', pn: '', wc: 'false', mci: 'false', hmt: 'false', ihp: 'true',
+    });
+    const again = searchQueryToUrl(q);
+    expect(parse(again)).toEqual(q);
+    // Every param comes back with the same value; the empty c and s are omitted (and parse back to []).
+    const a = new URL(again).searchParams;
+    for (const [k, v] of new URL(S1_OBSERVED_URL).searchParams) {
+      if ((k === 'c' || k === 's') && v === '') expect(a.has(k), k).toBe(false);
+      else expect(a.get(k), k).toBe(v);
+    }
+  });
 });
 
 describe('searchQueryToUrl', () => {
