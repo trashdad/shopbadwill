@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { formatMoney } from '../../../../src/domain/money';
+import { formatDual } from '../../../../src/domain/time/pacific';
 import { classifyOutcome } from '../../../../src/domain/snipe/outcome';
 import type { Snipe } from '../../../../src/domain/snipe/types';
 import type { BidResult, ItemDetail } from '../../../../src/domain/types';
@@ -323,4 +325,80 @@ describe('T-87b rejected-unknown is settled by re-reading, never "Not bid"', () 
     const r = classifyOutcome(snipe(), unk({ isHighBidder: false }), detail({ currentPrice: 1500, isHighBidder: null }));
     expect(r.outcome).toBe('network');
   });
+});
+
+describe('T-87c: no-bid abort reasons', () => {
+  const unsent = (): Snipe => snipe({ attempt: {}, measured: undefined });
+  const reasons = ['extended', 'price', 'already-high', 'missed'] as const;
+
+  it('extended: heading, new end, re-arm, no bid', () => {
+    const newEnd = new Date(END_MS + 120_000).toISOString();
+    const r = classifyOutcome(unsent(), null, detail({ isClosed: false, endTime: newEnd }), { abort: 'extended' });
+    expect(r.outcome).toBe('extended');
+    expect(r.notify.title).toContain('Not bid: end time changed');
+    expect(r.notify.message).toContain('No bid was placed');
+    expect(r.notify.message).toContain('re-arm');
+    expect(r.notify.message).toContain(formatDual(Date.parse(newEnd), 'America/Los_Angeles'));
+    expect(r.final).toBe(false);
+    expect(r.report.newEndTime).toBe(newEnd);
+    expect(r.stamp).toBeNull();
+  });
+  it('extended without a post-read still explains', () => {
+    const r = classifyOutcome(unsent(), null, null, { abort: 'extended' });
+    expect(r.outcome).toBe('extended');
+    expect(r.notify.message).toContain('re-arm');
+    expect(r.report.newEndTime).toBeUndefined();
+  });
+  it('price: shows next acceptable and max', () => {
+    const r = classifyOutcome(unsent(), null, detail({ isClosed: false, minimumBid: 2450 }), { abort: 'price' });
+    expect(r.outcome).toBe('skipped');
+    expect(r.notify.title).toContain('Not bid: price passed your max');
+    expect(r.notify.message).toContain(formatMoney(2450));
+    expect(r.notify.message).toContain(formatMoney(2000));
+    expect(r.notify.message).toContain('No bid was placed');
+    expect(r.stamp).toBeNull();
+  });
+  it('price without a post-read still shows the max', () => {
+    const r = classifyOutcome(unsent(), null, null, { abort: 'price' });
+    expect(r.notify.message).toContain(formatMoney(2000));
+  });
+  it('already-high: no bid needed', () => {
+    const r = classifyOutcome(unsent(), null, detail({ isClosed: false, isHighBidder: true }), { abort: 'already-high' });
+    expect(r.outcome).toBe('skipped');
+    expect(r.notify.title).toContain("No bid needed: you're the high bidder");
+    expect(r.notify.message).toContain('No bid was placed');
+    expect(r.stamp).toBeNull();
+  });
+  it('missed: browser not running, advice without promises', () => {
+    const r = classifyOutcome(unsent(), null, null, { abort: 'missed' });
+    expect(r.outcome).toBe('skipped');
+    expect(r.notify.title).toContain("Missed: the browser wasn't running at the end");
+    expect(r.notify.message).toContain('No bid was placed');
+    expect(r.notify.message).toContain('companion');
+    expect(r.notify.message).not.toMatch(/guarantee|will always/i);
+    expect(r.stamp).toBeNull();
+  });
+
+  for (const reason of reasons) {
+    it(`${reason}: falls through to the judge path when sentAt is set`, () => {
+      const r = classifyOutcome(snipe(), null, null, { abort: reason });
+      expect(r.outcome).toBe('network');
+      expect(r.notify.message).not.toContain('No bid was placed');
+      expect(r.notify.message).toContain(`Stopped (${reason}) after a bid may have been sent`);
+    });
+    it(`${reason}: falls through when ambiguous`, () => {
+      const r = classifyOutcome(snipe({ attempt: { ambiguous: true }, measured: undefined }), null, null, { abort: reason });
+      expect(r.outcome).toBe('network');
+      expect(r.notify.message).not.toContain('No bid was placed');
+    });
+    it(`${reason}: falls through when a bid result exists`, () => {
+      const r = classifyOutcome(unsent(), bid('outbid'), detail({ isHighBidder: false }), { abort: reason });
+      expect(r.outcome).toBe('outbid');
+      expect(r.notify.message).not.toContain('No bid was placed');
+    });
+    it(`${reason}: never stamps won or lost`, () => {
+      const r = classifyOutcome(unsent(), null, null, { abort: reason });
+      expect(r.stamp).toBeNull();
+    });
+  }
 });
