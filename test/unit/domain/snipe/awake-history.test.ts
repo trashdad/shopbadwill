@@ -9,6 +9,7 @@ import {
   AWAKE_SLOT_MS,
   awakeAdvice,
   awakeDaysAt,
+  heartbeatDue,
   HEARTBEAT_INTERVAL_MS,
   likelihoodAwakeAt,
   recordHeartbeat,
@@ -112,6 +113,13 @@ describe('likelihoodAwakeAt: the 14-day window', () => {
     expect(likelihoodAwakeAt(19, [], { ...CTX, since: NOW })).toBe(0);
   });
 
+  it("pins the 'since' cutoff: a day counts when recording began before its hour ended", () => {
+    const hourEnd = local(7, 20); // Oct 7, 8:00 PM: the end of that day's 7 PM hour
+    expect(awakeDaysAt(19, [], { ...CTX, since: local(7, 19) }).observed).toBe(3); // Oct 7, 8, 9
+    expect(awakeDaysAt(19, [], { ...CTX, since: hourEnd - 1 }).observed).toBe(3);
+    expect(awakeDaysAt(19, [], { ...CTX, since: hourEnd }).observed).toBe(2); // Oct 8, 9
+  });
+
   it('rejects an hour outside 0-23', () => {
     expect(() => likelihoodAwakeAt(24, [], CTX)).toThrow(RangeError);
     expect(() => likelihoodAwakeAt(-1, [], CTX)).toThrow(RangeError);
@@ -119,15 +127,38 @@ describe('likelihoodAwakeAt: the 14-day window', () => {
   });
 });
 
+describe('DST: a local hour that does not exist that day', () => {
+  // US spring forward 2026: Sunday March 8, 2:00 AM -> 3:00 AM, so that day has no 2 AM hour.
+  const SPRING_NOW = zonedWallToInstant(Date.UTC(2026, 2, 10, 21, 0), NY).ms; // Tue Mar 10, 9 PM
+
+  it('is skipped, not counted as "not running": an always-on browser scores 14/14', () => {
+    const history = beats(SPRING_NOW - 15 * DAY, SPRING_NOW);
+    const ctx = { now: SPRING_NOW, timeZone: NY };
+    expect(awakeDaysAt(2, history, ctx)).toEqual({ hour: 2, awake: 14, observed: 14 });
+    for (let h = 0; h < 24; h++) expect(likelihoodAwakeAt(h, history, ctx)).toBe(1);
+  });
+
+  it('still 14/14 through the compacted ring at the retention edge (2 AM not over yet today)', () => {
+    // Sun Mar 22, 2:59 AM: the window is Mar 21 back to Mar 7 (Mar 8 skipped).
+    const now = zonedWallToInstant(Date.UTC(2026, 2, 22, 2, 59), NY).ms;
+    let ring: number[] = [];
+    for (const t of beats(now - 16 * DAY, now + 1)) ring = recordHeartbeat(ring, t);
+    expect(awakeDaysAt(2, ring, { now, timeZone: NY })).toEqual({ hour: 2, awake: 14, observed: 14 });
+  });
+});
+
 describe('recordHeartbeat: a compact, bounded ring in sbw:awake', () => {
-  it('stores the first heartbeat of each 15-minute slot and returns the same array when nothing changes', () => {
+  it('keeps the first heartbeat of each 15-minute slot plus the latest one; same array when nothing changes', () => {
     const slot = Math.floor(NOW / AWAKE_SLOT_MS) * AWAKE_SLOT_MS;
     const a = recordHeartbeat([], slot + MIN);
     expect(a).toEqual([slot + MIN]);
     const b = recordHeartbeat(a, slot + 6 * MIN);
-    expect(b).toBe(a);
-    const c = recordHeartbeat(b, slot + AWAKE_SLOT_MS);
-    expect(c).toEqual([slot + MIN, slot + AWAKE_SLOT_MS]);
+    expect(b).toEqual([slot + MIN, slot + 6 * MIN]);
+    const c = recordHeartbeat(b, slot + 11 * MIN);
+    expect(c).toEqual([slot + MIN, slot + 11 * MIN]); // 6 min was neither first nor latest
+    const d = recordHeartbeat(c, slot + 16 * MIN);
+    expect(d).toEqual([slot + MIN, slot + 16 * MIN]); // first of the next slot, and the latest
+    expect(recordHeartbeat(d, slot + 16 * MIN)).toBe(d);
     expect(a).toEqual([slot + MIN]); // input never mutated
   });
 
@@ -147,7 +178,7 @@ describe('recordHeartbeat: a compact, bounded ring in sbw:awake', () => {
 
   it('is retained for 15 days, enough for the 14 completed occurrences of any hour', () => {
     expect(AWAKE_RETENTION_MS).toBe((AWAKE_DAYS + 1) * DAY);
-    expect(AWAKE_MAX_ENTRIES).toBe((AWAKE_DAYS + 1) * 96 + 1);
+    expect(AWAKE_MAX_ENTRIES).toBe((AWAKE_DAYS + 1) * 96 + 2);
   });
 
   it('property: compaction loses nothing the per-hour likelihood needs, even in a :45 offset zone', () => {
@@ -200,6 +231,27 @@ describe('awakeAdvice: arm-time text in the brief format', () => {
   });
 });
 
+describe('heartbeatDue: one heartbeat per 5-minute cell, from the latest stored beat', () => {
+  // NOW is on a 5-minute boundary.
+  it('is due with no history', () => {
+    expect(heartbeatDue([], NOW)).toBe(true);
+  });
+
+  it('is not due again in the same 5-minute cell, and due in the next one', () => {
+    expect(heartbeatDue([NOW], NOW + 5 * MIN - 1)).toBe(false);
+    expect(heartbeatDue([NOW], NOW + 5 * MIN)).toBe(true);
+    expect(heartbeatDue([NOW + 6 * MIN], NOW + 9 * MIN)).toBe(false);
+  });
+
+  it('reads the latest entry, whatever the order', () => {
+    expect(heartbeatDue([NOW + 6 * MIN, NOW], NOW + 7 * MIN)).toBe(false);
+  });
+
+  it('is due when the clock moved back into an earlier cell', () => {
+    expect(heartbeatDue([NOW], NOW - HOUR)).toBe(true);
+  });
+});
+
 // ── src/background/jobs/heartbeat.ts ───────────────────────────────────────
 
 function setup() {
@@ -219,20 +271,28 @@ describe('heartbeat job (registered on the scheduler onTick hook)', () => {
     expect(await repo.get(STORAGE_KEYS.awake)).toEqual([NOW]);
   });
 
-  it('records at most once per 5 minutes on a 2-minute tick', async () => {
+  it('a 2-minute tick gives exactly one beat per 5-minute cell: 12 an hour, no 6-minute drift', async () => {
     const { clock, repo } = setup();
     const hb = createHeartbeat({ repo });
-    const results: string[] = [];
-    for (let i = 0; i < 16; i++) {
-      results.push(await hb.beat());
+    const beatAt: number[] = [];
+    for (let i = 0; i < 30; i++) {
+      if ((await hb.beat()) === 'stored') beatAt.push(clock.now() - NOW);
       clock.advance(2 * MIN);
     }
-    // Ticks at 0, 2, 4, ... 30 min; beats at 0, 6, 12, 18, 24, 30.
-    expect(results.filter((r) => r !== 'throttled')).toHaveLength(6);
-    expect(results[0]).toBe('stored');
-    expect(results[3]).toBe('same-slot'); // 6 min: same 15-minute slot as 0
-    // One per 15-minute slot touched (NOW is on a slot boundary).
-    expect(await repo.get(STORAGE_KEYS.awake)).toEqual([NOW, NOW + 18 * MIN, NOW + 30 * MIN]);
+    expect(beatAt.map((t) => t / MIN)).toEqual([0, 6, 10, 16, 20, 26, 30, 36, 40, 46, 50, 56]);
+    // The ring: first beat of each 15-minute slot plus the latest beat.
+    expect(await repo.get(STORAGE_KEYS.awake)).toEqual([0, 16, 30, 46, 56].map((m) => NOW + m * MIN));
+  });
+
+  it('spacing survives a worker restart: a new instance reads the last beat from sbw:awake', async () => {
+    const { clock, repo } = setup();
+    expect(await createHeartbeat({ repo }).beat()).toBe('stored');
+    clock.advance(2 * MIN);
+    const restarted = createHeartbeat({ repo }); // a fresh MV3 worker: no memory of the last beat
+    expect(await restarted.beat()).toBe('throttled');
+    clock.advance(3 * MIN);
+    expect(await restarted.beat()).toBe('stored');
+    expect(await repo.get(STORAGE_KEYS.awake)).toEqual([NOW, NOW + 5 * MIN]);
   });
 
   it('beats again after the clock moves backwards', async () => {

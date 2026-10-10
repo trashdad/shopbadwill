@@ -71,7 +71,8 @@ export function formatPacificNaive(ms: number): string {
   return frac === 0 ? base : `${base}.${pad(frac, 3)}`;
 }
 
-function clock(ms: number, timeZone: string): string {
+/** Wall-clock time in `timeZone`, "7:42 PM" (Intl's narrow and no-break spaces made plain). */
+export function formatClock(ms: number, timeZone: string): string {
   return formatter(timeZone, { hour: 'numeric', minute: '2-digit', hour12: true })
     .format(ms)
     .replaceAll(String.fromCharCode(0x202f), ' ')
@@ -94,9 +95,9 @@ function zoneLabel(ms: number, timeZone: string): string {
  * When the user's calendar date differs from Pacific's, " (+1 day)" / " (-1 day)" is appended.
  */
 export function formatDual(ms: number, userTz: string): string {
-  const pt = `${clock(ms, PACIFIC)} ${zoneLabel(ms, PACIFIC)}`;
+  const pt = `${formatClock(ms, PACIFIC)} ${zoneLabel(ms, PACIFIC)}`;
   if (userTz === PACIFIC) return pt;
-  const user = `${clock(ms, userTz)} ${zoneLabel(ms, userTz)}`;
+  const user = `${formatClock(ms, userTz)} ${zoneLabel(ms, userTz)}`;
   const p = wallParts(ms, PACIFIC);
   const u = wallParts(ms, userTz);
   const dayDiff = Math.round(

@@ -6,12 +6,20 @@
 // Money rules, in one place:
 // - The only bid this module can ask for is `applyFallbackProxy`, and its
 //   amount is exactly `Snipe.maxBid` (frozen rule). It never emits `placeBid`.
-// - No early proxy without a usable session (any 'auth' failure), without a
-//   passing `checkCaps` for that amount (which fails closed with no fresh
-//   ItemDetail), in a dry run (an audit entry only), or once the snipe has left
-//   the pre-fire states (a bid may already be out).
-// - "Nothing to win" (the next acceptable bid is above the max, or the auction
-//   is closed) never applies the fallback.
+// - No early proxy without a usable session (`sessionUsable`, and never for
+//   reason 'auth'), without bidding writes allowed (`writesAllowed`: kill
+//   switch, health, bidding gate), without a passing `checkCaps` for that
+//   amount (which fails closed with no fresh ItemDetail), in a dry run (an
+//   audit entry only), or once the snipe has left the pre-fire states (a bid
+//   may already be out).
+// - "Nothing to win" never applies the fallback: the auction is over (closed,
+//   SGW's clock past its end, or our clock past the end) or the next
+//   acceptable bid is above the max.
+//
+// Callers (T-80, T-84): call `fallbackDecision` BEFORE any disarm or kill
+// transition. It returns null once the snipe is 'killed' (or otherwise past
+// 'armed' / 'waking' / 'verified'), so a fallback asked for after the kill is
+// silently lost.
 import { formatMoney, nextAcceptable } from '../money';
 import { formatDual, relative } from '../time/pacific';
 import type { Cents, EpochMs, ItemDetail, SgwSessionState } from '../types';
@@ -21,6 +29,8 @@ import type { CapsCheck, CapsResult, Effect, Snipe, SnipeOutcome, SnipeState } f
 
 /** The runner's `:preflight` alarm fires this long before the auction end. */
 export const PREFLIGHT_LEAD_MS = 15 * 60_000;
+/** A preflight earlier than PREFLIGHT_LEAD_MS + this before the end is "not due": a no-op. */
+export const PREFLIGHT_EARLY_SLACK_MS = 2 * 60_000;
 /** R1: the saved session must stay valid until at least this long after the auction end. */
 export const SESSION_MARGIN_AFTER_END_MS = 5 * 60_000;
 
@@ -32,13 +42,20 @@ export type Fallback = Snipe['fallback'];
  */
 export type PreflightReason = 'ended' | 'price' | 'auth' | 'clock' | 'keep-awake' | 'cap';
 
+/**
+ * Why a fallback is being applied: the fallback-applying preflight reasons,
+ * plus T-80's verify-failed 'network' and T-84's auto-kill 'anomaly'.
+ */
+export type FallbackReason = Exclude<PreflightReason, 'ended' | 'price'> | 'network' | 'anomaly';
+
 export interface PreflightFailure {
   reason: PreflightReason;
   /**
-   * Machine-readable sub-cause: auth 'logged-out' | 'expired' | 'no-token' |
-   * 'expires-before-end'; clock: T-81's ClockAbortReason; price
-   * 'next-bid-above-max' | 'invalid-amount'; ended 'closed'; keep-awake
-   * 'not-held'; cap: the violated kinds, comma-separated ('per-day,exposure').
+   * Machine-readable sub-cause: ended 'closed' | 'server-past-end' |
+   * 'past-end'; price 'next-bid-above-max' | 'invalid-amount'; auth
+   * 'logged-out' | 'expired' | 'no-token' | 'expires-before-end'; clock: T-81's
+   * ClockAbortReason; keep-awake 'not-held'; cap: the violated kinds,
+   * comma-separated ('per-day,exposure').
    */
   cause: string;
   /** Plain text for the user. Never contains a token. */
@@ -62,6 +79,12 @@ export interface PreflightContext {
    * runner reports what it did.
    */
   keepAwake: 'held' | 'not-held' | 'not-required';
+  /**
+   * `GlobalSwitches.writesAllowed('bidding').ok`, asked just before preflight.
+   * It only gates the early proxy; it never fails preflight by itself (dry
+   * runs run with bidding writes blocked).
+   */
+  writesAllowed: boolean;
   /** The preflight ItemDetail read (lane `background`); null when the read failed. */
   detail: ItemDetail | null;
   /** Inputs to T-82's `checkCaps` for `snipe.maxBid`. */
@@ -69,20 +92,23 @@ export interface PreflightContext {
 }
 
 export interface FallbackInput {
-  /** Why the snipe cannot fire: a PreflightReason, or the reason T-80 has (e.g. a verify-failed one). */
-  reason: string;
+  reason: FallbackReason;
   /** Plain-text cause; it starts `Snipe.outcomeDetail`. */
   detail: string;
   /** `checkCaps` for `snipe.maxBid` at fallback time, with the freshest ItemDetail. */
   caps: CapsResult;
+  /** False when the session is expired, logged out, rejected, or expires too soon. */
+  sessionUsable: boolean;
+  /** `GlobalSwitches.writesAllowed('bidding').ok`. */
+  writesAllowed: boolean;
 }
 
 export interface FallbackDecision {
   /** `snipe.fallback`. */
   requested: Fallback;
-  /** What is done: an early proxy degrades to 'skip' for 'auth' or a failing cap. */
+  /** What is done: an early proxy degrades to 'skip' when any guard is closed. */
   applied: Fallback;
-  degradedBecause?: 'auth' | 'cap';
+  degradedBecause?: 'auth' | 'writes-blocked' | 'cap';
   /** Next snipe state: an early proxy keeps the snipe open (it can still win). */
   state: Extract<SnipeState, 'fallback-applied' | 'resolved'>;
   outcome: Extract<SnipeOutcome, 'fallback-proxy-placed' | 'skipped' | 'dry-run'>;
@@ -110,13 +136,18 @@ export type PreflightResult =
       detail: string;
       effects: Effect[];
     }
-  | {
-      /** The snipe is not 'armed' (disarmed, killed, or already past preflight): nothing happens. */
-      ok: false;
-      reason: 'not-armed';
-      detail: string;
-      effects: [];
-    };
+  /** Nothing happens: the snipe is disarmed, killed, or already past preflight. */
+  | PreflightNoOp<'not-armed'>
+  /** Nothing happens: more than PREFLIGHT_LEAD_MS + PREFLIGHT_EARLY_SLACK_MS before the end. */
+  | PreflightNoOp<'not-due'>;
+
+/** A preflight that does nothing (one variant per reason, so `reason` narrows). */
+export interface PreflightNoOp<R extends 'not-armed' | 'not-due'> {
+  ok: false;
+  reason: R;
+  detail: string;
+  effects: [];
+}
 
 /** States from which a fallback may still act: before any bid could have been sent. */
 const PRE_FIRE_STATES: ReadonlySet<SnipeState> = new Set(['armed', 'waking', 'verified']);
@@ -151,10 +182,29 @@ function nextAcceptableBid(d: ItemDetail): Cents | null {
   }
 }
 
-function auctionFailure(s: Snipe, d: ItemDetail): PreflightFailure | null {
-  if (d.isClosed) {
+/**
+ * Is the auction over? SGW's own clock first (the detail's serverTime against
+ * its endTime), then ours: `serverNow` is local time corrected by a good clock
+ * offset, or plain local time when the offset is unusable.
+ */
+function endedFailure(d: ItemDetail | null, serverNow: number, endMs: number): PreflightFailure | null {
+  if (d?.isClosed) {
     return { reason: 'ended', cause: 'closed', detail: 'The auction has already closed (ended early or withdrawn).' };
   }
+  if (d !== null && isoMs(d.serverTime) >= isoMs(d.endTime)) {
+    return { reason: 'ended', cause: 'server-past-end', detail: "ShopGoodwill's own clock shows the auction end has passed." };
+  }
+  if (serverNow >= endMs) {
+    return {
+      reason: 'ended',
+      cause: 'past-end',
+      detail: 'The auction end time has passed: this check ran after the end (the computer may have been asleep).',
+    };
+  }
+  return null;
+}
+
+function priceFailure(s: Snipe, d: ItemDetail): PreflightFailure | null {
   // R2 (corrected): price fails only when the next acceptable bid is above the max.
   const next = nextAcceptableBid(d);
   if (next === null) {
@@ -211,9 +261,12 @@ function notify(s: Snipe, heading: string, message: string): Extract<Effect, { k
 }
 
 /**
- * The fallback policy (the only one). Returns null when the snipe is not in a
+ * The fallback policy (the only one). An early proxy needs every guard open:
+ * reason not 'auth', `sessionUsable`, `writesAllowed` and `caps.ok`;
+ * otherwise it degrades to skip. Returns null when the snipe is not in a
  * pre-fire state ('armed', 'waking', 'verified'): after 'firing' a bid may
- * already be out, and a fallback must never add a second one.
+ * already be out, and a fallback must never add a second one. Call it before
+ * any disarm or kill (see the file header).
  */
 export function fallbackDecision(snipe: Snipe, input: FallbackInput): FallbackDecision | null {
   return PRE_FIRE_STATES.has(snipe.state) ? decide(snipe, input) : null;
@@ -224,9 +277,10 @@ function decide(snipe: Snipe, input: FallbackInput): FallbackDecision {
   const max = money(snipe.maxBid);
   const dry = snipe.dryRun ? 'Dry run: ' : '';
 
-  let degradedBecause: 'auth' | 'cap' | undefined;
+  let degradedBecause: FallbackDecision['degradedBecause'];
   if (requested === 'early-proxy') {
-    if (input.reason === 'auth') degradedBecause = 'auth';
+    if (input.reason === 'auth' || !input.sessionUsable) degradedBecause = 'auth';
+    else if (!input.writesAllowed) degradedBecause = 'writes-blocked';
     else if (!input.caps.ok) degradedBecause = 'cap';
   }
   const proxy = requested === 'early-proxy' && degradedBecause === undefined;
@@ -236,6 +290,8 @@ function decide(snipe: Snipe, input: FallbackInput): FallbackDecision {
     requested,
     applied,
     degradedBecause: degradedBecause ?? null,
+    sessionUsable: input.sessionUsable,
+    writesAllowed: input.writesAllowed,
     amount: proxy ? snipe.maxBid : null,
   });
   const base = { requested, applied, ...(degradedBecause ? { degradedBecause } : {}) };
@@ -264,6 +320,8 @@ function decide(snipe: Snipe, input: FallbackInput): FallbackDecision {
   let why: string;
   if (degradedBecause === 'auth') {
     why = 'An early proxy bid needs a valid ShopGoodwill session, so the snipe was skipped. Sign in on shopgoodwill.com.';
+  } else if (degradedBecause === 'writes-blocked') {
+    why = 'An early proxy bid is not possible while bidding is blocked (kill switch, health check or bidding gate), so the snipe was skipped.';
   } else if (degradedBecause === 'cap') {
     why = `The early proxy bid of ${max} is blocked by a spending cap (${input.caps.violations.join('; ')}), so the snipe was skipped.`;
   } else {
@@ -281,10 +339,12 @@ function decide(snipe: Snipe, input: FallbackInput): FallbackDecision {
 
 /**
  * The T-15 min preflight: can this snipe still fire safely? Checks, in
- * priority order: auction still open and next acceptable bid within the max (R2), session and
- * token (R1), clock (R3), keep-awake held, caps. On failure the fallback is
- * applied (R4) unless there is nothing to win. Pure (R6): the result lists the
- * effects for the runner; it does not perform them.
+ * priority order: auction not over (closed, SGW's clock, our clock) and next
+ * acceptable bid within the max (R2), session and token (R1), clock (R3),
+ * keep-awake held, caps. On failure the fallback is applied (R4) unless there
+ * is nothing to win. A run more than 17 min before the end is "not due" and
+ * does nothing. Pure (R6): the result lists the effects for the runner; it
+ * does not perform them.
  *
  * An unreadable ItemDetail (`detail` null) is not a failure by itself: the
  * price and per-item cap go unchecked here (a warning) and T-60's verify read
@@ -303,22 +363,37 @@ export function preflight(snipe: Snipe, ctx: PreflightContext): PreflightResult 
 
   const detail = ctx.detail !== null && ctx.detail.itemId === snipe.itemId ? ctx.detail : null;
   const endMs = Math.max(isoMs(snipe.endTime), detail === null ? Number.NEGATIVE_INFINITY : isoMs(detail.endTime));
+
+  // Local time, as the runner's alarm is scheduled.
+  if (ctx.now < endMs - PREFLIGHT_LEAD_MS - PREFLIGHT_EARLY_SLACK_MS) {
+    return {
+      ok: false,
+      reason: 'not-due',
+      detail: `Preflight is not due yet: it runs 15 min before the end, and the end is ${relative(endMs, ctx.now)}.`,
+      effects: [],
+    };
+  }
+
+  const clock = assessClock(ctx.clockOffset);
+  const serverNow = clock.ok ? ctx.now + clock.offsetMs : ctx.now;
   const failures: PreflightFailure[] = [];
   const warnings: string[] = [];
 
-  if (detail === null) {
+  const ended = endedFailure(detail, serverNow, endMs);
+  if (ended) {
+    failures.push(ended);
+  } else if (detail === null) {
     warnings.push(
       'The item could not be read, so the price and the per-item cap were not checked now; they are checked again 60 s before the bid.',
     );
   } else {
-    const f = auctionFailure(snipe, detail);
-    if (f) failures.push(f);
+    const price = priceFailure(snipe, detail);
+    if (price) failures.push(price);
   }
 
   const auth = sessionFailure(ctx, endMs);
   if (auth) failures.push(auth);
 
-  const clock = assessClock(ctx.clockOffset);
   if (!clock.ok) failures.push({ reason: 'clock', cause: clock.reason, detail: CLOCK_TEXT[clock.reason] });
 
   if (ctx.keepAwake === 'not-held') {
@@ -351,52 +426,55 @@ export function preflight(snipe: Snipe, ctx: PreflightContext): PreflightResult 
         notify(
           snipe,
           snipe.dryRun ? 'Dry-run snipe soon' : 'Snipe soon',
-          `${lead} up to ${money(snipe.maxBid)}, ending ${formatDual(endMs, ctx.timeZone)} (${relative(endMs, ctx.now)}). Keep this computer awake and the browser open.`,
+          `${lead} up to ${money(snipe.maxBid)}, ending ${formatDual(endMs, ctx.timeZone)} (${relative(endMs, serverNow)}). Keep this computer awake and the browser open.`,
         ),
       ],
     };
   }
 
   const causes = failures.map((f) => `${f.reason}:${f.cause}`).join(',');
+  const reason = first.reason;
 
   // Nothing to win: no fallback.
-  if (first.reason === 'ended' || first.reason === 'price') {
-    const outcome: SnipeOutcome = first.reason === 'ended' ? 'ended' : 'skipped';
+  if (reason === 'ended' || reason === 'price') {
+    const outcome: SnipeOutcome = reason === 'ended' ? 'ended' : 'skipped';
+    const heading = reason === 'price' ? 'Snipe skipped' : first.cause === 'past-end' ? 'Ended' : 'Ended early';
     const text = `${first.detail} No bid was placed.`;
     return {
       ok: false,
-      reason: first.reason,
+      reason,
       failures,
       fallback: null,
       state: 'resolved',
       outcome,
       detail: text,
       effects: [
-        auditEntry(snipe, 'snipe.preflight', { ok: false, reason: first.reason, causes, fallback: 'not-applied', outcome }),
-        notify(snipe, first.reason === 'ended' ? 'Ended early' : 'Snipe skipped', text),
+        auditEntry(snipe, 'snipe.preflight', { ok: false, reason, causes, fallback: 'not-applied', outcome }),
+        notify(snipe, heading, text),
       ],
     };
   }
 
-  // 'auth' sorts before every other fallback-applying reason, so an unusable session always
-  // decides. The raw caps result goes in: without detail it fails closed, so no early proxy.
-  const decision = decide(snipe, { reason: first.reason, detail: first.detail, caps });
+  // 'auth' sorts before every other fallback-applying reason, and sessionUsable
+  // says so explicitly. The raw caps result goes in: without detail it fails
+  // closed, so no early proxy.
+  const decision = decide(snipe, {
+    reason,
+    detail: first.detail,
+    caps,
+    sessionUsable: auth === null,
+    writesAllowed: ctx.writesAllowed,
+  });
   return {
     ok: false,
-    reason: first.reason,
+    reason,
     failures,
     fallback: decision,
     state: decision.state,
     outcome: decision.outcome,
     detail: decision.detail,
     effects: [
-      auditEntry(snipe, 'snipe.preflight', {
-        ok: false,
-        reason: first.reason,
-        causes,
-        fallback: decision.applied,
-        outcome: decision.outcome,
-      }),
+      auditEntry(snipe, 'snipe.preflight', { ok: false, reason, causes, fallback: decision.applied, outcome: decision.outcome }),
       ...decision.effects,
       notify(snipe, decision.heading, decision.detail),
     ],

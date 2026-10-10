@@ -5,8 +5,10 @@ import { DEFAULT_CAPS } from '../../../../src/domain/settings/defaults';
 import {
   fallbackDecision,
   preflight,
+  PREFLIGHT_EARLY_SLACK_MS,
   PREFLIGHT_LEAD_MS,
   SESSION_MARGIN_AFTER_END_MS,
+  type FallbackInput,
   type PreflightContext,
   type PreflightResult,
 } from '../../../../src/domain/snipe/preflight';
@@ -16,7 +18,7 @@ import type { ItemDetail } from '../../../../src/domain/types';
 const HOUR = 3_600_000;
 const END = '2026-10-09T23:42:00.000Z'; // 7:42 PM ET, 4:42 PM PT
 const END_MS = Date.UTC(2026, 9, 9, 23, 42);
-const NOW = END_MS - PREFLIGHT_LEAD_MS;
+const NOW = END_MS - 15 * 60_000; // T-15 min, written out (not the constant under test)
 const TZ = 'America/New_York';
 
 function snipe(over: Partial<Snipe> = {}): Snipe {
@@ -70,6 +72,7 @@ function ctx(over: Partial<PreflightContext> = {}): PreflightContext {
     session: { state: 'ok', token: { expiresAt: END_MS + 20 * 24 * HOUR } },
     clockOffset: { offsetMs: 1300, rttMs: 150, confidence: 'low' },
     keepAwake: 'not-required',
+    writesAllowed: true,
     detail: detail(),
     caps: { limits: { ...DEFAULT_CAPS }, others: [], spentToday: 0 },
     ...over,
@@ -84,11 +87,23 @@ const bids = (effects: readonly Effect[]) =>
 
 /** Narrow to the failure variant that carries a fallback decision. */
 function failed(r: PreflightResult) {
-  if (r.ok || r.reason === 'not-armed') throw new Error(`expected a preflight failure, got ${JSON.stringify(r)}`);
+  if (r.ok || r.reason === 'not-armed' || r.reason === 'not-due') throw new Error(`expected a preflight failure, got ${JSON.stringify(r)}`);
   return r;
 }
 
 const NO_CLOCK = { clockOffset: null };
+const iso = (ms: number): string => new Date(ms).toISOString();
+
+describe('constants (pinned)', () => {
+  it('preflight runs 15 min before the end, with a 2 min early slack', () => {
+    expect(PREFLIGHT_LEAD_MS).toBe(15 * 60_000);
+    expect(PREFLIGHT_EARLY_SLACK_MS).toBe(2 * 60_000);
+  });
+
+  it('the session must outlive the auction end by 5 min', () => {
+    expect(SESSION_MARGIN_AFTER_END_MS).toBe(5 * 60_000);
+  });
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -180,12 +195,12 @@ describe('R1: session at T-15', () => {
   });
 
   it("'expiring' passes when exp is at least the auction end + 5 min", () => {
-    const token = { expiresAt: END_MS + SESSION_MARGIN_AFTER_END_MS };
+    const token = { expiresAt: END_MS + 5 * 60_000 };
     expect(preflight(snipe(), ctx({ session: { state: 'expiring', token } })).ok).toBe(true);
   });
 
   it("'expiring' fails as auth when exp is before the auction end + 5 min", () => {
-    const token = { expiresAt: END_MS + SESSION_MARGIN_AFTER_END_MS - 1 };
+    const token = { expiresAt: END_MS + 5 * 60_000 - 1 };
     const r = failed(preflight(snipe(), ctx({ session: { state: 'expiring', token } })));
     expect(r.failures[0]).toMatchObject({ reason: 'auth', cause: 'expires-before-end' });
     expect(bids(r.effects)).toEqual([]);
@@ -193,8 +208,8 @@ describe('R1: session at T-15', () => {
   });
 
   it('the margin is measured from the later of the armed end and the fresh detail end', () => {
-    const token = { expiresAt: END_MS + SESSION_MARGIN_AFTER_END_MS };
-    const later = new Date(END_MS + 60_000).toISOString();
+    const token = { expiresAt: END_MS + 5 * 60_000 };
+    const later = iso(END_MS + 60_000);
     const r = failed(
       preflight(snipe(), ctx({ session: { state: 'expiring', token }, detail: detail({ endTime: later }) })),
     );
@@ -207,6 +222,78 @@ describe('R1: session at T-15', () => {
     );
     expect(r.failures.map((f) => f.reason)).toEqual(['auth', 'clock', 'keep-awake']);
     expect(bids(r.effects)).toEqual([]);
+  });
+});
+
+// ── Fix round 1: time-based "ended" guard and "not due yet" ────────────────
+
+describe('ended by time: never a fallback after the end', () => {
+  it('preflight at end + 1 h with isClosed false: ended, no proxy', () => {
+    const r = failed(preflight(snipe({ fallback: 'early-proxy' }), ctx({ now: END_MS + 60 * 60_000 })));
+    expect(r.failures[0]).toMatchObject({ reason: 'ended', cause: 'past-end' });
+    expect(r.reason).toBe('ended');
+    expect(r.fallback).toBeNull();
+    expect(bids(r.effects)).toEqual([]);
+    expect(r.outcome).toBe('ended');
+    expect(r.state).toBe('resolved');
+  });
+
+  it('at end + 1 h with a bad clock as well: still ended (no fallback), not clock', () => {
+    const r = failed(preflight(snipe(), ctx({ now: END_MS + 60 * 60_000, clockOffset: null })));
+    expect(r.failures.map((f) => f.reason)).toEqual(['ended', 'clock']);
+    expect(r.fallback).toBeNull();
+    expect(bids(r.effects)).toEqual([]);
+  });
+
+  it('at end + 1 h with the item unreadable: ended', () => {
+    const r = failed(preflight(snipe(), ctx({ now: END_MS + 60 * 60_000, detail: null })));
+    expect(r.failures[0]).toMatchObject({ reason: 'ended', cause: 'past-end' });
+    expect(r.fallback).toBeNull();
+  });
+
+  it("a detail whose endTime is before its own serverTime: ended (SGW's clock), even with the local clock early", () => {
+    const d = detail({ endTime: iso(NOW - 60_000), serverTime: iso(NOW) });
+    const r = failed(preflight(snipe(), ctx({ detail: d })));
+    expect(r.failures[0]).toMatchObject({ reason: 'ended', cause: 'server-past-end' });
+    expect(r.fallback).toBeNull();
+    expect(bids(r.effects)).toEqual([]);
+  });
+
+  it("serverTime exactly at the detail's endTime is ended", () => {
+    const r = failed(preflight(snipe(), ctx({ detail: detail({ serverTime: END }) })));
+    expect(r.failures[0]).toMatchObject({ reason: 'ended', cause: 'server-past-end' });
+  });
+
+  it('the local check uses server time when the clock offset is good: a local clock 60 s fast is not "ended"', () => {
+    // Local reads end + 30 s; SGW's clock (local - 60 s) reads end - 30 s.
+    const clockOffset = { offsetMs: -60_000, rttMs: 150, confidence: 'low' as const };
+    const r = preflight(snipe(), ctx({ now: END_MS + 30_000, clockOffset }));
+    expect(r.ok || r.reason !== 'ended').toBe(true);
+  });
+
+  it('one millisecond before the end (server time) is not ended', () => {
+    const clockOffset = { offsetMs: 0, rttMs: 150, confidence: 'low' as const };
+    const r = preflight(snipe(), ctx({ now: END_MS - 1, clockOffset }));
+    expect(r.ok || r.reason !== 'ended').toBe(true);
+  });
+});
+
+describe('not due yet: a preflight that runs early is a no-op', () => {
+  it('a preflight run 3 days early: not-due, no effects', () => {
+    const r = preflight(snipe(), ctx({ now: END_MS - 3 * 24 * HOUR, clockOffset: null }));
+    expect(r).toMatchObject({ ok: false, reason: 'not-due', effects: [] });
+  });
+
+  it('due from end - 15 min - 2 min; one millisecond earlier is not due', () => {
+    expect(preflight(snipe(), ctx({ now: END_MS - 17 * 60_000 })).ok).toBe(true);
+    const early = preflight(snipe(), ctx({ now: END_MS - 17 * 60_000 - 1, clockOffset: null }));
+    expect(early).toMatchObject({ ok: false, reason: 'not-due', effects: [] });
+  });
+
+  it('measured from the later of the armed end and the fresh detail end', () => {
+    const d = detail({ endTime: iso(END_MS + 60 * 60_000) });
+    expect(preflight(snipe(), ctx({ detail: d })).ok).toBe(false);
+    expect(preflight(snipe(), ctx({ detail: d }))).toMatchObject({ reason: 'not-due', effects: [] });
   });
 });
 
@@ -228,6 +315,19 @@ describe('R2 (corrected): price fails only when the next acceptable bid is above
     expect(r.failures[0]).toMatchObject({ reason: 'price', cause: 'next-bid-above-max' });
     expect(r.fallback).toBeNull();
     expect(bids(r.effects)).toEqual([]);
+  });
+
+  it("no-bid item: the price source is the detail's minimumBid, not startingMinimumBid", () => {
+    // startingMinimumBid below minimumBid: a max between them still fails.
+    const lowStart = detail({ numBids: 0, currentPrice: 500, startingMinimumBid: 500, minimumBid: 1000 });
+    expect(failed(preflight(snipe({ maxBid: 999 }), ctx({ detail: lowStart }))).failures[0]).toMatchObject({
+      reason: 'price',
+      cause: 'next-bid-above-max',
+    });
+    expect(preflight(snipe({ maxBid: 1000 }), ctx({ detail: lowStart })).ok).toBe(true);
+    // startingMinimumBid above minimumBid: a max equal to minimumBid passes.
+    const highStart = detail({ numBids: 0, currentPrice: 1500, startingMinimumBid: 1500, minimumBid: 1000 });
+    expect(preflight(snipe({ maxBid: 1000 }), ctx({ detail: highStart })).ok).toBe(true);
   });
 
   it('with bids, current price equal to max: next acceptable is current + one increment, above max, so it fails', () => {
@@ -390,35 +490,79 @@ describe('R4: the early proxy amount is exactly maxBid and must pass the caps', 
 
 describe('fallbackDecision (the only fallback rule; T-80 calls it too)', () => {
   const OK = { ok: true, violations: [] };
+  /** Every guard open: an early proxy is allowed. */
+  const open = (over: Partial<FallbackInput> = {}): FallbackInput => ({
+    reason: 'clock',
+    detail: 'x.',
+    caps: OK,
+    sessionUsable: true,
+    writesAllowed: true,
+    ...over,
+  });
 
-  it('early-proxy with a usable session and passing caps places exactly maxBid', () => {
-    const d = fallbackDecision(snipe({ maxBid: 4321 }), { reason: 'clock', detail: 'x.', caps: OK });
+  it('early-proxy with a usable session, writes allowed and passing caps places exactly maxBid', () => {
+    const d = fallbackDecision(snipe({ maxBid: 4321 }), open());
     expect(d?.effects.map((e) => e.kind)).toEqual(['applyFallbackProxy', 'audit']);
     expect(d && proxies(d.effects)).toEqual([{ kind: 'applyFallbackProxy', snipeId: 's1', amount: 4321 }]);
     expect(d).toMatchObject({ state: 'fallback-applied', outcome: 'fallback-proxy-placed', applied: 'early-proxy' });
   });
 
-  it("reason 'auth' never bids, even with passing caps", () => {
-    const d = fallbackDecision(snipe(), { reason: 'auth', detail: 'x.', caps: OK });
+  it('sessionUsable false never bids', () => {
+    const d = fallbackDecision(snipe(), open({ sessionUsable: false }));
+    expect(d).toMatchObject({ applied: 'skip', degradedBecause: 'auth', outcome: 'skipped' });
+    expect(d && bids(d.effects)).toEqual([]);
+  });
+
+  it('writesAllowed false (kill switch, health, bidding gate) never bids', () => {
+    const d = fallbackDecision(snipe(), open({ writesAllowed: false }));
+    expect(d).toMatchObject({ applied: 'skip', degradedBecause: 'writes-blocked', outcome: 'skipped' });
+    expect(d?.detail).toMatch(/bidding is blocked/);
+    expect(d && bids(d.effects)).toEqual([]);
+  });
+
+  it("reason 'auth' never bids, even if the caller says the session is usable", () => {
+    const d = fallbackDecision(snipe(), open({ reason: 'auth' }));
     expect(d).toMatchObject({ applied: 'skip', degradedBecause: 'auth', outcome: 'skipped' });
     expect(d && bids(d.effects)).toEqual([]);
   });
 
   it('failing caps never bid', () => {
-    const d = fallbackDecision(snipe(), { reason: 'network', detail: 'x.', caps: { ok: false, violations: ['per-day: y'] } });
+    const d = fallbackDecision(snipe(), open({ reason: 'network', caps: { ok: false, violations: ['per-day: y'] } }));
     expect(d).toMatchObject({ applied: 'skip', degradedBecause: 'cap', outcome: 'skipped' });
     expect(d?.detail).toMatch(/per-day: y/);
     expect(d && bids(d.effects)).toEqual([]);
   });
 
+  it('property: an early proxy only when every guard is open', () => {
+    fc.assert(
+      fc.property(
+        fc.constantFrom<FallbackInput['reason']>('auth', 'clock', 'keep-awake', 'cap', 'network', 'anomaly'),
+        fc.boolean(),
+        fc.boolean(),
+        fc.boolean(),
+        (reason, sessionUsable, writesAllowed, capsOk) => {
+          const caps = capsOk ? OK : { ok: false, violations: ['exposure: z'] };
+          const d = fallbackDecision(snipe(), open({ reason, sessionUsable, writesAllowed, caps }));
+          const allowed = reason !== 'auth' && sessionUsable && writesAllowed && capsOk;
+          expect(d && proxies(d.effects).length).toBe(allowed ? 1 : 0);
+        },
+      ),
+    );
+  });
+
+  it('reason is a closed union, not free text', () => {
+    // @ts-expect-error -- 'whatever' is not a FallbackReason
+    expect(fallbackDecision(snipe(), open({ reason: 'whatever' }))).not.toBeNull();
+  });
+
   it.each(['armed', 'waking', 'verified'] as const)('applies in the pre-fire state %s', (state) => {
-    expect(fallbackDecision(snipe({ state }), { reason: 'clock', detail: 'x.', caps: OK })).not.toBeNull();
+    expect(fallbackDecision(snipe({ state }), open())).not.toBeNull();
   });
 
   it.each(['draft', 'fallback-applied', 'firing', 'sent', 'resolved', 'killed'] as const)(
     'returns null in state %s (a bid may already be out, or the snipe is gone)',
     (state: SnipeState) => {
-      expect(fallbackDecision(snipe({ state }), { reason: 'clock', detail: 'x.', caps: OK })).toBeNull();
+      expect(fallbackDecision(snipe({ state }), open())).toBeNull();
     },
   );
 });
@@ -430,6 +574,17 @@ describe('other preflight checks', () => {
     const r = failed(preflight(snipe(), ctx({ keepAwake: 'not-held' })));
     expect(r.failures[0]).toMatchObject({ reason: 'keep-awake', cause: 'not-held' });
     expect(proxies(r.effects)).toHaveLength(1);
+  });
+
+  it('bidding writes blocked (writesAllowed false): early-proxy degrades to skip', () => {
+    const r = failed(preflight(snipe(), ctx({ clockOffset: null, writesAllowed: false })));
+    expect(r.reason).toBe('clock');
+    expect(r.fallback).toMatchObject({ applied: 'skip', degradedBecause: 'writes-blocked' });
+    expect(bids(r.effects)).toEqual([]);
+  });
+
+  it('writesAllowed false alone does not fail preflight (dry runs run with bidding blocked)', () => {
+    expect(preflight(snipe({ dryRun: true }), ctx({ writesAllowed: false })).ok).toBe(true);
   });
 
   it.each(['held', 'not-required'] as const)('keep-awake %s passes', (keepAwake) => {
@@ -512,7 +667,7 @@ describe('R6: preflight is pure and deterministic', () => {
     fc.assert(
       fc.property(
         fc.record({
-          fallback: fc.constantFrom('early-proxy', 'skip' as const),
+          fallback: fc.constantFrom<Snipe['fallback']>('early-proxy', 'skip'),
           dryRun: fc.boolean(),
           maxBid: fc.integer({ min: 0, max: 30_000 }),
           price: fc.integer({ min: 0, max: 30_000 }),
@@ -524,6 +679,8 @@ describe('R6: preflight is pure and deterministic', () => {
           hasBids: fc.boolean(),
           inc: fc.integer({ min: 1, max: 1000 }),
           spent: fc.integer({ min: 0, max: 20_000 }),
+          writesAllowed: fc.boolean(),
+          late: fc.boolean(),
         }),
         (p) => {
           const s = snipe({ fallback: p.fallback, dryRun: p.dryRun, maxBid: p.maxBid });
@@ -535,8 +692,10 @@ describe('R6: preflight is pure and deterministic', () => {
               session: { state: p.session, token: p.token ? { expiresAt: END_MS + 20 * 24 * HOUR } : null },
               clockOffset: p.clockBad ? null : ctx().clockOffset,
               keepAwake: p.keepAwake,
+              writesAllowed: p.writesAllowed,
               detail: d,
               caps: { limits: DEFAULT_CAPS, others: [], spentToday: p.spent },
+              ...(p.late ? { now: END_MS + 60_000 } : {}),
             }),
           );
           expect(kinds(r.effects)).not.toContain('placeBid');
@@ -551,6 +710,8 @@ describe('R6: preflight is pure and deterministic', () => {
             expect(d).not.toBeNull();
             expect(nextBid).toBeLessThanOrEqual(p.maxBid);
             expect(p.maxBid).toBeLessThanOrEqual(DEFAULT_CAPS.perItemMax);
+            expect(p.writesAllowed).toBe(true);
+            expect(p.late).toBe(false);
           }
         },
       ),

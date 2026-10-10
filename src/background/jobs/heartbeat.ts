@@ -1,11 +1,12 @@
 // T-83: the awake-history heartbeat. Registered on the scheduler's `onTick`
-// hook (T-52 owns it, I-07; the `sbw:tick` alarm runs every 2 min). Records at
-// most one heartbeat per HEARTBEAT_INTERVAL_MS (5 min) into `sbw:awake`, kept
-// compact by the domain's `recordHeartbeat`. It makes no network request and
-// calls no browser API directly: storage goes through the Repo, time through
-// the Repo's Clock. T-52 does not exist yet, so the hook is passed in rather
-// than imported; T-52/T-36 do the wiring.
-import { HEARTBEAT_INTERVAL_MS, recordHeartbeat } from '../../domain/snipe/awake-history';
+// hook (T-52 owns it, I-07; the `sbw:tick` alarm runs every 2 min). Records
+// one heartbeat per 5-minute cell into `sbw:awake`, kept compact by the
+// domain's `recordHeartbeat`. Spacing comes from the persisted ring (its latest
+// entry), not from memory, so an MV3 worker restart neither doubles a beat nor
+// drifts. It makes no network request and calls no browser API directly:
+// storage goes through the Repo, time through the Repo's Clock. T-52 does not
+// exist yet, so the hook is passed in rather than imported; T-52/T-36 wire it.
+import { heartbeatDue, recordHeartbeat } from '../../domain/snipe/awake-history';
 import type { Repo } from '../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 
@@ -18,12 +19,11 @@ export interface HeartbeatDeps {
 }
 
 /**
- * - 'stored': the record changed (a new 15-minute slot, or old entries pruned) and was written;
- * - 'same-slot': the slot already had a heartbeat (nothing written);
- * - 'throttled': less than 5 min since the last heartbeat (storage not touched);
+ * - 'stored': a heartbeat was recorded and written;
+ * - 'throttled': the latest stored heartbeat is in the same 5-minute cell (nothing written);
  * - 'error': storage failed (swallowed so the tick loop carries on).
  */
-export type BeatResult = 'stored' | 'same-slot' | 'throttled' | 'error';
+export type BeatResult = 'stored' | 'throttled' | 'error';
 
 export interface Heartbeat {
   beat(): Promise<BeatResult>;
@@ -31,22 +31,16 @@ export interface Heartbeat {
 
 export function createHeartbeat(deps: HeartbeatDeps): Heartbeat {
   const { repo } = deps;
-  // In memory: a restarted worker simply beats on its first tick.
-  let lastBeatAt: number | undefined;
   return {
     async beat(): Promise<BeatResult> {
       const now = repo.now();
-      // A clock that moved backwards (now < lastBeatAt) beats again rather than going quiet.
-      if (lastBeatAt !== undefined && now >= lastBeatAt && now - lastBeatAt < HEARTBEAT_INTERVAL_MS) {
-        return 'throttled';
-      }
-      lastBeatAt = now;
       try {
         // Same lock name as Repo.update, so concurrent writers of sbw:awake serialise.
         return await repo.withLock(STORAGE_KEYS.awake, async (): Promise<BeatResult> => {
           const current = await repo.get(STORAGE_KEYS.awake);
+          if (!heartbeatDue(current, now)) return 'throttled';
           const next = recordHeartbeat(current, now);
-          if (next === current) return 'same-slot';
+          if (next === current) return 'throttled';
           await repo.set(STORAGE_KEYS.awake, next);
           return 'stored';
         });
