@@ -379,3 +379,13 @@ Source: controller ruling, T-30 fix round 1.
 **Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
 
 **T-30 round 2 addition.** `HealthProbe` gains optional `firstSeenAt: EpochMs`, set once at the first run or recorded failure. A schema check that has never had a good probe escalates to `stale` (`ok:false`) once `now - firstSeenAt > 24h`, the same fail-closed path as the `lastGoodProbeAt` rule (an empty search, which leaves detail with nothing to probe, is exempt). Optional, backward compatible.
+
+## T-36 ruling: calendar writes are not gated by the SGW session (§3.3 note)
+
+Source: controller ruling on T-36 concern 2.
+
+§3.3's fail-closed rule lists four conditions for `GlobalSwitches.writesAllowed(feature)`. For `feature === 'calendar'`, the SGW-session condition (`SgwSession.state()` neither `'ok'` nor `'expiring'`) does not apply: calendar writes go to Google, not to SGW, so a lapsed SGW sign-in must not stop calendar sync. The other conditions still apply to calendar: the kill switch, `dryRun.calendar`, and a failing SGW HealthReport within 24 h (drifted SGW data could carry wrong end times). The storage-repair block (migrate() meta-corrupt or failed, T-33 carry) applies to every feature. `favorites` and `bidding` keep all four conditions.
+
+The port type (`src/ports/global-switches.ts`) is unchanged. `src/background/switches.ts` implements the rule, and `test/integration/background-main.test.ts` pins it ("calendar is exempt from the SGW session, but not from SGW health, the kill switch or dryRun.calendar").
+
+**Follow-up for the next PLAN edit.** Add the exemption to the fail-closed rule in PLAN §3.3 and contracts.md.

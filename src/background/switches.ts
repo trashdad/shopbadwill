@@ -9,7 +9,10 @@
 //   - dryRun[feature] is on;
 //   - health: the last HealthReport within 24 h has ok === false, or an SGW
 //     reply just failed its schema and T-30 has not stored that yet;
-//   - the SGW session is neither 'ok' nor 'expiring' (expiring still writes, I-08).
+//   - the SGW session is neither 'ok' nor 'expiring' (expiring still writes,
+//     I-08). Not for 'calendar' (T-36 ruling, docs/CONTRACT-DECISIONS.md):
+//     calendar writes go to Google, not SGW. SGW health still blocks calendar,
+//     since drifted SGW data could carry wrong end times.
 //
 // It is an in-memory snapshot (T-26 carry): writesAllowed() reads no storage
 // and calls no browser or session API, because T-26 asks it about twice a
@@ -153,6 +156,7 @@ export class Switches implements GlobalSwitches {
     if (this.dryRun[feature]) return { ok: false, why: WHY.dryRun };
     const now = this.deps.clock.now();
     if (this.healthFailing(now)) return { ok: false, why: WHY.health };
+    if (feature === 'calendar') return { ok: true }; // Google writes: the SGW session does not gate them
     const { state, expiresAt } = this.session;
     if (state !== 'ok' && state !== 'expiring') return { ok: false, why: WHY.session(state) };
     if (expiresAt !== null && expiresAt <= now) return { ok: false, why: WHY.session('expired') };

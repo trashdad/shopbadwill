@@ -250,6 +250,8 @@ async function verdicts(s: Switches): Promise<Record<string, { ok: boolean; why?
 }
 
 const ALL_OK = { favorites: { ok: true }, calendar: { ok: true }, bidding: { ok: true } };
+/** The features that write to the user's SGW account (calendar writes go to Google). */
+const SGW_FEATURES = ['favorites', 'bidding'] as const;
 
 /** A valid search reply with no rows (T-30 then has no item to probe: detail is unknown, never failing). */
 function emptySearch(): unknown {
@@ -571,12 +573,13 @@ describe('GlobalSwitches: an in-memory snapshot (R2)', () => {
     ],
     ['a failed health report within 24 h', { [STORAGE_KEYS.healthReport]: report(false, T0 - 23 * HOUR) }, {}, WRITE_FEATURES, 'health check failed'],
     ['a failed runtime health report', {}, { [STORAGE_KEYS.runtimeHealth]: report(false, T0 - MIN) }, WRITE_FEATURES, 'health check failed'],
-    ['no SGW session (logged-out)', { [STORAGE_KEYS.sgwSession]: undefined }, {}, WRITE_FEATURES, 'SGW session is logged-out'],
+    // Calendar writes go to Google: the SGW session never blocks them (T-36 ruling).
+    ['no SGW session (logged-out; SGW writes only)', { [STORAGE_KEYS.sgwSession]: undefined }, {}, SGW_FEATURES, 'SGW session is logged-out'],
     [
-      'an expired SGW session',
+      'an expired SGW session (SGW writes only)',
       { [STORAGE_KEYS.sgwSession]: { ...SESSION, expiresAt: T0 - 1 } },
       {},
-      WRITE_FEATURES,
+      SGW_FEATURES,
       'SGW session is expired',
     ],
     ['meta-corrupt storage', { [STORAGE_KEYS.meta]: 'garbage', [STORAGE_KEYS.rules]: 'not an array' }, {}, WRITE_FEATURES, 'storage needs repair'],
@@ -598,6 +601,32 @@ describe('GlobalSwitches: an in-memory snapshot (R2)', () => {
         expect(v, f).toEqual({ ok: true });
       }
     }
+  });
+
+  it('calendar is exempt from the SGW session, but not from SGW health, the kill switch or dryRun.calendar (T-36 ruling)', async () => {
+    const h = boot({ seed: { [STORAGE_KEYS.sgwSession]: { ...SESSION, expiresAt: T0 - 1 } } });
+    const ctx = await h.handle.ready;
+    expect(await ctx.session.state()).toBe('expired');
+    expect(await verdicts(ctx.switches)).toEqual({
+      favorites: { ok: false, why: 'SGW session is expired' },
+      calendar: { ok: true },
+      bidding: { ok: false, why: 'SGW session is expired' },
+    });
+    await h.areas.local.remove([STORAGE_KEYS.sgwSession]);
+    expect(await ctx.switches.writesAllowed('calendar')).toEqual({ ok: true });
+    expect(ctx.switches.view().writesAllowed).toEqual({ favorites: false, calendar: true, bidding: false });
+
+    // SGW health still blocks calendar: drifted SGW data could carry wrong end times.
+    await h.areas.local.set({ [STORAGE_KEYS.healthReport]: report(false, h.clock.now()) });
+    expect(await ctx.switches.writesAllowed('calendar')).toEqual({ ok: false, why: 'health check failed' });
+    await h.areas.local.set({ [STORAGE_KEYS.healthReport]: report(true, h.clock.now() + 1) });
+    expect(await ctx.switches.writesAllowed('calendar')).toEqual({ ok: true });
+
+    await h.ok('settings.set', { dryRun: { favorites: false, calendar: true, bidding: false } });
+    expect(await ctx.switches.writesAllowed('calendar')).toEqual({ ok: false, why: 'dry run' });
+    await h.ok('settings.set', { dryRun: { favorites: false, calendar: false, bidding: false } });
+    await h.ok('kill.set', { on: true });
+    expect(await ctx.switches.writesAllowed('calendar')).toEqual({ ok: false, why: 'kill switch is on' });
   });
 
   it('an expiring session (< 72 h left) still writes; an older failing report does not block', async () => {
