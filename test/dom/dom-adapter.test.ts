@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { createDomAdapter, type DiscoveryReport } from '../../src/adapters/sgw/dom-adapter';
 import { SGW_CONFIG_VERSION } from '../../src/adapters/sgw/config';
 import type { Decoration } from '../../src/ports/sgw-dom';
-import { decorationUi } from '../../src/content/ui/stub';
+import { decorationUi, shadowRootForTest } from '../../src/content/ui/stub';
 
 const FIX = resolve(__dirname, '../fixtures/sgw/html');
 const SEARCH = [
@@ -47,26 +47,39 @@ describe('discoverCards over real fixtures', () => {
         expect(c.layout).toBe(layout);
         expect(hrefIds(c.root)).toEqual([c.itemId]);
         expect(c.root.contains(c.anchor)).toBe(true);
-        expect(c.root.getAttribute('data-sbw-seen')).toBe('1');
+        expect((c as { degraded?: boolean }).degraded).toBe(false);
       }
       expect(reports.at(-1)).toMatchObject({ rank: 0, drifted: false, configVersion: SGW_CONFIG_VERSION });
       expect(dom.configVersion).toBe(SGW_CONFIG_VERSION);
     });
   }
 
-  it('discovery is linear: one query per rank, timing reported', () => {
-    const doc = load('search-grid-logged-out');
+  it('discovery scales roughly linearly: 40 vs 400 cards', () => {
+    const doc40 = load('search-grid-logged-out');
+    const doc400 = load('search-grid-logged-out');
+    const cell = doc400.querySelector('.item-col');
+    const parent = cell?.parentElement;
+    if (cell == null || parent == null) throw new Error('no grid cell');
+    const cells = Array.from(parent.querySelectorAll(':scope > .item-col'));
+    for (let rep = 0; rep < 9; rep++) for (const c of cells) parent.append(c.cloneNode(true));
     const { dom } = make();
-    const times: number[] = [];
-    for (let i = 0; i < 7; i++) {
-      const t0 = performance.now();
-      dom.discoverCards(doc);
-      times.push(performance.now() - t0);
-    }
-    times.sort((a, b) => a - b);
-    const median = times[3] ?? Infinity;
-    console.log(`discoverCards(40 cards, grid) median ${median.toFixed(2)} ms, max ${(times.at(-1) ?? 0).toFixed(2)} ms`);
-    expect(median).toBeLessThan(25);
+    const median = (doc: Document): number => {
+      const t: number[] = [];
+      dom.discoverCards(doc); // warm up
+      for (let i = 0; i < 7; i++) {
+        const t0 = performance.now();
+        dom.discoverCards(doc);
+        t.push(performance.now() - t0);
+      }
+      t.sort((x, y) => x - y);
+      return Math.max(t[3] ?? 0, 0.05);
+    };
+    expect(dom.discoverCards(doc400)).toHaveLength(400);
+    const m40 = median(doc40);
+    const m400 = median(doc400);
+    console.log(`discoverCards median 40 cards ${m40.toFixed(2)} ms, 400 cards ${m400.toFixed(2)} ms, ratio ${(m400 / m40).toFixed(1)}x`);
+    // Linear is ~10x; quadratic would be ~100x.
+    expect(m400 / m40).toBeLessThan(20);
   });
 });
 
@@ -184,16 +197,18 @@ describe('decorations', () => {
     const { doc, dom, card } = first();
     dom.applyDecoration(card, hide);
     const stub = doc.querySelector('[data-sbw-stub]');
-    expect(stub?.shadowRoot).toBeTruthy();
-    expect(stub?.shadowRoot?.querySelector('.text')?.textContent).toBe('Hidden by rule: No <b>junk</b>');
-    expect(stub?.shadowRoot?.querySelector('b')).toBeNull();
+    expect(stub?.shadowRoot).toBeNull(); // closed
+    const sr = shadowRootForTest(stub ?? null);
+    expect(sr).toBeTruthy();
+    expect(sr?.querySelector('.text')?.textContent).toBe('Hidden by rule: No <b>junk</b>');
+    expect(sr?.querySelector('b')).toBeNull();
     expect(stub?.children).toHaveLength(0);
   });
 
   it('Show on the stub reveals the card but keeps the stub', () => {
     const { doc, dom, card } = first();
     dom.applyDecoration(card, hide);
-    const btn = doc.querySelector('[data-sbw-stub]')?.shadowRoot?.querySelector('button');
+    const btn = shadowRootForTest(doc.querySelector('[data-sbw-stub]'))?.querySelector('button');
     btn?.click();
     expect(card.root.hasAttribute('style')).toBe(false);
     dom.applyDecoration(card, hide); // same decoration: stays revealed, still one stub
@@ -255,6 +270,78 @@ describe('decorations', () => {
     for (const c of cards) dom.applyDecoration(c, hide);
     // 40 stubs added, nothing removed.
     expect(doc.querySelectorAll('*').length).toBe(n + 40);
+  });
+});
+
+describe('degraded (rank 2) cards', () => {
+  const hideDeco: Decoration = { kind: 'hide', ruleId: 'r', ruleName: 'Junk' };
+  function rank2(name: string) {
+    const doc = load(name);
+    for (const el of Array.from(doc.querySelectorAll('app-home-product-items'))) unwrap(el);
+    for (const el of Array.from(doc.querySelectorAll('.feat-item'))) el.classList.remove('feat-item', 'feat-item-list');
+    const { dom } = make();
+    return { doc, dom, cards: dom.discoverCards(doc) };
+  }
+  for (const name of ['search-grid-logged-out', 'search-list-logged-out']) {
+    it(`${name}: hide is refused, falls back to a "would hide" chip`, () => {
+      const { doc, dom, cards } = rank2(name);
+      const before = doc.documentElement.outerHTML;
+      const c = cards[0];
+      if (c === undefined) throw new Error('no card');
+      expect((c as { degraded?: boolean }).degraded).toBe(true);
+      dom.applyDecoration(c, hideDeco);
+      dom.applyDecoration(c, hideDeco);
+      expect(doc.querySelectorAll('[data-sbw-stub]')).toHaveLength(0);
+      expect(doc.querySelector('[style*="display:none !important"]')).toBeNull();
+      expect(doc.querySelectorAll('[data-sbw-hidden]')).toHaveLength(0);
+      const labels = doc.querySelectorAll('[data-sbw-label]');
+      expect(labels).toHaveLength(1);
+      expect(shadowRootForTest(labels[0] ?? null)?.querySelector('.chip')?.textContent).toBe('Would hide: Junk');
+      dom.clearDecoration(c);
+      expect(doc.documentElement.outerHTML).toBe(before);
+    });
+  }
+  it('highlight and badge still work when degraded', () => {
+    const { doc, dom, cards } = rank2('search-grid-logged-out');
+    const c = cards[0];
+    if (c === undefined) throw new Error('no card');
+    dom.applyDecoration(c, { kind: 'highlight', label: 'L', ruleId: 'r', tone: 'blue' });
+    dom.applyDecoration(c, { kind: 'badge', badges: [{ id: 'a', text: 'A' }] });
+    expect(doc.querySelectorAll('[data-sbw-label]')).toHaveLength(1);
+  });
+  it('rank 1 still hides with a stub', () => {
+    const doc = load('search-grid-logged-out');
+    for (const el of Array.from(doc.querySelectorAll('app-home-product-items'))) unwrap(el);
+    const { dom } = make();
+    const c = dom.discoverCards(doc)[0];
+    if (c === undefined) throw new Error('no card');
+    expect((c as { degraded?: boolean }).degraded).toBe(false);
+    dom.applyDecoration(c, hideDeco);
+    expect(doc.querySelectorAll('[data-sbw-stub]')).toHaveLength(1);
+    expect(c.root.getAttribute('style')).toContain('display:none');
+  });
+});
+
+describe('idempotence', () => {
+  it('a second identical decorate performs zero DOM mutations', () => {
+    const doc = load('search-grid-logged-out');
+    const { dom } = make();
+    const c = dom.discoverCards(doc)[0];
+    if (c === undefined) throw new Error('no card');
+    const decos: Decoration[] = [
+      { kind: 'hide', ruleId: 'r', ruleName: 'N' },
+      { kind: 'highlight', label: 'L', ruleId: 'r', tone: 'green' },
+      { kind: 'badge', badges: [{ id: 'a', text: 'A' }] },
+    ];
+    const obs = new MutationObserver(() => undefined);
+    obs.observe(doc.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+    for (const d of decos) {
+      dom.applyDecoration(c, d);
+      obs.takeRecords();
+      dom.applyDecoration(c, d);
+      expect(obs.takeRecords()).toHaveLength(0);
+    }
+    obs.disconnect();
   });
 });
 

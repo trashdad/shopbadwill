@@ -55,13 +55,15 @@ export interface DomAdapterOptions {
   onReport?: (report: DiscoveryReport) => void;
 }
 
+/** CardHandle plus a flag set when the card root could only be guessed (rank 2): hiding it would break the site. */
+export type AdapterCardHandle = CardHandle & { degraded?: boolean };
+
 export interface SgwDomAdapter extends SgwDom {
   readonly lastReport: DiscoveryReport | null;
   /** Time-left text from the card ("5h 17m"), null when absent. Not a Listing field. */
   readTimeLeftText(card: CardHandle): string | null;
 }
 
-const A_SEEN = 'data-sbw-seen';
 const A_DECO = 'data-sbw-deco';
 const A_HIDDEN = 'data-sbw-hidden';
 const A_HILITE = 'data-sbw-highlight';
@@ -199,7 +201,7 @@ export function createDomAdapter(opts: DomAdapterOptions): SgwDomAdapter {
       }
     }
     const listCards = new Set<Element>(Array.from(scope.querySelectorAll(LIST_ROOT)));
-    const handles: CardHandle[] = [];
+    const handles: AdapterCardHandle[] = [];
     let unreadable = 0;
     for (const root of found) {
       const itemId = readItemId(root);
@@ -207,11 +209,10 @@ export function createDomAdapter(opts: DomAdapterOptions): SgwDomAdapter {
         unreadable += 1;
         continue;
       }
-      root.setAttribute(A_SEEN, '1');
       const inner = visualTarget(root);
       const layout: CardHandle['layout'] = listCards.has(inner) ? 'list' : inner.matches('.feat-item') ? 'grid' : 'unknown';
       const anchor = firstMatch(root, SC.anchor) ?? root;
-      handles.push({ itemId, root, anchor, layout });
+      handles.push({ itemId, root, anchor, layout, degraded: (rank ?? 0) >= 2 });
     }
     lastReport = {
       configVersion: SGW_CONFIG_VERSION,
@@ -284,16 +285,22 @@ export function createDomAdapter(opts: DomAdapterOptions): SgwDomAdapter {
       return;
     }
     const sig = JSON.stringify(d);
-    if (current === sig && intact(card, d)) return;
+    const degraded = (card as AdapterCardHandle).degraded === true;
+    // Degraded roots are partial cards: never hide, show what would have been hidden instead.
+    const eff: Decoration =
+      d.kind === 'hide' && degraded
+        ? { kind: 'highlight', label: `Would hide: ${d.ruleName}`, ruleId: d.ruleId, tone: 'amber' }
+        : d;
+    if (current === sig && intact(card, eff)) return;
     if (current !== null || stubOf(root) !== null || labelOf(card.anchor) !== null) clearDecoration(card);
     const doc = root.ownerDocument;
     root.setAttribute(A_DECO, sig);
-    switch (d.kind) {
+    switch (eff.kind) {
       case 'hide': {
         root.setAttribute(A_HIDDEN, '1');
         const stub = ui.createStub(doc, {
-          ruleId: d.ruleId,
-          ruleName: d.ruleName,
+          ruleId: eff.ruleId,
+          ruleName: eff.ruleName,
           itemId: card.itemId,
           onShow: () => {
             root.setAttribute(A_REVEALED, '1');
@@ -306,15 +313,15 @@ export function createDomAdapter(opts: DomAdapterOptions): SgwDomAdapter {
         break;
       }
       case 'highlight': {
-        root.setAttribute(A_HILITE, d.tone);
-        setStyle(visualTarget(root), `outline:3px solid ${TONE_COLOR[d.tone]};outline-offset:-3px`);
-        const label = ui.createLabel(doc, { chips: [{ text: d.label, tone: d.tone }] });
+        root.setAttribute(A_HILITE, eff.tone);
+        setStyle(visualTarget(root), `outline:3px solid ${TONE_COLOR[eff.tone]};outline-offset:-3px`);
+        const label = ui.createLabel(doc, { chips: [{ text: eff.label, tone: eff.tone }] });
         label.setAttribute(A_LABEL, '1');
         card.anchor.append(label);
         break;
       }
       case 'badge': {
-        const chips = d.badges.map((b) => (b.title === undefined ? { text: b.text } : { text: b.text, title: b.title }));
+        const chips = eff.badges.map((b) => (b.title === undefined ? { text: b.text } : { text: b.text, title: b.title }));
         const label = ui.createLabel(doc, { chips });
         label.setAttribute(A_LABEL, '1');
         card.anchor.append(label);

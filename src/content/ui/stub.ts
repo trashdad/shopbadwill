@@ -1,5 +1,5 @@
 // T-27: our own UI for decorated SGW cards. Every element lives in a Shadow DOM
-// (closed to site CSS/JS, no leakage either way) and every string from the site
+// (closed: page scripts cannot reach it; no CSS leaks either way) and every string from the site
 // or a rule is set as text, never as markup.
 import type { DecorationUi, LabelSpec, StubSpec } from '../../adapters/sgw/dom-adapter';
 
@@ -19,12 +19,20 @@ const LABEL_CSS = `
 .green { background: #1e7e34; } .amber { background: #b35c00; } .blue { background: #1a5fb4; }
 `;
 
+const roots = new WeakMap<Element, ShadowRoot>();
+
+/** Test-only accessor: the roots are closed, so page scripts cannot reach them. */
+export function shadowRootForTest(host: Element | null): ShadowRoot | undefined {
+  return host === null ? undefined : roots.get(host);
+}
+
 function shadowHost(doc: Document, tag: string, css: string): { host: HTMLElement; root: ShadowRoot } {
   const host = doc.createElement(tag);
-  const root = host.attachShadow({ mode: 'open' });
+  const root = host.attachShadow({ mode: 'closed' });
   const style = doc.createElement('style');
   style.textContent = css;
   root.append(style);
+  roots.set(host, root);
   return { host, root };
 }
 
