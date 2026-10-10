@@ -37,6 +37,7 @@ import { HEALTH_REPROBE_MIN_MS, UNKNOWN_PREFIX } from '../../src/adapters/sgw/he
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
+import type { SgwEndpointKey } from '../../src/adapters/sgw/config';
 import type { HealthReport, Listing, SgwSessionRecord } from '../../src/domain/types';
 import type { AuditEntry } from '../../src/domain/audit/types';
 import { loadFixture } from '../contract/sgw/fixtures';
@@ -1322,5 +1323,141 @@ describe('fix round 1: broadcasts reach content scripts (T-32 carry)', () => {
       decision: string;
     }>;
     expect(evaluated.map((r) => r.decision)).toEqual(['hide', 'none']);
+  });
+});
+
+describe('T-30b: feature-scoped sticky blocking and the audited resume', () => {
+  const fail = async (ctx: Awaited<BackgroundHandle['ready']>, h: ReturnType<typeof boot>, endpoint: SgwEndpointKey): Promise<void> => {
+    await ctx.health.recordSchemaFailure({ endpoint, message: `${endpoint} drifted`, at: h.clock.now() });
+    await flush();
+  };
+
+  it('a placeBid sticky failure blocks bidding only; favorites and calendar stay allowed', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'placeBid');
+    expect(await verdicts(ctx.switches)).toEqual({
+      favorites: { ok: true },
+      calendar: { ok: true },
+      bidding: { ok: false, why: 'health check failed' },
+    });
+  });
+
+  it('showBidModal blocks bidding; the favorites endpoints block favorites', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'showBidModal');
+    expect((await ctx.switches.writesAllowed('bidding')).ok).toBe(false);
+    expect((await ctx.switches.writesAllowed('favorites')).ok).toBe(true);
+    for (const e of ['addFavorite', 'removeFavorite', 'saveFavoriteNote', 'favorites'] as const) {
+      const h2 = boot();
+      const c2 = await h2.handle.ready;
+      await fail(c2, h2, e);
+      expect(await verdicts(c2.switches), e).toEqual({
+        favorites: { ok: false, why: 'health check failed' },
+        calendar: { ok: true },
+        bidding: { ok: true },
+      });
+    }
+  });
+
+  it('a search or itemDetail sticky failure blocks every feature; so does any other endpoint', async () => {
+    for (const e of ['search', 'itemDetail', 'currentTime', 'sellerInfo'] as const) {
+      const h = boot();
+      const ctx = await h.handle.ready;
+      await fail(ctx, h, e);
+      for (const f of WRITE_FEATURES) expect((await ctx.switches.writesAllowed(f)).ok, `${e} ${f}`).toBe(false);
+    }
+  });
+
+  it('a schema failure flagged but not yet stored is scoped the same way', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    ctx.switches.flagSchemaFailure({ endpoint: 'placeBid', message: 'x', at: h.clock.now() });
+    expect((await ctx.switches.writesAllowed('favorites')).ok).toBe(true);
+    expect((await ctx.switches.writesAllowed('bidding')).ok).toBe(false);
+  });
+
+  it('other failing checks keep their all-features effect, even next to a scoped sticky failure', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'placeBid');
+    await h.areas.local.set({ [STORAGE_KEYS.healthReport]: report(false, h.clock.now() + 1) }); // a drift/stale style failure
+    for (const f of WRITE_FEATURES) expect((await ctx.switches.writesAllowed(f)).ok, f).toBe(false);
+    // ...and the resume does not clear it.
+    await h.ok('health.clearSticky', { endpoint: 'placeBid' });
+    await flush();
+    for (const f of WRITE_FEATURES) expect((await ctx.switches.writesAllowed(f)).ok, f).toBe(false);
+  });
+
+  it('a stale probe escalation blocks all features, and a resume does not clear it', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await ctx.health.run('anonymous'); // no samples: probes are unknown
+    h.clock.advance(25 * HOUR);
+    await fail(ctx, h, 'placeBid'); // recompose: detail-schema is now stale + sticky
+    for (const f of WRITE_FEATURES) expect((await ctx.switches.writesAllowed(f)).ok, f).toBe(false);
+    await h.ok('health.clearSticky', { endpoint: 'placeBid' });
+    await flush();
+    const stored = h.areas.local.dump()[STORAGE_KEYS.healthReport] as HealthReport;
+    expect(stored.checks.some((c) => !c.ok && c.detail?.startsWith('stale') === true)).toBe(true);
+    for (const f of WRITE_FEATURES) expect((await ctx.switches.writesAllowed(f)).ok, f).toBe(false);
+  });
+
+  it('health.clearSticky removes only that entry, audits health.resume and re-evaluates at once', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'placeBid');
+    await fail(ctx, h, 'addFavorite');
+    expect((await ctx.switches.writesAllowed('bidding')).ok).toBe(false);
+    await h.ok('health.clearSticky', { endpoint: 'placeBid' });
+    const probe = h.areas.local.dump()[STORAGE_KEYS.healthProbe] as { sticky: Array<{ endpoint: string }> };
+    expect(probe.sticky.map((x) => x.endpoint)).toEqual(['addFavorite']);
+    expect(h.audit()).toContainEqual(
+      expect.objectContaining({ actor: 'user', kind: 'health.resume', details: expect.objectContaining({ endpoint: 'placeBid' }) as unknown }),
+    );
+    // No flush: the verdict is already updated.
+    expect((await ctx.switches.writesAllowed('bidding')).ok).toBe(true);
+    expect((await ctx.switches.writesAllowed('favorites')).ok).toBe(false);
+    await h.ok('health.clearSticky', { endpoint: 'addFavorite' });
+    expect(await verdicts(ctx.switches)).toEqual(ALL_OK);
+    expect((h.areas.local.dump()[STORAGE_KEYS.healthReport] as HealthReport).ok).toBe(true);
+  });
+
+  it('health.clearSticky for an endpoint that is not sticky changes nothing and audits nothing', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'placeBid');
+    await h.ok('health.clearSticky', { endpoint: 'addFavorite' });
+    expect(h.audit().filter((e) => e.kind === 'health.resume')).toEqual([]);
+    expect((await ctx.switches.writesAllowed('bidding')).ok).toBe(false);
+  });
+
+  it('health.clearSticky from a content script is refused', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'placeBid');
+    const r = await h.send('health.clearSticky', { endpoint: 'placeBid' }, CONTENT);
+    expect(r.ok).toBe(false);
+    expect((await ctx.switches.writesAllowed('bidding')).ok).toBe(false);
+    expect(h.audit().filter((e) => e.kind === 'health.resume')).toEqual([]);
+  });
+
+  it('health.get lists the sticky failures with the features they block', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'placeBid');
+    const got = (await h.ok('health.get')) as { sticky: unknown };
+    expect(got.sticky).toEqual([{ endpoint: 'placeBid', at: h.clock.now(), detail: 'placeBid drifted', features: ['bidding'] }]);
+  });
+
+  it('the scoped block survives a restart', async () => {
+    const h = boot();
+    const ctx = await h.handle.ready;
+    await fail(ctx, h, 'placeBid');
+    const h2 = boot({ areas: h.areas, clock: h.clock });
+    const ctx2 = await h2.handle.ready;
+    expect((await ctx2.switches.writesAllowed('favorites')).ok).toBe(true);
+    expect((await ctx2.switches.writesAllowed('bidding')).ok).toBe(false);
   });
 });

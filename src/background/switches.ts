@@ -8,7 +8,11 @@
 //   - the kill switch is on;
 //   - dryRun[feature] is on;
 //   - health: the last HealthReport within 24 h has ok === false, or an SGW
-//     reply just failed its schema and T-30 has not stored that yet;
+//     reply just failed its schema and T-30 has not stored that yet. A report
+//     that fails ONLY through sticky per-endpoint schema failures blocks just the
+//     features those endpoints affect (T-30b R1, stickyFeatures; the list comes
+//     from `sbw:healthProbe.sticky`, the frozen HealthReport is untouched). Any
+//     other failing check (stale, drift, clock, session, shipping) blocks all;
 //   - the SGW session is neither 'ok' nor 'expiring' (expiring still writes,
 //     I-08). Not for 'calendar' (T-36 ruling, docs/CONTRACT-DECISIONS.md):
 //     calendar writes go to Google, not SGW. SGW health still blocks calendar,
@@ -35,11 +39,12 @@
 // (expiresAt is kept in the snapshot).
 import type { SchemaFailure } from '../adapters/sgw/api-adapter';
 import { SGW_CONFIG_VERSION } from '../adapters/sgw/config';
+import { SHIPPING_MARK, STICKY_MARK } from '../adapters/sgw/health';
 import type { AuditLog } from '../domain/audit/types';
 import { defaultSettings } from '../domain/settings/defaults';
 import { SettingsSchema, type Settings } from '../domain/settings/schema';
 import type { Repo } from '../domain/storage/repo';
-import { STORAGE_KEYS } from '../domain/storage/schema';
+import { type HealthProbe, HealthProbeSchema, STORAGE_KEYS } from '../domain/storage/schema';
 import {
   HealthReportSchema,
   SgwSessionRecordSchema,
@@ -55,6 +60,40 @@ import { errorText, withTimeout } from './context';
 
 export const WRITE_FEATURES = ['favorites', 'calendar', 'bidding'] as const;
 export type WriteFeature = (typeof WRITE_FEATURES)[number];
+
+/**
+ * T-30b R1: the features a sticky schema failure on `endpoint` blocks. Favorites
+ * endpoints affect favorites, bid endpoints affect bidding; search and itemDetail
+ * are core data (calendar end times come from detail), and anything unknown is
+ * treated as affecting everything.
+ */
+export function stickyFeatures(endpoint: string): readonly WriteFeature[] {
+  switch (endpoint) {
+    case 'addFavorite':
+    case 'removeFavorite':
+    case 'saveFavoriteNote':
+    case 'favorites':
+      return ['favorites'];
+    case 'placeBid':
+    case 'showBidModal':
+      return ['bidding'];
+    default:
+      return WRITE_FEATURES;
+  }
+}
+
+/** A sticky entry as health.get shows it. */
+export interface StickyFailure {
+  endpoint: string;
+  at: EpochMs;
+  detail: string;
+  features: WriteFeature[];
+}
+
+/** True when the check fails only through sticky per-endpoint failures (not stale, a bad probe or a shipping quote). */
+function stickyOnly(c: { detail?: string | undefined }): boolean {
+  return c.detail !== undefined && c.detail.startsWith(STICKY_MARK) && !c.detail.includes(`; ${SHIPPING_MARK}`);
+}
 
 /** A failing HealthReport blocks writes for this long after its checkedAt. */
 export const HEALTH_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -112,6 +151,8 @@ export class Switches implements GlobalSwitches {
   private killWrites = 0;
   private dryRun: Settings['dryRun'] = { favorites: true, calendar: true, bidding: true };
   private lastReport: HealthReport | null = null;
+  /** `sbw:healthProbe.sticky`; null when unreadable, which blocks every feature. */
+  private sticky: HealthProbe['sticky'] | null = [];
   /** A schema failure flagged by the API that no stored report reflects yet. */
   private pendingSchemaFailure: SchemaFailure | null = null;
   private problem: { reason: string; at: EpochMs } | null = null;
@@ -155,7 +196,7 @@ export class Switches implements GlobalSwitches {
     if (this.killSwitchOn()) return { ok: false, why: WHY.kill };
     if (this.dryRun[feature]) return { ok: false, why: WHY.dryRun };
     const now = this.deps.clock.now();
-    if (this.healthFailing(now)) return { ok: false, why: WHY.health };
+    if (this.healthFailing(now, feature)) return { ok: false, why: WHY.health };
     if (feature === 'calendar') return { ok: true }; // Google writes: the SGW session does not gate them
     const { state, expiresAt } = this.session;
     if (state !== 'ok' && state !== 'expiring') return { ok: false, why: WHY.session(state) };
@@ -227,6 +268,7 @@ export class Switches implements GlobalSwitches {
     // A kill persisted while this load was reading is newer than what it read.
     this.applySettings(data.settings, this.killWrites !== killWrites);
     for (const r of data.reports) if (r !== undefined) this.noteHealthReport(r);
+    this.sticky = data.probe?.sticky ?? [];
     this.session = { state: data.state, expiresAt: data.expiresAt };
     this.isLoaded = true;
     const queued = this.queued ?? [];
@@ -240,9 +282,10 @@ export class Switches implements GlobalSwitches {
     const { repo, session } = this.deps;
     const settings = await repo.get(STORAGE_KEYS.settings);
     const reports = [await repo.find(STORAGE_KEYS.healthReport), await repo.find(STORAGE_KEYS.runtimeHealth)];
+    const probe = await repo.find(STORAGE_KEYS.healthProbe);
     const state = await session.state();
     const expiresAt = (await repo.find(STORAGE_KEYS.sgwSession))?.expiresAt ?? null;
-    return { settings, reports, state, expiresAt };
+    return { settings, reports, probe, state, expiresAt };
   }
 
   // ── Notes from the handlers and the API ───────────────────────────────
@@ -259,6 +302,22 @@ export class Switches implements GlobalSwitches {
     // T-30 has stored a report at or after the flagged failure: the report now speaks for it.
     if (this.pendingSchemaFailure !== null && report.checkedAt >= this.pendingSchemaFailure.at) this.pendingSchemaFailure = null;
     this.changed();
+  }
+
+  /** The probe record just written (T-30b clearSticky): its sticky list scopes the block. */
+  noteHealthProbe(probe: HealthProbe | undefined): void {
+    this.sticky = probe?.sticky ?? [];
+    this.changed();
+  }
+
+  /** The sticky schema failures and the write features each blocks (health.get shows them). */
+  stickyFailures(): StickyFailure[] {
+    return (this.sticky ?? []).map((x) => ({
+      endpoint: x.endpoint,
+      at: x.at,
+      detail: x.detail,
+      features: [...stickyFeatures(x.endpoint)],
+    }));
   }
 
   /**
@@ -337,11 +396,18 @@ export class Switches implements GlobalSwitches {
     return this.killOverride ?? this.killStored;
   }
 
-  private healthFailing(now: EpochMs): boolean {
-    if (this.pendingSchemaFailure !== null) return true;
+  private healthFailing(now: EpochMs, feature: WriteFeature): boolean {
+    const pending = this.pendingSchemaFailure;
+    if (pending !== null && stickyFeatures(pending.endpoint).includes(feature)) return true;
     const r = this.lastReport;
     // A checkedAt in the future (the clock moved back) still counts: fail closed.
-    return r !== null && !r.ok && now - r.checkedAt < HEALTH_WINDOW_MS;
+    if (r === null || r.ok || now - r.checkedAt >= HEALTH_WINDOW_MS) return false;
+    const failing = r.checks.filter((c) => !c.ok);
+    // Any failure that is not a sticky endpoint failure (stale, drift, clock, session...) blocks every feature.
+    if (failing.length === 0 || !failing.every(stickyOnly)) return true;
+    // Sticky only: just the features the sticky endpoints affect. An empty or unreadable list fails closed.
+    if (this.sticky === null || this.sticky.length === 0) return true;
+    return this.sticky.some((x) => stickyFeatures(x.endpoint).includes(feature));
   }
 
   private applySettings(settings: Settings, keepKill = false): void {
@@ -374,11 +440,21 @@ export class Switches implements GlobalSwitches {
     for (const [key, change] of Object.entries(changes)) {
       if (area === 'local' && key === STORAGE_KEYS.settings) this.settingsChanged(change.newValue);
       else if (area === 'local' && SESSION_KEYS.includes(key)) this.sessionChanged(key, change.newValue);
+      else if (area === 'local' && key === STORAGE_KEYS.healthProbe) this.probeChanged(change.newValue);
       else if (HEALTH_KEYS.includes(key) && STORAGE_AREA_OF[key] === area) {
         const parsed = HealthReportSchema.safeParse(change.newValue);
         if (parsed.success) this.noteHealthReport(parsed.data);
       }
     }
+  }
+
+  private probeChanged(value: unknown): void {
+    if (value === undefined) {
+      this.sticky = [];
+      return;
+    }
+    const parsed = HealthProbeSchema.safeParse(value);
+    this.sticky = parsed.success ? parsed.data.sticky : null;
   }
 
   private settingsChanged(value: unknown): void {

@@ -128,8 +128,9 @@ function fromError(name: CheckName, e: unknown): Check {
 
 const STALE_PROBE_MS = 24 * 3_600_000;
 const STALE_DETAIL = 'stale: no successful probe in 24h';
-const STICKY_MARK = 'sticky schema failure';
-const SHIPPING_MARK = 'shipping-quote:';
+/** Detail prefix of a check failing only through sticky per-endpoint failures (T-30b: GlobalSwitches scopes by endpoint). */
+export const STICKY_MARK = 'sticky schema failure';
+export const SHIPPING_MARK = 'shipping-quote:';
 /** Parts of a check detail that are derived on every run, never stored as a probe outcome. */
 const DERIVED_MARKS = [STICKY_MARK, STALE_DETAIL, SHIPPING_MARK];
 

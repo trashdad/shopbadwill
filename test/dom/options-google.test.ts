@@ -378,6 +378,74 @@ describe('health section', () => {
     expect(screen.getByText('card-selectors: 0 cards found')).toBeTruthy();
   });
 
+  describe('sticky failures (T-30b)', () => {
+    const sticky = (): NonNullable<MsgReply<'health.get'>['sticky']> => [
+      { endpoint: 'placeBid', at: NOW - 3_600_000, detail: 'unexpected reply shape', features: ['bidding'] },
+      { endpoint: 'search', at: NOW - 60_000, detail: 'items missing', features: ['favorites', 'calendar', 'bidding'] },
+    ];
+
+    it('lists each sticky failure with endpoint, time and detail', async () => {
+      healthApp(report({ sticky: sticky() }));
+      const item = (await screen.findByText(/placeBid/)).closest('li');
+      expect(item?.textContent).toContain('unexpected reply shape');
+      expect(item?.textContent).toMatch(/PT/);
+      expect(screen.getByText(/items missing/)).toBeTruthy();
+      expect(screen.getByRole('button', { name: "I've checked; resume bidding" })).toBeTruthy();
+      expect(screen.getByRole('button', { name: "I've checked; resume all features" })).toBeTruthy();
+    });
+
+    it('shows no sticky list when there is none', async () => {
+      healthApp(report({ sticky: [] }));
+      await screen.findByText(/Signed in to ShopGoodwill/);
+      expect(screen.queryByRole('button', { name: /resume/ })).toBeNull();
+    });
+
+    it('asks for confirmation first, sends health.clearSticky only after it, then reloads', async () => {
+      let current = sticky();
+      const fake = new FakeMessaging();
+      fake.handle('health.get', () => report({ sticky: current }));
+      fake.handle('settings.get', () => defaultSettings());
+      fake.handle('health.clearSticky', ({ endpoint }) => {
+        current = current.filter((x) => x.endpoint !== endpoint);
+        return undefined;
+      });
+      render(h(HealthSection, { client: fake }));
+      fireEvent.click(await screen.findByRole('button', { name: "I've checked; resume bidding" }));
+      const dialog = screen.getByRole('alertdialog');
+      expect(fake.sent.some((m) => m.type === 'health.clearSticky')).toBe(false);
+      // Cancel sends nothing.
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByRole('alertdialog')).toBeNull();
+      expect(fake.sent.some((m) => m.type === 'health.clearSticky')).toBe(false);
+      fireEvent.click(screen.getByRole('button', { name: "I've checked; resume bidding" }));
+      fireEvent.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: 'Yes, resume bidding' }));
+      await waitFor(() => {
+        expect(fake.sent.filter((m) => m.type === 'health.clearSticky')).toEqual([
+          { type: 'health.clearSticky', payload: { endpoint: 'placeBid' } },
+        ]);
+      });
+      await waitFor(() => {
+        expect(screen.queryByText(/unexpected reply shape/)).toBeNull();
+      });
+      expect(screen.getByText(/items missing/)).toBeTruthy();
+    });
+
+    it('shows a failed resume in an alert and keeps the failure listed', async () => {
+      const fake = new FakeMessaging();
+      fake.handle('health.get', () => report({ sticky: sticky() }));
+      fake.handle('settings.get', () => defaultSettings());
+      fake.handle('health.clearSticky', () => {
+        throw new Error('storage is busy');
+      });
+      render(h(HealthSection, { client: fake }));
+      fireEvent.click(await screen.findByRole('button', { name: "I've checked; resume bidding" }));
+      fireEvent.click(screen.getByRole('button', { name: 'Yes, resume bidding' }));
+      const alert = await screen.findByRole('alert');
+      expect(alert.textContent).toContain('storage is busy');
+      expect(screen.getByText(/unexpected reply shape/)).toBeTruthy();
+    });
+  });
+
   it('shows "unavailable" without crashing when health.get has no handler', async () => {
     healthApp(undefined);
     await waitFor(() => {
