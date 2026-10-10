@@ -49,6 +49,7 @@ export const STORAGE_KEYS = {
   sgwSession: 'sbw:sgwSession',
   sgwSessionRejection: 'sbw:sgwSessionRejection',
   google: 'sbw:google',
+  googleClient: 'sbw:googleClient',
   requestBudget: 'sbw:requestBudget',
   requestSchedulerState: 'sbw:requestSchedulerState',
   awake: 'sbw:awake',
@@ -188,6 +189,19 @@ export const RequestSchedulerStateSchema = z.object({
 });
 export type RequestSchedulerState = z.infer<typeof RequestSchedulerStateSchema>;
 
+/**
+ * `sbw:googleClient` (T-70): the OAuth client the user pasted on the options
+ * page. Optional; the options page is its only writer, and the background
+ * (`clientConfig()`) only reads it, so the token record `sbw:google` has a
+ * single writer.
+ */
+export const GoogleClientSchema = z.object({
+  clientId: z.string().min(1),
+  clientSecret: z.string().optional(),
+  updatedAt: EpochMsSchema,
+});
+export type GoogleClient = z.infer<typeof GoogleClientSchema>;
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -228,6 +242,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },
   [STORAGE_KEYS.sgwSessionRejection]: { area: 'local', schema: SgwSessionRejectionSchema },
   [STORAGE_KEYS.google]: { area: 'local', schema: GoogleCredentialsSchema },
+  [STORAGE_KEYS.googleClient]: { area: 'local', schema: GoogleClientSchema },
   [STORAGE_KEYS.requestBudget]: { area: 'local', schema: RequestBudgetSchema },
   [STORAGE_KEYS.requestSchedulerState]: { area: 'local', schema: RequestSchedulerStateSchema },
   [STORAGE_KEYS.awake]: { area: 'local', schema: z.array(EpochMsSchema) },

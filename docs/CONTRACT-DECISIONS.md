@@ -340,3 +340,24 @@ Source: S-2 (`docs/spikes/S-2.md`) and the controller's T-28 rulings.
 3. **R4/R5:** `SBW_SESSION_REFRESH = false`, so `refresh()` resolves `false` with no call. Only `BuyerId`, `exp` and (hashed) `jti` are read from the token.
 
 **Follow-up for the next PLAN edit.** Add `reportRejected(bearer)` and the 72 h threshold to PLAN Â§3.3 and contracts.md, and list the new key `sbw:sgwSessionRejection` in PLAN Â§3.11.
+
+## T-70 contract change: AuthStatus gains optional `refreshTokenExpiresAt`
+
+Source: S-4 (`docs/USER-STEPS/S-4-results.txt`) and the controller's T-70 ruling R3.
+
+`AuthStatusSchema` (`src/domain/calendar/types.ts`) gains `refreshTokenExpiresAt?: EpochMs`. Google states `refresh_token_expires_in` (about 604800 s) for an app in "Testing" publishing mode, so the refresh token dies 7 days after consent. T-62's provider already keeps the value in memory (`PkceAuthStatus`); with the field in the schema it survives the `calendar.connect`, `calendar.status` and `health.get` replies, and the options page can warn before the daily sync starts failing with `invalid_grant`. Optional, so no migration and no change for providers that cannot state it. `test/contract/types/spec-shapes.test.ts` and `examples/AuthStatus.valid.json` are updated.
+
+**Follow-up for the next PLAN edit.** Add the field to PLAN §3.8 `AuthStatus` and contracts.md.
+
+## T-70 contract change: new optional storage key `sbw:googleClient`
+
+Source: controller ruling on T-70 concern 1.
+
+The options page used to write the pasted client into `sbw:google`, where the background also writes tokens: a lost update could overwrite a live connection (`grantedScopes: []`). Instead `STORAGE_KEYS.googleClient = 'sbw:googleClient'` (area `local`, `GoogleClientSchema` in `src/domain/storage/schema.ts`) holds `{ clientId: string (min 1); clientSecret?: string; updatedAt: EpochMs }`. Optional record, no migration, `schemaVersion` stays 1.
+
+- The options page is its only writer and validates against the schema before writing. It never touches `sbw:google`.
+- T-36's `clientConfig()` reads `sbw:googleClient` (carried by the controller). T-62's own copy of the client in `sbw:google` is never used to authenticate.
+- The secret is never rendered back beyond "••••" plus the last 4 characters, and is never logged, audited or put in an error.
+- `test/contract/types/storage.test.ts` pins the key and schema; `test/dom/options-google.test.ts` pins that saving leaves `sbw:google` byte-identical.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
