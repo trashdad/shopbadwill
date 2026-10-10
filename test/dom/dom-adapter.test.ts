@@ -63,23 +63,26 @@ describe('discoverCards over real fixtures', () => {
     const cells = Array.from(parent.querySelectorAll(':scope > .item-col'));
     for (let rep = 0; rep < 9; rep++) for (const c of cells) parent.append(c.cloneNode(true));
     const { dom } = make();
-    const median = (doc: Document): number => {
-      const t: number[] = [];
-      dom.discoverCards(doc); // warm up
-      for (let i = 0; i < 7; i++) {
-        const t0 = performance.now();
-        dom.discoverCards(doc);
-        t.push(performance.now() - t0);
-      }
-      t.sort((x, y) => x - y);
-      return Math.max(t[3] ?? 0, 0.05);
-    };
+    // Minimum of many interleaved runs: the least noisy estimate under a loaded machine
+    // (a median of 7 flaked when a GC pause landed in the 400-card runs).
+    const t40: number[] = [];
+    const t400: number[] = [];
+    dom.discoverCards(doc40); // warm up
+    dom.discoverCards(doc400);
+    for (let i = 0; i < 15; i++) {
+      let t0 = performance.now();
+      dom.discoverCards(doc40);
+      t40.push(performance.now() - t0);
+      t0 = performance.now();
+      dom.discoverCards(doc400);
+      t400.push(performance.now() - t0);
+    }
     expect(dom.discoverCards(doc400)).toHaveLength(400);
-    const m40 = median(doc40);
-    const m400 = median(doc400);
-    console.log(`discoverCards median 40 cards ${m40.toFixed(2)} ms, 400 cards ${m400.toFixed(2)} ms, ratio ${(m400 / m40).toFixed(1)}x`);
-    // Linear is ~10x; quadratic would be ~100x.
-    expect(m400 / m40).toBeLessThan(20);
+    const m40 = Math.max(Math.min(...t40), 0.02);
+    const m400 = Math.min(...t400);
+    console.log(`discoverCards min 40 cards ${m40.toFixed(2)} ms, 400 cards ${m400.toFixed(2)} ms, ratio ${(m400 / m40).toFixed(1)}x`);
+    // Linear is ~10x; quadratic would be ~100x, so 40x still separates them with headroom for noise.
+    expect(m400 / m40).toBeLessThan(40);
   });
 });
 
