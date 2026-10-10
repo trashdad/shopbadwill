@@ -58,6 +58,8 @@ export const STORAGE_KEYS = {
   runtimeHealth: 'sbw:runtimeHealth',
   /** Optional (T-30): the last HealthReport, in local so a failure survives a browser restart. */
   healthReport: 'sbw:healthReport',
+  /** Optional (T-30): probe bookkeeping for SgwHealth; local so it survives a restart. */
+  healthProbe: 'sbw:healthProbe',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -204,6 +206,19 @@ export const GoogleClientSchema = z.object({
 });
 export type GoogleClient = z.infer<typeof GoogleClientSchema>;
 
+/**
+ * `sbw:healthProbe` (T-30): when SgwHealth last probed (`probedAt`, the only
+ * clock for its 6 h / 10 min rules), when each schema check last succeeded
+ * (24 h escalation), and the per-endpoint schema failures that stay failing
+ * until that endpoint succeeds (`sticky`).
+ */
+export const HealthProbeSchema = z.object({
+  probedAt: EpochMsSchema.nullable(),
+  lastGoodProbeAt: z.object({ search: EpochMsSchema.optional(), detail: EpochMsSchema.optional() }),
+  sticky: z.array(z.object({ endpoint: z.string().min(1), at: EpochMsSchema, detail: z.string() })),
+});
+export type HealthProbe = z.infer<typeof HealthProbeSchema>;
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -252,6 +267,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.googleAccess]: { area: 'session', schema: GoogleAccessSchema },
   [STORAGE_KEYS.runtimeHealth]: { area: 'session', schema: HealthReportSchema },
   [STORAGE_KEYS.healthReport]: { area: 'local', schema: HealthReportSchema },
+  [STORAGE_KEYS.healthProbe]: { area: 'local', schema: HealthProbeSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

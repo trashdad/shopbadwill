@@ -1,0 +1,13 @@
+{
+  "probedAt": 1791400000000,
+  "lastGoodProbeAt": {
+    "search": 1791400000000
+  },
+  "sticky": [
+    {
+      "endpoint": "favorites",
+      "at": 1791400000000,
+      "detail": "rows changed"
+    }
+  ]
+}

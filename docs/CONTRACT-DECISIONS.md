@@ -369,3 +369,11 @@ Source: controller ruling on T-30 concern 4.
 `GlobalSwitches` blocks writes while the last HealthReport within 24 h has `ok === false`, but `sbw:runtimeHealth` is in the session area, so a browser restart forgot a failure. `STORAGE_KEYS.healthReport = 'sbw:healthReport'` (area `local`, `HealthReportSchema`) holds the same report. `SgwHealthAdapter` writes both keys and `last()` reads the local one (falling back to `sbw:runtimeHealth`). Optional record, no migration, `schemaVersion` stays 1. `test/contract/types/storage.test.ts` pins the key.
 
 **Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
+
+## T-30 contract change: new optional storage key `sbw:healthProbe`
+
+Source: controller ruling, T-30 fix round 1.
+
+`STORAGE_KEYS.healthProbe = 'sbw:healthProbe'` (area `local`, `HealthProbeSchema`): `{ probedAt: EpochMs | null; lastGoodProbeAt: { search?, detail? }; sticky: Array<{ endpoint, at, detail }> }`. `probedAt` is the only clock for SgwHealth's 6 h trust and 10 min re-probe rules (a report's `checkedAt` is refreshed by every run and must not be used). `lastGoodProbeAt` drives the 24 h stale escalation. `sticky` holds per-endpoint schema failures that keep the report failing until `recordSchemaSuccess(endpoint)` (or a full run that probes that read endpoint). Optional, no migration, `schemaVersion` stays 1.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.

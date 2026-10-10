@@ -63,36 +63,47 @@ function setup(o: Opts = {}) {
     dom: o.dom === undefined ? { drifted: false } : o.dom,
     shipping: o.shipping,
   };
-  const health = new SgwHealthAdapter({
-    repo,
-    clock,
-    api,
-    audit,
-    sgwClock: {
-      offset: () =>
-        state.offsetMs === null ? null : { offsetMs: state.offsetMs, rttMs: 50, samples: 3, confidence: 'high' },
-    },
-    session: { state: () => Promise.resolve(state.session) },
-    domReport: () =>
-      Promise.resolve(
-        state.dom === null
-          ? null
-          : {
-              configVersion: SGW_CONFIG_VERSION,
-              rank: state.dom.rank ?? 0,
-              strategy: 'x',
-              count: state.dom.count ?? 40,
-              unreadable: 0,
-              drifted: state.dom.drifted,
-            },
-      ),
-    shippingReply: () => Promise.resolve(state.shipping),
-  });
+  const build = (): SgwHealthAdapter =>
+    new SgwHealthAdapter({
+      repo,
+      clock,
+      api,
+      audit,
+      sgwClock: {
+        offset: () =>
+          state.offsetMs === null
+            ? null
+            : {
+                offsetMs: state.offsetMs,
+                rttMs: 50,
+                samples: 3,
+                confidence: 'high',
+              },
+      },
+      session: { state: () => Promise.resolve(state.session) },
+      domReport: () =>
+        Promise.resolve(
+          state.dom === null
+            ? null
+            : {
+                configVersion: SGW_CONFIG_VERSION,
+                rank: state.dom.rank ?? 0,
+                strategy: 'x',
+                count: state.dom.count ?? 40,
+                unreadable: 0,
+                drifted: state.dom.drifted,
+              },
+        ),
+      shippingReply: () => Promise.resolve(state.shipping),
+    });
+  const health = build();
   const requests = () => api.calls.length;
-  return { clock, repo, api, audit, health, state, requests };
+  return { clock, repo, api, audit, health, state, requests, build };
 }
 
-type Checked = { checks: Array<{ name: string; ok: boolean; detail?: string }> };
+type Checked = {
+  checks: Array<{ name: string; ok: boolean; detail?: string }>;
+};
 function must<T>(v: T | undefined | null): T {
   if (v === undefined || v === null) throw new Error('expected a value');
   return v;
@@ -256,7 +267,9 @@ describe('SgwHealth.run', () => {
   });
 
   it('R1: a cached shipping reply is format-checked without any request', async () => {
-    const t = setup({ shipping: '<div>Shipping: $5.00<br>Handling: $1.00<br>Total Shipping and Handling: $6.00</div>' });
+    const t = setup({
+      shipping: '<div>Shipping: $5.00<br>Handling: $1.00<br>Total Shipping and Handling: $6.00</div>',
+    });
     const r = await t.health.run('anonymous');
     expect(named(r, 'detail-schema')?.ok).toBe(true);
     expect(t.api.calls.some((c) => c.method === 'shippingQuote')).toBe(false);
@@ -290,7 +303,12 @@ describe('persistence and probe query', () => {
   it('the one search uses the fixed known-good query', async () => {
     const t = setup();
     await t.health.run('anonymous');
-    expect(t.api.calls[0]?.args[0]).toEqual({ searchText: 'pyrex', categoryIds: [], sellerIds: [], page: 1 });
+    expect(t.api.calls[0]?.args[0]).toEqual({
+      searchText: 'pyrex',
+      categoryIds: [],
+      sellerIds: [],
+      page: 1,
+    });
   });
 });
 
@@ -315,7 +333,14 @@ describe('audit transitions', () => {
       clock: t.clock,
       api: t.api,
       audit: { append: () => Promise.reject(new Error('boom')) },
-      sgwClock: { offset: () => ({ offsetMs: 999_999, rttMs: 1, samples: 1, confidence: 'high' }) },
+      sgwClock: {
+        offset: () => ({
+          offsetMs: 999_999,
+          rttMs: 1,
+          samples: 1,
+          confidence: 'high',
+        }),
+      },
       session: { state: () => Promise.resolve('ok') },
       domReport: () => Promise.resolve(null),
     });
@@ -328,14 +353,22 @@ describe('recordSchemaFailure (the T-36 hook)', () => {
     const t = setup();
     await t.health.run('anonymous');
     t.clock.advance(MIN);
-    await t.health.recordSchemaFailure({ endpoint: 'search', message: 'bad rows', at: t.clock.now() });
+    await t.health.recordSchemaFailure({
+      endpoint: 'search',
+      message: 'bad rows',
+      at: t.clock.now(),
+    });
     const last = await t.health.last();
     expect(last?.ok).toBe(false);
     expect(named(must(last), 'search-schema')?.ok).toBe(false);
     expect(named(must(last), 'search-schema')?.detail).toContain('bad rows');
     expect(named(must(last), 'clock')).toBeDefined();
     expect(t.audit.kinds).toEqual(['health.fail']);
-    await t.health.recordSchemaFailure({ endpoint: 'search', message: 'again', at: t.clock.now() });
+    await t.health.recordSchemaFailure({
+      endpoint: 'search',
+      message: 'again',
+      at: t.clock.now(),
+    });
     expect(t.audit.kinds).toEqual(['health.fail']);
     const n = t.requests();
     await t.health.run('anonymous');
@@ -344,12 +377,176 @@ describe('recordSchemaFailure (the T-36 hook)', () => {
 
   it('works with no earlier report; other endpoints land on detail-schema; flagSchemaFailure never throws', async () => {
     const t = setup();
-    await t.health.recordSchemaFailure({ endpoint: 'favorites', message: 'x', at: T0 });
+    await t.health.recordSchemaFailure({
+      endpoint: 'favorites',
+      message: 'x',
+      at: T0,
+    });
     const last = await t.health.last();
     expect(last?.ok).toBe(false);
     expect(named(must(last), 'detail-schema')?.detail).toContain('favorites');
     expect(() => {
       t.health.flagSchemaFailure({ endpoint: 'search', message: 'y', at: T0 });
     }).not.toThrow();
+  });
+});
+
+describe('fix round 1', () => {
+  const H24 = 24 * H;
+
+  it('probe age survives a restart: a fresh adapter reuses a good probe under 6 h and re-probes (2 requests) after 7 h', async () => {
+    const t = setup();
+    await t.health.run('anonymous');
+    t.clock.advance(5 * H);
+    await t.health.run('anonymous'); // cache hit refreshes checkedAt but must not refresh probedAt
+    expect(t.requests()).toBe(2);
+    t.clock.advance(2 * H);
+    const restarted = t.build();
+    await restarted.run('anonymous');
+    expect(t.requests()).toBe(4);
+    expect((await t.repo.find(STORAGE_KEYS.healthProbe))?.probedAt).toBe(t.clock.now());
+  });
+
+  it('a failing report in a fresh adapter re-probes after 10 min, not before', async () => {
+    const t = setup();
+    t.api.failNext('search', 'schema');
+    await t.health.run('anonymous');
+    const n = t.requests();
+    t.clock.advance(5 * MIN);
+    await t.build().run('anonymous');
+    expect(t.requests()).toBe(n);
+    t.clock.advance(6 * MIN);
+    const r = await t.build().run('anonymous');
+    expect(t.requests()).toBe(n + 2);
+    expect(r.ok).toBe(true);
+  });
+
+  it('sticky: a favorites failure stays failing through good search/detail probes until recordSchemaSuccess(favorites)', async () => {
+    const t = setup();
+    await t.health.run('anonymous');
+    await t.health.recordSchemaFailure({
+      endpoint: 'favorites',
+      message: 'rows changed',
+      at: t.clock.now(),
+    });
+    t.clock.advance(7 * H);
+    const r = await t.health.run('full');
+    expect(t.requests()).toBe(4);
+    expect(r.ok).toBe(false);
+    expect(named(r, 'detail-schema')?.ok).toBe(false);
+    expect(named(r, 'detail-schema')?.detail).toContain('favorites');
+    expect(named(r, 'search-schema')?.ok).toBe(true);
+    await t.health.recordSchemaSuccess('search'); // a different endpoint clears nothing
+    expect((await t.health.last())?.ok).toBe(false);
+    await t.health.recordSchemaSuccess('favorites');
+    const after = await t.health.last();
+    expect(after?.ok).toBe(true);
+    expect((await t.repo.find(STORAGE_KEYS.healthProbe))?.sticky).toEqual([]);
+    expect(t.audit.kinds).toContain('health.recovered');
+  });
+
+  it('sticky search failure is cleared by a full run that probes search successfully, not by an anonymous one', async () => {
+    const t = setup();
+    await t.health.recordSchemaFailure({
+      endpoint: 'search',
+      message: 'bad',
+      at: T0,
+    });
+    t.clock.advance(11 * MIN);
+    expect((await t.health.run('anonymous')).ok).toBe(false);
+    t.clock.advance(11 * MIN);
+    const r = await t.health.run('full');
+    expect(r.ok).toBe(true);
+  });
+
+  it('a sticky favorites failure is never cleared by a full probe of search and detail', async () => {
+    const t = setup();
+    await t.health.recordSchemaFailure({
+      endpoint: 'favorites',
+      message: 'bad',
+      at: T0,
+    });
+    t.clock.advance(11 * MIN);
+    expect((await t.health.run('full')).ok).toBe(false);
+  });
+
+  it('recordSchemaFailure with no earlier report fills the other checks as unknown and costs no request', async () => {
+    const t = setup();
+    await t.health.recordSchemaFailure({
+      endpoint: 'search',
+      message: 'bad',
+      at: T0,
+    });
+    const last = must(await t.health.last());
+    expect(last.ok).toBe(false);
+    expect(isUnknownCheck(must(named(last, 'detail-schema')))).toBe(true);
+    expect(named(last, 'search-schema')?.ok).toBe(false);
+    await t.health.run('anonymous');
+    expect(t.requests()).toBe(0);
+  });
+
+  it('escalation: a schema check with no good probe in over 24 h fails as stale; not before', async () => {
+    const t = setup();
+    await t.health.run('anonymous');
+    t.clock.advance(H24 - H);
+    t.api.failNext('search', 'paused');
+    t.api.failNext('itemDetail', 'paused');
+    const early = await t.health.run('anonymous');
+    expect(early.ok).toBe(true);
+    t.clock.advance(2 * H);
+    t.api.failNext('search', 'paused');
+    t.api.failNext('itemDetail', 'paused');
+    const late = await t.health.run('anonymous');
+    expect(late.ok).toBe(false);
+    expect(named(late, 'search-schema')?.detail).toContain('stale: no successful probe in 24h');
+    expect(named(late, 'detail-schema')?.ok).toBe(false);
+  });
+
+  it('empty search, unknown clock and unknown cards are never escalated to stale', async () => {
+    const t = setup({ offsetMs: null, dom: null });
+    t.api.listings = [];
+    await t.health.run('anonymous');
+    t.clock.advance(3 * H24);
+    const r = await t.health.run('anonymous');
+    expect(r.ok).toBe(true);
+  });
+
+  it('concurrent run() calls make at most 2 requests in total', async () => {
+    const t = setup();
+    await Promise.all([t.health.run('anonymous'), t.health.run('anonymous')]);
+    expect(t.requests()).toBe(2);
+  });
+
+  it('a throwing shippingReply is ignored', async () => {
+    const t = setup();
+    const h = new SgwHealthAdapter({
+      repo: t.repo,
+      clock: t.clock,
+      api: t.api,
+      audit: t.audit,
+      sgwClock: { offset: () => null },
+      session: { state: () => Promise.resolve('ok') },
+      domReport: () => Promise.resolve(null),
+      shippingReply: () => Promise.reject(new Error('storage down')),
+    });
+    expect((await h.run('anonymous')).ok).toBe(true);
+  });
+
+  it('a shipping failure combined with a real detail failure keeps both, and the real one survives a throttled rerun', async () => {
+    const t = setup({ shipping: 'Postage is now free!' });
+    t.api.failNext('itemDetail', 'schema');
+    const r = await t.health.run('anonymous');
+    const d = must(named(r, 'detail-schema'));
+    expect(d.ok).toBe(false);
+    expect(d.detail).toContain('schema:');
+    expect(d.detail).toContain('shipping-quote');
+    t.clock.advance(MIN);
+    const again = must(named(await t.health.run('anonymous'), 'detail-schema'));
+    expect(again.ok).toBe(false);
+    expect(again.detail).toContain('schema:');
+    expect(again.detail?.match(/shipping-quote/g)).toHaveLength(1);
+    t.state.shipping = undefined;
+    t.clock.advance(11 * MIN);
+    expect((await t.health.run('anonymous')).ok).toBe(true);
   });
 });
