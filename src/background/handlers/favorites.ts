@@ -2,10 +2,11 @@
 // Caches the list and marks listed tracked items favorited. It never downgrades:
 // 'favorited' means "handled, and the user owns it now"; the cache is the truth
 // for "on SGW right now", so a favorite the user removed stays handled.
-// Registered by T-36's register(ctx), not here.
+// Registered through register(ctx) below (T-36 self-registration, I-01).
 import type { Repo } from '../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import type { SgwApi } from '../../ports/sgw-api';
+import type { BackgroundContext } from '../context';
 import type { Handler } from '../router';
 
 export interface FavoritesHandlerDeps {
@@ -32,4 +33,10 @@ export function createFavoritesHandlers(deps: FavoritesHandlerDeps): { 'favorite
       return undefined;
     },
   };
+}
+
+/** T-36 self-registration (I-01): main.ts's handler registry calls this once. */
+export function register(ctx: BackgroundContext): void {
+  const handlers = createFavoritesHandlers({ api: ctx.api, repo: ctx.repo });
+  ctx.router.register('favorites.sync', handlers['favorites.sync']);
 }

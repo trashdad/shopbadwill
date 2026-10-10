@@ -413,7 +413,8 @@ interface SpecSnipe {
   armedAt: EpochMs;
   fireAt?: EpochMs;
   wakeAlarm?: string;
-  attempt: { sentAt?: EpochMs; idempotencyKey?: string; ambiguous?: boolean };
+  // T-80 contract change: `reply` (docs/CONTRACT-DECISIONS.md).
+  attempt: { sentAt?: EpochMs; idempotencyKey?: string; ambiguous?: boolean; reply?: SpecBidResult };
   measured?: { offsetMs?: number; rttMs?: number; firedAt?: EpochMs; responseAt?: EpochMs };
   groupId?: string;
   history: Array<{ at: EpochMs; from: SpecSnipeState; to: SpecSnipeState; why: string }>;

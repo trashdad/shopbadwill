@@ -347,7 +347,7 @@ Source: S-4 (`docs/USER-STEPS/S-4-results.txt`) and the controller's T-70 ruling
 
 `AuthStatusSchema` (`src/domain/calendar/types.ts`) gains `refreshTokenExpiresAt?: EpochMs`. Google states `refresh_token_expires_in` (about 604800 s) for an app in "Testing" publishing mode, so the refresh token dies 7 days after consent. T-62's provider already keeps the value in memory (`PkceAuthStatus`); with the field in the schema it survives the `calendar.connect`, `calendar.status` and `health.get` replies, and the options page can warn before the daily sync starts failing with `invalid_grant`. Optional, so no migration and no change for providers that cannot state it. `test/contract/types/spec-shapes.test.ts` and `examples/AuthStatus.valid.json` are updated.
 
-**Follow-up for the next PLAN edit.** Add the field to PLAN §3.8 `AuthStatus` and contracts.md.
+**Follow-up for the next PLAN edit.** Add the field to PLAN Â§3.8 `AuthStatus` and contracts.md.
 
 ## T-70 contract change: new optional storage key `sbw:googleClient`
 
@@ -357,7 +357,58 @@ The options page used to write the pasted client into `sbw:google`, where the ba
 
 - The options page is its only writer and validates against the schema before writing. It never touches `sbw:google`.
 - T-36's `clientConfig()` reads `sbw:googleClient` (carried by the controller). T-62's own copy of the client in `sbw:google` is never used to authenticate.
-- The secret is never rendered back beyond "••••" plus the last 4 characters, and is never logged, audited or put in an error.
+- The secret is never rendered back beyond "â€¢â€¢â€¢â€¢" plus the last 4 characters, and is never logged, audited or put in an error.
 - `test/contract/types/storage.test.ts` pins the key and schema; `test/dom/options-google.test.ts` pins that saving leaves `sbw:google` byte-identical.
 
-**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+**Follow-up for the next PLAN edit.** Add the key to PLAN Â§2.3 and contracts.md.
+
+## T-30 contract change: new optional storage key `sbw:healthReport`
+
+Source: controller ruling on T-30 concern 4.
+
+`GlobalSwitches` blocks writes while the last HealthReport within 24 h has `ok === false`, but `sbw:runtimeHealth` is in the session area, so a browser restart forgot a failure. `STORAGE_KEYS.healthReport = 'sbw:healthReport'` (area `local`, `HealthReportSchema`) holds the same report. `SgwHealthAdapter` writes both keys and `last()` reads the local one (falling back to `sbw:runtimeHealth`). Optional record, no migration, `schemaVersion` stays 1. `test/contract/types/storage.test.ts` pins the key.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
+
+## T-30 contract change: new optional storage key `sbw:healthProbe`
+
+Source: controller ruling, T-30 fix round 1.
+
+`STORAGE_KEYS.healthProbe = 'sbw:healthProbe'` (area `local`, `HealthProbeSchema`): `{ probedAt: EpochMs | null; lastGoodProbeAt: { search?, detail? }; sticky: Array<{ endpoint, at, detail }> }`. `probedAt` is the only clock for SgwHealth's 6 h trust and 10 min re-probe rules (a report's `checkedAt` is refreshed by every run and must not be used). `lastGoodProbeAt` drives the 24 h stale escalation. `sticky` holds per-endpoint schema failures that keep the report failing until `recordSchemaSuccess(endpoint)` (or a full run that probes that read endpoint). Optional, no migration, `schemaVersion` stays 1.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
+
+**T-30 round 2 addition.** `HealthProbe` gains optional `firstSeenAt: EpochMs`, set once at the first run or recorded failure. A schema check that has never had a good probe escalates to `stale` (`ok:false`) once `now - firstSeenAt > 24h`, the same fail-closed path as the `lastGoodProbeAt` rule (an empty search, which leaves detail with nothing to probe, is exempt). Optional, backward compatible.
+
+## T-80 contract change: `Snipe.attempt.reply`
+
+Approved by the controller in the T-80 review (fix round 1, ruling on concern 1).
+
+**Change.** `Snipe.attempt` gains `reply?: BidResult` (`src/domain/snipe/types.ts`). It holds SGW's reply to the attempt's PlaceBid, and the reducer (`src/domain/snipe/state-machine.ts`) records it on `result`.
+
+**Why.** When a reply might have registered (`accepted`, `outbid`, `rejected-unknown`), the snipe waits for the outcome read. That read must be judged together with the reply: T-87's `classifyOutcome(snipe, reply, postDetail)` needs `rejected-unknown` to give the right copy, and `accepted` to infer a win from the price. The `post-read` event carries only the ItemDetail.
+
+Before this change, the reply could only be held in the runner's memory (the stopgap `ReduceContext.reply`, now removed). After a worker restart the reply was lost, so an accepted bid with an anonymous post-read under the max read "Unconfirmed" instead of "Won".
+
+**Rules.**
+- **One reply per attempt.** A second `result`, an `ambiguous` after a `result`, or a `result` after an `ambiguous` is refused as `duplicate`. T-101's SendStrategy dispatches exactly one of the two.
+- **Ambiguous sends.** After `ambiguous`, the outcome read is judged with no reply. A stored record that has both a reply and the ambiguity flag is judged the same way, conservatively. The reducer never writes such a record.
+- **Re-arming.** The `snipe.arm` handler already resets `attempt` to `{}`, so a re-armed snipe carries no reply. `arm` also refuses a draft that has one.
+
+**Migration.** None. The field is optional, so `sbw:meta.schemaVersion` stays 1, and snipes stored before this change have no reply.
+
+**Tests.**
+- `test/contract/types/spec-shapes.test.ts`: `SpecSnipe.attempt.reply?: SpecBidResult`.
+- `test/unit/domain/snipe/state-machine.test.ts`: covers a restart round trip through `SnipeSchema` (accepted reply, then an anonymous post-read under the max, resolves to Won), one reply per attempt, and the ambiguous-plus-reply record.
+
+**Follow-up for the next PLAN edit.** Add `reply?: BidResult` to `Snipe.attempt` in PLAN Â§3.9 and in `contracts.md`.
+
+## T-36 ruling: calendar writes are not gated by the SGW session (Â§3.3 note)
+
+Source: controller ruling on T-36 concern 2.
+
+Â§3.3's fail-closed rule lists four conditions for `GlobalSwitches.writesAllowed(feature)`. For `feature === 'calendar'`, the SGW-session condition (`SgwSession.state()` neither `'ok'` nor `'expiring'`) does not apply: calendar writes go to Google, not to SGW, so a lapsed SGW sign-in must not stop calendar sync. The other conditions still apply to calendar: the kill switch, `dryRun.calendar`, and a failing SGW HealthReport within 24 h (drifted SGW data could carry wrong end times). The storage-repair block (migrate() meta-corrupt or failed, T-33 carry) applies to every feature. `favorites` and `bidding` keep all four conditions.
+
+The port type (`src/ports/global-switches.ts`) is unchanged. `src/background/switches.ts` implements the rule, and `test/integration/background-main.test.ts` pins it ("calendar is exempt from the SGW session, but not from SGW health, the kill switch or dryRun.calendar").
+
+**Follow-up for the next PLAN edit.** Add the exemption to the fail-closed rule in PLAN Â§3.3 and contracts.md.

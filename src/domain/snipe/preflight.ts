@@ -157,7 +157,8 @@ function money(cents: number): string {
   return Number.isSafeInteger(cents) && cents >= 0 ? formatMoney(cents) : String(cents);
 }
 
-function isoMs(iso: string): number {
+/** IsoUtc (zod-validated) to epoch ms. Exported for the reducer (T-80), so it is not duplicated. */
+export function isoMs(iso: string): number {
   return new Date(iso).getTime();
 }
 

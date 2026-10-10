@@ -1,6 +1,9 @@
 // `pnpm check:prod-bundle`: greps the PRODUCTION outputs (.output/chrome-mv3,
 // .output/firefox-mv3) for tokens that must never ship, and fails on any hit:
 //   127.0.0.1  localhost  SBW_TEST  __scenario  sbw:test  innerHTML  eval(  new Function
+// `eval(` means the global eval however it is reached (bare, window/globalThis/
+// self, ["eval"], (0, eval)); a method that happens to be named eval, such as
+// re2js's Prefilter.eval, is not flagged (T-36 ruling).
 //
 // Two allowlist entries, nothing else:
 //
@@ -32,7 +35,13 @@ export const FORBIDDEN = [
   { name: '__scenario', pattern: /__scenario/g },
   { name: 'sbw:test', pattern: /sbw:test/g },
   { name: 'innerHTML', pattern: /innerHTML/g },
-  { name: 'eval(', pattern: /\beval\s*\(/g },
+  // A call to the global eval. Not a member call on another object (`x.eval(`)
+  // and not a method definition (`eval(a,b){`): re2js, bundled into the
+  // background for the rule engine, has a Prefilter method named `eval` (T-36
+  // ruling). Reaching the global through window/globalThis/self still counts.
+  { name: 'eval(', pattern: /(?<![.$\w])eval\s*\((?![^()]*\)\s*\{)/g },
+  { name: 'global.eval(', pattern: /\b(?:globalThis|window|self)\s*\.\s*eval\s*\(/g },
+  { name: '["eval"]', pattern: /\[\s*["'`]eval["'`]\s*\]/g },
   { name: 'new Function', pattern: /new\s+Function\b/g },
   // Function-constructor signatures that survive in a bundle even when the
   // spellings above do not match (zod's JIT probe and compiler, which

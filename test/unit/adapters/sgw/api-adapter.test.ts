@@ -130,6 +130,7 @@ interface SetupOpts {
   lanes?: Record<Lane, LaneConfig>;
   session?: { bearer: string; expiresAt: number; buyerId: string } | null;
   sgwClock?: Pick<SgwClockAdapter, 'sampleFromServerTime' | 'sampleFromGetCurrentTime'>;
+  writesAllowedNow?: (feature: 'favorites' | 'bidding') => { ok: boolean; why?: string };
 }
 
 function setup(opts: SetupOpts = {}) {
@@ -146,6 +147,7 @@ function setup(opts: SetupOpts = {}) {
   const audit = new FakeAuditLog(clock);
   const switches = new DelayedSwitches(clock);
   const failures: SchemaFailure[] = [];
+  const schemaOks: string[] = [];
   const rejections = { count: 0, bearers: [] as string[] };
   const sessionBox = {
     value: opts.session === undefined ? { bearer: BEARER, expiresAt: T0 + 24 * 60 * MIN, buyerId: '42' } : opts.session,
@@ -167,10 +169,14 @@ function setup(opts: SetupOpts = {}) {
       flagSchemaFailure: (f) => {
         failures.push(f);
       },
+      onSchemaOk: (endpoint) => {
+        schemaOks.push(endpoint);
+      },
     },
     sgwClock: opts.sgwClock ?? new SgwClockAdapter(clock),
+    ...(opts.writesAllowedNow === undefined ? {} : { writesAllowedNow: opts.writesAllowedNow }),
   });
-  return { clock, http, inner, scheduler, audit, switches, failures, rejections, sessionBox, api };
+  return { clock, http, inner, scheduler, audit, switches, failures, schemaOks, rejections, sessionBox, api };
 }
 
 type Setup = ReturnType<typeof setup>;
@@ -1124,6 +1130,124 @@ describe('schema failure → SgwApiError(schema) and health flagged', () => {
     t.http.on(`${BASE}ItemBid/ShowBidModal`, { status: 403, bodyText: '' });
     await rejectsWith(t.api.showBidModal(ITEM), 'blocked');
     expect(t.failures).toHaveLength(0);
+  });
+});
+
+// T-36 fix round 1 (#9): the async verdict a queued write holds can be up to
+// WRITE_GATE_MAX_AGE_MS / 2 old at its turn. When the synchronous
+// `writesAllowedNow` is given, build() asks it right before the send, so a kill
+// switch flipped in between stops the write with no window at all.
+describe('writesAllowedNow: a synchronous verdict asked by build() right before the send', () => {
+  const GAP: LaneConfig = { minIntervalMs: 120 * S, jitterMs: 0, maxConcurrent: 1, dailyBudget: 100 };
+  const BUSY_LANES: Record<Lane, LaneConfig> = { ...FAST_LANES, background: GAP };
+  const ADD_URL = `${BASE}Favorite/AddToFavorite?itemId=${String(ITEM)}`;
+
+  it('a kill flipped after the last refresh and 1 ms before the turn of the write: refused at build, audited, ZERO HTTP for it', async () => {
+    const now: { verdict: { ok: boolean; why?: string } } = { verdict: { ok: true } };
+    const asked: string[] = [];
+    const t = setup({
+      lanes: BUSY_LANES,
+      writesAllowedNow: (feature) => {
+        asked.push(feature);
+        return now.verdict;
+      },
+    });
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'background'); // starts the 120 s gap on the write lane
+    const pending = t.api.addFavorite(ITEM).catch((e: unknown) => e);
+    await flush();
+    await advance(t.clock, 120 * S - 1); // every async refresh said ok
+    now.verdict = { ok: false, why: 'kill switch is on' }; // the async switches still say ok
+    await advance(t.clock, 1);
+    const err = await pending;
+    expect(err).toBeInstanceOf(SgwApiError);
+    expect((err as SgwApiError).kind).toBe('paused');
+    expect((err as SgwApiError).message).toBe('kill switch is on');
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`]);
+    expect(asked).toEqual(['favorites']);
+    expect(t.audit.entries).toEqual([
+      expect.objectContaining({ kind: 'favorite.add', itemId: ITEM, details: { action: 'add', why: 'kill switch is on' } }),
+    ]);
+    expect(t.inner.stats().lanes.background.usedToday).toBe(1); // the refused turn cost no budget
+  });
+
+  it('an ok synchronous verdict lets the write go', async () => {
+    const t = setup({ lanes: BUSY_LANES, writesAllowedNow: () => ({ ok: true }) });
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'background');
+    const write = t.api.addFavorite(ITEM);
+    await flush();
+    await advance(t.clock, 120 * S);
+    await write;
+    expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}Search/ItemListing`, ADD_URL]);
+  });
+
+  it('a throwing hook refuses the write (fail closed)', async () => {
+    const t = setup({
+      writesAllowedNow: () => {
+        throw new Error('switches unavailable');
+      },
+    });
+    scriptAll(t.http);
+    const err = await rejectsWith(t.api.addFavorite(ITEM), 'paused');
+    expect(err.message).toBe('the write gate could not be read');
+    expect(t.http.requests).toHaveLength(0);
+  });
+});
+
+// T-36 (carried from T-30): health keeps schema failures per endpoint until the
+// same endpoint answers validly again, so a schema-valid reply must say so.
+describe('onSchemaOk: a schema-valid reply reports its endpoint (clears a sticky schema failure)', () => {
+  it('reads and writes report their endpoint once per valid reply', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    await t.api.search(PYREX, 'interactive');
+    await t.api.itemDetail(ITEM, 'interactive');
+    await t.api.favorites('open', 'interactive');
+    await t.api.addFavorite(ITEM);
+    expect(t.schemaOks).toEqual(['search', 'itemDetail', 'favorites', 'addFavorite']);
+    expect(t.failures).toEqual([]);
+  });
+
+  it('a schema failure, a non-2xx answer or a cache hit reports nothing', async () => {
+    const t = setup();
+    t.http.on(`${BASE}Search/ItemListing`, json({ nope: true }));
+    await rejectsWith(t.api.search(PYREX, 'interactive'), 'schema');
+    t.http.on(`${BASE}ItemDetail/`, { status: 404, bodyText: '' });
+    await rejectsWith(t.api.itemDetail(ITEM, 'interactive'), 'server');
+    expect(t.schemaOks).toEqual([]);
+
+    t.http.on(`${BASE}ItemDetail/`, json(loadFixture('item-detail-open')));
+    await t.api.itemDetail(ITEM, 'interactive');
+    await t.api.itemDetail(ITEM, 'interactive'); // served from the adapter's cache: no reply, nothing to report
+    expect(t.schemaOks).toEqual(['itemDetail']);
+  });
+
+  it('is optional, and a throwing hook never hides the reply', async () => {
+    const clock = new FakeClock(T0);
+    const http = new FakeHttp(clock);
+    const scheduler = new SgwRequestScheduler({ clock, http, storage: new FakeStorage(), lanes: FAST_LANES });
+    const deps = {
+      scheduler,
+      clock,
+      session: { current: () => Promise.resolve(null), reportRejected: () => Promise.resolve() },
+      switches: new FakeSwitches(),
+      audit: new FakeAuditLog(clock),
+      sgwClock: new SgwClockAdapter(clock),
+    };
+    scriptAll(http);
+    const without = new SgwApiAdapter({ ...deps, health: { flagSchemaFailure: () => undefined } });
+    await expect(without.itemDetail(ITEM, 'interactive')).resolves.toMatchObject({ itemId: ITEM });
+    const throwing = new SgwApiAdapter({
+      ...deps,
+      health: {
+        flagSchemaFailure: () => undefined,
+        onSchemaOk: () => {
+          throw new Error('sink broke');
+        },
+      },
+    });
+    await expect(throwing.search(PYREX, 'interactive')).resolves.toMatchObject({ page: 1 });
   });
 });
 

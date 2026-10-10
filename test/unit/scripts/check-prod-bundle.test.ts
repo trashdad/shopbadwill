@@ -76,6 +76,46 @@ describe('check-prod-bundle: forbidden tokens', () => {
   });
 });
 
+// T-36 ruling: the background bundles re2js (rules.evaluate), whose Prefilter
+// class has a method named `eval`. A method definition or a member call on some
+// other object is not JavaScript eval; every way of reaching the real one is.
+describe('check-prod-bundle: eval means the global eval, not a method named eval (T-36)', () => {
+  const tokensIn = (code: string): string[] => scanText('a.js', code).map((f) => f.token);
+
+  it.each([
+    ['bare eval(', 'eval("1+1")'],
+    ['bare eval( after an operator', 'a=eval(s),b'],
+    ['window.eval(', 'window.eval("x")'],
+    ['globalThis.eval(', 'globalThis.eval("x")'],
+    ['self.eval(', 'self.eval("x")'],
+    ['self["eval"](', 'self["eval"]("x")'],
+    ['(0, eval)(', '(0, eval)("x")'],
+    ['new Function(', 'const f = new Function(body)'],
+    ['Function( called as a constructor', 'Function("return this")()'],
+  ])('still flags %s', (_name, code) => {
+    expect(tokensIn(code).length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ['a member call on another object', 'if(!this.subs[e].eval(t,n))return!1'],
+    ['a chained member call', 'H.UNANCHORED&&!this.prefilter.eval(e,t)'],
+    ['x.eval(', 'x.eval(1)'],
+    ['a minified method definition', 'this.ac8=null}eval(t,n){switch(this.type){}}'],
+    ['a method definition after a comma', 'class A{a(){},eval(t){return t}}'],
+    ['an object-literal method', 'const o={eval(a,b){return a+b}}'],
+  ])('passes %s', (_name, code) => {
+    expect(tokensIn(code)).toEqual([]);
+  });
+
+  it('passes the real re2js build (its Prefilter.eval method)', async () => {
+    const re2js = path.dirname(require.resolve('re2js')); // build/index.cjs (package.json is not exported)
+    for (const file of ['index.js', 'index.cjs', 'index.umd.js']) {
+      const tokens = scanText(file, await readFile(path.join(re2js, file), 'utf8')).map((f) => f.token);
+      expect(tokens.filter((t) => t.includes('eval')), file).toEqual([]);
+    }
+  });
+});
+
 describe('check-prod-bundle: Firefox OAuth loopback allowlist (T-62)', () => {
   it('is exactly the mozoauth2 loopback prefix', () => {
     expect(ALLOWED_LOOPBACK_PREFIX).toBe('http://127.0.0.1/mozoauth2/');

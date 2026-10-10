@@ -4,11 +4,12 @@
 // domain's `recordHeartbeat`. Spacing comes from the persisted ring (its latest
 // entry), not from memory, so an MV3 worker restart neither doubles a beat nor
 // drifts. It makes no network request and calls no browser API directly:
-// storage goes through the Repo, time through the Repo's Clock. T-52 does not
-// exist yet, so the hook is passed in rather than imported; T-52/T-36 wire it.
+// storage goes through the Repo, time through the Repo's Clock. T-36 wires it
+// through register(ctx) below onto ctx.ticks, the tick hub T-52 drives.
 import { heartbeatDue, recordHeartbeat } from '../../domain/snipe/awake-history';
 import type { Repo } from '../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
+import type { BackgroundContext } from '../context';
 
 /** The scheduler hook: calls `cb` on every tick. Its return value is ignored. */
 export type OnTick = (cb: () => Promise<void>) => unknown;
@@ -58,4 +59,9 @@ export function registerHeartbeat(onTick: OnTick, deps: HeartbeatDeps): Heartbea
     await heartbeat.beat();
   });
   return heartbeat;
+}
+
+/** T-36 self-registration (I-01): one heartbeat per scheduler tick (ctx.ticks, driven by T-52). */
+export function register(ctx: BackgroundContext): void {
+  registerHeartbeat((cb) => ctx.ticks.onTick(cb), { repo: ctx.repo });
 }
