@@ -1,4 +1,4 @@
-// T-58: `audit.list` and `audit.undo`. Registered by T-36's register(ctx), not here.
+// T-58: `audit.list` and `audit.undo`. Registered through register(ctx) below (T-36, I-01).
 //
 // Undo is a real write (e.g. it unfavorites on the user's SGW account), so:
 //   - dry-run entries are refused (nothing was ever done);
@@ -14,6 +14,7 @@ import type { Repo } from '../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import { SgwApiError } from '../../ports/errors';
 import type { SgwApi } from '../../ports/sgw-api';
+import type { BackgroundContext } from '../context';
 import { parseUnfavoriteRef } from '../jobs/steps/favorite';
 import type { Handler } from '../router';
 
@@ -128,4 +129,11 @@ export function createAuditHandlers(deps: AuditHandlerDeps): {
       return undefined;
     },
   };
+}
+
+/** T-36 self-registration (I-01): main.ts's handler registry calls this once. */
+export function register(ctx: BackgroundContext): void {
+  const handlers = createAuditHandlers({ audit: ctx.audit, executors: createUndoExecutors({ api: ctx.api, repo: ctx.repo }) });
+  ctx.router.register('audit.list', handlers['audit.list']);
+  ctx.router.register('audit.undo', handlers['audit.undo']);
 }
