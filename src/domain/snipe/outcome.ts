@@ -10,7 +10,20 @@ import type { BidResult, Cents, EpochMs, ItemDetail, ItemId } from '../types';
 import type { Effect, Snipe, SnipeId, SnipeOutcome } from './types';
 
 /** Why the snipe stopped before a bid result existed, when the runner knows. */
-export type AbortReason = 'killed' | 'cap' | 'auth' | 'network' | 'ended';
+export type AbortReason =
+  | 'killed'
+  | 'cap'
+  | 'auth'
+  | 'network'
+  | 'ended'
+  /** End moved before the bid was sent (soft close / verify-failed extended). */
+  | 'extended'
+  /** Next acceptable bid was above the user's max before firing. */
+  | 'price'
+  /** The user already led, so no bid was needed. */
+  | 'already-high'
+  /** The fire moment passed (browser or computer asleep, or fire after the end) and nothing was sent. */
+  | 'missed';
 
 export interface OutcomeContext {
   /** IANA zone for the notification's local time. Default America/Los_Angeles. */
@@ -196,6 +209,33 @@ export function classifyOutcome(
     message = `Auction closed before the snipe could bid. No bid was placed (your max ${max}).`;
     detail = 'The auction ended (closed early or withdrawn) before the bid; no bid sent.';
     stampAs = 'ended-early';
+  } else if (abort === 'extended') {
+    outcome = 'extended';
+    heading = 'Not bid: end time changed';
+    final = false;
+    showEnd = false;
+    const moved = post !== null && !post.isClosed && isoMs(post.endTime) !== armedEndMs;
+    if (moved) newEndTime = post.endTime;
+    message = `The auction's end time moved${
+      moved ? ` to ${formatDual(isoMs(post.endTime), tz)} (was ${formatDual(armedEndMs, tz)})` : ''
+    }, so the bid was not placed. No bid was placed (your max ${max}). You can re-arm to bid at the new end.`;
+    detail = `End time changed before the bid${moved ? `: ${snipe.endTime} to ${post.endTime}` : ''}; no bid sent.`;
+  } else if (abort === 'price') {
+    outcome = 'skipped';
+    heading = 'Not bid: price passed your max';
+    const next = post?.minimumBid;
+    message = `${next !== undefined ? `The next acceptable bid was ${formatMoney(next)}, above` : 'The next acceptable bid was above'} your max ${max}. No bid was placed.`;
+    detail = `Next acceptable bid${next !== undefined ? ` ${formatMoney(next)}` : ''} exceeded max ${max} before firing; no bid sent.`;
+  } else if (abort === 'already-high') {
+    outcome = 'skipped';
+    heading = "No bid needed: you're the high bidder";
+    message = `You were already the high bidder when the snipe was due, so no bid was needed. No bid was placed (your max ${max}).`;
+    detail = 'Already the high bidder at fire time; no bid sent.';
+  } else if (abort === 'missed') {
+    outcome = 'skipped';
+    heading = "Missed: the browser wasn't running at the end";
+    message = `The fire moment passed (the browser or computer was asleep, or the fire came after the end) and no bid was sent. No bid was placed (your max ${max}). To avoid this, keep the browser running through the end, or use the companion.`;
+    detail = 'Fire moment passed without the browser running; no bid sent.';
   } else if (snipe.dryRun) {
     // A dry run never bids; the post-read is the harmless measuring read at fire time.
     outcome = 'dry-run';
