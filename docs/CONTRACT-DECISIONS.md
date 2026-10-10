@@ -324,3 +324,40 @@ The frozen `JobRun` had no field for any of this. `Repo.set` parses before writi
 ## T-58: disableRule undo ref = rule id
 
 An audit entry with `undo: { kind: 'disableRule', ref }` carries the disabled rule's id in `ref`. `createUndoExecutors` (`src/background/handlers/audit.ts`) re-enables that rule. No card writes such an entry yet; the writer must use this format. Audit entries cannot be updated in place, so an undo is recorded as a new `undo` entry (`details.undoneSeq`), and `audit.list` reports `undo.done` from those.
+
+## T-28 contract change: SgwSession `expiring` is 72 h, and `reportRejected()` is new
+
+Source: S-2 (`docs/spikes/S-2.md`) and the controller's T-28 rulings.
+
+1. **R1: `expiring` means less than 72 h left**, not 12 h. `src/adapters/sgw/session-adapter.ts` exports `SESSION_EXPIRING_MS = 72 * 3_600_000`. The comments in `src/ports/sgw-session.ts` and on `SgwSessionStateSchema` (`src/domain/types.ts`) say 72 h. No type changes. `expiring` still allows writes (I-08). Why: SGW has no refresh (S-2), so only the user can renew, and 12 h is too late to ask.
+2. **R2 (revised in fix round 1): new port method `reportRejected(bearer: string): Promise<void>`.**
+   - It sets state `expired` with no network call and **keeps the record** (R3), so the BuyerId rule still applies. `current()` returns `null` while expired. `clear()` stays the explicit logout path (`logged-out`) and keeps the rejected-token history.
+   - **It takes the bearer the rejected request actually carried** and is ignored unless that is the held token (same identity: `jti`, else `exp` plus hash). A late 401 for an older token therefore cannot poison a newer one.
+   - Rejected identities are SHA-256 hashes (of the `jti`, or `exp` plus a hash of the token). The last 8 are kept under the new storage key `sbw:sgwSessionRejection` (`STORAGE_KEYS`, area `local`, record `{ ids: string[] (max 8), at: EpochMs }`, schema module-private). The record is optional (absent = nothing rejected), so there is no migration and `schemaVersion` stays 1. It is read and written through `Repo`, so an invalid record is quarantined. The raw token and raw `jti` are never stored. Accepting a new token does not erase the history.
+   - `observe()` never accepts a token whose identity is in that history, and never lets a token with an earlier `exp` replace a held token that is still valid and not rejected.
+   - `jti` is read from the payload only to be hashed (token identity). It is never stored or logged raw. `BuyerId` and `exp` are the other two claims read.
+   - `SgwApiAdapter` (T-26) calls it once when a request that was actually **sent** with the bearer ends in an `auth` error (HTTP 401 or `isUnauthorized`), passing that bearer. Requests the scheduler fails while queued behind a 401 never left and report nothing. A PlaceBid reply with `isUnauthorized` is returned by `bid.ts` as `kind: 'auth'`; the adapter reports it when PlaceBid was sent. `ApiAdapterDeps.session` requires the method (`Pick<SgwSession, 'current' | 'reportRejected'>`), so a forgotten wiring cannot silently skip the expired marking. The deps builders in `test/contract/sgw/bid.test.ts` and `test/integration/sgw-api.test.ts` were updated.
+3. **R4/R5:** `SBW_SESSION_REFRESH = false`, so `refresh()` resolves `false` with no call. Only `BuyerId`, `exp` and (hashed) `jti` are read from the token.
+
+**Follow-up for the next PLAN edit.** Add `reportRejected(bearer)` and the 72 h threshold to PLAN Â§3.3 and contracts.md, and list the new key `sbw:sgwSessionRejection` in PLAN Â§3.11.
+
+## T-70 contract change: AuthStatus gains optional `refreshTokenExpiresAt`
+
+Source: S-4 (`docs/USER-STEPS/S-4-results.txt`) and the controller's T-70 ruling R3.
+
+`AuthStatusSchema` (`src/domain/calendar/types.ts`) gains `refreshTokenExpiresAt?: EpochMs`. Google states `refresh_token_expires_in` (about 604800 s) for an app in "Testing" publishing mode, so the refresh token dies 7 days after consent. T-62's provider already keeps the value in memory (`PkceAuthStatus`); with the field in the schema it survives the `calendar.connect`, `calendar.status` and `health.get` replies, and the options page can warn before the daily sync starts failing with `invalid_grant`. Optional, so no migration and no change for providers that cannot state it. `test/contract/types/spec-shapes.test.ts` and `examples/AuthStatus.valid.json` are updated.
+
+**Follow-up for the next PLAN edit.** Add the field to PLAN §3.8 `AuthStatus` and contracts.md.
+
+## T-70 contract change: new optional storage key `sbw:googleClient`
+
+Source: controller ruling on T-70 concern 1.
+
+The options page used to write the pasted client into `sbw:google`, where the background also writes tokens: a lost update could overwrite a live connection (`grantedScopes: []`). Instead `STORAGE_KEYS.googleClient = 'sbw:googleClient'` (area `local`, `GoogleClientSchema` in `src/domain/storage/schema.ts`) holds `{ clientId: string (min 1); clientSecret?: string; updatedAt: EpochMs }`. Optional record, no migration, `schemaVersion` stays 1.
+
+- The options page is its only writer and validates against the schema before writing. It never touches `sbw:google`.
+- T-36's `clientConfig()` reads `sbw:googleClient` (carried by the controller). T-62's own copy of the client in `sbw:google` is never used to authenticate.
+- The secret is never rendered back beyond "••••" plus the last 4 characters, and is never logged, audited or put in an error.
+- `test/contract/types/storage.test.ts` pins the key and schema; `test/dom/options-google.test.ts` pins that saving leaves `sbw:google` byte-identical.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.

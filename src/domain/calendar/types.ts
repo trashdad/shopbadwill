@@ -2,7 +2,7 @@
 // CalendarSink, CalendarApi and GoogleAuthProvider ports are in src/ports.
 import { z } from 'zod';
 
-import { IsoUtcSchema, ItemIdSchema, type ItemId } from '../types';
+import { EpochMsSchema, IsoUtcSchema, ItemIdSchema, type ItemId } from '../types';
 
 const ReminderSchema = z.object({ method: z.enum(['popup', 'email']), minutes: z.number().int().nonnegative() });
 
@@ -91,6 +91,8 @@ export const AuthStatusSchema = z.object({
   account: z.string().optional(),
   grantedScopes: z.array(z.string()),
   refreshTokenAgeDays: z.number().nonnegative().optional(),
+  /** When Google states one (`refresh_token_expires_in`): an app in "Testing" mode signs out after 7 days (T-70, S-4). */
+  refreshTokenExpiresAt: EpochMsSchema.optional(),
   lastError: GoogleAuthErrorCodeSchema.optional(),
   needsInteraction: z.boolean(),
   configured: z.boolean(),

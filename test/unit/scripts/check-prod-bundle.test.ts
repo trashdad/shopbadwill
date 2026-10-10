@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  ALLOWED_LOOPBACK_PREFIX,
   allowedInnerHtmlOffsets,
   isPreactRuntime,
   scanDirectory,
@@ -72,6 +73,45 @@ describe('check-prod-bundle: forbidden tokens', () => {
 
   it('does not match identifiers that merely contain eval', () => {
     expect(scanText('a.js', 'const medieval = retrieval(1);')).toEqual([]);
+  });
+});
+
+describe('check-prod-bundle: Firefox OAuth loopback allowlist (T-62)', () => {
+  it('is exactly the mozoauth2 loopback prefix', () => {
+    expect(ALLOWED_LOOPBACK_PREFIX).toBe('http://127.0.0.1/mozoauth2/');
+  });
+
+  it('passes the prefix as a minifier emits it: a concatenation or a template', () => {
+    expect(scanText('background.js', 'const r="http://127.0.0.1/mozoauth2/"+h;')).toEqual([]);
+    expect(scanText('background.js', 'const r=`http://127.0.0.1/mozoauth2/${h}`;')).toEqual([]);
+    expect(scanText('background.js', "const r='http://127.0.0.1/mozoauth2/'+h;")).toEqual([]);
+  });
+
+  it.each([
+    'http://127.0.0.1:8788/token',
+    'http://127.0.0.1/*',
+    'http://127.0.0.1/mozoauth2',
+    'https://127.0.0.1/mozoauth2/',
+    'ws://127.0.0.1/mozoauth2/',
+    'xhttp://127.0.0.1/mozoauth2/',
+    'http://127.0.0.1/mozoauth2x/',
+    'http://127.0.0.1/other/mozoauth2/',
+    'http://user@127.0.0.1/mozoauth2/',
+    '127.0.0.1',
+  ])('still flags any other 127.0.0.1 string: %s', (url) => {
+    expect(scanText('background.js', `const u="${url}";`).map((f) => f.token)).toEqual(['127.0.0.1']);
+  });
+
+  it('in a file with both, flags only the other one', async () => {
+    await write('background.js', 'const a="http://127.0.0.1/mozoauth2/"+h;\nconst b="http://127.0.0.1:8788/";\n');
+    const findings = await scanDirectory(dir);
+    expect(findings.map((f) => `${f.token}@${String(f.line)}`)).toEqual(['127.0.0.1@2']);
+  });
+
+  it('passes the provider source that builds the loopback (src/adapters/google/auth-pkce.ts)', async () => {
+    const source = await readFile(path.join(import.meta.dirname, '../../../src/adapters/google/auth-pkce.ts'), 'utf8');
+    expect(source).toContain(ALLOWED_LOOPBACK_PREFIX);
+    expect(scanText('auth-pkce.ts', source).filter((f) => f.token === '127.0.0.1')).toEqual([]);
   });
 });
 

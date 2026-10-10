@@ -47,7 +47,9 @@ export const STORAGE_KEYS = {
   snipes: 'sbw:snipes',
   auditMeta: 'sbw:auditMeta',
   sgwSession: 'sbw:sgwSession',
+  sgwSessionRejection: 'sbw:sgwSessionRejection',
   google: 'sbw:google',
+  googleClient: 'sbw:googleClient',
   requestBudget: 'sbw:requestBudget',
   requestSchedulerState: 'sbw:requestSchedulerState',
   awake: 'sbw:awake',
@@ -187,6 +189,19 @@ export const RequestSchedulerStateSchema = z.object({
 });
 export type RequestSchedulerState = z.infer<typeof RequestSchedulerStateSchema>;
 
+/**
+ * `sbw:googleClient` (T-70): the OAuth client the user pasted on the options
+ * page. Optional; the options page is its only writer, and the background
+ * (`clientConfig()`) only reads it, so the token record `sbw:google` has a
+ * single writer.
+ */
+export const GoogleClientSchema = z.object({
+  clientId: z.string().min(1),
+  clientSecret: z.string().optional(),
+  updatedAt: EpochMsSchema,
+});
+export type GoogleClient = z.infer<typeof GoogleClientSchema>;
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -198,6 +213,17 @@ export type QuarantineRecord = z.infer<typeof QuarantineRecordSchema>;
 // ── Key → area and schema ──────────────────────────────────────────────────
 
 export type StorageArea = 'local' | 'session';
+
+/**
+ * Stored at `sbw:sgwSessionRejection` (T-28). Absent means "nothing rejected"
+ * (no migration needed). `ids` holds the most recent identities (at most 8) of
+ * tokens SGW refused: `jti:<hash of jti>` or `exp:<exp ms>:<hash of token>`.
+ * The raw token and the raw jti are never stored. `at` is when the last one was
+ * added. Module-private: an exported *Schema would join the locked list in
+ * test/contract/types/examples.test.ts.
+ */
+const SgwSessionRejectionSchema = z.object({ ids: z.array(z.string().min(1)).max(8), at: EpochMsSchema });
+export type SgwSessionRejection = z.infer<typeof SgwSessionRejectionSchema>;
 
 export const STORAGE_RECORDS = {
   [STORAGE_KEYS.meta]: { area: 'local', schema: StorageMetaSchema },
@@ -214,7 +240,9 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.snipes]: { area: 'local', schema: z.record(SnipeIdSchema, SnipeSchema) },
   [STORAGE_KEYS.auditMeta]: { area: 'local', schema: AuditMetaSchema },
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },
+  [STORAGE_KEYS.sgwSessionRejection]: { area: 'local', schema: SgwSessionRejectionSchema },
   [STORAGE_KEYS.google]: { area: 'local', schema: GoogleCredentialsSchema },
+  [STORAGE_KEYS.googleClient]: { area: 'local', schema: GoogleClientSchema },
   [STORAGE_KEYS.requestBudget]: { area: 'local', schema: RequestBudgetSchema },
   [STORAGE_KEYS.requestSchedulerState]: { area: 'local', schema: RequestSchedulerStateSchema },
   [STORAGE_KEYS.awake]: { area: 'local', schema: z.array(EpochMsSchema) },

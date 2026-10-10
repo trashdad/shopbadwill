@@ -185,7 +185,7 @@ export const HealthReportSchema = z.object({
 });
 export type HealthReport = z.infer<typeof HealthReportSchema>;
 
-/** `SgwSession.state()`; `expiring` = less than 12 h left (and still allowed to write, I-08). */
+/** `SgwSession.state()`; `expiring` = less than 72 h left (and still allowed to write, I-08). */
 export const SgwSessionStateSchema = z.enum(['ok', 'expiring', 'expired', 'logged-out']);
 export type SgwSessionState = z.infer<typeof SgwSessionStateSchema>;
 

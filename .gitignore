@@ -24,3 +24,6 @@ test/fixtures/sgw/raw/
 .DS_Store
 Thumbs.db
 *.log
+
+# Local test-browser runner config (machine-specific paths)
+web-ext.config.ts
