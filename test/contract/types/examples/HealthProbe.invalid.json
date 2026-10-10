@@ -1,0 +1,19 @@
+{
+  "invalidBecause": "a sticky entry needs a non-empty endpoint",
+  "path": [
+    "sticky",
+    0,
+    "endpoint"
+  ],
+  "value": {
+    "probedAt": 1791400000000,
+    "lastGoodProbeAt": {},
+    "sticky": [
+      {
+        "endpoint": "",
+        "at": 1791400000000,
+        "detail": "x"
+      }
+    ]
+  }
+}

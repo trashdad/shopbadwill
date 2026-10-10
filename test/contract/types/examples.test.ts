@@ -101,6 +101,8 @@ const EXPECTED_SCHEMAS: Record<string, string[]> = {
     'RequestBudget',
     'RequestSchedulerState',
     'GoogleAccess',
+    'GoogleClient',
+    'HealthProbe',
     'QuarantineRecord',
   ],
   'src/messaging/protocol.ts': ['Msg', 'MsgEnvelope', 'SnipeCountdownTick'],

@@ -189,16 +189,21 @@ export type SellerInfoResponse = z.infer<typeof SellerInfoResponseSchema>;
 
 // ── Endpoints without a captured fixture ────────────────────────────────────
 
-// provisional: evidence=bundle
-// Response shape unknown (USER STEP S-1, step 8). T-04 guessed
-// {shippingPrice, handlingPrice}, the names ItemDetail uses. Accepts bare or
-// enveloped; `null` fields mean "cannot be quoted".
-export const ShippingQuoteResponseSchema = flatOrEnvelope(
-  z.looseObject({
-    shippingPrice: NullableDollars.optional(),
-    handlingPrice: NullableDollars.optional(),
-  }),
-);
+// Observed (USER STEP S-1, T-24b): the reply is a JSON STRING holding an HTML
+// fragment (SGW_FIELDS.shippingQuote); normalizeShippingQuote parses it. The
+// object forms T-04/T-24 guessed ({shippingPrice, handlingPrice}, bare or
+// enveloped) are still accepted, but SGW has not been seen to send them.
+// TEMPORARY: remove the object forms once the fake server and the api-adapter
+// unit tests use the real HTML-string shape.
+export const ShippingQuoteResponseSchema = z.union([
+  z.string(),
+  flatOrEnvelope(
+    z.looseObject({
+      shippingPrice: NullableDollars.optional(),
+      handlingPrice: NullableDollars.optional(),
+    }),
+  ),
+]);
 export type ShippingQuoteResponse = z.infer<typeof ShippingQuoteResponseSchema>;
 
 // provisional: evidence=community
@@ -210,6 +215,8 @@ export const FavoriteRowSchema = z.looseObject({
   notes: z.string().nullable().optional(),
   endTime: Pacific,
   sellerId: Id,
+  /** "Open" | "Close" (observed, T-07 stage 2): the row's own status. Other values are ignored. */
+  type: z.string().nullable().optional(),
 });
 export type FavoriteRow = z.infer<typeof FavoriteRowSchema>;
 export const FavoritesResponseSchema = envelope(z.array(FavoriteRowSchema));
@@ -226,18 +233,33 @@ export const SaveFavoriteNoteResponseSchema = AckResponseSchema;
 export const RevokeTokenResponseSchema = AckResponseSchema;
 export type AckResponse = z.infer<typeof AckResponseSchema>;
 
-// provisional: evidence=community
-// Auth. Enveloped, `data` is the list (config.ts). Fields beyond id/name are
-// the SearchQuery inputs; all optional until a fixture shows them.
-export const SavedSearchRowSchema = z.looseObject({
-  saveSearchId: Id,
-  searchName: z.string(),
-  searchText: z.string().nullable().optional(),
-  selectedCategoryIds: z.string().nullable().optional(),
-  selectedSellerIds: z.string().nullable().optional(),
-  lowPrice: z.union([z.number(), z.string()]).nullable().optional(),
-  highPrice: z.union([z.number(), z.string()]).nullable().optional(),
-});
+// Observed (USER STEP S-1, T-24b). Auth. Enveloped, `data` is the list. The real
+// id key is `savedSearchId`; there is NO name field (the normalizer derives one).
+// The old guessed keys (`saveSearchId`, `searchName`) are still accepted.
+// TEMPORARY: remove them (and the refine) once the fake server and the
+// api-adapter unit tests use the real `savedSearchId` rows.
+export const SavedSearchRowSchema = z
+  .looseObject({
+    savedSearchId: Id.optional(),
+    saveSearchId: Id.optional(),
+    searchName: z.string().nullable().optional(),
+    searchText: z.string().nullable().optional(),
+    selectedCategoryIds: z.string().nullable().optional(),
+    selectedSellerIds: z.string().nullable().optional(),
+    lowPrice: z.union([z.number(), z.string()]).nullable().optional(),
+    highPrice: z.union([z.number(), z.string()]).nullable().optional(),
+    searchPickupOnly: z.boolean().nullable().optional(),
+    searchNoPickupOnly: z.boolean().nullable().optional(),
+    searchOneCentShippingOnly: z.boolean().nullable().optional(),
+    searchClosedAuctions: z.boolean().nullable().optional(),
+    sortColumn: z.number().int().nullable().optional(),
+    sortDescending: z.boolean().nullable().optional(),
+    layout: z.string().nullable().optional(),
+  })
+  .refine((r) => r.savedSearchId !== undefined || r.saveSearchId !== undefined, {
+    message: 'savedSearchId: required',
+    path: ['savedSearchId'],
+  });
 export type SavedSearchRow = z.infer<typeof SavedSearchRowSchema>;
 export const SavedSearchesResponseSchema = envelope(z.array(SavedSearchRowSchema));
 export type SavedSearchesResponse = z.infer<typeof SavedSearchesResponseSchema>;

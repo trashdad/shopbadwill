@@ -48,10 +48,10 @@ function searchResponse() {
           minimumBid: 12.99,
           numBids: 0,
           endTime: '2026-10-07T19:18:30',
-          sellerId: 148,
+          sellerId: 9101,
           sellerName: 'Goodwill of Greater Washington',
           categoryId: 45,
-          imageURL: 'https://shopgoodwillimages.azureedge.net/production/148/10-7-2026/abc123.jpg',
+          imageURL: 'https://shopgoodwillimages.azureedge.net/production/9101/10-7-2026/abc123.jpg',
           imageServer: 'https://shopgoodwillimages.azureedge.net/production/',
           itemUrl: '/item/279250057',
         },
@@ -79,7 +79,7 @@ function detailResponse() {
     title: 'Vintage Pyrex Butterfly Gold Bowl 403',
     sellerName: 'Goodwill of Greater Washington',
     serverTime: '2026-10-07T19:01:02.345',
-    imageUrlString: 'https://shopgoodwillimages.azureedge.net/production/148/10-7-2026/abc123.jpg;https://shopgoodwillimages.azureedge.net/production/148/10-7-2026/abc124.jpg',
+    imageUrlString: 'https://shopgoodwillimages.azureedge.net/production/9101/10-7-2026/abc123.jpg;https://shopgoodwillimages.azureedge.net/production/9101/10-7-2026/abc124.jpg',
     relatedItemIds: [279250999],
     bidHistory: {
       bidSummary: [
@@ -95,7 +95,7 @@ function detailResponse() {
 
 const CARD_HTML = `<!DOCTYPE html><html><head>
 <title>Vintage Pyrex Butterfly Gold Bowl 403 | ShopGoodwill</title>
-<meta property="og:image" content="https://shopgoodwillimages.azureedge.net/production/148/10-7-2026/abc123.jpg">
+<meta property="og:image" content="https://shopgoodwillimages.azureedge.net/production/9101/10-7-2026/abc123.jpg">
 <link rel="stylesheet" href="https://shopgoodwill.com/styles.abc.css">
 <script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script>
 <script>window.__token = "Bearer ${JWT}";</script>
@@ -104,7 +104,7 @@ const CARD_HTML = `<!DOCTYPE html><html><head>
 <div class="item-col"><app-home-product-items _ngcontent-ng-c1="">
 <div class="feat-item" onclick="track(279250057)">
 <a class="feat-item_name" id="279250057" href="/item/279250057" title="Vintage Pyrex Butterfly Gold Bowl 403">Vintage Pyrex Butterfly Gold Bowl 403</a>
-<img src="https://shopgoodwillimages.azureedge.net/production/148/10-7-2026/abc123.jpg" alt="Vintage Pyrex Butterfly Gold Bowl 403">
+<img src="https://shopgoodwillimages.azureedge.net/production/9101/10-7-2026/abc123.jpg" alt="Vintage Pyrex Butterfly Gold Bowl 403">
 <p class="feat-item_price">$12.99</p>
 <span class="seller">Goodwill of Greater Washington</span>
 <a class="btn-heart" aria-label="Add to your Favorites list" href="javascript:void(0)"></a>
@@ -344,7 +344,7 @@ describe('sanitize-fixtures', () => {
     function sellerDetail() {
       return {
         itemId: 279250057,
-        sellerId: 148,
+        sellerId: 9101,
         sellerCompanyName: 'Goodwill Industries of Lower Examplia',
         sellerLandingPageName: 'Samplton ',
         pickupStreet: '42 N. Fictional Blvd',
@@ -363,7 +363,7 @@ describe('sanitize-fixtures', () => {
     it('replaces name variants, a nested seller.name, the slug (JSON and href) and pickup street, city, ZIP and phone', () => {
       const s = new FixtureSanitizer({ salt: 'test-salt' });
       const detail = s.sanitizeJson(sellerDetail());
-      const info = s.sanitizeJson({ sellerId: 148, companyName: 'Goodwill Industries of Lower Examplia', street: '42 N. Fictional', city: 'Samplton', state: 'OR', zip: '97999' });
+      const info = s.sanitizeJson({ sellerId: 9101, companyName: 'Goodwill Industries of Lower Examplia', street: '42 N. Fictional', city: 'Samplton', state: 'OR', zip: '97999' });
       const html = s.sanitizeHtml(
         '<!DOCTYPE html><html><body><a class="seller" href="/Samplton">Goodwill of Lower Examplia</a><p>42 N. Fictional<br> Samplton, OR 97999</p><p>Thanks from Upper Fakeland Goodwill, (503) 555-0199</p></body></html>',
       );
@@ -479,7 +479,7 @@ describe('sanitize-fixtures', () => {
     const ITEM_DETAIL = JSON.stringify({
       itemId: 279250057,
       title: 'Rare Example Teapot 77',
-      sellerId: 148,
+      sellerId: 9101,
       sellerCompanyName: 'Goodwill Industries of Lower Examplia',
       sellerLandingPageName: 'Samplton',
       pickupStreet: '42 N. Fictional Blvd',
@@ -554,7 +554,7 @@ describe('sanitize-fixtures', () => {
     });
 
     it('N5: user JSON with an unclassified *id key fails the build, naming the key but not its value', () => {
-      expect(unclassifiedIdKeys({ itemId: 1, sellerId: 2, watchlistId: 3, minimumBid: 4, nested: [{ favoriteGroupId: 5, categoryId: 6 }], id: 7 })).toEqual(['favoriteGroupId', 'id']);
+      expect(unclassifiedIdKeys({ itemId: 1, sellerId: 9102, watchlistId: 3, minimumBid: 4, nested: [{ favoriteGroupId: 5, categoryId: 6 }], id: 7 })).toEqual(['favoriteGroupId', 'id']);
       const dir = tempFixturesDir({ 'favs.json': '{"data":[{"itemId":279250057,"favoriteGroupId":8675309}]}' }, [
         { ...userSource('favorites-open', 'json', 'user/favs.json'), endpoint: 'favorites' },
       ]);
@@ -567,6 +567,296 @@ describe('sanitize-fixtures', () => {
       expect(message).toMatch(/json\/favorites-open\.json: unclassified id key\(s\) in user JSON: favoriteGroupId/);
       expect(message).not.toContain('8675309');
       expect(existsSync(path.join(dir, 'json', 'favorites-open.json'))).toBe(false);
+    });
+  });
+
+  describe('stage 2: shapes seen in the real logged-in captures (all values invented)', () => {
+    // Logged-in ItemDetail: the buyer's own saved address and login ride along.
+    function loggedInDetail() {
+      return {
+        itemId: 279250057,
+        title: 'Rare Example Teapot 77',
+        sellerId: 9101,
+        sellerCompanyName: 'Goodwill Industries of Lower Examplia',
+        sellerLandingPageName: 'Samplton',
+        pickupCity: 'Samplton',
+        pickupState: 'OR',
+        pickupZip: '97999-1234',
+        buyerCountryCode: 'US',
+        bidHistory: { authenticatedBuyerLogin: 'janeqb', isHighBidderLogIn: false, bidComplete: [] },
+        buyerShippingAddresses: [{ address: '12 Elmwood Lane', city: 'Bendington', state: 'OR', zip: '97701-0005', country: 'United States', buyerId: 4242, shippingAddressId: 0 }],
+      };
+    }
+    // CalculateShipping answers with a JSON string of HTML; "Address:" is the buyer's destination.
+    const QUOTE =
+      "<p>Estimated Shipping and Handling:</p><p>Shipped From: Samplton, OR 97999</p><p>Shipping Carrier: FedEx<p>Address:   97701-0005 US</p><p>Shipping: <span id='shipping-span'>¤11.04 (GROUND_HOME_DELIVERY)</span></p><p>Handling: ¤3.00</p>";
+
+    it("learns the buyer's own address and login and scrubs them everywhere, with a leak check", () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      const detail = s.sanitizeJson(loggedInDetail());
+      const quote = s.sanitizeJson(QUOTE);
+      const html = s.sanitizeHtml(
+        '<!DOCTYPE html><html><body><app-header>Hi janeqb</app-header><p>Ship to 12 Elmwood Lane, Bendington, OR 97701</p></body></html>',
+      );
+      const all = (allStrings(detail) + quote + html).toLowerCase();
+      for (const real of ['elmwood', 'bendington', '97701', 'janeqb', 'samplton', '97999']) expect(all, real).not.toContain(real);
+      expect(quote).toContain('¤11.04 (GROUND_HOME_DELIVERY)');
+      expect(quote).toContain('Handling: ¤3.00');
+      for (const leak of ['12 elmwood lane', 'BENDINGTON', 'zip 97701-0005', 'user janeqb']) expect(s.findLeaks(leak), leak).not.toEqual([]);
+    });
+
+    it('redacts the "Address:" line of a shipping quote even when nothing about the buyer was learned', () => {
+      const out = new FixtureSanitizer({ salt: 'test-salt' }).sanitizeJson(QUOTE);
+      expect(out).toContain('Address:   [redacted address]</p>');
+      expect(out).not.toContain('97701');
+    });
+
+    it('applies learned seller identity before redact.txt, so a seller named after the user\'s city stays one synthetic seller', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt', redact: ['Bendington'] });
+      const favs = s.sanitizeJson({
+        status: true,
+        data: [
+          { itemId: 279250057, watchlistId: 55500123, sellerId: 9, sellerName: 'Goodwill of Bendington', title: 'Rare Example Teapot 77' },
+          { itemId: 279250099, watchlistId: 55500124, sellerId: 9, sellerName: 'Goodwill of Bendington', title: 'Another Example Lamp 12' },
+        ],
+      });
+      const [a, b] = favs.data;
+      expect(a?.sellerName).toMatch(/^Goodwill of [A-Z]\d*$/);
+      expect(b?.sellerName).toBe(a?.sellerName);
+      expect(allStrings(favs).toLowerCase()).not.toContain('bendington');
+    });
+
+    it('redacts every saved-address option in select#buyerAddress except the placeholder, digits or not', () => {
+      const html = new FixtureSanitizer({ salt: 'test-salt' }).sanitizeHtml(`<!DOCTYPE html><html><body><app-shipping-tab>
+        <select id="buyerAddress" name="buyerAddress"><option value="">Select an address</option><option value="h">Home</option><option value="12 Elm Way 97701">12 Elm Way, Bend</option></select>
+        <select id="country"><option>United States</option></select></app-shipping-tab></body></html>`);
+      expect(html).toContain('<option value="">Select an address</option>');
+      expect(html).not.toContain('Home');
+      expect(html).not.toContain('Elm Way');
+      expect(html.match(/\[redacted address\]/g)).toHaveLength(2);
+      expect(html).toContain('<option>United States</option>');
+    });
+
+    it('restores the doctype of a page copied as documentElement.outerHTML (USER STEP 0.3), but not of a fragment', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      expect(s.sanitizeHtml('<html lang="en"><head></head><body><p>x</p></body></html>').startsWith('<!DOCTYPE html>\n<html')).toBe(true);
+      expect(s.sanitizeHtml('<!doctype html><html><head></head><body></body></html>').startsWith('<!DOCTYPE html>\n<html')).toBe(true);
+      expect(s.sanitizeHtml('<div><p>x</p></div>').startsWith('<!DOCTYPE')).toBe(false);
+    });
+
+    it('writes LF line endings even when the user pasted CRLF (a rebuild matches what git stores)', () => {
+      const dir = tempFixturesDir({ 'grid.html': '<html lang="en">\r\n<head></head>\r\n<body>\r\n<p>x</p>\r\n</body>\r\n</html>\r\n' }, [
+        { ...userSource('search-grid-logged-in', 'html', 'user/grid.html'), page: 'search', layout: 'grid' },
+      ]);
+      buildFixtures(new FixtureSanitizer({ salt: 'test-salt' }), dir);
+      const out = readFileSync(path.join(dir, 'html', 'search-grid-logged-in.html'), 'utf8');
+      expect(out).not.toContain('\r');
+      expect(out.startsWith('<!DOCTYPE html>\n<html')).toBe(true);
+    });
+
+    it('hashes relative image file paths (ShowBidModal azureFilePath / thumbFilePath) and classifies itemImageId', () => {
+      const out = new FixtureSanitizer({ salt: 'test-salt' }).sanitizeJson({
+        itemId: 279250057,
+        itemImageId: 777,
+        azureFilePath: '60\\Item\\2026-10-01\\abc-def-1.jpg',
+        thumbFilePath: '60\\Item\\2026-10-01\\abc-def-1t.jpeg',
+        azureServerPath: 'https://shopgoodwillimages.azureedge.net/production/',
+      });
+      expect(out.azureFilePath).toMatch(/^[0-9a-f]{16}\.jpg$/);
+      expect(out.thumbFilePath).toMatch(/^[0-9a-f]{16}\.jpg$/);
+      expect(out.azureServerPath).toBe('https://img.test/');
+      expect(unclassifiedIdKeys({ itemImageId: 777, maxBid: null })).toEqual([]);
+    });
+  });
+
+  describe('stage 2 fix round 1 (all names invented)', () => {
+    const HEADER = `<!DOCTYPE html><html><body><app-header>
+      <a class="btn btn-primary text-capitalize"><i class="pi pi-user mr-1"></i> Hello, Zelda</a>
+      <a id="personalInfoLink"><div class="lead"><i class="pi pi-user mr-3"></i><strong class="text-capitalize">Hello, Zelda</strong></div></a>
+      </app-header><p>Zeldaria is a word, not a name.</p></body></html>`;
+
+    it('always redacts the header greeting next to the .pi-user icon, both variants, and keeps "Sign In"', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      const html = s.sanitizeHtml(HEADER);
+      expect(html.toLowerCase()).not.toMatch(/hello,\s*zelda/);
+      expect(html.match(/Hello, \[redacted\]/g)).toHaveLength(2);
+      expect(html).toContain('<strong class="text-capitalize">Hello, [redacted]</strong>');
+      const out = s.sanitizeHtml('<!DOCTYPE html><html><body><a class="btn"><i class="pi pi-user"></i> Sign In</a><a><i class="pi pi-user"></i> Welcome back, Zelda</a></body></html>');
+      expect(out).toContain('</i> Sign In</a>');
+      expect(out).not.toContain('Zelda');
+      expect(s.findLeaks('<a><i class="pi pi-user"></i> Hello, Zelda</a>')).toContain('greeting');
+    });
+
+    it('matches every 3+-letter word of a digit-free redact.txt line on its own, case-insensitively, as whole words', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt', redact: ['Zelda Quixote', '12 Elm Way, Bend', 'Al Bo'] });
+      const html = s.sanitizeHtml(
+        '<!DOCTYPE html><html><body><p>ZELDA says hi to quixote.</p><p>Zeldaria stays.</p><p>Way and Elm stay: their line has digits.</p><p>Al and Bo are too short.</p></body></html>',
+      );
+      expect(html.toLowerCase()).not.toMatch(/\bzelda\b|\bquixote\b/);
+      expect(html).toContain('Zeldaria stays.');
+      expect(html).toContain('Way and Elm stay');
+      expect(html).toContain('Al and Bo are too short.');
+      expect(s.findLeaks('regards, zelda')).toContain('personal word: Zelda');
+      expect(s.findLeaks('Zeldaria')).toEqual([]);
+    });
+
+    it('replaces titles case-insensitively, including uppercase img alt text with dropped punctuation', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      s.sanitizeJson({ itemId: 279250057, title: 'Rare Example Teapot & Lid 77' });
+      const html = s.sanitizeHtml(
+        '<!DOCTYPE html><html><body><img alt="RARE EXAMPLE TEAPOT & LID 77"><img alt="RARE EXAMPLE TEAPOT  LID 77"><p>rare example teapot &amp; lid 77</p></body></html>',
+      );
+      expect(html.toLowerCase()).not.toContain('teapot');
+      expect(html).toMatch(/alt="[A-Z ]+"/);
+      expect(s.findLeaks('<img alt="RARE EXAMPLE TEAPOT  LID 77">')).not.toEqual([]);
+      expect(s.findLeaks('<p>rare example TEAPOT & lid 77</p>')).not.toEqual([]);
+    });
+
+    it('privatizes favorites rows: a salted time shift that keeps order and durations, top-level category, remapped sellerId', () => {
+      const rows = () => ({
+        status: true,
+        data: [
+          { itemId: 279250057, watchlistId: 55500123, sellerId: 9103, catFullName: "Clothing > Men's Clothing > Shoes Men's > Size 12", startTime: '2026-10-02T07:03:36', endTime: '2026-10-09T20:22:00' },
+          { itemId: 279250099, watchlistId: 55500124, sellerId: 9103, catFullName: 'Home > Kitchen', startTime: '2026-06-06T09:00:00.5', endTime: '2026-06-13T17:00:00' },
+          { itemId: 279250111, watchlistId: 55500125, sellerId: 23, catFullName: 'Toys', startTime: '2026-09-30T23:59:59.99', endTime: '2026-10-07T23:59:59.99' },
+        ],
+      });
+      // Seller ids are remapped by sanitizeJson itself now (fix round 2), consistently across all fixtures.
+      const PRIVACY = ['shiftTimes', 'topCategory'] as const;
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      const out = s.applyPrivacy(s.sanitizeJson(rows()), PRIVACY);
+      const ms = (t: string): number => Date.parse(`${t}Z`);
+      const before = rows().data;
+      const shift = ms(out.data[0]?.endTime ?? '') - ms(before[0]?.endTime ?? '');
+      expect(shift).not.toBe(0);
+      expect(shift % 86_400_000).toBe(0);
+      out.data.forEach((r, i) => {
+        const b = before[i];
+        expect(r.startTime).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/);
+        expect(ms(r.startTime) - ms(b?.startTime ?? '')).toBe(shift);
+        expect(ms(r.endTime) - ms(b?.endTime ?? '')).toBe(shift);
+        expect(r.startTime.split('.')[1]).toBe(b?.startTime.split('.')[1]);
+      });
+      expect(out.data.map((r) => r.catFullName)).toEqual(['Clothing', 'Home', 'Toys']);
+      expect(out.data[0]?.sellerId).toBe(out.data[1]?.sellerId);
+      expect(out.data[0]?.sellerId).not.toBe(9103);
+      expect(out.data[2]?.sellerId).not.toBe(23);
+      expect(Number.isSafeInteger(out.data[0]?.sellerId)).toBe(true);
+      // Deterministic for one salt.
+      const again = new FixtureSanitizer({ salt: 'test-salt' });
+      expect(again.applyPrivacy(again.sanitizeJson(rows()), PRIVACY)).toEqual(out);
+    });
+
+    it('the build applies a source\'s privacy list to user JSON', () => {
+      const dir = tempFixturesDir(
+        { 'favs.json': JSON.stringify({ status: true, data: [{ itemId: 279250057, watchlistId: 55500123, sellerId: 9103, catFullName: 'Home > Kitchen', endTime: '2026-10-09T20:22:00', title: 'Rare Example Teapot 77' }] }) },
+        [{ ...userSource('favorites-all', 'json', 'user/favs.json'), endpoint: 'favorites', privacy: ['shiftTimes', 'topCategory'] }],
+      );
+      buildFixtures(new FixtureSanitizer({ salt: 'test-salt' }), dir);
+      const built = JSON.parse(readFileSync(path.join(dir, 'json', 'favorites-all.json'), 'utf8')) as { data: Array<Record<string, unknown>> };
+      expect(built.data[0]).toMatchObject({ catFullName: 'Home' });
+      expect(built.data[0]?.sellerId).not.toBe(9103);
+      expect(built.data[0]?.endTime).not.toBe('2026-10-09T20:22:00');
+    });
+  });
+
+  describe('stage 2 fix round 2 (all values invented)', () => {
+    const page = (body: string, head = ''): string => `<!DOCTYPE html><html><head>${head}</head><body>${body}</body></html>`;
+
+    it("matches titles with punctuation deleted (the site's alt drops / . - ' without leaving a space)", () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      s.sanitizeJson({ itemId: 279250057, title: "Mid-Century A/B Lamp 5.5 in. O'Neil Studio" });
+      const html = s.sanitizeHtml(page('<section><img alt="MIDCENTURY AB LAMP 55 IN ONEIL STUDIO"></section>'));
+      expect(html.toLowerCase()).not.toContain('oneil');
+      expect(s.findLeaks('<img alt="MIDCENTURY AB LAMP 55 IN ONEIL STUDIO">')).not.toEqual([]);
+      expect(s.findLeaks('midcentury ab lamp 55 in oneil studio')).not.toEqual([]);
+    });
+
+    it("replaces every non-UI img alt in a card or the item gallery with that card's (or item's) synthetic title", () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      const html = s.sanitizeHtml(
+        page(`<app-home-product-items><div class="feat-item"><a href="/item/279250057"><img alt="SOMETHING ELSE ENTIRELY 9"></a>
+          <a class="feat-item_name" id="279250057" href="/item/279250057">Rare Example Teapot 77</a>
+          <a class="btn-heart"><img alt="Add to Favorites"></a></div></app-home-product-items>
+          <app-detail><h1 id="279250099">Another Example Lamp 12</h1><app-image-gallery><img alt="another example lamp twelve (front)"></app-image-gallery></app-detail>`),
+      );
+      for (const real of ['SOMETHING ELSE', 'Teapot', 'Lamp 12', 'twelve']) expect(html, real).not.toContain(real);
+      const cardTitle = /class="feat-item_name"[^>]*>([^<]+)</.exec(html)?.[1] ?? 'missing';
+      expect(html).toContain(`alt="${cardTitle.toUpperCase()}"`);
+      expect(html).toContain('alt="Add to Favorites"');
+      const itemTitle = /<h1[^>]*>([^<]+)</.exec(html)?.[1] ?? 'missing';
+      expect(html).toContain(`alt="${itemTitle}"`);
+    });
+
+    it('fails closed when a raw img alt that is not site chrome survives verbatim', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      expect(() => s.sanitizeHtml(page('<section><img alt="Grandmas Secret Recipe Box"></section>'), 'html/x.html')).toThrow(
+        /html\/x\.html: an img alt from the input survived/,
+      );
+      expect(() => s.sanitizeHtml(page('<footer><img alt="shopgoodwill logo"><img alt="Follow us on Facebook"></footer>'))).not.toThrow();
+    });
+
+    it('drops #related-recs, and finds item ids in /Item/ links, data-*item* attributes and og:url', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      const html = s.sanitizeHtml(
+        page(
+          `<div data-scarabitem="279250022"></div>
+           <div id="related-recs"><p>You may also like</p><div data-scarabitem="279250033"><a href="https://www.shopgoodwill.com/Item/279250033"><img alt="SECRET INTEREST WIDGET"></a></div></div>`,
+          '<meta property="og:url" content="https://shopgoodwill.com/Item/279250011">',
+        ),
+      );
+      for (const real of ['279250011', '279250022', '279250033', 'related-recs', 'SECRET INTEREST', 'You may also like']) expect(html, real).not.toContain(real);
+      expect(html).toContain(`content="https://shopgoodwill.com/Item/${String(s.remapItemId(279250011))}"`);
+      expect(html).toContain(`data-scarabitem="${String(s.remapItemId(279250022))}"`);
+    });
+
+    it('the build fails closed on a raw 6+-digit number that survives (fractions, hex colors and public constants aside)', () => {
+      const ok = '<p>default 999999</p><svg><path d="M0.123456 1.654321"></path></svg><p style="color:#888888">x</p>';
+      const src = [{ ...userSource('search-grid-logged-out', 'html', 'user/page.html'), page: 'search', layout: 'grid', loggedIn: false }];
+      const bad = tempFixturesDir({ 'page.html': page(`${ok}<p>Ref 778899001</p>`) }, src);
+      expect(() => {
+        buildFixtures(new FixtureSanitizer({ salt: 'test-salt' }), bad);
+      }).toThrow(/raw 6\+-digit number \(9 digits\)/);
+      const good = tempFixturesDir({ 'page.html': page(ok) }, src);
+      buildFixtures(new FixtureSanitizer({ salt: 'test-salt' }), good);
+      expect(readFileSync(path.join(good, 'html', 'search-grid-logged-out.html'), 'utf8')).toContain('999999');
+    });
+
+    it('redacts "Hello Zelda", "Welcome back, Zelda" and "Hi Zelda" header greetings', () => {
+      const html = new FixtureSanitizer({ salt: 'test-salt' }).sanitizeHtml(
+        page('<app-header><span>Hello Zelda</span><div>Welcome back, Zelda!</div><b>Hi Zelda</b></app-header>'),
+      );
+      expect(html).not.toContain('Zelda');
+      for (const ok of ['Hello, [redacted]', 'Welcome back, [redacted]', 'Hi, [redacted]']) expect(html).toContain(ok);
+    });
+
+    it('the BUILD fails when a greeting survives (outside the header)', () => {
+      const dir = tempFixturesDir({ 'page.html': page('<main><p>Hello, Zelda</p></main>') }, [
+        { ...userSource('search-grid-logged-in', 'html', 'user/page.html'), page: 'search', layout: 'grid' },
+      ]);
+      expect(() => {
+        buildFixtures(new FixtureSanitizer({ salt: 'test-salt' }), dir);
+      }).toThrow(/greeting/);
+    });
+
+    it('remaps seller ids consistently in JSON keys, id lists and seller URLs', () => {
+      const s = new FixtureSanitizer({ salt: 'test-salt' });
+      const detail = s.sanitizeJson({ itemId: 279250057, sellerId: 9104, sellerCompanyName: 'Goodwill Industries of Lower Examplia' });
+      const info = s.sanitizeJson({ sellerId: 9104, companyName: 'Goodwill Industries of Lower Examplia', state: 'OR' });
+      const rows = s.sanitizeJson({ searchResults: { items: [{ itemId: 279250099, sellerId: 9104 }, { itemId: 279250111, sellerId: 9105 }] } });
+      const saved = s.sanitizeJson({ data: [{ savedSearchId: 5, selectedSellerIds: '9104,9105' }] });
+      const idA = detail.sellerId;
+      const idB = rows.searchResults.items[1]?.sellerId;
+      expect(idA).not.toBe(9104);
+      expect(Number.isSafeInteger(idA)).toBe(true);
+      expect(idB).not.toBe(9105);
+      expect(idB).not.toBe(idA);
+      expect([info.sellerId, rows.searchResults.items[0]?.sellerId]).toEqual([idA, idA]);
+      expect(saved.data[0]?.selectedSellerIds).toBe(`${String(idA)},${String(idB)}`);
+      expect(s.sanitizeUrl('GET https://buyerapi.shopgoodwill.com/api/Seller/GetSellerInfo/9104')).toBe(
+        `GET https://buyerapi.shopgoodwill.com/api/Seller/GetSellerInfo/${String(idA)}`,
+      );
+      expect(s.sanitizeUrl('/api/Home/GetSellerItems?sellerId=9104&categoryId=0')).toBe(`/api/Home/GetSellerItems?sellerId=${String(idA)}&categoryId=0`);
     });
   });
 

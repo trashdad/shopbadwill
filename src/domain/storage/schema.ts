@@ -49,12 +49,17 @@ export const STORAGE_KEYS = {
   sgwSession: 'sbw:sgwSession',
   sgwSessionRejection: 'sbw:sgwSessionRejection',
   google: 'sbw:google',
+  googleClient: 'sbw:googleClient',
   requestBudget: 'sbw:requestBudget',
   requestSchedulerState: 'sbw:requestSchedulerState',
   awake: 'sbw:awake',
   clock: 'sbw:clock',
   googleAccess: 'sbw:googleAccess',
   runtimeHealth: 'sbw:runtimeHealth',
+  /** Optional (T-30): the last HealthReport, in local so a failure survives a browser restart. */
+  healthReport: 'sbw:healthReport',
+  /** Optional (T-30): probe bookkeeping for SgwHealth; local so it survives a restart. */
+  healthProbe: 'sbw:healthProbe',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -188,6 +193,34 @@ export const RequestSchedulerStateSchema = z.object({
 });
 export type RequestSchedulerState = z.infer<typeof RequestSchedulerStateSchema>;
 
+/**
+ * `sbw:googleClient` (T-70): the OAuth client the user pasted on the options
+ * page. Optional; the options page is its only writer, and the background
+ * (`clientConfig()`) only reads it, so the token record `sbw:google` has a
+ * single writer.
+ */
+export const GoogleClientSchema = z.object({
+  clientId: z.string().min(1),
+  clientSecret: z.string().optional(),
+  updatedAt: EpochMsSchema,
+});
+export type GoogleClient = z.infer<typeof GoogleClientSchema>;
+
+/**
+ * `sbw:healthProbe` (T-30): when SgwHealth last probed (`probedAt`, the only
+ * clock for its 6 h / 10 min rules), when each schema check last succeeded
+ * (24 h escalation), and the per-endpoint schema failures that stay failing
+ * until that endpoint succeeds (`sticky`).
+ */
+export const HealthProbeSchema = z.object({
+  probedAt: EpochMsSchema.nullable(),
+  /** Set once, at the first run or recorded failure: the clock for escalating a check that was never good. */
+  firstSeenAt: EpochMsSchema.optional(),
+  lastGoodProbeAt: z.object({ search: EpochMsSchema.optional(), detail: EpochMsSchema.optional() }),
+  sticky: z.array(z.object({ endpoint: z.string().min(1), at: EpochMsSchema, detail: z.string() })),
+});
+export type HealthProbe = z.infer<typeof HealthProbeSchema>;
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -228,12 +261,15 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },
   [STORAGE_KEYS.sgwSessionRejection]: { area: 'local', schema: SgwSessionRejectionSchema },
   [STORAGE_KEYS.google]: { area: 'local', schema: GoogleCredentialsSchema },
+  [STORAGE_KEYS.googleClient]: { area: 'local', schema: GoogleClientSchema },
   [STORAGE_KEYS.requestBudget]: { area: 'local', schema: RequestBudgetSchema },
   [STORAGE_KEYS.requestSchedulerState]: { area: 'local', schema: RequestSchedulerStateSchema },
   [STORAGE_KEYS.awake]: { area: 'local', schema: z.array(EpochMsSchema) },
   [STORAGE_KEYS.clock]: { area: 'session', schema: z.array(ClockSampleSchema) },
   [STORAGE_KEYS.googleAccess]: { area: 'session', schema: GoogleAccessSchema },
   [STORAGE_KEYS.runtimeHealth]: { area: 'session', schema: HealthReportSchema },
+  [STORAGE_KEYS.healthReport]: { area: 'local', schema: HealthReportSchema },
+  [STORAGE_KEYS.healthProbe]: { area: 'local', schema: HealthProbeSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

@@ -40,7 +40,7 @@ describe('fake serves the fixture item 702801256', () => {
       startingMinimumBid: 999,
       bidIncrement: 100,
       numBids: 22,
-      sellerId: 135,
+      sellerId: 955353,
       sellerName: 'Goodwill of O',
       sellerState: 'IL',
       endTimeRaw: real.endTimeRaw,
