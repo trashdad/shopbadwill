@@ -1,14 +1,14 @@
-// T-70: where the pasted Google OAuth client lives. T-62's PkceRefreshProvider
-// reads its client from the `sbw:google` record (GoogleCredentials) through an
-// injected clientConfig(); this store is the options page's side of that.
+// T-70: where the pasted Google OAuth client lives: `sbw:googleClient`, a record
+// of its own (T-36's clientConfig() reads it). This page never touches
+// `sbw:google`, the token record the background writes, so it cannot clobber a
+// live connection.
 //
 // The secret goes in and never comes back out: load() reports only whether one
-// is saved and its last four characters (ruling R2). Nothing here logs, throws
-// with, or audits a value.
+// is saved and its last four characters. Nothing here logs, throws with, or
+// audits a value.
 import { browser } from 'wxt/browser';
 
-import { STORAGE_KEYS } from '../../../../domain/storage/schema';
-import { GoogleCredentialsSchema, type GoogleCredentials } from '../../../../domain/types';
+import { GoogleClientSchema, STORAGE_KEYS, type GoogleClient } from '../../../../domain/storage/schema';
 
 /** `<digits>-<alnum>.apps.googleusercontent.com` (ruling R1). */
 export const CLIENT_ID_RE = /^\d+-[A-Za-z0-9]+\.apps\.googleusercontent\.com$/;
@@ -40,10 +40,10 @@ export function createGoogleConfigStore(
   area: () => LocalArea = () => browser.storage.local,
   now: () => number = Date.now,
 ): GoogleConfigStore {
-  const key = STORAGE_KEYS.google;
-  const read = async (): Promise<GoogleCredentials | undefined> => {
+  const key = STORAGE_KEYS.googleClient;
+  const read = async (): Promise<GoogleClient | undefined> => {
     const raw = (await area().get(key))[key];
-    const parsed = GoogleCredentialsSchema.safeParse(raw);
+    const parsed = GoogleClientSchema.safeParse(raw);
     return parsed.success ? parsed.data : undefined;
   };
   return {
@@ -58,12 +58,12 @@ export function createGoogleConfigStore(
     async save(input) {
       const cur = await read();
       const secret = input.clientSecret === undefined || input.clientSecret === '' ? cur?.clientSecret : input.clientSecret;
-      // The shape a disconnect leaves behind: no tokens, no scopes, a connectedAt.
-      const next: GoogleCredentials = {
-        ...(cur ?? { provider: 'pkce' as const, grantedScopes: [], connectedAt: now() }),
+      // Validated before it is written; this key is the only one the page ever writes.
+      const next = GoogleClientSchema.parse({
         clientId: input.clientId,
         ...(secret === undefined ? {} : { clientSecret: secret }),
-      };
+        updatedAt: now(),
+      });
       await area().set({ [key]: next });
     },
   };

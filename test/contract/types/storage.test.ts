@@ -44,6 +44,7 @@ const LOCAL_KEYS = [
   'sbw:sgwSession',
   'sbw:sgwSessionRejection',
   'sbw:google',
+  'sbw:googleClient',
   'sbw:requestBudget',
   'sbw:requestSchedulerState',
   'sbw:awake',
@@ -68,6 +69,7 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:sgwSession': example('SgwSessionRecord'),
   'sbw:sgwSessionRejection': { ids: ['jti:' + 'a'.repeat(64)], at: 1791400000000 },
   'sbw:google': example('GoogleCredentials'),
+  'sbw:googleClient': { clientId: '123456789012-abc.apps.googleusercontent.com', clientSecret: 'x', updatedAt: 1791400000000 },
   'sbw:requestBudget': example('RequestBudget'),
   'sbw:requestSchedulerState': example('RequestSchedulerState'),
   'sbw:awake': [1791400000000, 1791400300000],
@@ -105,6 +107,13 @@ describe('storage schema v1', () => {
       const result = spec.schema.safeParse(SAMPLE_VALUES[key]);
       if (!result.success) expect.fail(`${key}:\n${z.prettifyError(result.error)}`);
     }
+  });
+
+  it('keeps the options-page Google client in its own optional record (T-70)', () => {
+    const schema = STORAGE_RECORDS[STORAGE_KEYS.googleClient].schema;
+    expect(schema.safeParse({ clientId: 'a', updatedAt: 1 }).success).toBe(true);
+    expect(schema.safeParse({ clientId: '', updatedAt: 1 }).success).toBe(false);
+    expect(schema.safeParse({ clientId: 'a' }).success).toBe(false);
   });
 
   it('keys ItemId records by positive integer ids', () => {

@@ -147,7 +147,8 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
       setModeMsg({ message: `Could not save ${what}: your settings have not loaded.`, tone: 'error' });
       return;
     }
-    const next = { ...settings.calendar, ...patch };
+    // Only the dedicated calendar works with the narrow scope (T-62), so never store another mode.
+    const next = { ...settings.calendar, ...patch, mode: 'dedicated' as const };
     client.send('settings.set', { calendar: next }).then(
       () => {
         setSettings({ ...settings, calendar: next });
@@ -172,7 +173,6 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
 
   const expiresAt = auth?.refreshTokenExpiresAt;
   const testingWarning = auth?.connected === true && expiresAt !== undefined && expiresAt <= now() + TESTING_WINDOW_MS;
-  const mode = settings?.calendar.mode ?? 'dedicated';
 
   return (
     <div class="sbw-google">
@@ -323,28 +323,16 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
         <Status message={modeMsg.message} tone={modeMsg.tone} />
         <fieldset class="sbw-inline-fieldset">
           <legend>Which calendar</legend>
-          {(
-            [
-              ['dedicated', 'A separate ShopBadwill calendar (recommended)'],
-              ['primary', 'My primary calendar'],
-            ] as const
-          ).map(([value, label]) => (
-            <label key={value}>
-              <input
-                type="radio"
-                name="calendar-mode"
-                value={value}
-                checked={mode === value}
-                aria-describedby="g-mode-hint"
-                onChange={() => {
-                  saveCalendar({ mode: value }, 'calendar choice');
-                }}
-              />{' '}
-              {label}
-            </label>
-          ))}
+          <label>
+            <input type="radio" name="calendar-mode" value="dedicated" checked readOnly aria-describedby="g-mode-hint" /> A separate
+            ShopBadwill calendar (recommended)
+          </label>
+          <label>
+            <input type="radio" name="calendar-mode" value="primary" checked={false} disabled aria-describedby="g-mode-hint" /> My
+            primary calendar
+          </label>
           <p class="sbw-hint" id="g-mode-hint">
-            The separate calendar needs only the narrow "calendar.app.created" permission. Your primary calendar needs broader access to your events, and the current connection does not grant it.
+            Not available: uses a narrower Google permission (only calendars this extension creates).
           </p>
         </fieldset>
 

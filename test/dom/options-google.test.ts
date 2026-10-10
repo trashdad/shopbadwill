@@ -191,18 +191,34 @@ describe('google section', () => {
     expect(document.body.innerHTML).not.toContain(SECRET);
   });
 
-  it('saves the calendar mode through settings.set as a whole group', async () => {
+  it('offers only the dedicated calendar: primary is disabled with a note, and nothing saves it', async () => {
     const { fake } = googleApp();
-    const radio = await screen.findByLabelText('My primary calendar');
+    const primary = await screen.findByLabelText<HTMLInputElement>(/My primary calendar/);
+    expect(primary.disabled).toBe(true);
+    expect(screen.getByLabelText<HTMLInputElement>(/separate ShopBadwill calendar/).checked).toBe(true);
+    expect(
+      screen.getByText('Not available: uses a narrower Google permission (only calendars this extension creates).'),
+    ).toBeTruthy();
+    fireEvent.click(primary);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent(fake, 'settings.set')).toHaveLength(0);
+  });
+
+  it('never sends primary even when stored settings say primary', async () => {
+    const fake = new FakeMessaging();
+    fake.handle('calendar.status', () => status());
+    fake.handle('settings.get', () => ({ ...defaultSettings(), calendar: { ...defaultSettings().calendar, mode: 'primary' as const } }));
+    fake.handle('settings.set', () => undefined);
+    render(h(GoogleSection, { client: fake, store: new MemStore(), now: () => NOW }));
     await waitFor(() => {
       expect(sent(fake, 'settings.get')).toHaveLength(1);
     });
     await new Promise((r) => setTimeout(r, 0));
-    fireEvent.click(radio);
+    fireEvent.click(screen.getByRole('button', { name: 'Save reminders' }));
     await waitFor(() => {
       expect(sent(fake, 'settings.set')).toHaveLength(1);
     });
-    expect(sent(fake, 'settings.set')[0]?.payload).toEqual({ calendar: { ...defaultSettings().calendar, mode: 'primary' } });
+    expect(sent(fake, 'settings.set')[0]?.payload).toMatchObject({ calendar: { mode: 'dedicated' } });
   });
 });
 
@@ -254,39 +270,45 @@ describe('reminders editor', () => {
 });
 
 describe('google config store', () => {
-  function area(initial: Record<string, unknown> = {}): LocalArea & { data: Record<string, unknown> } {
+  function area(initial: Record<string, unknown> = {}): LocalArea & { data: Record<string, unknown>; writes: string[] } {
     const data = { ...initial };
+    const writes: string[] = [];
     return {
       data,
+      writes,
       get: (k) => Promise.resolve(k in data ? { [k]: data[k] } : {}),
       set: (items) => {
+        writes.push(...Object.keys(items));
         Object.assign(data, items);
         return Promise.resolve();
       },
     };
   }
 
-  it('creates the disconnected shape, and load reveals only the last 4', async () => {
+  it('writes only sbw:googleClient, and load reveals only the last 4', async () => {
     const a = area();
     const store = createGoogleConfigStore(() => a, () => 42);
     await store.save({ clientId: GOOD_ID, clientSecret: SECRET });
-    expect(a.data['sbw:google']).toEqual({
-      provider: 'pkce',
-      clientId: GOOD_ID,
-      clientSecret: SECRET,
-      grantedScopes: [],
-      connectedAt: 42,
-    });
+    expect(a.data['sbw:googleClient']).toEqual({ clientId: GOOD_ID, clientSecret: SECRET, updatedAt: 42 });
+    expect(a.writes).toEqual(['sbw:googleClient']);
     expect(await store.load()).toEqual({ clientId: GOOD_ID, secretTail: '1234' });
   });
 
-  it('keeps tokens and the saved secret when only the id changes', async () => {
-    const a = area({
-      'sbw:google': { provider: 'pkce', clientId: 'x', clientSecret: SECRET, refreshToken: 'r', grantedScopes: [SCOPE], connectedAt: 1 },
-    });
+  it('leaves a live sbw:google token record byte-identical', async () => {
+    const tokens = { provider: 'pkce', clientId: 'x', refreshToken: 'r', grantedScopes: [SCOPE], connectedAt: 1 };
+    const a = area({ 'sbw:google': tokens });
+    const before = JSON.stringify(a.data['sbw:google']);
     const store = createGoogleConfigStore(() => a);
+    await store.save({ clientId: GOOD_ID, clientSecret: SECRET });
+    expect(JSON.stringify(a.data['sbw:google'])).toBe(before);
+    expect(a.writes).not.toContain('sbw:google');
+  });
+
+  it('keeps the saved secret when only the id changes', async () => {
+    const a = area({ 'sbw:googleClient': { clientId: 'x', clientSecret: SECRET, updatedAt: 1 } });
+    const store = createGoogleConfigStore(() => a, () => 2);
     await store.save({ clientId: GOOD_ID });
-    expect(a.data['sbw:google']).toMatchObject({ clientId: GOOD_ID, clientSecret: SECRET, refreshToken: 'r', connectedAt: 1 });
+    expect(a.data['sbw:googleClient']).toEqual({ clientId: GOOD_ID, clientSecret: SECRET, updatedAt: 2 });
   });
 });
 
