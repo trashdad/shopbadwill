@@ -40,6 +40,14 @@
 //   `state-invalid` event, and means no pause. A failed write emits
 //   `state-write-failed`.
 // - A resume() issued before the read finishes wins over the saved pause.
+// - A read that never settles fails closed too (T-36): after
+//   STATE_READ_TIMEOUT_MS on the Clock, load() resolves false and run()
+//   refuses with `paused`, so a hung storage can never hang a lane (snipe
+//   included). The next request retries the read.
+//
+// dispose() (T-36) settles everything: queued requests are rejected with
+// `paused`, later run() calls are refused, and gap timers are cleared. A
+// request already in flight still settles normally.
 //
 // One instance per profile. The background context owns the only scheduler.
 // As a safety net against a second instance (a second background page, a
@@ -96,6 +104,8 @@ export const RETRY_AFTER_CAP_MS = 24 * 60 * 60_000;
 export const MAX_RESTORED_WAIT_MS = Math.max(BLOCK_PAUSE_MS, BLOCKED_BACKOFF_MS, BACKOFF_CAP_MS, RETRY_AFTER_CAP_MS);
 /** How a request is refused while the saved state cannot be read: retry this soon. */
 export const STATE_READ_RETRY_MS = 30_000;
+/** The saved-state read fails closed when storage has not answered after this long (T-36). */
+export const STATE_READ_TIMEOUT_MS = 5_000;
 /** A stored budget day this far ahead of the local day is a bogus clock, not a backward jump. */
 export const MAX_BUDGET_DAY_AHEAD_MS = 48 * 60 * 60_000;
 /** In-memory result cache size; the oldest entry goes first. */
@@ -292,6 +302,8 @@ export class SgwRequestScheduler implements RequestScheduler {
   private readonly echoes: string[] = [];
   private writes: Promise<void> = Promise.resolve();
   private readonly unsubscribe: () => void;
+  /** Set by dispose(): nothing is queued or sent any more. */
+  private disposed = false;
 
   constructor(deps: RequestSchedulerDeps) {
     this.clock = deps.clock;
@@ -324,6 +336,7 @@ export class SgwRequestScheduler implements RequestScheduler {
   // ── RequestScheduler port ──────────────────────────────────────────────
 
   run<T>(r: ScheduledRequest<T>): Promise<T> {
+    if (this.disposed) return Promise.reject(disposedError());
     const key = r.key;
     if (key !== undefined) {
       const hit = this.cached(key);
@@ -407,7 +420,7 @@ export class SgwRequestScheduler implements RequestScheduler {
    */
   load(): Promise<boolean> {
     if (this.loaded) return Promise.resolve(true);
-    this.loadAttempt ??= this.restore().then(
+    this.loadAttempt ??= this.withReadTimeout(this.restore()).then(
       () => {
         this.loaded = true;
         this.loadAttempt = undefined;
@@ -432,13 +445,21 @@ export class SgwRequestScheduler implements RequestScheduler {
     return this.writes;
   }
 
-  /** Stops following storage changes and drops pending gap timers. */
+  /**
+   * Stops following storage changes, drops pending gap timers and rejects
+   * every queued request with `paused` (T-36: nothing is left unsettled, so a
+   * caller's refresh timers stop). Later run() calls are refused. A request
+   * already in flight settles normally.
+   */
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.unsubscribe();
     for (const lane of LANES) {
       const ls = this.lanes[lane];
       if (ls.timer !== undefined) this.clock.clearTimeout(ls.timer);
       ls.timer = undefined;
+      for (const waiting of ls.queue.splice(0)) waiting.reject(disposedError());
     }
   }
 
@@ -513,6 +534,7 @@ export class SgwRequestScheduler implements RequestScheduler {
 
   /** Why the lane may not send at all right now (pause, backoff, budget), as the error to throw. */
   private refusal(lane: Lane): SgwApiError | undefined {
+    if (this.disposed) return disposedError();
     const now = this.clock.now();
     const pause = this.activePause(now);
     if (pause !== undefined) {
@@ -796,6 +818,29 @@ export class SgwRequestScheduler implements RequestScheduler {
 
   // ── Persistence ─────────────────────────────────────────────────────────
 
+  /**
+   * Settles like `p`, or rejects once STATE_READ_TIMEOUT_MS has passed on the
+   * Clock without an answer (T-36: a hung storage fails closed). A late answer
+   * is ignored by the caller; restore() only ever merges stricter state.
+   */
+  private withReadTimeout<T>(p: Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = this.clock.setTimeout(() => {
+        reject(new Error(`storage did not answer within ${String(STATE_READ_TIMEOUT_MS)} ms`));
+      }, STATE_READ_TIMEOUT_MS);
+      p.then(
+        (value) => {
+          this.clock.clearTimeout(timer);
+          resolve(value);
+        },
+        (e: unknown) => {
+          this.clock.clearTimeout(timer);
+          reject(e instanceof Error ? e : new Error(String(e)));
+        },
+      );
+    });
+  }
+
   /** Reads both records; throws if storage cannot be read (nothing is applied then). */
   private async restore(): Promise<void> {
     const budget = await this.readValidated(BUDGET_KEY, RequestBudgetSchema);
@@ -975,6 +1020,10 @@ export class SgwRequestScheduler implements RequestScheduler {
       }
     }
   }
+}
+
+function disposedError(): SgwApiError {
+  return new SgwApiError('paused', 'SGW requests are paused: the request scheduler was shut down');
 }
 
 /** Http.send throws HttpTimeoutError or HttpNetworkError (anything else is treated as a network failure). */
