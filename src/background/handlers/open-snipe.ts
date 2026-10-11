@@ -13,7 +13,7 @@
 import { browser } from 'wxt/browser';
 
 import type { ItemId } from '../../domain/types';
-import { MSG_VERSION, MsgEnvelopeSchema } from '../../messaging/protocol';
+import { MSG_VERSION, MsgEnvelopeSchema, PORT_NAMES } from '../../messaging/protocol';
 import type { BackgroundContext } from '../context';
 
 /** The dashboard surfaces this handler can open; feature-checked per browser. */
@@ -73,17 +73,82 @@ export async function openDashboard(b: DashboardBrowser, itemId: ItemId): Promis
   return 'tab';
 }
 
-export function register(ctx: BackgroundContext): void {
-  ctx.router.register('ui.openSnipe', async ({ itemId }) => {
-    await openDashboard(browser as unknown as DashboardBrowser, itemId).catch(() => undefined);
+/**
+ * Ruling 4: how long a "Snipe…" item waits for a side panel or sidebar that
+ * was just opened and is not listening yet (at most 60 s, memory only).
+ */
+export const PREFILL_HOLD_MS = 60_000;
+
+/** The parts of a connecting port the relay reads. */
+export interface DashboardPort {
+  name: string;
+  sender?: { url?: string };
+}
+
+export interface OpenSnipeDeps {
+  browser: DashboardBrowser;
+  /** runtime.sendMessage: reaches extension pages (never content scripts). */
+  sendMessage(message: unknown): Promise<unknown>;
+  /** runtime.onConnect.addListener. Observes only: the port stays served by its owner. */
+  onConnect(listener: (port: DashboardPort) => void): void;
+  /** This extension's page origin, e.g. "chrome-extension://<id>". */
+  extensionOrigin: string;
+  now(): number;
+}
+
+/**
+ * The `ui.openSnipe` handler with its browser seams. After opening the
+ * dashboard it sends the prefill to the pages already listening. A panel or
+ * sidebar it just opened may not be listening yet, so the item is also held
+ * in memory (never storage) for at most PREFILL_HOLD_MS, and re-sent ONCE when
+ * an extension page connects the snipe-countdown port, which the Snipes
+ * section does on mount. The message is the same prefill: nothing here arms.
+ */
+export function registerOpenSnipe(ctx: Pick<BackgroundContext, 'router'>, deps: OpenSnipeDeps): void {
+  let held: { itemId: ItemId; at: number } | null = null;
+
+  const sendPrefill = async (itemId: ItemId): Promise<void> => {
     const message = { v: MSG_VERSION, type: 'ui.openSnipe', payload: { itemId }, reqId: crypto.randomUUID() };
-    if (MsgEnvelopeSchema.safeParse(message).success) {
-      try {
-        await browser.runtime.sendMessage(message);
-      } catch {
-        // No dashboard page is open to receive it. A fallback tab reads ?item= itself.
-      }
+    if (!MsgEnvelopeSchema.safeParse(message).success) return;
+    try {
+      await deps.sendMessage(message);
+    } catch {
+      // No dashboard page is listening yet: the held item or the tab's ?item= covers it.
     }
+  };
+
+  ctx.router.register('ui.openSnipe', async ({ itemId }) => {
+    const surface = await openDashboard(deps.browser, itemId).catch(() => null);
+    // A fallback tab reads ?item= itself; nothing opened means nothing to wait for.
+    held = surface === 'side-panel' || surface === 'sidebar' ? { itemId, at: deps.now() } : null;
+    await sendPrefill(itemId);
     return undefined;
+  });
+
+  deps.onConnect((port) => {
+    if (port.name !== PORT_NAMES.snipeCountdown || held === null) return;
+    // Only a dashboard page (not a content script on a web page) counts as listening.
+    if (port.sender?.url?.startsWith(`${deps.extensionOrigin}/`) !== true) return;
+    const take = held;
+    held = null;
+    if (deps.now() - take.at <= PREFILL_HOLD_MS) void sendPrefill(take.itemId);
+  });
+}
+
+export function register(ctx: BackgroundContext): void {
+  const b = browser as unknown as DashboardBrowser;
+  registerOpenSnipe(ctx, {
+    browser: b,
+    sendMessage: (message) => browser.runtime.sendMessage(message),
+    onConnect: (listener) => {
+      try {
+        browser.runtime.onConnect.addListener(listener);
+      } catch (e) {
+        // The relay only helps a panel that opens slowly; the deep link still works without it.
+        console.warn('open-snipe: the prefill relay could not listen for dashboards', e);
+      }
+    },
+    extensionOrigin: new URL(browser.runtime.getURL('/sidepanel.html')).origin,
+    now: () => ctx.clock.now(),
   });
 }
