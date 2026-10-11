@@ -47,6 +47,7 @@ interface Opts {
   noWatchHandlers?: boolean;
   failStatus?: boolean;
   watches?: Watch[];
+  dryRunFavorites?: boolean;
 }
 
 function app(opts: Opts = {}) {
@@ -55,6 +56,7 @@ function app(opts: Opts = {}) {
   const rules = [...(opts.rules ?? [])];
   const settings = defaultSettings();
   settings.calendar.enabled = opts.calendarEnabled ?? true;
+  if (opts.dryRunFavorites !== undefined) settings.dryRun.favorites = opts.dryRunFavorites;
   fake.handle('settings.get', () => {
     if (opts.failStatus === true) throw new Error('boom');
     return settings;
@@ -257,10 +259,13 @@ describe('options: Watches', () => {
           skipped++;
           continue;
         }
-        store.push({
-          id: `i-${t}`, name: t, enabled: true, query, ruleIds: [], maxPages: 1, favoriteMode: 'sgw',
-          calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
-        });
+        // Shaped like T-52's handler: `sgw-saved-<id>`, disabled, no rules, schema-default favoriteMode.
+        store.push(
+          WatchSchema.parse({
+            id: `sgw-saved-${String(store.length + 1)}`, name: t, enabled: false, query, ruleIds: [], maxPages: 1,
+            calendar: false, notify: false, nextRunAt: NOW, seenItemIds: [],
+          }),
+        );
         imported++;
       }
       return { imported, skipped };
@@ -423,6 +428,97 @@ describe('options: Watches', () => {
     await waitFor(() => {
       expect(store[0]?.ruleIds).toEqual(['a']);
     });
+  });
+});
+
+describe('imported saved searches (T-52 carry): say they favorite on ShopGoodwill once enabled with rules', () => {
+  // Shaped like T-52's `watches.importSaved`: `sgw-saved-<id>`, disabled, no rules, favoriteMode the schema default.
+  const imported = (over: Partial<Watch> = {}): Watch =>
+    WatchSchema.parse({
+      id: 'sgw-saved-41', name: 'pyrex', enabled: false,
+      query: { searchText: 'pyrex', categoryIds: [], sellerIds: [], page: 1 },
+      ruleIds: [], maxPages: 1, calendar: false, notify: false, nextRunAt: NOW, seenItemIds: [], ...over,
+    });
+  const mine: Watch = {
+    id: 'w9', name: 'mine', enabled: false, query: { searchText: 'mine', categoryIds: [], sellerIds: [], page: 1 },
+    ruleIds: [], maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
+  };
+  const item = async (name: string): Promise<HTMLElement> => {
+    const heading = await screen.findByRole('heading', { name });
+    const li = heading.closest('li');
+    if (li === null) throw new Error(`no list item for ${name}`);
+    return li;
+  };
+
+  it('the import status and the imported watch say it starts disabled and will favorite for real', async () => {
+    const { fake, store } = app({ watches: [mine] });
+    fake.handle('watches.importSaved', () => {
+      store.push(imported());
+      return { imported: 1, skipped: 0 };
+    });
+    expect(imported().favoriteMode).toBe('sgw');
+    await item('mine');
+    click(/Import my saved searches/);
+    const status = await screen.findByText(/Imported watches start disabled/);
+    expect(status.closest('[role="status"]')).not.toBeNull();
+    expect(status.textContent).toContain(
+      'Imported 1 saved search. Skipped 0 already here. Imported watches start disabled with no rules. Once you enable one and add rules, matches are favorited on your ShopGoodwill account (unless dry-run is on).',
+    );
+    const li = await item('pyrex');
+    expect(li.textContent).toContain(
+      'Imported disabled. Once you enable it and add rules, matches are favorited on your ShopGoodwill account (unless dry-run is on). Favorites dry-run is on right now, so nothing is written to your ShopGoodwill account yet.',
+    );
+    // The switch that turns it on is described by that note.
+    const sw = screen.getByRole('switch', { name: 'Watch "pyrex" is on' });
+    const describedBy = sw.getAttribute('aria-describedby');
+    expect(describedBy).not.toBeNull();
+    expect(document.getElementById(describedBy ?? '')?.textContent).toContain('Imported disabled.');
+    // A watch the user made is not labelled as imported.
+    expect((await item('mine')).textContent).not.toContain('Imported');
+  });
+
+  it('an enabled imported watch with rules, with favorites dry-run off, says its favorites are real', async () => {
+    app({ dryRunFavorites: false, rules: [rule('a')], watches: [imported({ enabled: true, ruleIds: ['a'] })] });
+    expect((await item('pyrex')).textContent).toContain(
+      'Imported from your ShopGoodwill saved searches. Matches are favorited on your ShopGoodwill account (unless dry-run is on). Favorites dry-run is off right now, so these favorites are real.',
+    );
+  });
+
+  it('a local-only imported watch says nothing is favorited on ShopGoodwill', async () => {
+    app({ watches: [imported({ favoriteMode: 'local' })] });
+    const text = (await item('pyrex')).textContent;
+    expect(text).toContain(
+      'Imported disabled. Once you enable it and add rules, matches are tracked in ShopBadwill only; nothing is favorited on your ShopGoodwill account.',
+    );
+    expect(text).not.toContain('dry-run');
+  });
+
+  it('the editor shows the note for an imported watch and follows the draft', async () => {
+    app({ rules: [rule('a')], watches: [imported()] });
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit pyrex' }));
+    await screen.findByRole('heading', { name: 'Edit watch' });
+    const note = (): string => screen.getByTestId('watch-imported-editor-note').textContent;
+    await waitFor(() => {
+      expect(note()).toContain(
+        'Imported disabled. Once you enable it and add rules, matches are favorited on your ShopGoodwill account (unless dry-run is on).',
+      );
+    });
+    fireEvent.click(screen.getByLabelText('Rule a'));
+    await waitFor(() => {
+      expect(note()).toContain(
+        'Imported disabled. Once you enable it, matches are favorited on your ShopGoodwill account (unless dry-run is on).',
+      );
+    });
+    fireEvent.click(screen.getByLabelText(/Track in ShopBadwill only/));
+    await waitFor(() => {
+      expect(note()).toContain('nothing is favorited on your ShopGoodwill account');
+    });
+  });
+
+  it('a new watch from a search tab has no imported note', async () => {
+    app();
+    await openForm();
+    expect(screen.queryByTestId('watch-imported-editor-note')).toBeNull();
   });
 });
 

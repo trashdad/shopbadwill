@@ -152,6 +152,47 @@ export function buildWatch(draft: WatchDraft, nextRunAt: number, base?: Watch): 
   return { ok: true, watch: parsed.data };
 }
 
+/**
+ * T-52's `watches.importSaved` stores an imported saved search as
+ * `sgw-saved-<savedSearchId>`: disabled, no rules, favoriteMode the schema
+ * default ('sgw'). The Watch schema has no other import marker.
+ */
+export const IMPORTED_WATCH_ID_PREFIX = 'sgw-saved-';
+
+export function isImportedWatch(w: { id: string }): boolean {
+  return w.id.startsWith(IMPORTED_WATCH_ID_PREFIX);
+}
+
+/** Appended to the import result when anything was imported. */
+export const IMPORT_STATUS_NOTE =
+  'Imported watches start disabled with no rules. Once you enable one and add rules, matches are favorited on your ShopGoodwill account (unless dry-run is on).';
+
+/**
+ * What an imported watch will do once it runs (T-52 carry): favorite on the
+ * user's ShopGoodwill account unless it is local-only or favorites dry-run is
+ * on. `dryRunFavorites` is `settings.dryRun.favorites`, or undefined when the
+ * settings could not be read (then the current state is not claimed).
+ */
+export function importedWatchNote(
+  w: { enabled: boolean; favoriteMode: FavoriteMode; ruleIds: readonly string[] },
+  dryRunFavorites: boolean | undefined,
+): string {
+  const lead = w.enabled ? 'Imported from your ShopGoodwill saved searches.' : 'Imported disabled.';
+  const steps = [...(w.enabled ? [] : ['enable it']), ...(w.ruleIds.length === 0 ? ['add rules'] : [])];
+  const effect =
+    w.favoriteMode === 'local'
+      ? 'matches are tracked in ShopBadwill only; nothing is favorited on your ShopGoodwill account.'
+      : `matches are favorited on your ShopGoodwill account${w.favoriteMode === 'sgw-late' ? ' shortly before they end' : ''} (unless dry-run is on).`;
+  const sentence = steps.length === 0 ? effect.charAt(0).toUpperCase() + effect.slice(1) : `Once you ${steps.join(' and ')}, ${effect}`;
+  let now = '';
+  if (w.favoriteMode !== 'local' && dryRunFavorites !== undefined) {
+    now = dryRunFavorites
+      ? ' Favorites dry-run is on right now, so nothing is written to your ShopGoodwill account yet.'
+      : ' Favorites dry-run is off right now, so these favorites are real.';
+  }
+  return `${lead} ${sentence}${now}`;
+}
+
 /** The URL of the most recently used SGW search tab, or undefined when none is open. */
 export function pickSearchTab(tabs: ReadonlyArray<{ url?: string | undefined; lastAccessed?: number | undefined }>): string | undefined {
   let best: { url: string; at: number } | undefined;

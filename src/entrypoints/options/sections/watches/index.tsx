@@ -15,9 +15,12 @@ import { Card, Field } from '../../../../ui/components/Field';
 import { Status } from '../../../../ui/components/Status';
 import type { SectionDef, SectionProps } from '../../registry';
 import {
+  IMPORT_STATUS_NOTE,
   MATCH_ALL_RULE_ID,
   buildWatch,
   draftFromWatch,
+  importedWatchNote,
+  isImportedWatch,
   matchEverythingRule,
   newDraft,
   pickSearchTab,
@@ -190,6 +193,9 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
       ? 'Calendar events are turned off in Settings. Turn them on to use this.'
       : 'Adds matches to your calendar.';
 
+  /** undefined until settings load (or when they fail): the note then does not claim the current state. */
+  const dryRunFavorites = settings?.dryRun.favorites;
+
   const enabledSelected = (d: WatchDraft): number =>
     d.ruleIds.filter((id) => rules.some((r) => r.id === id && r.enabled)).length;
 
@@ -272,7 +278,7 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
           message:
             r.imported === 0 && r.skipped === 0
               ? 'No saved searches were found on your ShopGoodwill account.'
-              : `Imported ${String(r.imported)} saved search${r.imported === 1 ? '' : 'es'}. Skipped ${String(r.skipped)} already here.`,
+              : `Imported ${String(r.imported)} saved search${r.imported === 1 ? '' : 'es'}. Skipped ${String(r.skipped)} already here.${r.imported > 0 ? ` ${IMPORT_STATUS_NOTE}` : ''}`,
           tone: 'ok',
         });
         loadWatches();
@@ -350,6 +356,11 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
           <p>
             Search: <span data-testid="watch-query">{summarizeQuery(draft.query)}</span>
           </p>
+          {isImportedWatch(draft) ? (
+            <p class="sbw-hint" data-testid="watch-imported-editor-note">
+              {importedWatchNote(draft, dryRunFavorites)}
+            </p>
+          ) : null}
           {errors['query'] === undefined ? null : (
             <p class="sbw-error" role="alert">
               <strong>Error:</strong> {errors['query']}
@@ -536,6 +547,11 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
                 {summarizeQuery(w.query)}. {w.maxPages} page{w.maxPages === 1 ? '' : 's'}, favorites: {w.favoriteMode}
                 {w.calendar ? ', calendar' : ''}.
               </p>
+              {isImportedWatch(w) ? (
+                <p class="sbw-hint" id={`watch-imported-${w.id}`}>
+                  {importedWatchNote(w, dryRunFavorites)}
+                </p>
+              ) : null}
               {w.ruleIds.length === 0 ? <p class="sbw-hint">No rules: this watch will never match.</p> : null}
               {w.lastError === undefined ? null : <p class="sbw-hint">Last error: {w.lastError}</p>}
               <div class="sbw-actions">
@@ -545,6 +561,7 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
                     role="switch"
                     checked={w.enabled}
                     aria-label={`Watch "${w.name}" is on`}
+                    aria-describedby={isImportedWatch(w) ? `watch-imported-${w.id}` : undefined}
                     onChange={(e) => {
                       toggleEnabled(w, e.currentTarget.checked);
                     }}
