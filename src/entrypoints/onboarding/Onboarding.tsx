@@ -11,7 +11,10 @@
 //                      off and `icsFallback` on, with the .ics note (R5).
 //   4. First watch     the current SGW search tab, else the whole-site template;
 //                      `favoriteMode` is the `Watch` schema default 'sgw'
-//                      (§15 Q5), matching everything new in the search.
+//                      (§15 Q5) unless the user chooses not to favorite
+//                      (`local`), matching everything new in the search. The
+//                      preview says that once dry-run is off, every new item
+//                      is favorited on the ShopGoodwill account.
 //   5. Dry run         plain ToS/risk copy behind an explicit checkbox (R3), the
 //                      optional `notifications` permission requested from the
 //                      click handler through src/ui/permissions.ts (R6, I-21),
@@ -24,6 +27,7 @@ import { useCallback, useEffect, useState } from 'preact/hooks';
 
 import { BrowserPermissions } from '../../adapters/browser/permissions';
 import type { AuthStatus } from '../../domain/calendar/types';
+import { DEFAULT_WATCH_FAVORITE_MODE } from '../../domain/settings/defaults';
 import type { Settings } from '../../domain/settings/schema';
 import type { SearchQuery } from '../../domain/types';
 import type { Watch } from '../../domain/watches/schema';
@@ -46,9 +50,9 @@ export interface OnboardingProps {
   /** Injectable for tests: the optional-permissions API; the request happens inside the click handler (I-21). */
   permissions?: Pick<Permissions, 'contains' | 'request'>;
   /** Injectable for tests: opens the options page at the Google section (T-70). */
-  openGoogleOptions?: () => void | Promise<void>;
+  openGoogleOptions?: () => void;
   /** Injectable for tests: opens the plain options page. */
-  openOptions?: () => void | Promise<void>;
+  openOptions?: () => void;
   now?: () => number;
   newId?: () => string;
 }
@@ -91,6 +95,8 @@ export function Onboarding(props: OnboardingProps): VNode {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [calNote, setCalNote] = useState('');
   const [source, setSource] = useState<{ query: SearchQuery; fromTab: boolean } | null>(null);
+  /** True saves the schema default (`sgw`). False is "don't favorite" (`local`). */
+  const [favoriteOnAccount, setFavoriteOnAccount] = useState(true);
   const [watch, setWatch] = useState<Watch | null>(null);
   const [watchBusy, setWatchBusy] = useState(false);
   const [watchError, setWatchError] = useState('');
@@ -231,7 +237,12 @@ export function Onboarding(props: OnboardingProps): VNode {
       if (!rules.some((r) => r.id === MATCH_ALL_RULE_ID)) {
         await client.send('rules.save', matchEverythingRule(now()));
       }
-      const built = buildFirstWatch(source.query, now(), newId());
+      const built = buildFirstWatch(
+        source.query,
+        now(),
+        newId(),
+        favoriteOnAccount ? DEFAULT_WATCH_FAVORITE_MODE : 'local',
+      );
       if (!built.ok) {
         setWatchError(built.error);
         return;
@@ -300,7 +311,7 @@ export function Onboarding(props: OnboardingProps): VNode {
               <button
                 type="button"
                 onClick={() => {
-                  void openOptions();
+                  openOptions();
                 }}
               >
                 Open options
@@ -449,7 +460,7 @@ export function Onboarding(props: OnboardingProps): VNode {
                 type="button"
                 class="sbw-secondary"
                 onClick={() => {
-                  void openGoogle();
+                  openGoogle();
                 }}
               >
                 Connect Google
@@ -479,10 +490,7 @@ export function Onboarding(props: OnboardingProps): VNode {
             <h2 id="onboarding-step-heading" tabIndex={-1}>
               Your first watch
             </h2>
-            <p>
-              A watch is a ShopGoodwill search that ShopBadwill runs for you each day. New matches are favorited on your
-              ShopGoodwill account — dry-run keeps that pretend until you turn it off.
-            </p>
+            <p>A watch is a ShopGoodwill search that ShopBadwill runs for you each day.</p>
             {source === null ? (
               <p>Checking for a ShopGoodwill search tab...</p>
             ) : (
@@ -495,9 +503,24 @@ export function Onboarding(props: OnboardingProps): VNode {
                 <Card>
                   <h3>{defaultWatchName(source.query)}</h3>
                   <p data-testid="onboarding-watch-query">{summarizeQuery(source.query)}</p>
+                  <p>
+                    {favoriteOnAccount
+                      ? 'Once dry-run is off, every new item in this search will be favorited on your ShopGoodwill account.'
+                      : 'Nothing in this search will be favorited on your ShopGoodwill account.'}
+                  </p>
                   <p class="sbw-hint">
                     It matches everything new in this search. You can add rules, sellers and price limits later in options.
                   </p>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={!favoriteOnAccount}
+                      onChange={(e) => {
+                        setFavoriteOnAccount(!e.currentTarget.checked);
+                      }}
+                    />{' '}
+                    Don't favorite on ShopGoodwill
+                  </label>
                 </Card>
                 <div class="sbw-actions">
                   <button

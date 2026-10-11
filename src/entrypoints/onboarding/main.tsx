@@ -5,6 +5,7 @@ import { BrowserPermissions } from '../../adapters/browser/permissions';
 import { createMessagingClient } from '../../messaging/client';
 import { pickSearchTab } from '../options/sections/watches/draft';
 import { Onboarding } from './Onboarding';
+import { googleOptionsUrl } from './steps';
 import './style.css';
 
 /** The most recently used ShopGoodwill search tab, or undefined when none is open. */
@@ -27,7 +28,7 @@ if (root !== null) {
       openGoogleOptions={() => {
         // openOptionsPage() cannot carry a hash, so open the page at the Google anchor (T-70).
         void browser.tabs
-          .create({ url: `${browser.runtime.getURL('/options.html')}#section-google` })
+          .create({ url: googleOptionsUrl(browser.runtime.getURL('/options.html')) })
           .then(
             () => undefined,
             () => undefined,

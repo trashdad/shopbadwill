@@ -19,9 +19,11 @@ import { WatchSchema } from '../../src/domain/watches/schema';
 import { Onboarding } from '../../src/entrypoints/onboarding/Onboarding';
 import {
   buildFirstWatch,
+  googleOptionsUrl,
   templateQuery,
   zipError,
 } from '../../src/entrypoints/onboarding/steps';
+import { App } from '../../src/entrypoints/options/App';
 import {
   MATCH_ALL_RULE_ID,
   matchEverythingRule,
@@ -75,7 +77,15 @@ interface Harness {
 }
 
 function app(
-  opts: { sessionState?: SessionState; settings?: Settings; tab?: string; rules?: Rule[]; permissions?: FakePermissions } = {},
+  opts: {
+    sessionState?: SessionState;
+    settings?: Settings;
+    tab?: string;
+    rules?: Rule[];
+    permissions?: FakePermissions;
+    /** When set, calendar.status reports Google as connected under this account. */
+    account?: string;
+  } = {},
 ): Harness {
   const fake = new FakeMessaging();
   const healthState = { sessionState: opts.sessionState ?? 'ok' };
@@ -89,7 +99,7 @@ function app(
     settingsSet.push(p);
     return undefined;
   });
-  fake.handle('calendar.status', () => googleStatus());
+  fake.handle('calendar.status', () => googleStatus(opts.account === undefined ? {} : { connected: true, account: opts.account }));
   fake.handle('watches.list', () => []);
   fake.handle('watches.save', (w) => {
     watchesSaved.push(w);
@@ -436,5 +446,219 @@ describe('onboarding helpers (steps.ts)', () => {
       notify: true,
       query: templateQuery(),
     });
+  });
+
+  it('buildFirstWatch can turn favoriting off before the watch is saved', () => {
+    const built = buildFirstWatch(templateQuery(), NOW, 'w1', 'local');
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const watch = WatchSchema.parse(built.watch);
+    expect(watch.favoriteMode).toBe('local');
+    expect(watch.ruleIds).toEqual([MATCH_ALL_RULE_ID]);
+  });
+
+  it('googleOptionsUrl opens the T-70 options page at the Google anchor', () => {
+    expect(googleOptionsUrl('chrome-extension://ext/options.html')).toBe(
+      'chrome-extension://ext/options.html#section-google',
+    );
+  });
+});
+
+describe('onboarding: first watch favorite warning', () => {
+  it('says every new item is favorited once dry-run is off, and can save without favoriting', async () => {
+    const h = app();
+    await toStep(h, 4);
+    expect(
+      await screen.findByText(
+        'Once dry-run is off, every new item in this search will be favorited on your ShopGoodwill account.',
+      ),
+    ).toBeTruthy();
+    const optOut = screen.getByRole<HTMLInputElement>('checkbox', { name: "Don't favorite on ShopGoodwill" });
+    expect(optOut.checked).toBe(false);
+
+    fireEvent.click(optOut);
+    expect(
+      screen.queryByText(
+        'Once dry-run is off, every new item in this search will be favorited on your ShopGoodwill account.',
+      ),
+    ).toBeNull();
+    expect(screen.getByText('Nothing in this search will be favorited on your ShopGoodwill account.')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create my first watch' }));
+    await waitFor(() => {
+      expect(h.watchesSaved).toHaveLength(1);
+    });
+    const watch = WatchSchema.parse(h.watchesSaved[0]);
+    expect(watch.favoriteMode).toBe('local');
+    expect(watch.ruleIds).toEqual([MATCH_ALL_RULE_ID]);
+  });
+});
+
+describe('onboarding: options shell link', () => {
+  it('offers Run setup again, pointing at onboarding.html', () => {
+    render(h(App, { client: new FakeMessaging(), sections: [] }));
+    const link = screen.getByRole('link', { name: 'Run setup again' });
+    expect(link.getAttribute('href')).toBe('onboarding.html');
+  });
+});
+
+describe('onboarding: text safety', () => {
+  it('renders user-provided search text and the Google account as text', async () => {
+    const probe = '<img id=sbw-xss src=x onerror=globalThis.__sbwXss=1>';
+    const account = '<img id=sbw-xss-acct src=x>';
+    const h = app({
+      tab: `https://shopgoodwill.com/categories/listing?st=${encodeURIComponent(probe)}`,
+      account,
+    });
+    await toStep(h, 3);
+    const accountLine = await screen.findByText(
+      (_text, el) => el !== null && el.tagName === 'STRONG' && el.textContent.includes(account),
+    );
+    expect(accountLine.textContent).toContain(account);
+    expect(document.getElementById('sbw-xss-acct')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    const heading = await screen.findByRole('heading', { level: 3 });
+    expect(heading.textContent).toBe(probe);
+    expect(document.getElementById('sbw-xss')).toBeNull();
+    expect((globalThis as { __sbwXss?: unknown }).__sbwXss).toBeUndefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Create my first watch' }));
+    await waitFor(() => {
+      expect(h.watchesSaved).toHaveLength(1);
+    });
+    expect(screen.getByText(new RegExp(`Runs "${probe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`))).toBeTruthy();
+    expect(document.getElementById('sbw-xss')).toBeNull();
+  });
+});
+
+describe('onboarding: ZIP is private (R4)', () => {
+  it('stores the ZIP only as settings.homeZip and does not log, audit, or send it elsewhere', async () => {
+    const zip = '00501';
+    const logs: string[] = [];
+    const record = (...args: unknown[]): void => {
+      logs.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+    };
+    const spies = (['log', 'info', 'warn', 'debug'] as const).map((method) => vi.spyOn(console, method).mockImplementation(record));
+    try {
+      const h = app();
+      await toStep(h, 2);
+      fireEvent.input(screen.getByLabelText('Home ZIP (optional)'), { target: { value: zip } });
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+      await waitFor(() => {
+        expect(h.settingsSet.some((p) => p['homeZip'] === zip)).toBe(true);
+      });
+      const skip = await screen.findByRole<HTMLButtonElement>('button', { name: 'Skip for now' });
+      await waitFor(() => {
+        expect(skip.disabled).toBe(false);
+      });
+      fireEvent.click(skip);
+      await screen.findByText(/\.ics downloads/);
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Create my first watch' }));
+      await waitFor(() => {
+        expect(h.watchesSaved).toHaveLength(1);
+      });
+      fireEvent.click(screen.getByLabelText(/understand the risks/i));
+      fireEvent.click(screen.getByRole('button', { name: 'Dry-run it now' }));
+      await waitFor(() => {
+        expect(h.runNow).toHaveLength(1);
+      });
+      for (const m of h.fake.sent) {
+        const body = JSON.stringify(m);
+        if (!body.includes(zip)) continue;
+        expect(m.type).toBe('settings.set');
+        expect(m.payload).toEqual({ homeZip: zip });
+      }
+      expect(h.fake.sent.some((m) => m.type.toLowerCase().includes('audit'))).toBe(false);
+      expect(logs.join('\n')).not.toContain(zip);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+});
+
+/**
+ * Own-property trap for `document.cookie`. An own getter shadows happy-dom's
+ * prototype getter, which `vi.spyOn(Document.prototype)` does not see.
+ */
+function trapCookie(): { reads: () => number; restore: () => void } {
+  let reads = 0;
+  Object.defineProperty(document, 'cookie', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      return 'sbw-secret-cookie=1';
+    },
+  });
+  return {
+    reads: () => reads,
+    restore() {
+      Reflect.deleteProperty(document, 'cookie');
+    },
+  };
+}
+
+describe('onboarding: no credentials are read (R2)', () => {
+  it('has no password, token, or cookie field and does not read document.cookie', async () => {
+    document.cookie = 'sbw-secret-cookie=1';
+    const cookie = trapCookie();
+    try {
+      const h = app({ sessionState: 'logged-out' });
+      await screen.findByRole('button', { name: 'Check again' });
+      const bad = [...document.querySelectorAll('input, textarea')].filter((el) =>
+        /password|token|cookie/i.test(
+          `${el.getAttribute('type') ?? ''} ${el.getAttribute('name') ?? ''} ${el.getAttribute('id') ?? ''} ${el.getAttribute('autocomplete') ?? ''}`,
+        ),
+      );
+      expect(bad).toEqual([]);
+      expect(cookie.reads()).toBe(0);
+      expect(JSON.stringify(h.fake.sent)).not.toContain('sbw-secret-cookie');
+    } finally {
+      cookie.restore();
+    }
+  });
+});
+
+describe('onboarding: dry-run stays on (R1, R3)', () => {
+  it('turns every dry-run flag on before job.runNow and never writes snipe', async () => {
+    const h = app({
+      settings: { ...defaultSettings(), dryRun: { favorites: false, calendar: true, bidding: true } },
+    });
+    await toStep(h, 5);
+    const dry = screen.getByRole<HTMLButtonElement>('button', { name: 'Dry-run it now' });
+    expect(dry.disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Finish' })).toBeNull();
+    fireEvent.click(dry);
+    expect(h.runNow).toEqual([]);
+    fireEvent.click(screen.getByLabelText(/understand the risks/i));
+    fireEvent.click(dry);
+    await waitFor(() => {
+      expect(h.runNow).toEqual([{ watchIds: ['watch-1'] }]);
+    });
+    const dryIdx = h.fake.sent.findIndex(
+      (m) => m.type === 'settings.set' && JSON.stringify(m.payload) === JSON.stringify({ dryRun: { favorites: true, calendar: true, bidding: true } }),
+    );
+    const runIdx = h.fake.sent.findIndex((m) => m.type === 'job.runNow');
+    expect(dryIdx).toBeGreaterThan(-1);
+    expect(dryIdx).toBeLessThan(runIdx);
+    expect(JSON.stringify(h.fake.sent)).not.toContain('"snipe"');
+    for (const m of h.fake.sent) {
+      if (m.type !== 'settings.set' || m.payload === undefined || !('dryRun' in (m.payload as object))) continue;
+      expect((m.payload as { dryRun: { favorites: boolean; calendar: boolean; bidding: boolean } }).dryRun).toEqual({
+        favorites: true,
+        calendar: true,
+        bidding: true,
+      });
+    }
+  });
+});
+
+describe('onboarding: notification request timing (R6)', () => {
+  it('does not request the permission until the click, and requests it in that turn', async () => {
+    const h = app();
+    await toStep(h, 5);
+    expect(h.permissions.requested).toEqual([]);
+    fireEvent.click(screen.getByRole('button', { name: 'Allow notifications' }));
+    expect(h.permissions.requested).toEqual([{ permissions: ['notifications'] }]);
   });
 });
