@@ -5,23 +5,30 @@
 //   - the typo guard requires the retyped amount to equal the max;
 //   - the confirmation shows both times (user zone and SGW Pacific);
 //   - a dry-run snipe is visibly labelled everywhere it appears.
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { badge as snipeLinkBadge } from '../../src/content/ui/badges/snipe-link';
+import { formatMoney } from '../../src/domain/money';
+import { classifyOutcome } from '../../src/domain/snipe/outcome';
 import type { Snipe } from '../../src/domain/snipe/types';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
+import { formatDual } from '../../src/domain/time/pacific';
 import type { ItemDetail } from '../../src/domain/types';
 import { PORT_NAMES, type MsgPayload } from '../../src/messaging/protocol';
-import { DRY_RUN_LABEL } from '../../src/ui/dashboard/sections/snipes/arm-form';
-import { SnipesSection } from '../../src/ui/dashboard/sections/snipes';
+import { itemIdFromSearch, SnipesSection } from '../../src/ui/dashboard/sections/snipes';
+import { ExposureMeter, measureExposure } from '../../src/ui/exposure';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
+
+/** The exact dry-run sentence. A renamed constant in the form must not keep this green. */
+const DRY_RUN = 'DRY RUN — no bid will be placed';
 
 afterEach(() => {
   vi.useRealTimers();
   cleanup();
+  window.history.replaceState(null, '', '/');
 });
 
 const TZ = 'America/New_York';
@@ -141,9 +148,19 @@ describe('dashboard snipes: money guards (tests first)', () => {
   it('cannot submit above the per-item cap', async () => {
     const { m } = setup({ s: settings({ snipe: { ...settings().snipe, caps: { ...generousCaps, perItemMax: 5000 } } }) });
     await prepare(m);
+    const review = (): HTMLButtonElement => screen.getByRole<HTMLButtonElement>('button', { name: /^review and arm$/i });
+    // Exactly the cap is allowed; one cent over is not. The button is disabled
+    // and the submit handler (click or Enter) still refuses.
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '50.00' } });
+    expect(review().disabled).toBe(false);
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '50.01' } });
+    expect(review().disabled).toBe(true);
     fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '60.00' } });
-    fireEvent.click(screen.getByRole('button', { name: /^review and arm$/i }));
+    expect(review().disabled).toBe(true);
+    fireEvent.click(review());
+    fireEvent.submit(review().closest('form') as HTMLFormElement);
     expect(await screen.findByText(/per-item: .* exceeds the \$50\.00 per-item cap/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^arm snipe$/i })).toBeNull();
     expect(armSent(m)).toHaveLength(0);
   });
 
@@ -163,8 +180,39 @@ describe('dashboard snipes: money guards (tests first)', () => {
     });
     await prepare(m);
     fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '20.00' } });
-    fireEvent.click(screen.getByRole('button', { name: /^review and arm$/i }));
+    const review = screen.getByRole<HTMLButtonElement>('button', { name: /^review and arm$/i });
+    expect(review.disabled).toBe(true);
+    fireEvent.click(review);
+    fireEvent.submit(review.closest('form') as HTMLFormElement);
     expect(await screen.findByText(/per-day: .* exceed the \$50\.00 daily cap/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^arm snipe$/i })).toBeNull();
+    expect(armSent(m)).toHaveLength(0);
+  });
+
+  it('cannot submit one cent above the daily cap still remaining, shipping included', async () => {
+    vi.useFakeTimers({ now: new Date(NOW), toFake: ['Date'] });
+    // $30 already spent. Cap $50, so $20 of landed cost remains. This item's
+    // shipping ($9) and handling ($1) leave $10.00 of bid; $10.01 does not fit.
+    const spent = snipe({
+      id: 'won1',
+      dryRun: false,
+      state: 'resolved',
+      outcome: 'won',
+      maxBid: 3000,
+      history: [{ at: NOW, from: 'firing', to: 'resolved', why: 'post-read' }],
+    });
+    const { m } = setup({
+      s: settings({ snipe: { ...settings().snipe, caps: { ...generousCaps, perDayMax: 5000 } } }),
+      snipes: [spent],
+    });
+    await prepare(m);
+    const review = (): HTMLButtonElement => screen.getByRole<HTMLButtonElement>('button', { name: /^review and arm$/i });
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '10.00' } });
+    expect(review().disabled).toBe(false);
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '10.01' } });
+    expect(review().disabled).toBe(true);
+    fireEvent.click(review());
+    expect(await screen.findByText(/per-day:/)).toBeTruthy();
     expect(armSent(m)).toHaveLength(0);
   });
 
@@ -178,17 +226,29 @@ describe('dashboard snipes: money guards (tests first)', () => {
     const armButton = (): HTMLButtonElement => screen.getByRole<HTMLButtonElement>('button', { name: /^arm snipe$/i });
     expect(armButton().disabled).toBe(true);
     const confirm = amountInput(/^type the amount to confirm$/i);
-    fireEvent.input(confirm, { target: { value: '74.00' } });
+    // One cent off is not the max. A click must not send, even though the
+    // button is disabled (the handler refuses; disabled is not the only guard).
+    fireEvent.input(confirm, { target: { value: '75.01' } });
     expect(armButton().disabled).toBe(true);
     expect(screen.getByText(/That is not the amount/)).toBeTruthy();
-    fireEvent.input(confirm, { target: { value: '75.00' } });
+    // Bypassing the disabled attribute must still not send: the handler compares cents.
+    armButton().disabled = false;
+    fireEvent.click(armButton());
+    expect(armSent(m)).toHaveLength(0);
+    // Same cents, different spelling: "$75.00" matches 7500 and enables the button.
+    fireEvent.input(confirm, { target: { value: '$75.00' } });
+    expect(armButton().disabled).toBe(false);
+    // A dollar off, then back. One cent was already refused above.
+    fireEvent.input(confirm, { target: { value: '74.00' } });
+    expect(armButton().disabled).toBe(true);
+    fireEvent.input(confirm, { target: { value: '75' } });
     expect(armButton().disabled).toBe(false);
     fireEvent.click(armButton());
     await waitFor(() => {
       expect(armSent(m)).toHaveLength(1);
     });
     const sent = armSent(m)[0]?.payload as { typedConfirmation?: string; snipe: Snipe };
-    expect(sent.typedConfirmation).toBe('75.00');
+    expect(sent.typedConfirmation).toBe('75');
     expect(sent.snipe.maxBid).toBe(7500);
   });
 
@@ -216,24 +276,104 @@ describe('dashboard snipes: money guards (tests first)', () => {
     const confirm = (await screen.findByText(/^review your snipe$/i)).closest('div');
     expect(confirm).not.toBeNull();
     const region = within(confirm as HTMLElement);
-    expect(region.getByText(/PT/)).toBeTruthy();
-    expect(region.getByText(/ET/)).toBeTruthy();
-    expect(region.getAllByText(/\$20\.00/).length).toBeGreaterThanOrEqual(1);
-    expect(region.getByText(/estimated all-in: \$30\.00/i)).toBeTruthy();
+    // Max, estimated all-in with the known shipping and handling, and the end
+    // in both zones. The time node is formatDual's own string.
+    expect(region.getByText('Max bid: $20.00')).toBeTruthy();
+    expect(region.getByText('Estimated all-in: $30.00 (max $20.00 + shipping $9.00 + handling $1.00)')).toBeTruthy();
+    const bothZones = formatDual(END_MS, TZ);
+    expect(bothZones).toMatch(/PT/);
+    expect(bothZones).toMatch(/ET/);
+    expect(region.getByText(bothZones)).toBeTruthy();
+  });
+
+  it('parses dollar text into cents and refuses junk', async () => {
+    // $1,234.56 is over the default per-item cap. These caps still trip the
+    // typo guard (3× the $12.99 price), so the big amount must be retyped.
+    const high = { perItemMax: 200_000, perDayMax: 200_000, openExposureMax: 200_000, typoMultiplier: 3 as const, typoAbsolute: 2500 };
+    const { m } = setup({ s: settings({ snipe: { ...settings().snipe, caps: high } }) });
+    await prepare(m);
+
+    const review = (): HTMLButtonElement => screen.getByRole<HTMLButtonElement>('button', { name: /^review and arm$/i });
+    for (const junk of ['12.345', '1e2', 'abc', '12.5.0']) {
+      fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: junk } });
+      fireEvent.click(review());
+      fireEvent.submit(review().closest('form') as HTMLFormElement);
+      expect(screen.queryByRole('button', { name: /^arm snipe$/i })).toBeNull();
+    }
+    expect(screen.getByText(/Enter the max in dollars/)).toBeTruthy();
+    expect(armSent(m)).toHaveLength(0);
+
+    const armText = async (text: string, cents: number, confirm?: string): Promise<void> => {
+      const before = armSent(m).length;
+      fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: text } });
+      fireEvent.click(review());
+      const region = within((await screen.findByText(/^review your snipe$/i)).closest('div') as HTMLElement);
+      expect(region.getByText(`Max bid: ${formatMoney(cents)}`)).toBeTruthy();
+      if (confirm !== undefined) {
+        fireEvent.input(amountInput(/^type the amount to confirm$/i), { target: { value: confirm } });
+      }
+      fireEvent.click(screen.getByRole('button', { name: /^arm snipe$/i }));
+      await waitFor(() => {
+        expect(armSent(m)).toHaveLength(before + 1);
+      });
+      const sent = armSent(m).at(-1)?.payload as { snipe: Snipe };
+      expect(sent.snipe.maxBid).toBe(cents);
+      expect(Number.isSafeInteger(sent.snipe.maxBid)).toBe(true);
+      // Wait until the arm promise has reset the form, then prepare the next amount.
+      await screen.findByText(/Snipe armed/);
+      await prepare(m);
+    };
+
+    // "12.5" and "12.50" are the same 1250 cents. "12.10" is 1210, which
+    // `12.10 * 100` is not.
+    await armText('12.50', 1250);
+    await armText('12.5', 1250);
+    await armText('12.10', 1210);
+    await armText('$1,234.56', 123456, '$1,234.56');
+  });
+
+  it('renders a hostile title as text, never as HTML', async () => {
+    // A quote would break out of an HTML-string attribute. The DOM API must keep it text.
+    const title = '<img src=x onerror=alert(1)>"><img src=y>';
+    setup({ snipes: [snipe({ title, dryRun: false })] });
+    const link = await screen.findByRole('link', { name: title });
+    expect(document.body.querySelector('img')).toBeNull();
+    expect(link.textContent).toBe(title);
+    expect(link.innerHTML).not.toContain('<img');
+    expect(link.innerHTML).toContain('&lt;img');
   });
 
   it('a dry-run snipe is visibly labelled everywhere it appears', async () => {
     const { m } = setup({
-      s: settings({ dryRun: { favorites: true, calendar: true, bidding: true } }),
-      snipes: [snipe({ dryRun: true })],
+      s: settings({
+        dryRun: { favorites: true, calendar: true, bidding: true },
+        snipe: { ...settings().snipe, caps: generousCaps },
+      }),
+      snipes: [snipe({ id: 'dry', dryRun: true }), snipe({ id: 'live', dryRun: false, title: 'Live bowl' })],
     });
-    expect(await screen.findByText(DRY_RUN_LABEL)).toBeTruthy(); // the armed row
+    const list = await screen.findByRole('list', { name: 'Armed snipes' });
+    const dryRow = within(list).getByRole('link', { name: 'Vintage Pyrex Butterfly Gold Bowl 403' }).closest('li') as HTMLElement;
+    const liveRow = within(list).getByRole('link', { name: 'Live bowl' }).closest('li') as HTMLElement;
+    expect(within(dryRow).getByText(DRY_RUN)).toBeTruthy();
+    expect(within(liveRow).queryByText(DRY_RUN)).toBeNull();
+
+    await waitFor(() => {
+      expect(m.openPorts(PORT_NAMES.snipeCountdown)).toBe(1);
+    });
+    m.emitTick(PORT_NAMES.snipeCountdown, { snipeId: 'dry', serverNow: NOW, fireAt: END_MS - 1000, state: 'armed' });
+    expect(await within(dryRow).findByText(/in \d/)).toBeTruthy();
+    expect(within(dryRow).getByText(DRY_RUN)).toBeTruthy();
+
     await prepare(m);
-    // The form's checkbox is forced on by the global bidding dry run, and the label shows there too.
-    expect(screen.getAllByText(DRY_RUN_LABEL).length).toBeGreaterThanOrEqual(2);
+    const form = screen.getByRole('button', { name: /^review and arm$/i }).closest('form') as HTMLElement;
+    expect(within(form.parentElement as HTMLElement).getByText(DRY_RUN)).toBeTruthy();
     const box = screen.getByLabelText<HTMLInputElement>('Dry run (no bid will be placed)');
     expect(box.checked).toBe(true);
     expect(box.disabled).toBe(true);
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '20.00' } });
+    fireEvent.click(screen.getByRole('button', { name: /^review and arm$/i }));
+    const confirm = (await screen.findByText(/^review your snipe$/i)).closest('div') as HTMLElement;
+    expect(within(confirm).getByText(DRY_RUN)).toBeTruthy();
   });
 });
 
@@ -283,6 +423,14 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
     expect(m.openPorts(PORT_NAMES.snipeCountdown)).toBe(0);
     await vi.advanceTimersByTimeAsync(1000);
     expect(m.openPorts(PORT_NAMES.snipeCountdown)).toBe(1);
+    // The new port is the one that receives ticks. A reconnect that only
+    // counted an open port, and did not listen, would leave this unchanged.
+    // `act` flushes the tick onto the new port. A reconnect that only reopened
+    // the port, and did not listen, never paints "in 5s".
+    await act(() => {
+      m.emitTick(PORT_NAMES.snipeCountdown, { snipeId: 's1', serverNow: NOW, fireAt: NOW + 5000, state: 'armed' });
+    });
+    expect(within(row as HTMLElement).getByText('in 5s')).toBeTruthy();
   });
 
   it('disarm sends snipe.disarm with the id', async () => {
@@ -316,15 +464,24 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
       history: [{ at: NOW, from: 'armed', to: 'killed', why: 'disarm:user' }],
     });
     setup({ snipes: [won, killed] });
-    expect(await screen.findByText(/^Leading: Vintage Pyrex Butterfly Gold Bowl 403$/)).toBeTruthy();
-    expect(screen.getByText(/^Stopped: Vintage Pyrex Butterfly Gold Bowl 403$/)).toBeTruthy();
-    expect(screen.getByText(/Stopped before the bid\. No bid was placed \(your max \$20\.00\)\./)).toBeTruthy();
+    const leading = classifyOutcome(won, won.attempt.reply ?? null, null, { userTz: TZ });
+    const stopped = classifyOutcome(killed, null, null, { userTz: TZ, abort: 'killed' });
+    expect(leading.notify.title.startsWith('Leading:')).toBe(true);
+    expect(leading.final).toBe(false);
+    expect(await screen.findByText(leading.notify.title)).toBeTruthy();
+    expect(screen.getByText(leading.notify.message)).toBeTruthy();
+    expect(screen.queryByText(/^Won:/)).toBeNull();
+    expect(screen.getByText(stopped.notify.title)).toBeTruthy();
+    expect(screen.getByText(stopped.notify.message)).toBeTruthy();
   });
 
   it('the exposure meter counts armed, sent and unconfirmed snipes against the daily cap', async () => {
     vi.useFakeTimers({ now: new Date(NOW), toFake: ['Date'] });
     const armedA = snipe({ id: 'a1', dryRun: false, maxBid: 2000 });
     const armedB = snipe({ id: 'a2', dryRun: false, maxBid: 3000 });
+    // A sent snipe counts, including its known shipping. A dry run does not.
+    const sent = snipe({ id: 'sent1', dryRun: false, maxBid: 500, estShipping: 250, state: 'sent' });
+    const dry = snipe({ id: 'dry', dryRun: true, maxBid: 99_999, state: 'armed' });
     const unconfirmed = snipe({
       id: 'u1',
       dryRun: false,
@@ -334,11 +491,49 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
       attempt: { sentAt: END_MS - 8000, ambiguous: true },
       history: [{ at: NOW, from: 'sent', to: 'resolved', why: 'post-read failed' }],
     });
-    setup({ snipes: [armedA, armedB, unconfirmed] });
+    const rows = [armedA, armedB, sent, dry, unconfirmed];
+    const measured = measureExposure(rows, NOW, TZ);
+    expect(measured.open.total).toBe(5750);
+    expect(measured.open.count).toBe(3);
+    expect(measured.spentToday).toBe(1000);
+    expect(measured.used).toBe(6750);
+    setup({ snipes: rows });
     const bar = await screen.findByRole('progressbar', { name: /exposure/i });
-    expect(bar.getAttribute('aria-valuenow')).toBe('6000');
+    expect(bar.getAttribute('aria-valuenow')).toBe('6750');
     expect(bar.getAttribute('aria-valuemax')).toBe('10000');
-    expect(screen.getByText(/Exposure \$60\.00 of \$100\.00/)).toBeTruthy();
+    expect(screen.getByText('Exposure $67.50 of $100.00')).toBeTruthy();
+    expect(screen.getByText(/3 armed snipes/)).toBeTruthy();
+    expect(screen.getByText(/\$10\.00 spent or unconfirmed today/)).toBeTruthy();
+  });
+
+  it('renders the exposure meter on its own, from src/ui/exposure', () => {
+    cleanup();
+    render(h(ExposureMeter, { used: 1500, cap: 10000 }));
+    expect(screen.getByRole('progressbar', { name: /exposure/i }).getAttribute('aria-valuenow')).toBe('1500');
+    expect(screen.getByText('Exposure $15.00 of $100.00')).toBeTruthy();
+  });
+
+  it('a dashboard tab opened with ?item= prepares that item and does not arm', async () => {
+    window.history.replaceState(null, '', `/?item=${String(ITEM_ID)}`);
+    const { m } = setup({ s: settings({ snipe: { ...settings().snipe, caps: generousCaps } }) });
+    expect(await screen.findByText('Vintage Pyrex Butterfly Gold Bowl 403')).toBeTruthy();
+    expect(screen.getByLabelText<HTMLInputElement>('Item id').value).toBe(String(ITEM_ID));
+    await waitFor(() => {
+      expect(m.sent.some((s) => s.type === 'snipe.prepare' && (s.payload as { itemId: number }).itemId === ITEM_ID)).toBe(true);
+    });
+    expect(armSent(m)).toHaveLength(0);
+  });
+
+  it('a junk ?item= query does not prepare', async () => {
+    window.history.replaceState(null, '', '/?item=12.5');
+    const { m } = setup({ s: settings({ snipe: { ...settings().snipe, caps: generousCaps } }) });
+    await screen.findByRole('button', { name: /^prepare$/i });
+    expect(m.sent.some((s) => s.type === 'snipe.prepare')).toBe(false);
+    expect(screen.getByLabelText<HTMLInputElement>('Item id').value).toBe('');
+    expect(itemIdFromSearch('?item=12.5')).toBeNull();
+    expect(itemIdFromSearch('?item=0')).toBeNull();
+    expect(itemIdFromSearch('?item=9007199254740993')).toBeNull();
+    expect(itemIdFromSearch(`?item=${String(ITEM_ID)}`)).toBe(ITEM_ID);
   });
 
   it('the ui.openSnipe deep link pre-fills and prepares (never arms)', async () => {

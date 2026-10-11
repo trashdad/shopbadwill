@@ -80,6 +80,61 @@ function snipeId(itemId: ItemId): string {
   return `sn-${String(itemId)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Cap lines from checkCaps. Anything else (a bad lead, an unparsed amount) is not one. */
+function isCapLine(problem: string): boolean {
+  return /^(per-item|per-day|exposure|invalid):/.test(problem);
+}
+
+/**
+ * Violations that make a submit impossible: per-item, the daily cap still
+ * remaining (this bid's max plus known shipping and handling, on top of what
+ * is already spent), and open exposure. Empty when the amount is not yet a
+ * positive bid. Integer cents only, through the domain.
+ */
+function capViolations(
+  amount: string,
+  mode: 'max' | 'all-in',
+  detail: PrepareReply['detail'] | undefined,
+  settings: Settings | null,
+  snipes: readonly Snipe[],
+  dryRun: boolean,
+): string[] {
+  if (settings === null || detail === undefined) return [];
+  const cents = parseCents(amount);
+  if (cents === null) return [];
+  const maxBid = mode === 'all-in' ? allInToBid(cents, detail.shippingPrice ?? null, detail.handlingPrice ?? null) : cents;
+  if (maxBid <= 0) return [];
+  const estShipping = isKnownShipping(detail) ? detail.shippingPrice : undefined;
+  const estHandling = detail.handlingPrice;
+  const now = Date.now();
+  const draft: Snipe = {
+    id: '__cap-check__',
+    itemId: detail.itemId,
+    title: detail.title,
+    endTime: detail.endTime,
+    endTimeAtArm: detail.endTime,
+    sellerId: detail.sellerId,
+    maxBid,
+    ...(estShipping !== undefined ? { estShipping } : {}),
+    ...(estHandling !== undefined ? { estHandling } : {}),
+    leadMs: settings.snipe.defaultLeadMs,
+    fallback: settings.snipe.defaultFallback,
+    dryRun,
+    state: 'draft',
+    armedAt: now,
+    attempt: {},
+    history: [],
+  };
+  return checkCaps(
+    draft,
+    snipes,
+    spentToday(snipes, now, settings.locale.timeZone),
+    settings.snipe.caps,
+    detail,
+    settings.locale.timeZone,
+  ).violations;
+}
+
 export function ArmForm(props: ArmFormProps): VNode {
   const { client, settings } = props;
   const [stage, setStage] = useState<Stage>('idle');
@@ -151,6 +206,13 @@ export function ArmForm(props: ArmFormProps): VNode {
     const s = settings;
     const d = prep?.detail;
     if (s === null || d === undefined) return;
+    // Caps refuse here, not only via the disabled button. Enter in the field
+    // submits the form even when that button is disabled.
+    const blocked = capViolations(amount, mode, d, s, props.snipes, effectiveDryRun);
+    if (blocked.length > 0) {
+      setProblems(blocked);
+      return;
+    }
     setProblems([]);
     const found: string[] = [];
     const cents = parseCents(amount);
@@ -227,6 +289,9 @@ export function ArmForm(props: ArmFormProps): VNode {
     if (p === null || d === undefined || arming) return;
     setArmError('');
     const typed = p.needsTypo ? confirmText.trim() : undefined;
+    // The button is disabled until the retyped text is the max to the cent.
+    // Refuse here too: a click that bypasses `disabled` must not send.
+    if (p.needsTypo && !confirmsAmount(typed ?? '', p.maxBid)) return;
     const payload = {
       id: snipeId(p.itemId),
       itemId: p.itemId,
@@ -266,6 +331,8 @@ export function ArmForm(props: ArmFormProps): VNode {
 
   const d = prep?.detail;
   const endMs = d === undefined ? undefined : new Date(d.endTime).getTime();
+  const blocked = capViolations(amount, mode, d, settings, props.snipes, effectiveDryRun);
+  const shownProblems = [...blocked, ...problems.filter((p) => !isCapLine(p))];
   const typoProblem =
     planned?.needsTypo === true && confirmText.trim() !== '' && !confirmsAmount(confirmText, planned.maxBid)
       ? 'That is not the amount. Type the exact max to confirm.'
@@ -437,11 +504,11 @@ export function ArmForm(props: ArmFormProps): VNode {
               </label>
             </p>
             {effectiveDryRun ? <p class="sbw-warn">{DRY_RUN_LABEL}</p> : null}
-            {problems.length > 0 ? (
+            {shownProblems.length > 0 ? (
               <div role="alert" class="sbw-error">
                 <strong>Problem: </strong>
                 <ul>
-                  {problems.map((p) => (
+                  {shownProblems.map((p) => (
                     <li key={p}>{p}</li>
                   ))}
                 </ul>
@@ -450,6 +517,7 @@ export function ArmForm(props: ArmFormProps): VNode {
             <p>
               <button
                 type="button"
+                disabled={blocked.length > 0}
                 onClick={() => {
                   review();
                 }}
