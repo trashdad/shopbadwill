@@ -167,7 +167,8 @@ Describe 'companion protocol' {
       foreach ($bad in @(
           'a"b', 'a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b',
           "a`nb", "a`rb", 'pre`post', '$(calc)', 'a$(Get-Date)b',
-          '..\..\Windows\System32', 'foo/../bar', 'foo\..\bar', '..'
+          '..\..\Windows\System32', 'foo/../bar', 'foo\..\bar', '..',
+          ']]>', 'a]]>b', '<![CDATA[x', '-headless', '--user-data-dir=C:\x', '-'
         )) {
         $cfg = New-SbwTestConfig
         $cfg.chrome = [pscustomobject]@{ exePath = 'C:\browser\chrome.exe'; profile = $bad }
@@ -232,9 +233,12 @@ Describe 'companion protocol' {
       Assert-False (Test-SbwProfileValue '')
       Assert-False (Test-SbwProfileValue ('x' * 261))
       Assert-True (Test-SbwProfileValue 'foo..bar')
-      foreach ($bad in @('a"b', 'a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', "a`nb", 'pre`post', '$(calc)', 'a$(Get-Date)b', '..\..\Windows\System32', 'foo/../bar', 'foo\..\bar', '..')) {
+      foreach ($bad in @('a"b', 'a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', "a`nb", 'pre`post', '$(calc)', 'a$(Get-Date)b', '..\..\Windows\System32', 'foo/../bar', 'foo\..\bar', '..', ']]>', '-headless', '--user-data-dir=C:\x')) {
         Assert-False (Test-SbwProfileValue $bad) $bad
       }
+      # A dash is fine anywhere but first (Firefox would read "-P -x" as two flags).
+      Assert-True (Test-SbwProfileValue 'default-release')
+      Assert-True (Test-SbwProfileValue 'C:\Users\me\x-profile')
     }
   }
 }

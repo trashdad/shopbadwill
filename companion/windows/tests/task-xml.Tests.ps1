@@ -175,6 +175,18 @@ Describe 'companion task XML' {
       Assert-NotMatch $text 'HighestAvailable'
       Assert-NotMatch $text '<Password>'
     }
+    It 'XML-escapes every value it carries (no string-built XML)' {
+      $exe = 'C:\a&b<c>d"e''f]]>g\x.exe'
+      $argText = '"q" ]]> <![CDATA[ <&> ''s'' $(x) `b %p% ^c'
+      $text = New-SbwTaskXml -TaskName 'ShopBadwill-test' -WakeAtUtc (Get-SbwTestWakeUtc) `
+        -Execute $exe -Arguments $argText -UserId 'D\u&<>'
+      $xml = [xml]$text
+      Assert-Equal ([string]$xml.Task.Actions.Exec.Command) $exe
+      Assert-Equal ([string]$xml.Task.Actions.Exec.Arguments) $argText
+      Assert-Equal ([string]$xml.Task.Principals.Principal.UserId) 'D\u&<>'
+      Assert-Equal @($xml.Task.Actions.Exec).Count 1
+      Assert-NotMatch $text '<!\[CDATA\['
+    }
     It 'runs as the interactive, least-privileged current user' {
       Assert-Equal ([string](Get-SbwTestXml).Task.Principals.Principal.LogonType) 'InteractiveToken'
       Assert-Equal ([string](Get-SbwTestXml).Task.Principals.Principal.RunLevel) 'LeastPrivilege'

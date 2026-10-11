@@ -10,7 +10,7 @@
     - browser:    exactly 'chrome' or 'firefox'
     - profile:    known profile name or path; no `"`, `&`, `|`, `<`, `>`, `^`,
                   `%`, `!`, newlines, PowerShell backticks or `$(` / `${`
-                  subexpressions, and no `..` path segment
+                  subexpressions, no `..` path segment, and no leading `-`
 #>
 
 $SbwMaxFrameBytes = 1048576
@@ -94,10 +94,12 @@ function Test-SbwSnipeId {
 }
 
 # Shared with install.ps1: a profile value is a name or path, 1..260 chars,
-# with none of the R2-forbidden characters.
+# with none of the R2-forbidden characters. It may not start with '-': it is
+# passed after Firefox's -P / -profile, where "-x" would be read as a flag.
 function Test-SbwProfileValue {
   param([string]$Value)
   ($Value.Length -ge 1) -and ($Value.Length -le 260) -and
+    (-not $Value.StartsWith('-')) -and
     ($Value -cnotmatch $SbwProfileForbiddenRegex) -and
     ($Value -cnotmatch $SbwProfileSubexprRegex) -and
     ($Value -cnotmatch $SbwProfileTraversalRegex)

@@ -49,7 +49,7 @@ Validation, verbatim from ruling R2:
 | `snipeId` | `^[A-Za-z0-9_-]{1,64}$` |
 | `wakeAtUtc` | RFC 3339 (`YYYY-MM-DDTHH:mm:ss[.fff]Z` or `+00:00`), in the future, no more than 30 days ahead |
 | `browser` | `chrome` or `firefox` (case-sensitive) |
-| `profile` | one of the profiles configured by install.ps1 for that browser; no `"`, `&`, `\|`, `<`, `>`, `^`, `%`, `!`, newlines, PowerShell backticks, `$(` / `${` subexpressions, or a `..` path segment |
+| `profile` | one of the profiles configured by install.ps1 for that browser; no `"`, `&`, `\|`, `<`, `>`, `^`, `%`, `!`, newlines, PowerShell backticks, `$(` / `${` subexpressions, a `..` path segment, or a leading `-` |
 
 Errors specific to the wake time: `wake-in-past`, `wake-too-far-ahead`.
 `browser-not-configured` = that browser has no profile at install.

@@ -124,7 +124,8 @@ and the data dir. It never changes power settings. Restart the browsers afterwar
 - Every message from the extension is validated strictly (ruling R2):
   `snipeId` `^[A-Za-z0-9_-]{1,64}$`; `wakeAtUtc` RFC 3339 UTC, future, ≤ 30
   days; `browser` `chrome|firefox`; `profile` a configured value without
-  `"` `&` `|` `<` `>` `^` `%` `!` or newlines. Task names are always
+  `"` `&` `|` `<` `>` `^` `%` `!`, backticks, `$(`, `..` segments, newlines
+  or a leading `-`. Task names are always
   `ShopBadwill-` prefixed; cancel/list/uninstall touch nothing else.
 - Every `schtasks`/`reg`/browser-launch command is built as an argument array,
   never a concatenated shell string, never `Invoke-Expression`.

@@ -234,7 +234,7 @@ function Invoke-SbwInstall {
   }
   foreach ($p in @($ChromeProfile, $FirefoxProfile)) {
     if ($p -and -not (Test-SbwProfileValue -Value $p)) {
-      throw "Invalid profile value '$p': must be a profile name or path without quotes, &, |, <, >, ^, %, ! or newlines."
+      throw "Invalid profile value '$p': must be a profile name or path without quotes, &, |, <, >, ^, %, !, backticks, `$(, .. segments or newlines, and not starting with -."
     }
   }
   foreach ($p in @($sourceDir, $dataDir)) {
