@@ -698,6 +698,23 @@ describe('T-101 rulings', () => {
     expect(proofOpts).toEqual([{ maxAgeMs: 0 }]);
   });
 
+  it('R2: a proof read showing the item closed is never "nothing changed": no resend, even with time left on our clock', async () => {
+    const clock = new FakeClock(T0);
+    let calls = 0;
+    const api = {
+      itemDetail: () => Promise.resolve(makeDetail({ isClosed: true, isHighBidder: false, numBids: 0, bidHistory: [] })),
+      placeBid: () => {
+        calls += 1;
+        return Promise.reject(new HttpTimeoutError(1000));
+      },
+    } as unknown as SgwApi;
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), makeDeps(api, clock, () => END - 10 * SEC));
+
+    expect(outcome.kind).toBe('ambiguous');
+    expect(calls).toBe(1);
+  });
+
   it('R2: isHighBidder true is present even when numBids is 0: accepted, no resend', async () => {
     const clock = new FakeClock(T0);
     let calls = 0;

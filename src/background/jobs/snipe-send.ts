@@ -69,9 +69,11 @@ function bidPresent(detail: ItemDetail): boolean {
  * from `bidHistory`). A truthful zero therefore cannot sit beside a visible
  * bid. A history row means some bid registered, so the zero is not proof and
  * the read is inconclusive. `isHighBidder !== true` per the accepted C2 subset.
+ * A closed item is never "nothing changed": SGW's own clock says it is over,
+ * whatever ours says, so there is nothing a resend could do.
  */
 function nothingChanged(detail: ItemDetail): boolean {
-  return detail.isHighBidder !== true && detail.numBids === 0 && detail.bidHistory.length === 0;
+  return !detail.isClosed && detail.isHighBidder !== true && detail.numBids === 0 && detail.bidHistory.length === 0;
 }
 
 /**
