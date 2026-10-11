@@ -261,9 +261,28 @@ export class NtfySink {
   private readonly pacer: Pacer;
   /** R8: after a 429/5xx, no request until this time (the next upsert retries). */
   private rateLimitedUntil = 0;
+  /** The tail of each item's queue: calls for one item run one at a time (see `withItem`). */
+  private readonly itemQueues = new Map<ItemId, Promise<void>>();
 
   constructor(private readonly deps: NtfySinkDeps) {
     this.pacer = new Pacer(deps.clock, deps.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS);
+  }
+
+  /**
+   * Runs `fn` after every earlier call for the same item has finished. Calendar
+   * sync and the job-run hook share this sink; without the queue two upserts
+   * of one item both read "nothing stored" and both publish, and a remove that
+   * overlaps an upsert reads the record before the upsert writes it, so the
+   * pushes the upsert sent are never cancelled. Other items are not held up.
+   */
+  private withItem(itemId: ItemId, fn: () => Promise<void>): Promise<void> {
+    const run = (this.itemQueues.get(itemId) ?? Promise.resolve()).then(fn);
+    const tail = run.catch(() => undefined);
+    this.itemQueues.set(itemId, tail);
+    void tail.then(() => {
+      if (this.itemQueues.get(itemId) === tail) this.itemQueues.delete(itemId);
+    });
+    return run;
   }
 
   /** R2: the three conditions, plus the v1 server allow-list. Reads settings once per call. */
@@ -291,7 +310,15 @@ export class NtfySink {
     await this.audit({ kind: 'ntfy.status', details: { status } });
   }
 
-  async upsert(event: DesiredEvent): Promise<void> {
+  upsert(event: DesiredEvent): Promise<void> {
+    return this.withItem(event.itemId, () => this.upsertNow(event));
+  }
+
+  remove(itemId: ItemId): Promise<void> {
+    return this.withItem(itemId, () => this.removeNow(itemId));
+  }
+
+  private async upsertNow(event: DesiredEvent): Promise<void> {
     try {
       const prep = await this.prepare();
       if (prep.status !== 'ok') {
@@ -357,7 +384,7 @@ export class NtfySink {
     }
   }
 
-  async remove(itemId: ItemId): Promise<void> {
+  private async removeNow(itemId: ItemId): Promise<void> {
     try {
       const prep = await this.prepare();
       if (prep.status !== 'ok') {

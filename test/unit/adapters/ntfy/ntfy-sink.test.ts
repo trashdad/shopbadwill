@@ -525,6 +525,24 @@ describe('idempotency', () => {
     expect(r.store.state).toEqual(before);
   });
 
+  it('concurrent upserts of one item (calendar sync and the job-run hook) publish each lead once', async () => {
+    const r = rig();
+    const e = desiredEvent(7, 2 * HOUR);
+    await Promise.all([r.sink.upsert(e), r.sink.upsert(e), r.sink.upsert(e)]);
+    expect(r.requests.map((x) => x.headers['x-sequence-id'])).toEqual([
+      sequenceId(7, 60, 0),
+      sequenceId(7, 15, 0),
+      sequenceId(7, 5, 0),
+    ]);
+  });
+
+  it('a remove that overlaps an upsert of the same item still cancels what the upsert published', async () => {
+    const r = rig();
+    await Promise.all([r.sink.upsert(desiredEvent(7, 2 * HOUR)), r.sink.remove(7)]);
+    expect(r.requests.map((x) => x.kind)).toEqual(['post', 'post', 'post', 'delete', 'delete', 'delete']);
+    expect(r.store.state.items['7']).toBeUndefined();
+  });
+
   it('an invalid sbw:ntfy record reads as empty through the Repo and cannot cause a resend storm', async () => {
     const areas = new FakeStorageAreas();
     const clock = new FakeClock(T0);
