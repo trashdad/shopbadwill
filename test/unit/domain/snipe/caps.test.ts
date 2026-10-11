@@ -429,4 +429,56 @@ describe('spentToday (local day, America/New_York)', () => {
   it('is zero for nothing', () => {
     expect(spentToday([], Date.now(), TZ)).toBe(0);
   });
+
+  // T-80b R4: Unconfirmed counts conservatively; proven not-sent does not.
+  it('R4: an Unconfirmed outcome counts at the ceiling (the bid may have been placed)', () => {
+    const now = t('2026-10-08T15:00:00Z');
+    const unconfirmed = won('a', '2026-10-08T14:00:00Z', {
+      outcome: 'network',
+      attempt: { sentAt: t('2026-10-07T23:42:05Z') },
+    });
+    expect(spentToday([unconfirmed], now, TZ)).toBe(1200);
+  });
+
+  it('R4: an Unconfirmed ambiguous send (no reply, no post-read) counts too', () => {
+    const now = t('2026-10-08T15:00:00Z');
+    const unconfirmed = won('a', '2026-10-08T14:00:00Z', {
+      outcome: 'network',
+      attempt: { ambiguous: true },
+    });
+    expect(spentToday([unconfirmed], now, TZ)).toBe(1200);
+  });
+
+  it('R4: a proven not-sent does not count, however the outcome reads "network"', () => {
+    const now = t('2026-10-08T15:00:00Z');
+    const notSent = won('a', '2026-10-08T14:00:00Z', {
+      outcome: 'network',
+      attempt: { sentAt: t('2026-10-07T23:42:05Z'), notSent: true },
+    });
+    expect(spentToday([notSent], now, TZ)).toBe(0);
+  });
+
+  it('R4: a network outcome with no send recorded at all does not count', () => {
+    const now = t('2026-10-08T15:00:00Z');
+    const never = won('a', '2026-10-08T14:00:00Z', {
+      outcome: 'network',
+      attempt: {},
+    });
+    expect(spentToday([never], now, TZ)).toBe(0);
+  });
+
+  it('R4: a win that also has send evidence is counted once, not again as Unconfirmed', () => {
+    const now = t('2026-10-08T15:00:00Z');
+    const wonWithSend = won('a', '2026-10-08T14:00:00Z', {
+      attempt: { sentAt: t('2026-10-07T23:42:05Z'), ambiguous: true },
+    });
+    const unconfirmed = won('b', '2026-10-08T14:00:00Z', {
+      outcome: 'network',
+      attempt: { sentAt: t('2026-10-07T23:42:05Z') },
+    });
+    // 1000 max + 200 shipping. A second add for the send evidence would be 2400.
+    expect(spentToday([wonWithSend], now, TZ)).toBe(1200);
+    expect(spentToday([unconfirmed], now, TZ)).toBe(1200);
+    expect(spentToday([wonWithSend, unconfirmed], now, TZ)).toBe(2400);
+  });
 });

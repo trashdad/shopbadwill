@@ -213,13 +213,26 @@ function resolvedAt(s: Snipe): number {
  * can still win), resolved on the local day of `nowMs`. Each counts at its
  * ceiling (max bid plus known shipping and handling): the actual final price
  * is not stored on the snipe, and overcounting only makes the guard stricter.
+ *
+ * T-80b R4: an Unconfirmed outcome (`network`, with send evidence recorded)
+ * counts too, conservatively, because the bid may have been placed. A
+ * proven `not-sent` (`attempt.notSent === true`) never counts: nothing went
+ * out, so nothing can be spent.
  */
 export function spentToday(snipes: readonly Snipe[], nowMs: number, timeZone: string = DEFAULT_TIME_ZONE): Cents {
   const today = localDayKey(nowMs, timeZone);
   let total = 0;
   for (const s of snipes) {
     if (s.dryRun) continue;
-    if (s.outcome !== 'won' && s.outcome !== 'fallback-proxy-placed') continue;
+    const counts =
+      s.outcome === 'won' ||
+      s.outcome === 'fallback-proxy-placed' ||
+      // T-80b R4: Unconfirmed — the bid may have been placed — counts at the
+      // ceiling. Proven not-sent, and 'network' with no send evidence, do not.
+      (s.outcome === 'network' &&
+        s.attempt.notSent !== true &&
+        (s.attempt.sentAt !== undefined || s.attempt.ambiguous === true));
+    if (!counts) continue;
     if (localDayKey(resolvedAt(s), timeZone) === today) total += landed(s);
   }
   return total;

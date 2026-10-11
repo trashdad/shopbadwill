@@ -14,6 +14,7 @@ export type AbortReason =
   | 'killed'
   | 'cap'
   | 'auth'
+  /** The bid provably never went out (T-80b's `not-sent`, e.g. a BidNotSentError); also a network failure before the send. */
   | 'network'
   | 'ended'
   /** End moved before the bid was sent (soft close / verify-failed extended). */
@@ -30,6 +31,19 @@ export interface OutcomeContext {
   userTz?: string;
   /** Set when the snipe stopped before a bid result existed. */
   abort?: AbortReason;
+  /**
+   * Extra text for the abort copy, in parentheses after "No bid was sent":
+   * T-80b's `not-sent` passes the BidNotSentError's message here.
+   */
+  abortDetail?: string;
+  /**
+   * The dry run's measure read was given up (`post-read-failed` in `firing`).
+   * Ignored unless the snipe is a dry run and there is no post-read. The result
+   * is unconfirmed (`final: false`) under the usual 'Dry run' heading. It must
+   * not produce the live "Unconfirmed" heading or "bid may have been placed"
+   * copy: a dry run never bids.
+   */
+  dryRunMeasureFailed?: boolean;
 }
 
 export interface OutcomeTiming {
@@ -172,9 +186,11 @@ export function classifyOutcome(
   let showEnd = true;
 
   const bidMayHaveGone =
-    bidResult === null
-      ? snipe.attempt.sentAt !== undefined || snipe.attempt.ambiguous === true
-      : bidResult.kind === 'accepted' || bidResult.kind === 'outbid' || bidResult.kind === 'rejected-unknown';
+    snipe.attempt.notSent === true
+      ? false // T-80b: proven not sent, whatever the attempt record says.
+      : bidResult === null
+        ? snipe.attempt.sentAt !== undefined || snipe.attempt.ambiguous === true
+        : bidResult.kind === 'accepted' || bidResult.kind === 'outbid' || bidResult.kind === 'rejected-unknown';
   // An abort never overrides evidence that a bid went out: fall through to the judge path.
   const abort = bidMayHaveGone ? undefined : ctx.abort;
   const abortNote =
@@ -199,10 +215,12 @@ export function classifyOutcome(
     message = 'Not bid: you were signed out of ShopGoodwill. Sign in before the next snipe.';
     detail = 'No valid session at verify time; no bid sent.';
   } else if (abort === 'network') {
+    // T-80b: plain copy for a bid that provably never went out (BidNotSentError).
     outcome = 'network';
     heading = 'Not bid';
-    message = 'Not bid: could not reach ShopGoodwill (network problem). This is not an outbid.';
-    detail = 'Network failure before the bid was sent.';
+    const why = ctx.abortDetail !== undefined && ctx.abortDetail !== '' ? ` (${ctx.abortDetail})` : '';
+    message = `No bid was sent${why}. This is not an outbid.`;
+    detail = `The bid provably never went out${why}; nothing was sent.`;
   } else if (abort === 'ended') {
     outcome = 'ended';
     heading = 'Ended early';
@@ -246,6 +264,12 @@ export function classifyOutcome(
       wouldHaveWon = closed ? snipe.maxBid > post.currentPrice : snipe.maxBid >= post.minimumBid;
       bits.push(`price was ${formatMoney(post.currentPrice)}, next bid ${formatMoney(post.minimumBid)}`);
       bits.push(wouldHaveWon ? 'it would have been leading (a later bid could still beat it)' : 'it would NOT have won');
+    } else if (ctx.dryRunMeasureFailed === true) {
+      // The measure read never arrived. Unknown result, and no bid exists. The
+      // heading stays 'Dry run': 'Unconfirmed' is the live heading for a bid
+      // that may be out, and a dry run must never read like one.
+      final = false;
+      bits.push('the dry-run measure failed, so the result is unconfirmed');
     } else {
       bits.push('the item could not be read, so the result is unknown');
     }
@@ -310,32 +334,42 @@ export function classifyOutcome(
     detail = message;
     stampAs = priceKnown ? 'lost' : null;
   } else {
-    // accepted, outbid, or an ambiguous send settled by re-reading the item.
+    // accepted, outbid, or an ambiguous send settled by re-reading the item, or
+    // (T-80b `post-read-failed`) judged with no read at all.
     const v = judgeAccepted(snipe, bidResult, post);
     final = closed;
     finalPrice = price;
     const unknown = bidResult?.kind === 'rejected-unknown' ? bidResult : null;
-    const via =
-      bidResult === null
+    // No ItemDetail: never claim a re-read, or an auction "still open", that nobody saw.
+    const unread = post === null;
+    const via = unread
+      ? bidResult === null
+        ? ' The bid response was lost and the item could not be read.'
+        : unknown
+          ? " ShopGoodwill's reply was not recognised and the item could not be read."
+          : " This comes from ShopGoodwill's reply; the item could not be read afterwards."
+      : bidResult === null
         ? ' The bid response was lost; this comes from re-reading the item.'
         : unknown
           ? " ShopGoodwill's reply was not recognised; this comes from re-reading the item."
           : '';
+    const stillOpen = unread ? '' : 'auction still open; ';
     const rawNote = unknown
       ? ` Unrecognised reply (status ${String(unknown.rawStatus)}, result ${String(unknown.rawResult)}): ${unknown.messageText}`
       : '';
     const at = price !== undefined ? ` at ${formatMoney(price)}` : '';
     if (v.outcome === 'won') {
       outcome = 'won';
-      heading = 'Won';
-      message = `Won${final ? '' : ' (leading; auction still open)'}${at} (your max ${max}).${via}`;
+      // Not final means nothing proves the win yet: say "Leading", never "Won".
+      heading = final ? 'Won' : 'Leading';
+      message = `${final ? 'Won' : unread ? 'Leading when the bid went in' : 'Leading (auction still open)'}${at} (your max ${max}).${via}`;
       detail = `Won; ${v.how}.${rawNote}`;
       stampAs = final ? 'won' : null;
     } else if (v.outcome === 'outbid') {
       outcome = 'outbid';
       heading = final ? 'Lost' : 'Outbid';
       if (price !== undefined) marginCents = price > snipe.maxBid ? price - snipe.maxBid : 0;
-      message = `${final ? 'Lost: outbid' : 'Currently outbid'}${at} (${final ? '' : 'auction still open; '}your max ${max})${marginCents ? `, short by ${formatMoney(marginCents)}` : ''}.${via}`;
+      message = `${final ? 'Lost: outbid' : unread ? 'Outbid when the bid went in' : 'Currently outbid'}${at} (${final ? '' : stillOpen}your max ${max})${marginCents ? `, short by ${formatMoney(marginCents)}` : ''}.${via}`;
       detail = `Outbid; ${v.how}.${rawNote}`;
       stampAs = final ? 'lost' : null;
     } else {

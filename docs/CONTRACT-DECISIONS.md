@@ -102,7 +102,6 @@ These are every place where §3 (v1.1) was ambiguous or incomplete and I chose t
 
     `DEFAULT_FAVORITE_WITHIN_HOURS` is 6 (§1.8). `WatchSchema` uses `DEFAULT_WATCH_FAVORITE_MODE` (`'sgw'`) as its default.
 
-
 ## Review fix round 1 (amendments to the decisions above)
 
 **Commit:** `b037ae8 fix(contracts): review round 1 — Messaging port, adapter storage access, freeze minors (T-02)` (on top of `32129a9`).
@@ -187,7 +186,6 @@ $ tsx scripts/run-vitest.ts contract -- test/contract/types
 > vitest run --project contract test/contract/types
 
  RUN  v4.1.11 C:/tools/shopbadwill-wt/T-02
-
 
  Test Files  7 passed (7)
       Tests  281 passed (281)
@@ -456,3 +454,36 @@ Source: T-67 (provisional: S-5 pending, so the recreate strategy is `bump-genera
 **ReminderSink (I-34).** `registerReminderSink(sink)` and `ReminderSink { name, upsert(event), remove(itemId) }` are exported from `src/background/jobs/calendar-sync.ts`. Sinks are fed from the desired set (open items only), independent of Google, changed events only, and not at all in dry-run or under the kill switch.
 
 **Late add (I-18).** An insert whose event ends in under 60 minutes (T-56's `isLateAdd`) sends one local notification, id `sbw:notify:late:<itemId>`, and appends the same `notify.late-add` audit entry T-56 uses, so the two never double-alert.
+
+## T-80b contract change: `post-read-failed` and `not-sent` events, `Snipe.attempt.notSent`
+
+Approved by the controller (T-80b rulings R1–R5) and made in `task/T-80b`.
+
+**Why.** The T-84 runner retries the post-read for a sent snipe with a bound (about 7 days), then gives up and tells the user "Unconfirmed: check the item" — but the reducer had no event to settle `sent` without an ItemDetail, so the snipe kept counting in the caps' exposure forever. And a bid that provably never went out (`bid.ts` threw `BidNotSentError` after `sent` was dispatched) could only be recorded as `ambiguous`, so the post-read judge could label it "outbid" when the bid had never registered.
+
+**Changes.**
+
+1. **New event `post-read-failed`** (`{ type: 'post-read-failed', now }`), accepted in `sent`. It resolves the snipe through `classifyOutcome(snipe, attempt.reply ?? null, null, ctx)` — with no post-read the outcome is "Unconfirmed: the bid may have been placed … check ShopGoodwill", never "Not bid". Terminal, emits the usual notify/audit effects and no money effect. See the review correction below for the dry-run `firing` exception.
+2. **New event `not-sent`** (`{ type: 'not-sent', now, reason }`), accepted only in `sent` and only when no reply and no ambiguity are recorded (else `duplicate`). The runner dispatches it when `bid.ts` throws `BidNotSentError`. It resolves through `classifyOutcome` with abort `network` and copy "No bid was sent (reason). This is not an outbid." — never the judge path. Terminal, no money effect.
+3. **`Snipe.attempt.notSent?: boolean`** (`src/domain/snipe/types.ts`). The `not-sent` handler records the proof on the attempt, so it survives a restart. `classifyOutcome` treats it as overriding the send evidence (the abort path wins over the judge path), and `spentToday` reads it (R4).
+4. **`OutcomeContext.abortDetail?: string`** (`src/domain/snipe/outcome.ts`): the text after "No bid was sent". The abort-`network` copy is now "No bid was sent (…). This is not an outbid."
+5. **Spend accounting (R4, `src/domain/snipe/caps.ts`).** An Unconfirmed outcome (`network` with send evidence: `sentAt` or `ambiguous`) counts toward `spentToday` at the ceiling (max bid plus known shipping/handling), because the bid may have been placed. A proven `not-sent` does not count.
+
+**Migration.** None. `notSent` is optional, so `sbw:meta.schemaVersion` stays 1; snipes stored before this change have no flag.
+
+**Tests.** `test/contract/types/spec-shapes.test.ts` mirrors both events and `notSent`. The reducer table, the fast-check properties and the spend tests are in `test/unit/domain/snipe/`.
+
+**Follow-up for the next PLAN edit.** Add both events to PLAN §3.9's event list, `notSent` to `Snipe.attempt`, and the R4 rule to the caps text; update `contracts.md`.
+
+**Review correction (Grok).** `post-read-failed` is also accepted in `firing` when `snipe.dryRun` is true, and never when it is false. A dry run whose measure read fails forever would otherwise stay in `firing` with no settle path. That settlement is outcome `dry-run`, heading Unconfirmed, copy that the dry-run measure failed — not "the bid may have been placed", and not "No bid was sent". No money effect. A live snipe in `firing` is still refused with `not-sent`. No schema change and no migration.
+
+**Final check correction (Opus).** Three changes, all additive. No schema change and no migration.
+
+1. **The dry-run give-up keeps its title.** A dry run settled by `post-read-failed` in `firing` is titled "Dry run", like every other dry-run outcome. The review correction above had it titled "Unconfirmed". The result is still unconfirmed (`final: false`, copy "the dry-run measure failed, so the result is unconfirmed"). "Unconfirmed" stays the live heading for a bid that may be out. The flag is `OutcomeContext.dryRunMeasureFailed?: boolean` in `src/domain/snipe/outcome.ts`; it is additive and ignored for a live snipe.
+2. **A settlement with no read says so.** When `classifyOutcome` judges a sent snipe with no ItemDetail (`post-read-failed` in `sent`), the copy now says that the item could not be read. Three phrases change:
+   - "this comes from re-reading the item" no longer appears, because nothing was read;
+   - "leading; auction still open" becomes "leading when the bid went in";
+   - "Currently outbid (auction still open; …)" becomes "Outbid when the bid went in".
+
+   Outcomes, `final`, stamps and the with-a-read copy are unchanged.
+3. **No stale proof on a draft.** `reduce(arm)` refuses a draft that carries `attempt.notSent` (`invalid-snipe`), as it already refused `sentAt`, the key and a `reply`. A stale proof would keep the next attempt's Unconfirmed outcome out of `spentToday` (R4).

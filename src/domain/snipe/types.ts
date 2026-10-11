@@ -92,6 +92,13 @@ export const SnipeSchema = z.object({
      * second `result`, or a `result` after `ambiguous`, is refused.
      */
     reply: BidResultSchema.optional(),
+    /**
+     * T-80b contract change: true when the attempt provably never went out
+     * (`not-sent`, dispatched when bid.ts threw `BidNotSentError`). It
+     * overrides the send evidence in classifyOutcome (never the judge path)
+     * and keeps the unconfirmed-but-never-sent outcome out of `spentToday`.
+     */
+    notSent: z.boolean().optional(),
   }),
   measured: z
     .object({
@@ -130,6 +137,23 @@ export const SnipeEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('result'), now, result: BidResultSchema }),
   z.object({ type: z.literal('ambiguous'), now }),
   z.object({ type: z.literal('post-read'), now, detail: ItemDetailSchema }),
+  /**
+   * T-80b: the runner gave up retrying the outcome read (about 7 days) and no
+   * ItemDetail will ever settle this snipe. In `sent`, the reducer resolves it
+   * through `classifyOutcome` with the recorded reply and no post-read:
+   * "Unconfirmed … check ShopGoodwill", never "Not bid". In `firing` it is
+   * accepted only for a dry run, whose measure read failed: outcome `dry-run`
+   * with an unconfirmed result under the "Dry run" title, and never a claim
+   * that a bid may have been placed.
+   */
+  z.object({ type: z.literal('post-read-failed'), now }),
+  /**
+   * T-80b: bid.ts threw `BidNotSentError` after `sent` was dispatched, so the
+   * bid provably never went out. `reason` is the failure's message. The
+   * reducer resolves the snipe as "No bid was sent (reason)", never through
+   * the judge path. Accepted only when no reply and no ambiguity are recorded.
+   */
+  z.object({ type: z.literal('not-sent'), now, reason: z.string().min(1) }),
   z.object({ type: z.literal('preflight-failed'), now, reason: z.string() }),
   z.object({ type: z.literal('apply-fallback'), now, mode: FallbackSchema }),
 ]);
@@ -150,9 +174,14 @@ export const EffectSchema = z.discriminatedUnion('kind', [
    * Read ItemDetail on lane `snipe`; the runner then dispatches:
    * - `verify` (the T−60 s read) → `verified`, or `verify-failed` with its reason;
    * - `post-read` (the outcome read after `sent`, a `result` or `ambiguous`) → `post-read`;
+   *   when the runner gives up retrying it (about 7 days), → `post-read-failed`
+   *   instead (T-80b), which settles the snipe without the ItemDetail;
    * - `measure` (dry run only: the harmless read at fire time, in place of
    *   PlaceBid, that measures real latency) → `post-read` with the detail it
-   *   read; the reducer resolves the snipe with outcome 'dry-run'.
+   *   read; the reducer resolves the snipe with outcome 'dry-run'. When the
+   *   runner gives up on that read, → `post-read-failed` instead, which
+   *   settles the dry run with an unconfirmed result (the measure failed). A
+   *   live snipe in `firing` refuses that event.
    */
   z.object({
     kind: z.literal('readDetail'),
