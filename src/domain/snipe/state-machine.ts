@@ -490,7 +490,13 @@ function invalidSnipe(s: Snipe, now: EpochMs): string | null {
   const endMs = isoMs(s.endTime);
   if (!Number.isFinite(endMs)) return 'The auction end time is not a valid instant.';
   if (now >= endMs) return 'The auction has already ended.';
-  if (s.attempt.sentAt !== undefined || s.attempt.idempotencyKey !== undefined || s.attempt.reply !== undefined) {
+  // T-80b: `notSent` too. A stale proof would keep this attempt's Unconfirmed outcome out of spentToday (R4).
+  if (
+    s.attempt.sentAt !== undefined ||
+    s.attempt.idempotencyKey !== undefined ||
+    s.attempt.reply !== undefined ||
+    s.attempt.notSent !== undefined
+  ) {
     return 'A draft must not carry a send attempt (the arm handler resets it).';
   }
   return null;

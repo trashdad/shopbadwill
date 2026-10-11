@@ -1208,6 +1208,9 @@ describe('C1: caps through the precomputed CapsResult', () => {
     ['an ended auction', { endTime: iso(ARM_AT - 1) }],
     ['an auction ending right now', { endTime: iso(ARM_AT) }],
     ['a recorded send', { attempt: { sentAt: ARM_AT - 5 } }],
+    // T-80b: a stale not-sent proof would keep this attempt's Unconfirmed
+    // outcome out of spentToday (R4), so a draft must not carry one either.
+    ['a recorded not-sent proof', { attempt: { notSent: true } }],
   ])('arm rejects %s as invalid-snipe', (_label, over) => {
     expect(reduce(snipe(over), E.arm(), CAPS_OK, CTX).rejection?.reason).toBe('invalid-snipe');
   });
