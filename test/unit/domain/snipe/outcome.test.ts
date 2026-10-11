@@ -495,7 +495,9 @@ describe('T-80b: a sent snipe judged with no read at all', () => {
     expect(r.outcome).toBe('won');
     expect(r.final).toBe(false);
     expect(r.stamp).toBeNull();
-    expect(r.notify.message).toContain('leading when the bid went in');
+    expect(r.notify.title).toMatch(/^Leading:/);
+    expect(r.notify.message).toMatch(/^Leading when the bid went in/);
+    expect(r.notify.message).not.toMatch(/^Won/);
     expect(r.notify.message).toContain('the item could not be read');
     expect(r.notify.message).not.toContain('still open');
     expect(r.notify.message).not.toContain('re-reading');
@@ -514,7 +516,7 @@ describe('T-80b: a sent snipe judged with no read at all', () => {
 
   it('with a read, the open-auction copy is unchanged', () => {
     const open = detail({ isClosed: false, serverTime: new Date(END_MS - 2000).toISOString(), isHighBidder: true, currentPrice: 1800 });
-    expect(classifyOutcome(snipe(), bid('accepted'), open).notify.message).toContain('Won (leading; auction still open) at $18.00');
+    expect(classifyOutcome(snipe(), bid('accepted'), open).notify.message).toContain('Leading (auction still open) at $18.00');
     expect(classifyOutcome(snipe(), null, detail({ currentPrice: 1500 })).notify.message).toContain('re-reading the item');
   });
 });

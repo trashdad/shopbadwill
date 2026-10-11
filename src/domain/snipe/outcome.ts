@@ -360,8 +360,9 @@ export function classifyOutcome(
     const at = price !== undefined ? ` at ${formatMoney(price)}` : '';
     if (v.outcome === 'won') {
       outcome = 'won';
-      heading = 'Won';
-      message = `Won${final ? '' : unread ? ' (leading when the bid went in)' : ' (leading; auction still open)'}${at} (your max ${max}).${via}`;
+      // Not final means nothing proves the win yet: say "Leading", never "Won".
+      heading = final ? 'Won' : 'Leading';
+      message = `${final ? 'Won' : unread ? 'Leading when the bid went in' : 'Leading (auction still open)'}${at} (your max ${max}).${via}`;
       detail = `Won; ${v.how}.${rawNote}`;
       stampAs = final ? 'won' : null;
     } else if (v.outcome === 'outbid') {
