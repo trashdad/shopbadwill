@@ -1,0 +1,316 @@
+// T-55: the Watches options section, driven through FakeMessaging.
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { h } from 'preact';
+import { afterEach, describe, expect, it } from 'vitest';
+
+import type { AuthStatus } from '../../src/domain/calendar/types';
+import type { Rule } from '../../src/domain/rules/schema';
+import { defaultSettings } from '../../src/domain/settings/defaults';
+import { WatchSchema, type Watch } from '../../src/domain/watches/schema';
+import { loadSections } from '../../src/entrypoints/options/registry';
+import { section, WatchesSection } from '../../src/entrypoints/options/sections/watches';
+import { MATCH_ALL_RULE_ID } from '../../src/entrypoints/options/sections/watches/draft';
+import { MessagingError } from '../../src/messaging/errors';
+import { FakeMessaging } from '../fakes/ports/fake-messaging';
+
+afterEach(cleanup);
+
+const NOW = 1_800_000_000_000;
+const TAB = 'https://shopgoodwill.com/categories/listing?st=pyrex&p=3&catIds=12&cln=4&lp=5&layout=grid';
+
+const auth = (connected: boolean): AuthStatus => ({
+  connected,
+  provider: 'pkce',
+  grantedScopes: [],
+  needsInteraction: false,
+  configured: true,
+});
+
+const rule = (id: string, over: Partial<Rule> = {}): Rule => ({
+  id,
+  name: `Rule ${id}`,
+  enabled: true,
+  action: 'highlight',
+  all: [{ kind: 'price', max: 5000 }],
+  createdAt: 1,
+  updatedAt: 1,
+  ...over,
+});
+
+interface Opts {
+  tab?: string | undefined;
+  rules?: Rule[];
+  connected?: boolean;
+  calendarEnabled?: boolean;
+  noWatchHandlers?: boolean;
+}
+
+function app(opts: Opts = {}) {
+  const fake = new FakeMessaging();
+  const store: Watch[] = [];
+  const rules = [...(opts.rules ?? [])];
+  const settings = defaultSettings();
+  settings.calendar.enabled = opts.calendarEnabled ?? true;
+  fake.handle('settings.get', () => settings);
+  fake.handle('calendar.status', () => auth(opts.connected ?? true));
+  fake.handle('rules.list', () => rules);
+  fake.handle('rules.save', (r) => {
+    rules.push(r);
+    return undefined;
+  });
+  if (opts.noWatchHandlers !== true) {
+    fake.handle('watches.list', () => store);
+    fake.handle('watches.save', (w) => {
+      const i = store.findIndex((x) => x.id === w.id);
+      if (i >= 0) store[i] = w;
+      else store.push(w);
+      return undefined;
+    });
+    fake.handle('watches.delete', ({ id }) => {
+      const i = store.findIndex((x) => x.id === id);
+      if (i >= 0) store.splice(i, 1);
+      return undefined;
+    });
+  }
+  let n = 0;
+  render(
+    h(WatchesSection, {
+      client: fake,
+      now: () => NOW,
+      newId: () => `w${String(++n)}`,
+      timeZone: 'America/Los_Angeles',
+      getActiveTabUrl: () => Promise.resolve('tab' in opts ? opts.tab : TAB),
+    }),
+  );
+  return { fake, store, rules };
+}
+
+const click = (name: string | RegExp): void => {
+  fireEvent.click(screen.getByRole('button', { name }));
+};
+
+async function openForm(): Promise<void> {
+  click('Use my current tab');
+  await screen.findByRole('heading', { name: 'New watch' });
+}
+
+describe('options: Watches', () => {
+  it('registers as a section', () => {
+    expect(loadSections({ 'x/index.tsx': { section } })[0]?.id).toBe('watches');
+  });
+
+  it('produces a schema-valid, normalized Watch with the sgw default', async () => {
+    const { store } = app({ rules: [rule('a'), rule('b')] });
+    await openForm();
+    expect(screen.getByLabelText<HTMLInputElement>(/Favorite on ShopGoodwill right away/).checked).toBe(true);
+    expect(screen.getByLabelText<HTMLInputElement>('Name').value).toBe('pyrex');
+    fireEvent.click(screen.getByLabelText('Rule a'));
+    fireEvent.change(screen.getByLabelText('Pages to search'), { target: { value: '2' } });
+    click('Save watch');
+    await waitFor(() => {
+      expect(store).toHaveLength(1);
+    });
+    const w = store[0] as Watch;
+    expect(WatchSchema.safeParse(w).success).toBe(true);
+    expect(w).toMatchObject({
+      id: 'w1',
+      name: 'pyrex',
+      enabled: true,
+      ruleIds: ['a'],
+      maxPages: 2,
+      favoriteMode: 'sgw',
+      calendar: false,
+      seenItemIds: [],
+    });
+    expect(w.query.page).toBe(1);
+    expect(Object.keys(w.query.extra ?? {})).not.toContain('catIds');
+    expect(Object.keys(w.query.extra ?? {})).not.toContain('cln');
+    expect(w.nextRunAt).toBeGreaterThan(NOW);
+    expect(w.favoriteWithinHours).toBeUndefined();
+  });
+
+  it('refuses to save a query with unparsed params and names the keys', async () => {
+    const { store } = app({ tab: 'https://shopgoodwill.com/categories/listing?st=a&lp=cheap' });
+    click('Use my current tab');
+    const alert = await screen.findByText(/could not read: lp/);
+    expect(alert.closest('[role="alert"]')).not.toBeNull();
+    expect(screen.queryByRole('heading', { name: 'New watch' })).toBeNull();
+    expect(store).toHaveLength(0);
+  });
+
+  it('shows a clear error for a non-search tab and offers paste when the URL is unreadable', async () => {
+    app({ tab: 'https://shopgoodwill.com/item/123' });
+    click('Use my current tab');
+    expect((await screen.findByText(/not a ShopGoodwill search page/)).closest('[role="alert"]')).not.toBeNull();
+    cleanup();
+    app({ tab: undefined });
+    click('Use my current tab');
+    await screen.findByText(/Paste the search address below/);
+    fireEvent.input(screen.getByLabelText('ShopGoodwill search address'), { target: { value: TAB } });
+    click('Use this address');
+    await screen.findByRole('heading', { name: 'New watch' });
+  });
+
+  it('rejects other hosts', async () => {
+    app({ tab: 'https://evil.example/categories/listing?st=a' });
+    click('Use my current tab');
+    await screen.findByText(/not a ShopGoodwill search page/);
+  });
+
+  it('warns on a rule-less watch, allows saving it, and offers match-everything', async () => {
+    const { store, rules } = app();
+    await openForm();
+    expect(screen.getByText('No rules: this watch will never match.')).toBeTruthy();
+    click('Match everything new in this search');
+    await waitFor(() => {
+      expect(rules.map((r) => r.id)).toEqual([MATCH_ALL_RULE_ID]);
+    });
+    expect(rules[0]?.all).toEqual([{ kind: 'price', min: 0 }]);
+    await waitFor(() => {
+      expect(screen.queryByText('No rules: this watch will never match.')).toBeNull();
+    });
+    click('Save watch');
+    await waitFor(() => {
+      expect(store[0]?.ruleIds).toEqual([MATCH_ALL_RULE_ID]);
+    });
+  });
+
+  it('saves a rule-less watch after the warning', async () => {
+    const { store } = app();
+    await openForm();
+    screen.getByText('No rules: this watch will never match.');
+    click('Save watch');
+    await waitFor(() => {
+      expect(store).toHaveLength(1);
+    });
+    expect(store[0]?.ruleIds).toEqual([]);
+    expect(await screen.findAllByText('No rules: this watch will never match.')).toHaveLength(1);
+  });
+
+  it('explains the favorite modes and saves sgw-late with hours', async () => {
+    const { store } = app();
+    await openForm();
+    expect(screen.getByText(/attract other bidders/)).toBeTruthy();
+    expect(screen.getByText(/nothing is written to your ShopGoodwill account/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(/shortly before the auction ends/));
+    fireEvent.input(screen.getByLabelText('Hours before the end'), { target: { value: '0' } });
+    click('Save watch');
+    await screen.findByText(/greater than zero/);
+    expect(store).toHaveLength(0);
+    fireEvent.input(screen.getByLabelText('Hours before the end'), { target: { value: '4' } });
+    click('Save watch');
+    await waitFor(() => {
+      expect(store[0]).toMatchObject({ favoriteMode: 'sgw-late', favoriteWithinHours: 4 });
+    });
+  });
+
+  it('disables the calendar toggle with a hint unless Google is connected and calendar is enabled', async () => {
+    app({ connected: false });
+    await openForm();
+    await waitFor(() => {
+      expect(screen.getByText(/Connect Google Calendar/)).toBeTruthy();
+    });
+    expect(screen.getByLabelText<HTMLInputElement>('Add matches to my calendar').disabled).toBe(true);
+    cleanup();
+    app({ calendarEnabled: false });
+    await openForm();
+    await screen.findByText(/turned off in Settings/);
+    expect(screen.getByLabelText<HTMLInputElement>('Add matches to my calendar').disabled).toBe(true);
+    cleanup();
+    const { store } = app();
+    await openForm();
+    await waitFor(() => {
+      expect(screen.getByLabelText<HTMLInputElement>('Add matches to my calendar').disabled).toBe(false);
+    });
+    fireEvent.click(screen.getByLabelText('Add matches to my calendar'));
+    click('Save watch');
+    await waitFor(() => {
+      expect(store[0]?.calendar).toBe(true);
+    });
+  });
+
+  it('import is user-triggered, reports counts, reloads and is idempotent (no duplicates)', async () => {
+    const fake = new FakeMessaging();
+    const store: Watch[] = [];
+    const saved = ['pyrex', 'corelle', 'pyrex'];
+    const hash = (q: Watch['query']): string => JSON.stringify([q.searchText, q.categoryIds, q.sellerIds]);
+    fake.handle('settings.get', () => defaultSettings());
+    fake.handle('calendar.status', () => auth(false));
+    fake.handle('rules.list', () => []);
+    fake.handle('watches.list', () => store);
+    fake.handle('watches.importSaved', () => {
+      let imported = 0;
+      let skipped = 0;
+      for (const t of saved) {
+        const query = { searchText: t, categoryIds: [], sellerIds: [], page: 1 };
+        if (store.some((w) => hash(w.query) === hash(query))) {
+          skipped++;
+          continue;
+        }
+        store.push({
+          id: `i-${t}`, name: t, enabled: true, query, ruleIds: [], maxPages: 1, favoriteMode: 'sgw',
+          calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
+        });
+        imported++;
+      }
+      return { imported, skipped };
+    });
+    render(h(WatchesSection, { client: fake, now: () => NOW }));
+    await screen.findByText('You have no watches yet.');
+    expect(fake.sent.some((s) => s.type === 'watches.importSaved')).toBe(false);
+    click(/Import my saved searches/);
+    await screen.findByText(/Imported 2 saved searches. Skipped 1/);
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+    click(/Import my saved searches/);
+    await screen.findByText(/Imported 0 saved searches. Skipped 3/);
+    expect(screen.getAllByRole('listitem')).toHaveLength(2);
+    expect(fake.sent.filter((s) => s.type === 'watches.importSaved')).toHaveLength(2);
+  });
+
+  it('says so when the watches handler is missing', async () => {
+    app({ noWatchHandlers: true });
+    expect((await screen.findByText(/Watches are not available yet/)).closest('[role="status"]')).not.toBeNull();
+    await openForm();
+    click('Save watch');
+    await waitFor(() => {
+      const err = screen.getAllByText(/Could not save the watch\. Watches are not available yet/);
+      expect(err.some((e) => e.closest('[role="alert"]') !== null)).toBe(true);
+    });
+  });
+
+  it('renders search terms as text only', async () => {
+    app({ tab: 'https://shopgoodwill.com/categories/listing?st=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E' });
+    await openForm();
+    expect(document.querySelector('img')).toBeNull();
+    expect(screen.getByTestId('watch-query').textContent).toContain('<img');
+  });
+
+  it('lists, toggles and deletes a watch with keyboard-reachable buttons', async () => {
+    const { store } = app();
+    await openForm();
+    click('Save watch');
+    await screen.findByRole('list', { name: 'Your watches' });
+    fireEvent.click(screen.getByRole('switch', { name: 'Watch "pyrex" is on' }));
+    await waitFor(() => {
+      expect(store[0]?.enabled).toBe(false);
+    });
+    click('Delete pyrex');
+    click('Confirm delete pyrex');
+    await waitFor(() => {
+      expect(store).toHaveLength(0);
+    });
+  });
+
+  it('shows a handler error as an alert', async () => {
+    const { fake } = app();
+    await openForm();
+    // a failing save: swap by sending through a MessagingError-throwing client
+    const orig = fake.send.bind(fake);
+    fake.send = ((type: string, payload: unknown) =>
+      type === 'watches.save'
+        ? Promise.reject(new MessagingError('handler_error', 'disk full'))
+        : orig(type as never, payload as never));
+    click('Save watch');
+    expect((await screen.findByText(/disk full/)).closest('[role="alert"]')).not.toBeNull();
+  });
+});
