@@ -171,6 +171,8 @@ describe('noteDryRunComplete (which outcomes count)', () => {
   it('never counts a live snipe', async () => {
     expect(await noteDryRunComplete(deps, dry({ dryRun: false, outcome: 'won' }))).toBe('ignored');
     expect(await noteDryRunComplete(deps, dry({ id: 'live-late', dryRun: false, outcome: 'late' }))).toBe('ignored');
+    // Even a live record that claims the dry-run outcome is not counted.
+    expect(await noteDryRunComplete(deps, dry({ id: 'live-odd', dryRun: false, outcome: 'dry-run' }))).toBe('ignored');
     expect(await completed()).toBe(0);
     expect(await storage.local.get(DRY_RUN_COUNTED_KEY)).toBeUndefined();
   });

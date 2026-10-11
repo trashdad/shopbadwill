@@ -74,6 +74,12 @@ describe('percentile (nearest-rank, documented in soak.ts)', () => {
     expect([50, 95, 99].map((p) => percentile([1, 1, 1, 1], p))).toEqual([1, 1, 1]);
   });
 
+  it('rounds the rank up, never to the nearest: p95 of 1..11 is 11, p99 of 1..51 is 51', () => {
+    // 0.95 × 11 = 10.45 and 0.99 × 51 = 50.49: a rounded rank would pick 10 and 50.
+    expect(percentile(Array.from({ length: 11 }, (_, i) => i + 1), 95)).toBe(11);
+    expect(percentile(Array.from({ length: 51 }, (_, i) => i + 1), 99)).toBe(51);
+  });
+
   it('returns null for no values and does not mutate its input', () => {
     expect(percentile([], 99)).toBeNull();
     const input = [3, 1, 2];
