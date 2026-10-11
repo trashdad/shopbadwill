@@ -88,7 +88,16 @@ function Invoke-SbwCancel {
     $taskName = Get-SbwTaskName -SnipeId ([string]$Msg.snipeId)
     if ($taskName -cnotmatch $SbwTaskNameRegex) { return New-SbwErrorResponse -Op 'cancel' -Error 'bad-request' }
     $run = Invoke-SchTasks -SchTasksPath ([string]$Config.schtasksPath) -ArgList (Get-SbwCancelArgs -TaskName $taskName)
-    $alreadyGone = $run.Output -match 'cannot find'
+    $alreadyGone = $false
+    if ($run.ExitCode -ne 0) {
+      # schtasks' "cannot find" text is localized, so ask again: a failed
+      # delete is a failure only if the task can still be queried.
+      $alreadyGone = $run.Output -match 'cannot find'
+      if (-not $alreadyGone) {
+        $probe = Invoke-SchTasks -SchTasksPath ([string]$Config.schtasksPath) -ArgList (Get-SbwQueryArgs -TaskName $taskName)
+        $alreadyGone = ($probe.ExitCode -ne 0)
+      }
+    }
     if ($run.ExitCode -ne 0 -and -not $alreadyGone) {
       [Console]::Error.WriteLine("Sbw cancel failed: $($run.Output)")
       return New-SbwErrorResponse -Op 'cancel' -Error 'schtasks-failed'

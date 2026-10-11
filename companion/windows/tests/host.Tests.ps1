@@ -20,6 +20,13 @@ Describe 'companion host' {
       if ($ArgList -ccontains '/Delete' -and $script:sbwDeleteMissing) {
         return @{ ExitCode = 1; Output = 'ERROR: The system cannot find the file specified.' }
       }
+      # A non-English Windows: same exit code, localized text.
+      if ($script:sbwLocalizedMissing -and ($ArgList -ccontains '/Delete' -or $ArgList -ccontains '/Query')) {
+        return @{ ExitCode = 1; Output = 'FEHLER: Das System kann die angegebene Datei nicht finden.' }
+      }
+      if ($ArgList -ccontains '/Delete' -and $script:sbwDeleteDenied) {
+        return @{ ExitCode = 1; Output = 'ERROR: Access is denied.' }
+      }
       if ($script:sbwSchTasksFail) { return @{ ExitCode = 1; Output = 'ERROR: boom.' } }
       @{ ExitCode = 0; Output = '' }
     }
@@ -61,6 +68,8 @@ Describe 'companion host' {
       $script:sbwXml = $null
       $script:sbwQueryMissing = $false
       $script:sbwDeleteMissing = $false
+      $script:sbwLocalizedMissing = $false
+      $script:sbwDeleteDenied = $false
       $script:sbwSchTasksFail = $false
     }
 
@@ -185,12 +194,26 @@ Describe 'companion host' {
       $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"a"}' -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
       Assert-ArrayEqual $script:sbwCalls[0] @('/Delete', '/TN', 'ShopBadwill-a', '/F')
     }
-    It 'reports a real delete failure' {
+    It 'cancel of a task that is already gone is idempotent on a non-English Windows too' {
       Reset-SbwFakes
-      $script:sbwSchTasksFail = $true
-      $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"a"}' -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
+      $cfg = New-SbwTestConfig
+      $null = Invoke-SbwMessage -Json '{"op":"schedule","snipeId":"s1","wakeAtUtc":"2026-10-10T13:00:00.000Z","browser":"chrome","profile":"Default"}' -Config $cfg -Now (Get-SbwTestNow)
+      $script:sbwLocalizedMissing = $true
+      $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"s1"}' -Config $cfg -Now (Get-SbwTestNow)
+      Assert-Equal $resp.ok $true
+      Assert-Equal $script:sbwState.Count 0
+      Assert-ArrayEqual $script:sbwCalls[1] @('/Delete', '/TN', 'ShopBadwill-s1', '/F')
+      Assert-ArrayEqual $script:sbwCalls[2] @('/Query', '/TN', 'ShopBadwill-s1', '/FO', 'CSV', '/NH')
+    }
+    It 'reports a real delete failure (the task is still there) and keeps its state row' {
+      Reset-SbwFakes
+      $cfg = New-SbwTestConfig
+      $null = Invoke-SbwMessage -Json '{"op":"schedule","snipeId":"a","wakeAtUtc":"2026-10-10T13:00:00.000Z","browser":"chrome","profile":"Default"}' -Config $cfg -Now (Get-SbwTestNow)
+      $script:sbwDeleteDenied = $true
+      $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"a"}' -Config $cfg -Now (Get-SbwTestNow)
       Assert-Equal $resp.ok $false
       Assert-Equal $resp.error 'schtasks-failed'
+      Assert-Equal $script:sbwState.Count 1
     }
   }
 
