@@ -28,6 +28,7 @@ export class FakeMessaging implements MessagingClient {
   readonly sent: Array<{ type: MsgType; payload: unknown }> = [];
   private readonly handlers = new Map<MsgType, (payload: never) => unknown>();
   private readonly ports = new Map<PortName, Set<(t: never) => void>>();
+  private readonly gone = new Map<(t: never) => void, () => void>();
   private readonly broadcasts = new Map<MsgBroadcastType, Set<(p: never) => void>>();
 
   /** Registers the handler for `type`. Like router.register, a duplicate throws. */
@@ -61,13 +62,15 @@ export class FakeMessaging implements MessagingClient {
     return checked.data as MsgReply<K>;
   }
 
-  connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void): () => void {
+  connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void, onDisconnect?: () => void): () => void {
     const set = this.ports.get(name) ?? new Set();
     this.ports.set(name, set);
     const cb = onTick as (t: never) => void;
     set.add(cb);
+    if (onDisconnect !== undefined) this.gone.set(cb, onDisconnect);
     return () => {
       set.delete(cb);
+      this.gone.delete(cb);
     };
   }
 
@@ -91,6 +94,17 @@ export class FakeMessaging implements MessagingClient {
   broadcast<K extends MsgBroadcastType>(type: K, payload: MsgPayload<K>): void {
     MsgSchema.parse(payload === undefined ? { type } : { type, payload });
     for (const cb of [...(this.broadcasts.get(type) ?? [])]) cb(structuredClone(payload) as never);
+  }
+
+  /** Test helper: the background goes away (worker restart). Every open port of that name closes and its onDisconnect fires. */
+  disconnectPorts(name: PortName): void {
+    const set = this.ports.get(name) ?? new Set();
+    for (const cb of [...set]) {
+      set.delete(cb);
+      const g = this.gone.get(cb);
+      this.gone.delete(cb);
+      g?.();
+    }
   }
 
   /** Test helper: how many ports of that name are open. */
