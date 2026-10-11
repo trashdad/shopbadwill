@@ -27,6 +27,7 @@ import {
   runFailures,
   runnerFor,
   SGW_HOST_ORIGINS,
+  type StepResult,
 } from '../../src/background/jobs/daily-job-runner';
 import { CATCH_UP_GRACE_MS, schedulerFor, TICK_ALARM, TICK_PERIOD_MINUTES } from '../../src/background/jobs/scheduler';
 import { FAVORITE_SKIP_PREFIX } from '../../src/background/jobs/steps/favorite';
@@ -39,10 +40,10 @@ import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { STORAGE_KEYS, STORAGE_LIMITS } from '../../src/domain/storage/schema';
 import type { AuditEntry } from '../../src/domain/audit/types';
-import { DEFAULT_LANES, type SgwSessionRecord, type TrackedItem } from '../../src/domain/types';
+import { DEFAULT_LANES, type Lane, type SgwSessionRecord, type TrackedItem } from '../../src/domain/types';
 import type { JobRun, Watch } from '../../src/domain/watches/schema';
 import { PORT_NAMES } from '../../src/messaging/protocol';
-import { HttpNetworkError } from '../../src/ports/errors';
+import { HttpNetworkError, SgwApiError } from '../../src/ports/errors';
 import type { HttpRequest } from '../../src/ports/http';
 import { loadFixture } from '../contract/sgw/fixtures';
 import { FakeAlarms } from '../fakes/ports/fake-alarms';
@@ -705,6 +706,30 @@ describe('R3: one run at a time', () => {
     expect(h.ctx.scheduler.stats().lanes.interactive.usedToday).toBeGreaterThan(0);
   });
 
+  it('between two Run now drain steps (no step in flight) a tick is still busy: the draining flag alone guards it', async () => {
+    const h = await ready({ watches: [watch('w1')] });
+    const runner = runnerFor(h.ctx);
+    // White box: the drain's step is parked without entering step(), so the step
+    // counter stays 0, as it is for a moment between two drain steps. Only the
+    // draining flag can refuse the tick now (the test above cannot tell the two apart).
+    const internals = runner as unknown as { step: (lane: Lane) => Promise<StepResult> };
+    const realStep = internals.step.bind(runner);
+    let endDrain: (r: StepResult) => void = () => undefined;
+    const parked = new Promise<StepResult>((resolve) => {
+      endDrain = resolve;
+    });
+    vi.spyOn(internals, 'step').mockImplementation((lane) => (lane === 'interactive' ? parked : realStep(lane)));
+    expect(await h.send('job.runNow', {})).toEqual({ ok: true });
+    expect(await runner.tick()).toBe('busy');
+    await h.advance(SEC);
+    expect(h.sent).toEqual([]);
+    // Once the drain has ended, a tick steps on lane background again.
+    endDrain('idle');
+    await flush();
+    expect(await runner.tick()).toBe('stepped');
+    expect(h.sgw('search')).toHaveLength(1);
+    expect(h.ctx.scheduler.stats().lanes.background.usedToday).toBe(1);
+  });
 });
 
 // ── R4: carries ─────────────────────────────────────────────────────────────
@@ -857,6 +882,18 @@ describe('carries: DailyJob wiring', () => {
     expect(await step).toBe('stepped');
     expect(h.lastRun()).toMatchObject({ status: 'paused', cursor: 0 });
     expect(h.lastRun()?.results.errors).toEqual([expect.objectContaining({ step: 0, message: expect.stringMatching(/^search: /) as unknown })]);
+  });
+
+  it('an executor refused for budget after the gate let the step through is not run', async () => {
+    // E.g. a higher-priority request took the lane's last request while this one was queued.
+    const h = await ready({ watches: [watch('w1', { nextRunAt: T0 - MIN })] });
+    vi.spyOn(h.ctx.api, 'search').mockRejectedValueOnce(
+      new SgwApiError('budget', 'background lane has used its daily budget of 1 requests', { retryAfterMs: HOUR }),
+    );
+    expect(await runnerFor(h.ctx).tick()).toBe('not-run');
+    expect(h.sent).toEqual([]);
+    expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 0 });
+    expect(h.lastRun()?.results.errors).toEqual([]);
   });
 
   it('a retryable failure pauses the run; resume(run) retries once the lane backoff ends; three failures skip the step', async () => {
