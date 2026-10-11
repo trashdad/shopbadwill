@@ -7,7 +7,11 @@
 // veto refuses the write with the interceptor's message.
 //
 // It never changes `killSwitch`: kill.set and the shortcut own it (R3), so a
-// stale whole-settings object can never resume automation. The new settings
+// stale whole-settings object can never resume automation. For the same
+// reason it never changes `snipe.completedDryRuns` (T-90): the dry-run counter
+// owns it, and live bidding is gated on it. A page that sends back its whole
+// `snipe` group cannot roll the count back with a stale copy, nor raise it.
+// The interceptors see the kept count in `next`. The new settings
 // reach the switches (dry-run) and the scheduler (considerate mode) before the
 // reply, not only when storage.onChanged arrives.
 import { SettingsSchema, type Settings } from '../../domain/settings/schema';
@@ -28,7 +32,11 @@ export async function applySettingsPatch(ctx: BackgroundContext, patch: Partial<
     const current = await ctx.repo.get(STORAGE_KEYS.settings);
     const groups: Partial<Settings> = { ...patch };
     delete groups.killSwitch;
-    const merged = SettingsSchema.parse({ ...current, ...groups, killSwitch: current.killSwitch });
+    const draft = { ...current, ...groups, killSwitch: current.killSwitch };
+    const merged = SettingsSchema.parse({
+      ...draft,
+      snipe: { ...draft.snipe, completedDryRuns: current.snipe.completedDryRuns },
+    });
     await ctx.interceptors.settingsSet.check({ patch, current, next: merged, sender: hctx });
     await ctx.repo.set(STORAGE_KEYS.settings, merged);
     return merged;
