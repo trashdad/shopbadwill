@@ -4,7 +4,7 @@
   See docs/COMPANION.md. It deletes only scheduled tasks named
   `ShopBadwill-<snipeId>` (controller ruling R2), unregisters the
   native-messaging host for both browsers, and removes the companion data
-  directory. Power settings are never touched: any manual power-plan changes
+  directory (including the private host copy in host\). Power settings are never touched: any manual power-plan changes
   are yours to revert (COMPANION.md).
 
 .EXAMPLE
@@ -104,6 +104,14 @@ function Get-SbwStateTaskNames {
   }
 }
 
+# Removes a directory only when it exists and is empty.
+function Remove-SbwEmptyDir {
+  param([string]$Path, [string]$What)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+  if (@(Get-ChildItem -LiteralPath $Path -Force).Count -gt 0) { return }
+  if ($PSCmdlet.ShouldProcess($Path, $What)) { Remove-Item -LiteralPath $Path -Force }
+}
+
 function Invoke-SbwUninstall {
   $dataDir = Get-SbwUninstallDataDir
   $hostName = Get-SbwHostName
@@ -145,16 +153,25 @@ function Invoke-SbwUninstall {
       if ($PSCmdlet.ShouldProcess($p, 'delete companion data file')) { Remove-Item -LiteralPath $p -Force }
     }
   }
+  $hostDir = Join-Path $dataDir 'host'
+  foreach ($file in @(Get-SbwHostFileNames)) {
+    $p = Join-Path $hostDir $file
+    if (Test-Path -LiteralPath $p) {
+      if ($PSCmdlet.ShouldProcess($p, 'delete the private host copy')) { Remove-Item -LiteralPath $p -Force }
+    }
+  }
+  Remove-SbwEmptyDir -Path $hostDir -What 'remove the now-empty host copy directory'
   if (Test-Path -LiteralPath $dataDir) {
     foreach ($p in @(Get-ChildItem -LiteralPath $dataDir -Filter 'ShopBadwill-*.xml' -ErrorAction SilentlyContinue)) {
       if ($p.BaseName -cnotmatch $SbwTaskNameRegex) { continue }
       if ($PSCmdlet.ShouldProcess($p.FullName, 'delete generated task XML')) { Remove-Item -LiteralPath $p.FullName -Force }
     }
-    if (-not @(Get-ChildItem -LiteralPath $dataDir -Force)) {
-      if ($PSCmdlet.ShouldProcess($dataDir, 'remove the now-empty companion data directory')) {
-        Remove-Item -LiteralPath $dataDir -Force
-      }
-    }
+  }
+  Remove-SbwEmptyDir -Path $dataDir -What 'remove the now-empty companion data directory'
+  # install created %LOCALAPPDATA%\ShopBadwill along with ...\companion.
+  $parent = Split-Path -Parent $dataDir
+  if ($parent -and (Split-Path -Leaf $parent) -ceq 'ShopBadwill') {
+    Remove-SbwEmptyDir -Path $parent -What 'remove the now-empty ShopBadwill folder'
   }
 
   if (-not $WhatIfPreference) {

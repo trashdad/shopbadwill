@@ -162,19 +162,111 @@ Describe 'companion install and uninstall' {
   }
 
   Context 'launcher .cmd content' {
-    It 'invokes powershell.exe with the host script and config, quoted' {
-      $content = Get-SbwLauncherContent -PowerShellExe 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
-        -HostScriptPath 'C:\tools\shopbadwill\companion\windows\host\shopbadwill-host.ps1' `
-        -ConfigPath 'C:\Users\me\AppData\Local\ShopBadwill\companion\config.json'
+    It 'runs the private host copy next to it through the system PowerShell' {
+      $content = Get-SbwLauncherContent
       Assert-Match $content '@echo off'
-      Assert-Match $content '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File'
-      Assert-Match $content ([regex]::Escape('"C:\tools\shopbadwill\companion\windows\host\shopbadwill-host.ps1"'))
-      Assert-Match $content ([regex]::Escape('-ConfigPath "C:\Users\me\AppData\Local\ShopBadwill\companion\config.json"'))
+      Assert-Match $content ([regex]::Escape('"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File'))
+      Assert-Match $content ([regex]::Escape('-File "%~dp0host\shopbadwill-host.ps1" -ConfigPath "%~dp0config.json"'))
+    }
+    It 'is pure ASCII, so cmd.exe reads it the same in any code page' {
+      # cmd.exe decodes a batch file in the OEM code page; a UTF-8 profile path
+      # such as C:\Users\Jos<e-acute> would be garbled. %~dp0 expands at run time.
+      Assert-True ((Get-SbwLauncherContent) -cmatch '^[\x00-\x7F]*$')
     }
     It 'keeps the content on two lines only (nothing else writes to stdout)' {
-      $content = Get-SbwLauncherContent -PowerShellExe 'pwsh.exe' -HostScriptPath 'h.ps1' -ConfigPath 'c.json'
+      $content = Get-SbwLauncherContent
       $lines = @($content -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 })
       Assert-Equal $lines.Count 2
+    }
+  }
+
+  Context 'install runs a private host copy, uninstall removes it all' {
+    It 'copies the host scripts under the data dir and never points at the checkout' {
+      $tmp = New-TestTempDir
+      try {
+        $fakeChrome = Join-Path $tmp 'chrome.exe'
+        [IO.File]::WriteAllText($fakeChrome, '')
+        $data = Join-Path $tmp 'ShopBadwill\companion'
+        $script:sbwRegCalls = @()
+        $ChromeExtensionId = 'abcdefghijklmnopabcdefghijklmnop'
+        $ChromeProfile = 'Default'
+        $FirefoxProfile = ''
+        $ChromeExe = $fakeChrome
+        $FirefoxExe = ''
+        $SourceDir = ''
+        $DataDir = $data
+        Invoke-SbwInstall 6>$null | Out-Null
+
+        foreach ($n in @(Get-SbwHostFileNames)) {
+          $copy = Join-Path $data "host\$n"
+          Assert-True (Test-Path -LiteralPath $copy) "missing private copy of $n"
+          Assert-Equal ([IO.File]::ReadAllText($copy)) (Get-SbwTestText "..\host\$n") $n
+        }
+        Assert-ArrayEqual @(Get-SbwHostFileNames) @('shopbadwill-host.ps1', 'protocol.ps1', 'task-xml.ps1', 'io.ps1')
+        $launcher = [IO.File]::ReadAllText((Join-Path $data 'shopbadwill-host.cmd'))
+        Assert-Equal $launcher (Get-SbwLauncherContent)
+        $checkout = [IO.Path]::GetFullPath((Get-SbwTestPath '..'))
+        Assert-False ($launcher.IndexOf($checkout, [StringComparison]::OrdinalIgnoreCase) -ge 0) 'launcher names the checkout'
+        $manifest = [IO.File]::ReadAllText((Join-Path $data 'chrome-manifest.json')) | ConvertFrom-Json
+        Assert-Equal $manifest.path (Join-Path $data 'shopbadwill-host.cmd')
+        Assert-Equal $script:sbwRegCalls.Count 1
+      } finally {
+        Remove-TestTempDir $tmp
+      }
+    }
+    It 'uninstall after install leaves no file, folder, task, or host key behind' {
+      $tmp = New-TestTempDir
+      try {
+        $fakeChrome = Join-Path $tmp 'chrome.exe'
+        [IO.File]::WriteAllText($fakeChrome, '')
+        $data = Join-Path $tmp 'ShopBadwill\companion'
+        $ChromeExtensionId = 'abcdefghijklmnopabcdefghijklmnop'
+        $ChromeProfile = 'Default'
+        $FirefoxProfile = 'default-release'
+        $ChromeExe = $fakeChrome
+        $FirefoxExe = $fakeChrome
+        $SourceDir = ''
+        $DataDir = $data
+        $script:sbwRegCalls = @()
+        Invoke-SbwInstall 6>$null | Out-Null
+        Assert-Equal $script:sbwRegCalls.Count 2
+        # A schedule the host would have made.
+        Set-Content -LiteralPath (Join-Path $data 'ShopBadwill-s1.xml') -Value '<Task/>' -Encoding ASCII
+        @{ version = 1; tasks = @(@{ snipeId = 's1'; taskName = 'ShopBadwill-s1' }) } |
+          ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $data 'state.json') -Encoding ASCII
+
+        $script:SbwUninstallDataDir = $data
+        $script:sbwSchtasksCalls = @()
+        $script:sbwQueryCsv = ''
+        $script:sbwRegCalls = @()
+        Invoke-SbwUninstall 6>$null | Out-Null
+
+        Assert-False (Test-Path -LiteralPath $data) 'data dir left behind'
+        Assert-False (Test-Path -LiteralPath (Join-Path $tmp 'ShopBadwill')) 'empty ShopBadwill parent left behind'
+        Assert-ArrayEqual @(Get-ChildItem -LiteralPath $tmp -Force | ForEach-Object { $_.Name }) @('chrome.exe')
+        Assert-Equal $script:sbwRegCalls.Count 2
+        $deleted = @($script:sbwSchtasksCalls | ForEach-Object { $a = @($_); if ($a -ccontains '/Delete') { $a[2] } })
+        Assert-ArrayEqual $deleted @('ShopBadwill-s1')
+      } finally {
+        Remove-TestTempDir $tmp
+      }
+    }
+    It 'uninstall keeps a ShopBadwill parent folder that still holds something else' {
+      $tmp = New-TestTempDir
+      try {
+        $parent = Join-Path $tmp 'ShopBadwill'
+        $data = Join-Path $parent 'companion'
+        New-Item -ItemType Directory -Path $data -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $parent 'other.txt') -Value 'keep' -Encoding ASCII
+        $script:SbwUninstallDataDir = $data
+        $script:sbwSchtasksCalls = @()
+        $script:sbwQueryCsv = ''
+        Invoke-SbwUninstall 6>$null | Out-Null
+        Assert-False (Test-Path -LiteralPath $data)
+        Assert-True (Test-Path -LiteralPath (Join-Path $parent 'other.txt'))
+      } finally {
+        Remove-TestTempDir $tmp
+      }
     }
   }
 

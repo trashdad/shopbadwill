@@ -9,7 +9,8 @@
 .DESCRIPTION
   What it changes (all per-user, all reversible with uninstall.ps1):
     - %LOCALAPPDATA%\ShopBadwill\companion\   (config.json, host manifests,
-      shopbadwill-host.cmd launcher, state)
+      shopbadwill-host.cmd launcher, state, and host\ = a private copy of
+      the host scripts; the browser runs that copy, never the checkout)
     - HKCU\Software\Google\Chrome\NativeMessagingHosts\com.shopbadwill.companion
     - HKCU\Software\Mozilla\NativeMessagingHosts\com.shopbadwill.companion
   The host manifests allow ONLY the extension ids given here (controller
@@ -167,9 +168,20 @@ function Invoke-SbwReg {
 # this two-line launcher. Chrome runs non-executable hosts through cmd.exe;
 # Firefox documents batch-file hosts (MDN, Native_messaging). @echo off keeps
 # everything except the host's frames off stdout.
+# The launcher runs the private host copy next to it (%~dp0 is the launcher's
+# own folder) with the system PowerShell, so it names no absolute path: the
+# checkout can move or change without affecting the installed host, and the
+# file stays ASCII (cmd.exe decodes batch files in the OEM code page).
 function Get-SbwLauncherContent {
-  param([string]$PowerShellExe, [string]$HostScriptPath, [string]$ConfigPath)
-  "@echo off`r`n`"$PowerShellExe`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$HostScriptPath`" -ConfigPath `"$ConfigPath`"`r`n"
+  "@echo off`r`n`"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"%~dp0host\shopbadwill-host.ps1`" -ConfigPath `"%~dp0config.json`"`r`n"
+}
+
+# The host scripts install copies into <data dir>\host. The default data dir
+# is under %LOCALAPPDATA%, which only this user, SYSTEM and Administrators can
+# write; a checkout under C:\ (e.g. C:\tools) is writable by every signed-in
+# user, so the browser must never run the host from there.
+function Get-SbwHostFileNames {
+  @('shopbadwill-host.ps1', 'protocol.ps1', 'task-xml.ps1', 'io.ps1')
 }
 
 # cmd.exe would mangle a path containing % or &, so refuse those locations.
@@ -210,16 +222,6 @@ function Get-SbwSchTasksPath {
   if ($c) { $c.Source } else { Join-Path $env:SystemRoot 'System32\schtasks.exe' }
 }
 
-function Get-SbwPowerShellExe {
-  $c = Get-Command powershell.exe -ErrorAction SilentlyContinue
-  if ($c) { $c.Source } else { Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
-}
-
-function Get-SbwHostScriptPath {
-  param([string]$SourceDir)
-  Join-Path $SourceDir 'host\shopbadwill-host.ps1'
-}
-
 function Invoke-SbwInstall {
   $sourceDir = $SourceDir
   if (-not $sourceDir) { $sourceDir = $PSScriptRoot }
@@ -249,9 +251,11 @@ function Invoke-SbwInstall {
     throw "Invalid -FirefoxExtensionId '$FirefoxExtensionId'."
   }
 
-  $hostScriptPath = Get-SbwHostScriptPath -SourceDir $sourceDir
-  if (-not (Test-Path -LiteralPath $hostScriptPath)) {
-    throw "Host script not found at '$hostScriptPath'. Run install.ps1 from the repo's companion\windows folder."
+  foreach ($n in @(Get-SbwHostFileNames)) {
+    $src = Join-Path $sourceDir "host\$n"
+    if (-not (Test-Path -LiteralPath $src)) {
+      throw "Host script not found at '$src'. Run install.ps1 from the repo's companion\windows folder."
+    }
   }
 
   $chromeExePath = $null
@@ -279,7 +283,7 @@ function Invoke-SbwInstall {
   $configPath = Join-Path $dataDir 'config.json'
   $chromeManifestPath = Join-Path $dataDir 'chrome-manifest.json'
   $firefoxManifestPath = Join-Path $dataDir 'firefox-manifest.json'
-  $powerShellExe = Get-SbwPowerShellExe
+  $hostDir = Join-Path $dataDir 'host'
 
   $config = [ordered]@{
     version      = 1
@@ -305,9 +309,15 @@ function Invoke-SbwInstall {
     [IO.File]::WriteAllText($configPath, $configJson, (New-Object Text.UTF8Encoding($false)))
   }
 
+  if ($PSCmdlet.ShouldProcess($hostDir, 'copy the host scripts (the browser runs this private copy)')) {
+    New-Item -ItemType Directory -Path $hostDir -Force | Out-Null
+    foreach ($n in @(Get-SbwHostFileNames)) {
+      Copy-Item -LiteralPath (Join-Path $sourceDir "host\$n") -Destination (Join-Path $hostDir $n) -Force
+    }
+  }
+
   if ($PSCmdlet.ShouldProcess($launcherPath, 'write the host launcher')) {
-    $launcher = Get-SbwLauncherContent -PowerShellExe $powerShellExe -HostScriptPath $hostScriptPath -ConfigPath $configPath
-    [IO.File]::WriteAllText($launcherPath, $launcher, (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($launcherPath, (Get-SbwLauncherContent), [Text.Encoding]::ASCII)
   }
 
   if ($ChromeProfile) {
