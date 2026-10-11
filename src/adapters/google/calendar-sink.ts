@@ -93,7 +93,7 @@ export const CALENDAR_SUMMARY = 'ShopGoodwill Auctions';
  * the calendar we created, and a crash after insert must not create a second one.
  */
 export const CALENDAR_MARKER = 'sbw:dedicated-calendar';
-const CALENDAR_DESCRIPTION = `Auction end times from ShopBadwill. ${CALENDAR_MARKER}`;
+export const CALENDAR_DESCRIPTION = `Auction end times from ShopBadwill. ${CALENDAR_MARKER}`;
 /** The calendarId of a link queued before any calendar exists. Re-homed when the calendar is created. */
 export const PENDING_CALENDAR_ID = 'pending';
 /** At most 1 Google request per second (R4). */
@@ -119,10 +119,15 @@ export function parseDeleteEventRef(ref: string): { itemId: ItemId; eventId: str
 
 // ── Limiter ─────────────────────────────────────────────────────────────────
 
-/** Serializes calls and keeps `minIntervalMs` between request starts (monotonic clock). */
+/**
+ * Serializes calls and starts each one at least `minIntervalMs` after the
+ * previous one ENDED (monotonic clock). Counting from the end, not the start,
+ * keeps the spacing true when one port call holds several HTTP attempts (the
+ * adapter's own retries, themselves at least 1 s apart, see GoogleCalendarApi).
+ */
 export class RequestLimiter {
   private tail: Promise<unknown> = Promise.resolve();
-  private lastStart = Number.NEGATIVE_INFINITY;
+  private lastDone = Number.NEGATIVE_INFINITY;
 
   constructor(
     private readonly clock: Clock,
@@ -131,14 +136,17 @@ export class RequestLimiter {
 
   run<T>(fn: () => Promise<T>): Promise<T> {
     const result = this.tail.then(async () => {
-      const wait = this.lastStart + this.minIntervalMs - this.clock.monotonic();
+      const wait = this.lastDone + this.minIntervalMs - this.clock.monotonic();
       if (wait > 0) {
         await new Promise<void>((resolve) => {
           this.clock.setTimeout(resolve, wait);
         });
       }
-      this.lastStart = this.clock.monotonic();
-      return fn();
+      try {
+        return await fn();
+      } finally {
+        this.lastDone = this.clock.monotonic();
+      }
     });
     this.tail = result.catch(() => undefined);
     return result;
@@ -388,6 +396,8 @@ export class GoogleCalendarSink implements CalendarSink {
     const verdict = await this.deps.switches.writesAllowed('calendar');
     if (!verdict.ok) throw new Error(`calendar writes are off: ${verdict.why ?? 'blocked'}`);
     await this.exclusive(async () => {
+      const { cooldownUntil } = await this.state.read();
+      if (cooldownUntil > this.deps.clock.now()) throw new Error(`cooling down until ${new Date(cooldownUntil).toISOString()}`);
       const state = await this.deps.store.load();
       const link = state.links[itemId];
       if (link === undefined || link.status === 'deleted' || link.status === 'pending' || state.calendarId === undefined) return;
@@ -600,8 +610,7 @@ export class GoogleCalendarSink implements CalendarSink {
       await audit.append({ actor: 'calendar', kind: 'calendar.recreated', details: { lost: stored.calendarId } });
     }
     // A crash after insert leaves the calendar on Google with no saved id.
-    // Listing finds it (by the private marker, or by summary for one created
-    // before the marker existed) so we do not insert a second one.
+    // Listing finds it by our marker so we do not insert a second one.
     const existing = await this.findDedicated();
     if (existing !== undefined) {
       await this.persistCalendar(existing);
@@ -617,6 +626,15 @@ export class GoogleCalendarSink implements CalendarSink {
 
   /**
    * The id of our dedicated calendar, if a list can see one. Does not create.
+   *
+   * ACCOUNT SAFETY: whatever is adopted here becomes the calendar the sink
+   * writes to, so only a calendar we demonstrably created qualifies: the user
+   * OWNS it (a calendar shared by someone else is not ours), it is not the
+   * primary calendar, and its description carries CALENDAR_MARKER (written by
+   * calendarsInsert below). The summary alone never qualifies: a user calendar
+   * may share the name. Every build that creates the calendar writes the
+   * marker, so no calendar of ours lacks it.
+   *
    * `calendar.app.created` is not on Google's published scope list for
    * calendarList.list (it is allowed for calendarList.get). A 403 there is
    * "we cannot look", not "the user must reconnect": fall through and insert.
@@ -629,10 +647,9 @@ export class GoogleCalendarSink implements CalendarSink {
       if (e instanceof CalendarApiError && e.code === 'insufficient-scope') return undefined;
       throw e;
     }
-    const usable = listed.filter((c) => c.id !== '' && c.id !== 'primary');
-    const marked = usable.find((c) => (c.description ?? '').includes(CALENDAR_MARKER));
-    if (marked !== undefined) return marked.id;
-    return usable.find((c) => c.summary === CALENDAR_SUMMARY)?.id;
+    return listed.find(
+      (c) => c.id !== '' && c.id !== 'primary' && c.primary !== true && c.accessRole === 'owner' && (c.description ?? '').includes(CALENDAR_MARKER),
+    )?.id;
   }
 
   private async persistCalendar(id: string): Promise<void> {

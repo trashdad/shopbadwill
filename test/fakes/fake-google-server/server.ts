@@ -64,6 +64,10 @@ export interface FakeCalendar {
   description?: string;
   /** Created through calendars.insert (what calendar.app.created may touch). */
   appCreated: boolean;
+  /** calendarList accessRole; default 'owner'. A calendar shared with the user is 'writer' or 'reader'. */
+  accessRole?: 'owner' | 'writer' | 'reader' | 'freeBusyReader';
+  /** The user's primary calendar (Google lists it under the account email, with primary: true). */
+  primary?: boolean;
   events: Map<string, FakeEvent>;
 }
 export interface RequestRecord { method: string; path: string; query: string; status?: number }
@@ -372,9 +376,10 @@ export async function startFakeGoogle(opts: { port?: number; host?: string; scen
           id: cal.id,
           summary: cal.summary,
           timeZone: cal.timeZone,
-          accessRole: 'owner',
+          accessRole: cal.accessRole ?? 'owner',
         };
         if (cal.description !== undefined) entry['description'] = cal.description;
+        if (cal.primary === true) entry['primary'] = true;
         return entry;
       });
       const body: Json = { kind: 'calendar#calendarList', etag: newEtag(), items };

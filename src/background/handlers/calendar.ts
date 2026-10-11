@@ -8,9 +8,11 @@
 //
 // Undo ref format (documented in docs/CONTRACT-DECISIONS.md): an audit entry
 // `calendar.insert` carries `undo: { kind: 'deleteEvent', ref: 'deleteEvent:<itemId>:<eventId>' }`.
-// Undo deletes that event (through the sink, so the ownership guard and the
-// dry-run / kill gates apply) and turns `tracked[itemId].calendar` off, so the
-// next sync does not put it back.
+// Undo turns `tracked[itemId].calendar` off FIRST (so a sync that runs meanwhile
+// cannot put the event back), then deletes the event through the sink (the
+// ownership guard and the dry-run / kill / cooldown gates apply). A refusal
+// restores the flag and is "not now: ...". Google not connected is refused
+// before any call. Running it again is a no-op.
 import { parseDeleteEventRef } from '../../adapters/google/calendar-sink';
 import { buildIcs } from '../../domain/calendar/ics';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
@@ -66,25 +68,32 @@ export function createCalendarUndoExecutors(ctx: BackgroundContext): { deleteEve
       if (parsed === undefined) throw new Error('This entry has no valid calendar event to undo.');
       const link = (await ctx.repo.get(STORAGE_KEYS.calendar)).links[parsed.itemId];
       if (link === undefined || link.status === 'deleted') {
-        await turnOff(ctx, parsed.itemId);
+        await setCalendarFlag(ctx, parsed.itemId, false);
         return; // already gone
       }
       if (link.eventId !== parsed.eventId) throw new Error('That calendar event has changed since; nothing was undone.');
+      const auth = await ctx.google.status();
+      if (!auth.connected || auth.needsInteraction) throw new Error('not now: Google Calendar is not connected. Connect it, then undo again.');
+      const wasOn = await setCalendarFlag(ctx, parsed.itemId, false);
       try {
         await syncFor(ctx).sink.remove(parsed.itemId);
       } catch (e) {
+        if (wasOn) await setCalendarFlag(ctx, parsed.itemId, true);
         throw new Error(`not now: ${e instanceof Error ? e.message : String(e)}`, { cause: e });
       }
-      await turnOff(ctx, parsed.itemId);
     },
   };
 }
 
-async function turnOff(ctx: BackgroundContext, itemId: number): Promise<void> {
+/** Sets `tracked[itemId].calendar`. Returns whether it was on before. */
+async function setCalendarFlag(ctx: BackgroundContext, itemId: number, on: boolean): Promise<boolean> {
+  let was = false;
   await ctx.repo.update(STORAGE_KEYS.tracked, (cur) => {
     const t = cur[itemId];
-    return t === undefined ? cur : { ...cur, [itemId]: { ...t, calendar: false, updatedAt: ctx.repo.now() } };
+    was = t?.calendar === true;
+    return t === undefined || t.calendar === on ? cur : { ...cur, [itemId]: { ...t, calendar: on, updatedAt: ctx.repo.now() } };
   });
+  return was;
 }
 
 /** T-36 self-registration (I-01). */

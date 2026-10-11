@@ -3,7 +3,7 @@
 // normalized to `GcalEvent`. Every failure surfaces as a `CalendarApiError`.
 import type { GcalEvent, GcalEventBody } from '../../domain/calendar/types';
 import type { Clock } from '../../ports/clock';
-import type { CalendarApi } from '../../ports/calendar';
+import type { CalendarApi, CalendarListRow } from '../../ports/calendar';
 import { CalendarApiError, GoogleAuthError, HttpNetworkError, HttpTimeoutError, type CalendarApiErrorCode } from '../../ports/errors';
 import type { GoogleAuthProvider } from '../../ports/google-auth';
 import type { Http, HttpRequest, HttpResponse } from '../../ports/http';
@@ -23,6 +23,12 @@ export interface GoogleCalendarApiOptions {
   baseDelayMs?: number;
   /** Backoff ceiling. Default 16 000 ms. */
   maxDelayMs?: number;
+  /**
+   * No retry comes sooner than this, whatever the backoff or Retry-After says.
+   * Default 1000 ms: Google calls are paced at 1 request/second (T-67 R4), and
+   * the sink's limiter only sees whole port calls, not the attempts inside one.
+   */
+  minRetryDelayMs?: number;
   /** A Retry-After above this is not waited for: the call fails now. Default 60 000 ms. */
   maxRetryAfterMs?: number;
   requestTimeoutMs?: number;
@@ -100,6 +106,7 @@ export class GoogleCalendarApi implements CalendarApi {
   private readonly maxAttempts: number;
   private readonly baseDelayMs: number;
   private readonly maxDelayMs: number;
+  private readonly minRetryDelayMs: number;
   private readonly maxRetryAfterMs: number;
   private readonly timeoutMs: number;
   private readonly random: () => number;
@@ -112,6 +119,7 @@ export class GoogleCalendarApi implements CalendarApi {
     this.maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? 5));
     this.baseDelayMs = opts.baseDelayMs ?? 500;
     this.maxDelayMs = opts.maxDelayMs ?? 16_000;
+    this.minRetryDelayMs = Math.max(0, opts.minRetryDelayMs ?? 1000);
     this.maxRetryAfterMs = opts.maxRetryAfterMs ?? 60_000;
     this.timeoutMs = opts.requestTimeoutMs ?? 15_000;
     this.random = opts.random ?? Math.random;
@@ -137,8 +145,8 @@ export class GoogleCalendarApi implements CalendarApi {
    * One page is not enough: a dedicated calendar past the first page must
    * still be found, or the caller would create a duplicate.
    */
-  async calendarListList(): Promise<Array<{ id: string; summary: string; description?: string }>> {
-    const out: Array<{ id: string; summary: string; description?: string }> = [];
+  async calendarListList(): Promise<CalendarListRow[]> {
+    const out: CalendarListRow[] = [];
     let pageToken: string | undefined;
     for (let page = 0; page < MAX_LIST_PAGES; page++) {
       const q = new URLSearchParams({ maxResults: '250' });
@@ -149,8 +157,10 @@ export class GoogleCalendarApi implements CalendarApi {
       for (const item of parsed.data.items ?? []) {
         const entry = RawCalendarListEntrySchema.safeParse(item);
         if (!entry.success) continue;
-        const row: { id: string; summary: string; description?: string } = { id: entry.data.id, summary: entry.data.summary ?? '' };
+        const row: CalendarListRow = { id: entry.data.id, summary: entry.data.summary ?? '' };
         if (entry.data.description !== undefined) row.description = entry.data.description;
+        if (entry.data.accessRole !== undefined) row.accessRole = entry.data.accessRole;
+        if (entry.data.primary !== undefined) row.primary = entry.data.primary;
         out.push(row);
       }
       pageToken = parsed.data.nextPageToken;
@@ -296,7 +306,7 @@ export class GoogleCalendarApi implements CalendarApi {
 
       const retryAfter = parseRetryAfter(header(res, 'retry-after'), this.clock.now());
       if (retryAfter !== undefined && retryAfter > this.maxRetryAfterMs) throw fail();
-      await this.sleep(retryAfter ?? this.backoffMs(attempt));
+      await this.sleep(Math.max(this.minRetryDelayMs, retryAfter ?? this.backoffMs(attempt)));
     }
   }
 

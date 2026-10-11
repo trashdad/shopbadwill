@@ -51,6 +51,8 @@ export const RawCalendarListEntrySchema = z.looseObject({
   id: z.string().min(1),
   summary: lenient(z.string()),
   description: lenient(z.string()),
+  accessRole: lenient(z.string()),
+  primary: lenient(z.boolean()),
 });
 
 export const RawCalendarListSchema = z.looseObject({

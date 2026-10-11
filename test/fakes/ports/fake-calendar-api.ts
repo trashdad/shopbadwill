@@ -1,6 +1,6 @@
 import type { GcalEvent, GcalEventBody } from '../../../src/domain/calendar/types';
 import { CalendarApiError, type CalendarApiErrorCode } from '../../../src/ports/errors';
-import type { CalendarApi } from '../../../src/ports/calendar';
+import type { CalendarApi, CalendarListRow } from '../../../src/ports/calendar';
 
 export type CalendarApiMethod = keyof CalendarApi;
 
@@ -48,11 +48,12 @@ export class FakeCalendarApi implements CalendarApi {
     return this.run('calendarListGet', [calendarId], () => (this.calendars.has(calendarId) ? { id: calendarId } : null));
   }
 
-  calendarListList(): Promise<Array<{ id: string; summary: string; description?: string }>> {
+  calendarListList(): Promise<CalendarListRow[]> {
     return this.run('calendarListList', [], () =>
       [...this.calendars.values()].map((c) => ({
         id: c.id,
         summary: c.summary,
+        accessRole: 'owner',
         ...(c.description === undefined ? {} : { description: c.description }),
       })),
     );

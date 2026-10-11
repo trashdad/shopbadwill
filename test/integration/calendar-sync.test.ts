@@ -11,7 +11,15 @@ import { BrowserHttp } from '../../src/adapters/browser/http';
 import { createStorageAreas } from '../../src/adapters/browser/storage';
 import { PkceRefreshProvider, type WebAuthFlow } from '../../src/adapters/google/auth-pkce';
 import { GoogleCalendarApi } from '../../src/adapters/google/calendar-api';
-import { CALENDAR_SUMMARY, RequestLimiter, SYNC_STATE_KEY, deleteEventRef, parseDeleteEventRef } from '../../src/adapters/google/calendar-sink';
+import {
+  CALENDAR_DESCRIPTION,
+  CALENDAR_MARKER,
+  CALENDAR_SUMMARY,
+  RequestLimiter,
+  SYNC_STATE_KEY,
+  deleteEventRef,
+  parseDeleteEventRef,
+} from '../../src/adapters/google/calendar-sink';
 import { createCalendarHandlers, createCalendarUndoExecutors } from '../../src/background/handlers/calendar';
 import type { BackgroundContext } from '../../src/background/context';
 import { CalendarSync, buildDesired, registerReminderSink, type ReminderSink } from '../../src/background/jobs/calendar-sync';
@@ -247,10 +255,10 @@ describe('first sync', () => {
 });
 
 describe('ensureCalendar looks up our calendar before creating one', () => {
-  it('adopts an existing calendar with our summary instead of creating a second one', async () => {
+  it('adopts our marked calendar instead of creating a second one', async () => {
     const r = await rig();
     // The insert reached Google and the worker died before the id was saved.
-    const seeded = await r.api.calendarsInsert(CALENDAR_SUMMARY, 'UTC');
+    const seeded = await r.api.calendarsInsert(CALENDAR_SUMMARY, 'UTC', CALENDAR_DESCRIPTION);
     const itemId = await r.track();
     await r.sync.syncNow('recover');
     const created = [...r.fake.state.calendars.values()].filter((c) => c.appCreated);
@@ -278,9 +286,12 @@ describe('ensureCalendar looks up our calendar before creating one', () => {
     expect(must(r.fake.state.calendars.get(saved)).events.has(eventIdFor(itemId, 0))).toBe(true);
   });
 
-  it('does not adopt a foreign calendar that only shares the summary, or an unrelated app calendar', async () => {
+  it('never adopts a calendar on its summary alone, or an unrelated app calendar', async () => {
     const r = await rig();
     r.fake.seedCalendar('user-cal@example.com', CALENDAR_SUMMARY);
+    // Listed (visible to this grant) and named exactly like ours, but without our marker.
+    const unmarked = 'unmarked@group.calendar.google.com';
+    r.fake.state.calendars.set(unmarked, { id: unmarked, summary: CALENDAR_SUMMARY, timeZone: 'UTC', appCreated: true, events: new Map() });
     r.fake.state.calendars.set('other@group.calendar.google.com', {
       id: 'other@group.calendar.google.com',
       summary: 'Other app calendar',
@@ -290,14 +301,40 @@ describe('ensureCalendar looks up our calendar before creating one', () => {
     });
     const itemId = await r.track();
     await r.sync.syncNow('one');
-    expect(r.fake.state.calendars.get('user-cal@example.com')?.events.size).toBe(0);
-    expect(r.fake.state.calendars.get('other@group.calendar.google.com')?.events.size).toBe(0);
-    const ours = [...r.fake.state.calendars.values()].filter((c) => c.appCreated && c.summary === CALENDAR_SUMMARY);
-    expect(ours).toHaveLength(1);
-    expect(must(ours[0]).events.has(eventIdFor(itemId, 0))).toBe(true);
+    const saved = must((await r.repo.get(STORAGE_KEYS.calendar)).calendarId);
+    expect([unmarked, 'user-cal@example.com', 'other@group.calendar.google.com']).not.toContain(saved);
+    for (const id of [unmarked, 'user-cal@example.com', 'other@group.calendar.google.com']) {
+      expect(r.fake.state.calendars.get(id)?.events.size).toBe(0);
+      expect(r.writes().filter((w) => w.includes(encodeURIComponent(id)))).toEqual([]);
+    }
+    expect(must(r.fake.state.calendars.get(saved)).description ?? '').toContain(CALENDAR_MARKER);
+    expect(must(r.fake.state.calendars.get(saved)).events.has(eventIdFor(itemId, 0))).toBe(true);
   });
 
-  it('after the saved calendar is deleted, reuses a leftover with our summary instead of creating another', async () => {
+  it('never adopts a marked calendar the user does not own, or the primary calendar', async () => {
+    const r = await rig();
+    // A ShopBadwill calendar someone shared with this user, and a primary calendar
+    // whose description happens to carry the marker: both listed, neither ours to write.
+    const shared = 'shared@group.calendar.google.com';
+    const primary = 'me@example.com';
+    r.fake.state.calendars.set(shared, {
+      id: shared, summary: CALENDAR_SUMMARY, description: CALENDAR_DESCRIPTION, accessRole: 'writer', timeZone: 'UTC', appCreated: true, events: new Map(),
+    });
+    r.fake.state.calendars.set(primary, {
+      id: primary, summary: 'Me', description: CALENDAR_MARKER, primary: true, timeZone: 'UTC', appCreated: true, events: new Map(),
+    });
+    const itemId = await r.track();
+    await r.sync.syncNow('one');
+    const saved = must((await r.repo.get(STORAGE_KEYS.calendar)).calendarId);
+    expect([shared, primary]).not.toContain(saved);
+    for (const id of [shared, primary]) {
+      expect(r.fake.state.calendars.get(id)?.events.size).toBe(0);
+      expect(r.writes().filter((w) => w.includes(encodeURIComponent(id)))).toEqual([]);
+    }
+    expect(must(r.fake.state.calendars.get(saved)).events.has(eventIdFor(itemId, 0))).toBe(true);
+  });
+
+  it('after the saved calendar is deleted, reuses a leftover with our marker instead of creating another', async () => {
     const r = await rig();
     const itemId = await r.track();
     await r.sync.syncNow('one');
@@ -306,6 +343,7 @@ describe('ensureCalendar looks up our calendar before creating one', () => {
     r.fake.state.calendars.set(leftoverId, {
       id: leftoverId,
       summary: CALENDAR_SUMMARY,
+      description: CALENDAR_DESCRIPTION,
       timeZone: 'UTC',
       appCreated: true,
       events: new Map(),
@@ -630,6 +668,38 @@ describe('R4: courtesy', () => {
     expect(must(s2) - must(s1)).toBeGreaterThanOrEqual(1000);
   });
 
+  it('the limiter also keeps 1 s after a slow call ends (its retries inside the adapter count)', async () => {
+    const clock = new FakeClock();
+    const limiter = new RequestLimiter(clock, 1000);
+    let firstEnded = 0;
+    let secondStarted = 0;
+    const first = limiter.run(() => {
+      clock.advance(1500); // the call (with an adapter-internal retry) took 1.5 s
+      firstEnded = clock.monotonic();
+      return Promise.resolve();
+    });
+    const second = limiter.run(() => {
+      secondStarted = clock.monotonic();
+      return Promise.resolve();
+    });
+    for (let i = 0; i < 4; i++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      clock.advance(500);
+    }
+    await Promise.all([first, second]);
+    expect(secondStarted - firstEnded).toBeGreaterThanOrEqual(1000);
+  });
+
+  it('the stamp port respects a recorded cooldown: no request until it ends', async () => {
+    const r = await rig();
+    const id = await r.track();
+    await r.sync.syncNow('one');
+    await browser.storage.local.set({ [SYNC_STATE_KEY]: { cooldownUntil: r.clock.now() + 5 * MIN, cooldownCount: 1 } });
+    const reqs = calendarRequests(r);
+    await expect(r.sync.sink.stamp(id, 'won')).rejects.toThrow(/cooling down/);
+    expect(calendarRequests(r)).toBe(reqs);
+  });
+
   it('a 429 halts the run, records a persisted cooldown, and the next sync makes no request until it ends', async () => {
     const r = await rig();
     await r.track();
@@ -730,6 +800,33 @@ describe('late add, reminder sinks, undo, handlers', () => {
     const n = r.writes().length;
     await r.sync.syncNow('two');
     expect(r.writes().length).toBe(n);
+
+    // Idempotent: a second run (a restart before the `undo` audit entry) writes nothing.
+    const reqs = calendarRequests(r);
+    await createCalendarUndoExecutors(ctx).deleteEvent(entry?.undo?.ref ?? '', must(entry));
+    expect(calendarRequests(r)).toBe(reqs);
+    expect(r.writes().length).toBe(n);
+
+    // Put back on the calendar later: a fresh generation, the cancelled id is never reused or touched.
+    await r.setTracked(id, { calendar: true });
+    await r.sync.syncNow('three');
+    expect(r.events().map((e) => [e.id, e.status]).sort()).toEqual([[eventIdFor(id, 0), 'cancelled'], [eventIdFor(id, 1), 'confirmed']]);
+    expect(r.writes().slice(n)).toEqual([`POST /calendars/${encodeURIComponent(r.calendarId())}/events`]);
+    expect((await links(r))[id]).toMatchObject({ eventId: eventIdFor(id, 1), status: 'synced' });
+  });
+
+  it('deleteEvent undo while Google is disconnected is refused without any Google request', async () => {
+    const r = await rig();
+    const id = await r.track();
+    await r.sync.syncNow('one');
+    const entry = must(r.audit.entries.find((e) => e.kind === 'calendar.insert'));
+    await r.provider.disconnect();
+    const reqs = calendarRequests(r);
+    await expect(createCalendarUndoExecutors(fakeCtx(r)).deleteEvent(entry.undo?.ref ?? '', entry)).rejects.toThrow(/not now/);
+    expect(calendarRequests(r)).toBe(reqs);
+    expect(r.events()[0]?.status).toBe('confirmed');
+    expect((await r.repo.get(STORAGE_KEYS.tracked))[id]?.calendar).toBe(true);
+    expect((await links(r))[id]?.status).toBe('synced');
   });
 
   it('deleteEvent undo is refused while calendar writes are off', async () => {
