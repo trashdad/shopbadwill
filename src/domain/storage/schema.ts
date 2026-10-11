@@ -44,6 +44,8 @@ export const STORAGE_KEYS = {
   favoritesCache: 'sbw:favoritesCache',
   jobRuns: 'sbw:jobRuns',
   calendar: 'sbw:calendar',
+  /** Optional (T-69): what the ntfy ReminderSink has scheduled, per item. */
+  ntfy: 'sbw:ntfy',
   snipes: 'sbw:snipes',
   auditMeta: 'sbw:auditMeta',
   sgwSession: 'sbw:sgwSession',
@@ -144,6 +146,46 @@ export type CalendarState = z.infer<typeof CalendarStateSchema>;
 /** `sbw:audit:<chunk>`. */
 export const AuditChunkSchema = z.array(AuditEntrySchema);
 export type AuditChunk = z.infer<typeof AuditChunkSchema>;
+
+/**
+ * `sbw:ntfy` (T-69, optional): what the ntfy ReminderSink has scheduled, per
+ * item. Module-private schema (an exported *Schema would join the locked list
+ * in test/contract/types/examples.test.ts). The change is additive and
+ * `schemaVersion` stays 1. An invalid record is quarantined by the Repo and
+ * reads as empty, so it can never cause a resend storm: the seqs are
+ * deterministic, so a re-publish overwrites rather than duplicates.
+ */
+const NtfyStateSchema = z.object({
+  /** Why the sink made no requests the last time it ran; absent when it ran. */
+  status: z.enum(['disabled', 'needs-permission']).optional(),
+  items: z.record(
+    ItemIdSchema,
+    z.object({
+      /** Stable identity of the event the entries belong to: end time, generation, reminder minutes. */
+      fingerprint: z.string().min(1),
+      entries: z.array(
+        z.object({
+          /** `sbw-<itemId>-<leadMin>-<gen>`; deterministic, so a re-publish overwrites. */
+          seq: z.string().min(1),
+          leadMin: z.number().int().nonnegative(),
+          fireAt: EpochMsSchema,
+          status: z.enum(['scheduled', 'deferred']),
+        }),
+      ),
+    }),
+  ),
+});
+export type NtfyState = z.infer<typeof NtfyStateSchema>;
+
+/**
+ * Missing or invalid `sbw:ntfy` reads as empty. Callers that cannot see the
+ * Repo (the options page) use this so a bad record cannot be treated as a list
+ * of messages to send again.
+ */
+export function parseNtfyState(raw: unknown): NtfyState {
+  const parsed = NtfyStateSchema.safeParse(raw);
+  return parsed.success ? parsed.data : { items: {} };
+}
 
 /** `sbw:auditMeta`: ring bookkeeping. */
 export const AuditMetaSchema = z.object({
@@ -330,6 +372,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.favoritesCache]: { area: 'local', schema: FavoritesCacheSchema },
   [STORAGE_KEYS.jobRuns]: { area: 'local', schema: z.array(JobRunSchema) },
   [STORAGE_KEYS.calendar]: { area: 'local', schema: CalendarStateSchema },
+  [STORAGE_KEYS.ntfy]: { area: 'local', schema: NtfyStateSchema },
   [STORAGE_KEYS.snipes]: { area: 'local', schema: z.record(SnipeIdSchema, SnipeSchema) },
   [STORAGE_KEYS.auditMeta]: { area: 'local', schema: AuditMetaSchema },
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },
