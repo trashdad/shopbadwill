@@ -41,6 +41,19 @@ const DAY = 24 * HOUR;
 const MIN_LEAD_EDGE = 10_000;
 const TOPIC = 'sbw-abcdefghijklmnopqrstuvwxyz';
 const TIME_ZONE = 'America/New_York';
+/** Real SGW titles carry curly quotes, dashes, emoji, and sanitizeTitle's "…". */
+const UNICODE_TITLE = 'Men’s “Butterprint” Pyrex bowl — 4 pc 🎉 Café…';
+
+/**
+ * Decodes RFC 2047 encoded-words (`=?UTF-8?B?...?=`), the way ntfy's server
+ * (Go's mime.WordDecoder) does: whitespace between adjacent words is dropped.
+ */
+function decodeRfc2047(value: string): string {
+  const words = value.split(' ');
+  if (!words.every((w) => /^=\?UTF-8\?B\?[A-Za-z0-9+/=]*\?=$/.test(w))) return value;
+  const bytes = words.flatMap((w) => [...Buffer.from(w.slice('=?UTF-8?B?'.length, -2), 'base64')]);
+  return new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+}
 
 interface Captured {
   kind: 'post' | 'delete';
@@ -209,6 +222,27 @@ describe('ntfyRequest (provisional wire shape)', () => {
       'X-Delay': String(Math.floor((T0 + 15 * MIN) / 1000)),
       'X-Sequence-ID': 'sbw-1-15-0',
     });
+  });
+
+  it('keeps a printable-ASCII title as-is, and RFC 2047-encodes any other title so fetch neither throws nor garbles it', () => {
+    const message = { seq: 'sbw-1-15-0', body: 'Ends in 15 min', clickUrl: 'https://shopgoodwill.com/item/1', fireAt: T0 + 15 * MIN };
+    expect(ntfyRequest('publish', 'sbw-abc', { ...message, title: 'Pyrex bowl (4 pc) #2' }).headers?.['X-Title']).toBe(
+      'Pyrex bowl (4 pc) #2',
+    );
+    for (const title of [UNICODE_TITLE, 'Café', 'A =?UTF-8?B?eA==?= lookalike', `${'é'.repeat(199)}…`]) {
+      const header = ntfyRequest('publish', 'sbw-abc', { ...message, title }).headers?.['X-Title'] ?? '';
+      expect(header, title).toMatch(/^[\x20-\x7e]+$/);
+      for (const word of header.split(' ')) expect(word.length, word).toBeLessThanOrEqual(75);
+      expect(decodeRfc2047(header), title).toBe(title);
+    }
+  });
+
+  it('sends a non-ASCII title (curly quotes, emoji, the truncation ellipsis) and ntfy can decode it back', async () => {
+    const r = rig();
+    await r.sink.upsert({ ...desiredEvent(7, 2 * HOUR), title: UNICODE_TITLE });
+    expect(r.requests.map((x) => x.kind)).toEqual(['post', 'post', 'post']);
+    for (const req of r.requests) expect(decodeRfc2047(req.headers['x-title'] ?? '')).toBe(UNICODE_TITLE);
+    expect(r.audit.kinds).not.toContain('ntfy.failed');
   });
 
   it('builds the cancel request: DELETE https://ntfy.sh/<topic>/<seq>', () => {

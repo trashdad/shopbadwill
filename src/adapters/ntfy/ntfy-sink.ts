@@ -91,6 +91,12 @@ export interface NtfyMessage {
  *            headers: X-Title, X-Click, X-Tags: hourglass,
  *                     X-Delay: <unix seconds>, X-Sequence-ID: <seq>
  *   cancel:  DELETE https://ntfy.sh/<topic>/<seq>
+ *
+ * HTTP header values are bytes: fetch throws on a character above U+00FF (curly
+ * quotes, emoji, the "…" sanitizeTitle appends) and sends U+0080-U+00FF as raw
+ * Latin-1, which ntfy would garble. A title that is not plain printable ASCII
+ * therefore goes as RFC 2047 encoded-words (`=?UTF-8?B?...?=`), which the ntfy
+ * server decodes. Also check that live.
  */
 export function ntfyRequest(kind: 'publish', topic: string, message: NtfyMessage): HttpRequest;
 export function ntfyRequest(kind: 'cancel', topic: string, message: Pick<NtfyMessage, 'seq'>): HttpRequest;
@@ -102,7 +108,7 @@ export function ntfyRequest(kind: 'publish' | 'cancel', topic: string, message: 
     url: `${NTFY_SERVER}/${topic}`,
     method: 'POST',
     headers: {
-      'X-Title': message.title,
+      'X-Title': headerText(message.title),
       'X-Click': message.clickUrl,
       'X-Tags': 'hourglass',
       'X-Delay': String(Math.floor(message.fireAt / 1000)),
@@ -112,6 +118,32 @@ export function ntfyRequest(kind: 'publish' | 'cancel', topic: string, message: 
     timeoutMs: REQUEST_TIMEOUT_MS,
     credentials: 'omit',
   };
+}
+
+/** Bytes per encoded-word: 45 bytes → 60 base64 chars → 72 with the `=?UTF-8?B?` / `?=` frame (RFC 2047 caps a word at 75). */
+const RFC2047_WORD_BYTES = 45;
+
+/**
+ * The title as an ASCII header value: unchanged when it is printable ASCII (and
+ * has no `=?` an RFC 2047 decoder could mistake for a word); otherwise UTF-8
+ * RFC 2047 B encoded-words, split on code-point boundaries, joined by spaces.
+ */
+function headerText(text: string): string {
+  if (/^[\x20-\x7e]*$/.test(text) && !text.includes('=?')) return text;
+  const encoder = new TextEncoder();
+  const words: string[] = [];
+  let chunk: number[] = [];
+  const flush = (): void => {
+    words.push(`=?UTF-8?B?${btoa(String.fromCharCode(...chunk))}?=`);
+    chunk = [];
+  };
+  for (const ch of text) {
+    const bytes = encoder.encode(ch);
+    if (chunk.length + bytes.length > RFC2047_WORD_BYTES) flush();
+    chunk.push(...bytes);
+  }
+  if (chunk.length > 0) flush();
+  return words.join(' ');
 }
 
 /** `sbw-<itemId>-<leadMin>-<gen>`: deterministic, so a re-publish overwrites (R5). */
