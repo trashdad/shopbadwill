@@ -942,6 +942,22 @@ describe('R2: not-sent proves the bid never went out', () => {
     }
   });
 
+  it('end to end (R4): a live walk ending in not-sent leaves exposure and spends nothing', () => {
+    const live = play(snipe(), [E.arm(), E.wake(), E.verified(), E.fire(), E.sent(), E.notSent()]);
+    expect(live.results.map((r) => r.rejection)).toEqual([null, null, null, null, null, null]);
+    expect(exposure([live.results[4]?.next ?? live.last]).count).toBe(1);
+    expect(live.last).toMatchObject({ state: 'resolved', outcome: 'network', attempt: { notSent: true } });
+    expect(exposure([live.last]).count).toBe(0);
+    expect(spentToday([live.last], RESULT_LOCAL, TZ)).toBe(0);
+  });
+
+  it('end to end (R4): a live walk ending in post-read-failed counts the max, once', () => {
+    const live = play(snipe(), [E.arm(), E.wake(), E.verified(), E.fire(), E.sent(), E.postReadFailed()]);
+    expect(live.last).toMatchObject({ state: 'resolved', outcome: 'network' });
+    expect(exposure([live.last]).count).toBe(0);
+    expect(spentToday([live.last], POST_LOCAL, TZ)).toBe(live.last.maxBid);
+  });
+
   it('is terminal: the snipe leaves exposure (resolved) and never emits money after', () => {
     const r = reduce(inState('sent'), E.notSent(), CAPS_OK, CTX);
     expect(r.next.state).toBe('resolved');
@@ -1640,13 +1656,19 @@ describe('R2: money properties', { timeout: PROP_TIMEOUT_MS }, () => {
     const reached = new Set<string>();
     const samples = fc.sample(fc.tuple(arbDraft, arbSteps), { numRuns: PROP_RUNS, seed: 80 });
     for (const [start, steps] of samples) {
-      for (const { r } of runProp(start, steps).steps) {
+      for (const { before, e, r } of runProp(start, steps).steps) {
         reached.add(r.next.state);
         for (const x of r.effects) reached.add(x.kind);
         if (r.rejection !== null) reached.add(`rejected:${r.rejection.reason}`);
+        else reached.add(`accepted:${before.dryRun ? 'dry' : 'live'}:${before.state}:${e.type}`);
       }
     }
     for (const state of STATES) expect(reached).toContain(state);
+    // T-80b: the properties run over accepted settlements by both new events.
+    for (const cell of ['live:sent:post-read-failed', 'live:sent:not-sent', 'dry:firing:post-read-failed']) {
+      expect(reached).toContain(`accepted:${cell}`);
+    }
+    expect(reached).not.toContain('accepted:live:firing:post-read-failed');
     for (const kind of ['placeBid', 'applyFallbackProxy', 'proposeRearm', 'stampCalendar']) expect(reached).toContain(kind);
     for (const reason of ['terminal', 'already-sent', 'already-fired', 'dry-run', 'caps', 'invalid-event', 'too-early', 'duplicate']) {
       expect(reached).toContain(`rejected:${reason}`);
