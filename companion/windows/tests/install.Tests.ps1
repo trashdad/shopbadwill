@@ -143,8 +143,8 @@ Describe 'companion install and uninstall' {
     It 'install registers via Invoke-SbwReg and does not pass reg.exe a single array object' {
       $install = Get-SbwInstallSource
       Assert-Match $install 'Invoke-SbwReg -ArgList \(Get-SbwRegAddArgs '
-      Assert-Match $install '& reg\.exe @ArgList'
-      Assert-NotMatch $install '& reg\.exe @\('
+      Assert-Match $install "& \(Get-SbwSystemExe 'reg\.exe'\) @ArgList"
+      Assert-NotMatch $install '& reg\.exe'
       Assert-Match $install 'reg query HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com\.shopbadwill\.companion'
       Assert-NotMatch $install 'NativeMessagingHosts /v com\.shopbadwill\.companion'
     }
@@ -445,6 +445,26 @@ Describe 'companion install and uninstall' {
       $src = Get-SbwTestText 'run.ps1'
       Assert-Match $src "\`$result\.Result -ne 'Passed'"
       Assert-Match $src '\$result\.PassedCount -eq 0'
+    }
+  }
+}
+
+# install.ps1 without the schtasks-path stub above. A directory early on PATH
+# must not decide which schtasks.exe the host runs for every snipe.
+Describe 'companion install system tools' {
+  BeforeAll {
+    . "$PSScriptRoot\test-helpers.ps1"
+    . "$PSScriptRoot\..\install.ps1"
+    function Get-Command { [pscustomobject]@{ Source = 'C:\planted\schtasks.exe'; Path = 'C:\planted\schtasks.exe' } }
+  }
+
+  Context 'system executables come from System32, not PATH' {
+    It 'stores the System32 schtasks.exe in the config' {
+      Assert-Equal (Get-SbwSchTasksPath) (Join-Path $env:SystemRoot 'System32\schtasks.exe')
+    }
+    It 'resolves reg.exe and schtasks.exe under %SystemRoot%\System32' {
+      Assert-Equal (Get-SbwSystemExe 'reg.exe') (Join-Path $env:SystemRoot 'System32\reg.exe')
+      Assert-Equal (Get-SbwSystemExe 'schtasks.exe') (Join-Path $env:SystemRoot 'System32\schtasks.exe')
     }
   }
 }

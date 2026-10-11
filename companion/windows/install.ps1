@@ -157,7 +157,7 @@ function Invoke-SbwReg {
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    & reg.exe @ArgList | Out-Null
+    & (Get-SbwSystemExe 'reg.exe') @ArgList | Out-Null
     $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $prev
@@ -217,9 +217,15 @@ function Get-SbwDataDir {
   if ($Explicit) { $Explicit } else { Join-Path $env:LOCALAPPDATA 'ShopBadwill\companion' }
 }
 
+# Windows tools by absolute path: a directory early on PATH must not choose
+# the schtasks.exe the host runs for every snipe, or the reg.exe install runs.
+function Get-SbwSystemExe {
+  param([string]$Name)
+  Join-Path $env:SystemRoot "System32\$Name"
+}
+
 function Get-SbwSchTasksPath {
-  $c = Get-Command schtasks.exe -ErrorAction SilentlyContinue
-  if ($c) { $c.Source } else { Join-Path $env:SystemRoot 'System32\schtasks.exe' }
+  Get-SbwSystemExe 'schtasks.exe'
 }
 
 function Invoke-SbwInstall {
