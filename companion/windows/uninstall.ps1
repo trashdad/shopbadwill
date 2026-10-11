@@ -91,18 +91,6 @@ function Invoke-SbwSchtasks {
   }
 }
 
-function Invoke-SbwReg {
-  param([string[]]$ArgList)
-  $prev = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  try {
-    & reg.exe @ArgList | Out-Null
-    $LASTEXITCODE
-  } finally {
-    $ErrorActionPreference = $prev
-  }
-}
-
 # Only task names that the companion itself could have created.
 function Get-SbwStateTaskNames {
   param([string]$StatePath)

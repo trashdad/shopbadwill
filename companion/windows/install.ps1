@@ -96,14 +96,71 @@ function Get-SbwFirefoxManifest {
   }
 }
 
+# Chrome and Firefox find a host by a subkey of NativeMessagingHosts whose
+# (Default) value is the manifest path. The host name is one path segment, so
+# a value like "..\Run" cannot escape the parent key.
+function Get-SbwNativeHostRegKey {
+  param([string]$ParentKey, [string]$HostName)
+  if ([string]::IsNullOrWhiteSpace($ParentKey) -or $ParentKey -notlike 'HKCU\*') {
+    throw "Refusing to touch a non-HKCU registry key: $ParentKey"
+  }
+  if ($ParentKey -match '(^|[\\/])\.\.([\\/]|$)') {
+    throw "Refusing a registry key that walks upward: $ParentKey"
+  }
+  if ([string]::IsNullOrEmpty($HostName) -or
+      $HostName -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
+      $HostName -cmatch '\.\.') {
+    throw "Refusing host name '$HostName'."
+  }
+  "$ParentKey\$HostName"
+}
+
+# Every registry-looking argument must be an HKCU key. Drive paths (the
+# manifest file) are not registry keys and are left alone.
+function Test-SbwRegArgsAreHkcu {
+  param([string[]]$ArgList)
+  $saw = $false
+  foreach ($a in @($ArgList)) {
+    if ($a -match '^[A-Za-z]:\\') { continue }
+    if ($a -match '^[A-Za-z]{2,8}\\') {
+      if ($a -notlike 'HKCU\*') { throw "Refusing to touch a non-HKCU registry key: $a" }
+      $saw = $true
+    }
+  }
+  if (-not $saw) { throw 'Refusing a reg command that does not name an HKCU key' }
+}
+
 function Get-SbwRegAddArgs {
   param([string]$Key, [string]$ValueName, [string]$ManifestPath)
-  @('add', $Key, '/v', $ValueName, '/t', 'REG_SZ', '/d', $ManifestPath, '/f')
+  $full = Get-SbwNativeHostRegKey -ParentKey $Key -HostName $ValueName
+  # /ve sets the key's default value. /v would create a named value the browser does not read.
+  $regArgs = @('add', $full, '/ve', '/t', 'REG_SZ', '/d', $ManifestPath, '/f')
+  Test-SbwRegArgsAreHkcu -ArgList $regArgs
+  $regArgs
 }
 
 function Get-SbwRegDeleteArgs {
   param([string]$Key, [string]$ValueName)
-  @('delete', $Key, '/v', $ValueName, '/f')
+  $full = Get-SbwNativeHostRegKey -ParentKey $Key -HostName $ValueName
+  # Delete the host subkey only. The parent NativeMessagingHosts key may hold other hosts.
+  $regArgs = @('delete', $full, '/f')
+  Test-SbwRegArgsAreHkcu -ArgList $regArgs
+  $regArgs
+}
+
+# The only reg.exe call in the companion. ArgList is splatted so each token
+# stays its own argument. Tests replace this function; they must not call reg.exe.
+function Invoke-SbwReg {
+  param([string[]]$ArgList)
+  Test-SbwRegArgsAreHkcu -ArgList $ArgList
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & reg.exe @ArgList | Out-Null
+    $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prev
+  }
 }
 
 # The native-messaging manifest `path` cannot carry arguments, so it points at
@@ -260,8 +317,8 @@ function Invoke-SbwInstall {
     }
     $regKey = Get-SbwChromeRegKey
     if ($PSCmdlet.ShouldProcess("$regKey\$hostName", 'register the Chrome native-messaging host (HKCU)')) {
-      & reg.exe @(Get-SbwRegAddArgs -Key $regKey -ValueName $hostName -ManifestPath $chromeManifestPath) | Out-Null
-      if ($LASTEXITCODE -ne 0) { throw "reg add failed for $regKey\$hostName" }
+      $code = Invoke-SbwReg -ArgList (Get-SbwRegAddArgs -Key $regKey -ValueName $hostName -ManifestPath $chromeManifestPath)
+      if ($code -ne 0) { throw "reg add failed for $regKey\$hostName" }
     }
   }
 
@@ -272,8 +329,8 @@ function Invoke-SbwInstall {
     }
     $regKey = Get-SbwFirefoxRegKey
     if ($PSCmdlet.ShouldProcess("$regKey\$hostName", 'register the Firefox native-messaging host (HKCU)')) {
-      & reg.exe @(Get-SbwRegAddArgs -Key $regKey -ValueName $hostName -ManifestPath $firefoxManifestPath) | Out-Null
-      if ($LASTEXITCODE -ne 0) { throw "reg add failed for $regKey\$hostName" }
+      $code = Invoke-SbwReg -ArgList (Get-SbwRegAddArgs -Key $regKey -ValueName $hostName -ManifestPath $firefoxManifestPath)
+      if ($code -ne 0) { throw "reg add failed for $regKey\$hostName" }
     }
   }
 
@@ -281,8 +338,8 @@ function Invoke-SbwInstall {
     Write-Host ''
     Write-Host 'Done. Next steps:'
     Write-Host '  1. FULLY RESTART the browser(s) you configured (native hosts load at startup).'
-    Write-Host '  2. Verify: reg query HKCU\Software\Google\Chrome\NativeMessagingHosts /v com.shopbadwill.companion'
-    Write-Host '     (Mozilla key likewise for Firefox).'
+    Write-Host '  2. Verify: reg query HKCU\Software\Google\Chrome\NativeMessagingHosts\com.shopbadwill.companion'
+    Write-Host '     (HKCU\Software\Mozilla\NativeMessagingHosts\com.shopbadwill.companion likewise for Firefox).'
     Write-Host '  3. In the extension, arm a snipe; the companion schedules the wake task.'
     Write-Host '     Check: Get-ScheduledTask -TaskName "ShopBadwill-*"'
     Write-Host '  4. Power-plan guidance and the wake test: docs/COMPANION.md'

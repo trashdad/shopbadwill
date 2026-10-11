@@ -93,14 +93,67 @@ Describe 'extension id validation' {
   }
 }
 
+# File-scoped on purpose: $PSScriptRoot inside It is empty under Pester 5.
+function Get-SbwUninstallSource {
+  Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1') -Raw
+}
+function Get-SbwCompanionDoc {
+  Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\..\..\docs\COMPANION.md') -Raw
+}
+
 Describe 'reg argument arrays' {
-  It 'reg add: value name com.shopbadwill.companion under the per-user key' {
+  It 'reg add creates the host subkey and sets its default value to the manifest' {
+    # Chrome and Firefox look up HKCU\...\NativeMessagingHosts\<host> (Default) = manifest path.
+    # A named value on the parent key is invisible to the browser.
     Assert-ArrayEqual (Get-SbwRegAddArgs -Key 'HKCU\Software\Google\Chrome\NativeMessagingHosts' -ValueName 'com.shopbadwill.companion' -ManifestPath 'C:\d\chrome-manifest.json') `
-      @('add', 'HKCU\Software\Google\Chrome\NativeMessagingHosts', '/v', 'com.shopbadwill.companion', '/t', 'REG_SZ', '/d', 'C:\d\chrome-manifest.json', '/f')
+      @('add', 'HKCU\Software\Google\Chrome\NativeMessagingHosts\com.shopbadwill.companion', '/ve', '/t', 'REG_SZ', '/d', 'C:\d\chrome-manifest.json', '/f')
   }
-  It 'reg delete removes only our value' {
+  It 'reg delete removes only that host subkey, not the parent key other hosts share' {
     Assert-ArrayEqual (Get-SbwRegDeleteArgs -Key 'HKCU\Software\Mozilla\NativeMessagingHosts' -ValueName 'com.shopbadwill.companion') `
-      @('delete', 'HKCU\Software\Mozilla\NativeMessagingHosts', '/v', 'com.shopbadwill.companion', '/f')
+      @('delete', 'HKCU\Software\Mozilla\NativeMessagingHosts\com.shopbadwill.companion', '/f')
+  }
+  It 'refuses a non-HKCU parent and a host name that could escape the key' {
+    foreach ($badKey in @(
+        'HKLM\Software\Google\Chrome\NativeMessagingHosts',
+        'HKCR\Software\X',
+        'HKU\S-1-5\Software\X',
+        'Software\Google\Chrome\NativeMessagingHosts',
+        'HKCU\Software\..\HKLM\Software'
+      )) {
+      $addThrew = $false
+      try { Get-SbwRegAddArgs -Key $badKey -ValueName 'com.shopbadwill.companion' -ManifestPath 'C:\d\m.json' | Out-Null } catch { $addThrew = $true }
+      Assert-True $addThrew $badKey
+      $delThrew = $false
+      try { Get-SbwRegDeleteArgs -Key $badKey -ValueName 'com.shopbadwill.companion' | Out-Null } catch { $delThrew = $true }
+      Assert-True $delThrew $badKey
+    }
+    foreach ($badName in @('..\Run', 'com.shopbadwill.companion\extra', 'a/b', '', '..')) {
+      $threw = $false
+      try { Get-SbwRegDeleteArgs -Key 'HKCU\Software\Mozilla\NativeMessagingHosts' -ValueName $badName | Out-Null } catch { $threw = $true }
+      Assert-True $threw $badName
+    }
+  }
+}
+
+Describe 'registry writes go through one splatted HKCU call' {
+  It 'install registers via Invoke-SbwReg and does not pass reg.exe a single array object' {
+    $install = Get-SbwInstallSource
+    Assert-Match $install 'Invoke-SbwReg -ArgList \(Get-SbwRegAddArgs '
+    Assert-Match $install '& reg\.exe @ArgList'
+    Assert-NotMatch $install '& reg\.exe @\('
+    Assert-Match $install 'reg query HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com\.shopbadwill\.companion'
+    Assert-NotMatch $install 'NativeMessagingHosts /v com\.shopbadwill\.companion'
+  }
+  It 'uninstall deletes through that same function and never calls reg.exe itself' {
+    $un = Get-SbwUninstallSource
+    Assert-Match $un 'Invoke-SbwReg -ArgList \(Get-SbwRegDeleteArgs '
+    Assert-NotMatch $un '& reg\.exe'
+  }
+  It 'the user-facing verify command queries the host subkey' {
+    $doc = Get-SbwCompanionDoc
+    Assert-Match $doc 'reg query HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com\.shopbadwill\.companion'
+    Assert-Match $doc 'reg query HKCU\\Software\\Mozilla\\NativeMessagingHosts\\com\.shopbadwill\.companion'
+    Assert-NotMatch $doc 'NativeMessagingHosts /v com\.shopbadwill\.companion'
   }
 }
 
@@ -220,6 +273,10 @@ Describe 'uninstall -DataDir survives dot-sourcing install.ps1' {
       Assert-Match $joined 'HKCU\\'
       Assert-NotMatch $joined 'HKLM'
       Assert-Match $joined 'com\.shopbadwill\.companion'
+      $key = @($args | Where-Object { $_ -like 'HK*\*' })
+      Assert-Equal $key.Count 1
+      Assert-Match ([string]$key[0]) '\\com\.shopbadwill\.companion$'
+      Assert-False ($args -ccontains '/v')
     }
     Assert-False (Test-Path -LiteralPath (Join-Path $tmp 'config.json'))
     Assert-False (Test-Path -LiteralPath (Join-Path $tmp 'shopbadwill-host.cmd'))

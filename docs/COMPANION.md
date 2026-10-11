@@ -10,8 +10,9 @@ leaves the browser.
 ## How it works
 
 - `companion/windows/install.ps1` (run once, per user) registers
-  `com.shopbadwill.companion` under `HKCU\Software\Google\Chrome\NativeMessagingHosts`
-  and/or `HKCU\Software\Mozilla\NativeMessagingHosts` and writes the config to
+  `com.shopbadwill.companion` as a subkey of `HKCU\Software\Google\Chrome\NativeMessagingHosts`
+  and/or `HKCU\Software\Mozilla\NativeMessagingHosts` (the subkey's default value is the
+  manifest path) and writes the config to
   `%LOCALAPPDATA%\ShopBadwill\companion\`.
 - When a snipe is armed, the extension asks the host to `schedule`; the host
   registers a one-off `ShopBadwill-<id>` task (`WakeToRun`,
@@ -19,8 +20,8 @@ leaves the browser.
   profile. `cancel` removes it; `list` reports it. Protocol:
   `companion/windows/PROTOCOL.md`.
 - Fired/orphaned tasks delete themselves (`DeleteExpiredTaskAfter PT10M`,
-  1 h `EndBoundary` window). `uninstall.ps1` removes every `ShopBadwill-*` task,
-  the registry values and the data dir.
+  1 h `EndBoundary` window). `uninstall.ps1` removes every task named
+  `ShopBadwill-<snipeId>`, both host subkeys, and the data dir.
 
 ## Power-plan guidance (from S-8 verdicts, provisional)
 
@@ -94,8 +95,8 @@ unattended option.
 5. Verify, then paste these two outputs back:
 
    ```powershell
-   reg query HKCU\Software\Google\Chrome\NativeMessagingHosts /v com.shopbadwill.companion
-   reg query HKCU\Software\Mozilla\NativeMessagingHosts /v com.shopbadwill.companion
+   reg query HKCU\Software\Google\Chrome\NativeMessagingHosts\com.shopbadwill.companion
+   reg query HKCU\Software\Mozilla\NativeMessagingHosts\com.shopbadwill.companion
    ```
 
    In the extension, arm a dry-run snipe and confirm a task appears
@@ -121,9 +122,8 @@ $R = 'C:\tools\shopbadwill-wt\T-110'
 powershell -ExecutionPolicy Bypass -File "$R\companion\windows\uninstall.ps1"     # append -WhatIf for a dry run
 ```
 
-It deletes only `ShopBadwill-*` tasks, removes both registry values and
-the data dir. It never changes power settings: revert any manual power-plan
-changes with the commands above. Restart the browsers afterwards.
+It deletes only tasks named `ShopBadwill-<snipeId>`, removes both host subkeys
+and the data dir. It never changes power settings. Restart the browsers afterwards.
 
 ## Security notes
 
@@ -140,7 +140,7 @@ changes with the commands above. Restart the browsers afterwards.
 ## Troubleshooting
 
 - "Specified native messaging host not found": the browser was not fully
-  restarted after install, or the registry value is missing — re-check step 5.
+  restarted after install, or the host subkey is missing — re-check step 5.
 - The extension reports `browser-not-found` or `unknown-profile`: re-run
   install.ps1 with the current exe path / profile from `chrome://version`.
 - The laptop did not wake: it was on battery (DC wake timers disabled), or the
