@@ -47,6 +47,18 @@ const STATE_TEXT: Readonly<Record<SnipeState, string>> = {
 
 const itemUrl = (id: ItemId): string => `https://shopgoodwill.com/item/${String(id)}`;
 
+/**
+ * Item id from a dashboard URL `?item=` (the tab opened when the side panel
+ * refuses). Junk, zero and non-integers are ignored so a bad query never prepares.
+ */
+export function itemIdFromSearch(search: string): ItemId | null {
+  const raw = new URLSearchParams(search).get('item');
+  if (raw === null || !/^[1-9]\d*$/.test(raw)) return null;
+  const id = Number(raw);
+  // Reject values that do not survive the number conversion unchanged (too big to be a safe integer).
+  return Number.isSafeInteger(id) && String(id) === raw ? id : null;
+}
+
 function SnipeRow(props: {
   snipe: Snipe;
   tick: SnipeCountdownTick | undefined;
@@ -115,7 +127,7 @@ export function SnipesSection(props: SectionProps): VNode {
   const [settings, reloadSettings] = useLoad(() => client.send('settings.get', undefined), [client]);
   const [snipes, reloadSnipes] = useLoad(() => client.send('snipe.list', undefined), [client]);
   const [ticks, setTicks] = useState<ReadonlyMap<string, SnipeCountdownTick>>(new Map());
-  const [openItem, setOpenItem] = useState<ItemId | null>(null);
+  const [openItem, setOpenItem] = useState<ItemId | null>(() => itemIdFromSearch(globalThis.location?.search ?? ''));
   const [disarming, setDisarming] = useState<string | null>(null);
   const [disarmError, setDisarmError] = useState('');
 
@@ -143,10 +155,14 @@ export function SnipesSection(props: SectionProps): VNode {
   );
 
   // The "Snipe…" deep link: the background re-sends ui.openSnipe to extension
-  // pages after opening the dashboard (handlers/open-snipe.ts). ui.openSnipe is
-  // not in the frozen broadcast union, so the subscription is cast; the client
-  // delivers any background-sent message of that type (it validates the same
-  // envelope). It only pre-fills the form — nothing here arms (R1, R2).
+  // pages after opening the dashboard (handlers/open-snipe.ts). A fallback tab
+  // also arrives with `?item=` (read above), because this message can land
+  // before the new page is listening.
+  // TODO(protocol): ui.openSnipe is not in the frozen broadcast union, so the
+  // subscription is cast. The client delivers any background-sent message of
+  // that type (it validates the same envelope). Replace the cast with a real
+  // protocol channel; do not change the protocol in this card. It only
+  // pre-fills the form — nothing here arms (R1, R2).
   useEffect(() => {
     const onBroadcast = client.onBroadcast.bind(client) as unknown as (type: string, cb: (payload: unknown) => void) => () => void;
     return onBroadcast('ui.openSnipe', (payload) => {
