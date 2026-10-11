@@ -434,3 +434,25 @@ A schema failure flagged by the API but not yet stored (`flagSchemaFailure`) is 
 **Tests.** `test/integration/background-main.test.ts` (T-30b block), `test/dom/options-google.test.ts` (sticky failures).
 
 **Follow-up for the next PLAN edit.** Add `health.clearSticky` to PLAN §3.12 and the `sticky` field to the `health.get` reply; add the feature scoping to §3.3.
+
+## T-67: CalendarSink, calendar sync job, `deleteEvent` undo, `sbw:calendarSync`
+
+Source: T-67 (provisional: S-5 pending, so the recreate strategy is `bump-generation`).
+
+**Undo ref.** A real `calendar.insert` audit entry carries `undo: { kind: 'deleteEvent', ref: 'deleteEvent:<itemId>:<eventId>' }` (e.g. `deleteEvent:9000001:sbv9000001g0`; `parseDeleteEventRef` in `src/adapters/google/calendar-sink.ts` accepts only `/^deleteEvent:(\d+):([a-v0-9]{5,1024})$/`). The executor (`createCalendarUndoExecutors`, `src/background/handlers/calendar.ts`, merged into T-58's map by `wiredUndoExecutors` in `handlers/audit.ts`; the activity UI's `UNDOABLE_KINDS` includes `deleteEvent` and a unit test pins it to those keys) first sets `tracked[itemId].calendar = false`, so a sync running meanwhile cannot put the event back, then deletes the event through the sink (ownership guard, kill switch, dry-run, health and cooldown gates apply). A refusal restores the flag and is "not now: ..."; the entry stays not done. Google not connected (or needing a reconnect) is refused before any Google call. A second run is a no-op (the link is `deleted`). Turning the item's calendar back on later inserts a fresh generation (`bump-generation`); the cancelled id is never reused. A dry-run `calendar.insert` has no `undo`.
+
+**Ownership guard.** The sink patches, stamps or deletes an event only when `extendedProperties.private.sbwItemId !== ''`, equals the item, and the event id equals `eventIdFor(itemId, generation)`, on our dedicated calendar. It reads the event first (one GET) to check. A failing check is audited `calendar.refused`, the event is not written, and the link is set to `error` (patch/stamp) or `deleted` (delete).
+
+**Dedicated calendar lookup.** Before `calendars.insert`, `ensureCalendar` calls `calendarList.list` (`CalendarApi.calendarListList`, rows carry `accessRole` and `primary`) and adopts an existing calendar only when ALL hold: its description contains `sbw:dedicated-calendar` (written on every insert), `accessRole === 'owner'`, and it is not the primary calendar (`primary: true` or id `primary`). The summary alone never qualifies (Opus check, T-67): a user calendar, or one shared with the user, may carry the same name, and the adopted calendar is where every later write goes. No build ever created our calendar without the marker. That covers a crash between insert and saving the id, and a deleted saved calendar when a marked leftover is still listed. Google's published scope list for `calendarList.list` does not include `calendar.app.created` (it does for `calendarList.get`); a 403 `insufficient-scope` on the list falls through to insert and does not raise the reconnect notice. A 429 or other error still halts. Adoption is audited as `calendar.adopted`.
+
+**Pacing (R4).** The sink's `RequestLimiter` starts each Calendar port call at least 1 s after the previous one ENDED. `GoogleCalendarApi` (T-64) waits at least `minRetryDelayMs` (default 1000 ms) before any internal retry, whatever the backoff or Retry-After says. Together no two Calendar requests from the sync start less than 1 s apart. The one exception is T-62's `authorizedHttp`: a 401 refreshes the token and resends that request once at once.
+
+**`sbw:calendarSync` (storage.local).** Bookkeeping the frozen `CalendarLink` has no room for: `retries` per item (reconciler backoff), `cooldownUntil`/`cooldownCount` (after a 403/429, exponential 60 s to 1 h), `noticeDay` (one reconnect notice per local day), `sinkHashes` (ReminderSink change detection), `dryRunSeen` (dry-run audit de-duplication). Not a Repo key: the sink owns it.
+
+**Pending links.** While Google is disconnected (or needs a reconnect) desired events are stored as `status: 'pending'` links with `calendarId: 'pending'`; when the calendar is created they are re-homed to its real id and inserted.
+
+**Stable description.** Sync drops the `Current price:` line from the event description (the price changes every bid and would patch the event each time). `calendar.ics` keeps it.
+
+**ReminderSink (I-34).** `registerReminderSink(sink)` and `ReminderSink { name, upsert(event), remove(itemId) }` are exported from `src/background/jobs/calendar-sync.ts`. Sinks are fed from the desired set (open items only), independent of Google, changed events only, and not at all in dry-run or under the kill switch.
+
+**Late add (I-18).** An insert whose event ends in under 60 minutes (T-56's `isLateAdd`) sends one local notification, id `sbw:notify:late:<itemId>`, and appends the same `notify.late-add` audit entry T-56 uses, so the two never double-alert.

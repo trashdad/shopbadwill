@@ -17,6 +17,7 @@ import type { SgwApi } from '../../ports/sgw-api';
 import type { BackgroundContext } from '../context';
 import { parseUnfavoriteRef } from '../jobs/steps/favorite';
 import type { Handler } from '../router';
+import { createCalendarUndoExecutors } from './calendar';
 
 export type UndoKind = NonNullable<AuditEntry['undo']>['kind'];
 
@@ -131,9 +132,18 @@ export function createAuditHandlers(deps: AuditHandlerDeps): {
   };
 }
 
+/**
+ * Every executor `audit.undo` runs in the extension: T-58's, plus T-67's
+ * `deleteEvent` (ref format in docs/CONTRACT-DECISIONS.md). The UI's
+ * UNDOABLE_KINDS is pinned to these keys by a unit test.
+ */
+export function wiredUndoExecutors(ctx: BackgroundContext): Partial<Record<UndoKind, UndoExecutor>> {
+  return { ...createUndoExecutors({ api: ctx.api, repo: ctx.repo }), ...createCalendarUndoExecutors(ctx) };
+}
+
 /** T-36 self-registration (I-01): main.ts's handler registry calls this once. */
 export function register(ctx: BackgroundContext): void {
-  const handlers = createAuditHandlers({ audit: ctx.audit, executors: createUndoExecutors({ api: ctx.api, repo: ctx.repo }) });
+  const handlers = createAuditHandlers({ audit: ctx.audit, executors: wiredUndoExecutors(ctx) });
   ctx.router.register('audit.list', handlers['audit.list']);
   ctx.router.register('audit.undo', handlers['audit.undo']);
 }

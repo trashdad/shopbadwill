@@ -18,10 +18,27 @@ export interface CalendarSink {
   ): Promise<Array<{ itemId: ItemId; op: string; error?: string }>>;
 }
 
+/** One `calendarList.list` entry, as far as the sink needs it. */
+export interface CalendarListRow {
+  id: string;
+  summary: string;
+  description?: string;
+  /** 'owner' | 'writer' | 'reader' | 'freeBusyReader' (Google's values). */
+  accessRole?: string;
+  primary?: boolean;
+}
+
 /** Thin typed Calendar v3 subset. */
 export interface CalendarApi {
-  calendarsInsert(summary: string, timeZone: string): Promise<{ id: string }>;
+  calendarsInsert(summary: string, timeZone: string, description?: string): Promise<{ id: string }>;
   calendarListGet(calendarId: string): Promise<{ id: string } | null>;
+  /**
+   * Calendars this grant can see. `calendar.app.created` sees only calendars
+   * this app created. An entry with no id is omitted. `accessRole` and
+   * `primary` are passed through when Google sends them (the sink adopts only
+   * an owned, non-primary calendar carrying its marker).
+   */
+  calendarListList(): Promise<CalendarListRow[]>;
   /** 409 → CalendarApiError('conflict'). */
   eventsInsert(calendarId: string, body: GcalEventBody & { id: string }): Promise<GcalEvent>;
   /** Includes status 'cancelled'. */

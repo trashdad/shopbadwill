@@ -64,16 +64,27 @@ describe('activity list', () => {
   });
 
   it('shows a disabled "Undo not available yet" button for kinds with no executor', async () => {
-    const fake = app([
-      entry(1, { undo: { kind: 'deleteEvent', ref: 'ev1' } }),
-      entry(2, { undo: { kind: 'disarm', ref: 's1' } }),
-    ]);
+    const fake = app([entry(2, { undo: { kind: 'disarm', ref: 's1' } })]);
     mount(fake);
     const btns = await screen.findAllByRole<HTMLButtonElement>('button', { name: /Undo not available yet/ });
-    expect(btns).toHaveLength(2);
+    expect(btns).toHaveLength(1);
     expect(btns.every((b) => b.disabled)).toBe(true);
     fireEvent.click(btns[0] as HTMLButtonElement);
     expect(undos(fake)).toHaveLength(0);
+  });
+
+  it('a calendar insert (T-67 deleteEvent) has a working Undo button', async () => {
+    const fake = app([
+      entry(1, { actor: 'calendar', kind: 'calendar.insert', undo: { kind: 'deleteEvent', ref: 'deleteEvent:101:sbv101g0' } }),
+    ]);
+    fake.handle('audit.undo', () => undefined);
+    mount(fake);
+    const btn = await screen.findByRole<HTMLButtonElement>('button', { name: /^Undo: Remove calendar event for item 101/ });
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(undos(fake)).toEqual([{ type: 'audit.undo', payload: { seq: 1 } }]);
+    });
   });
 
   it('shows done entries disabled and leaves a failed undo retryable', async () => {

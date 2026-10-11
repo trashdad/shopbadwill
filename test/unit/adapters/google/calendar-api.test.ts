@@ -39,7 +39,7 @@ const rawEvent = (over: Record<string, unknown> = {}) => ({
 });
 const ok = (body: unknown, headers?: Record<string, string>) => ({ status: 200, bodyText: JSON.stringify(body), ...(headers ? { headers } : {}) });
 
-function setup(opts: { random?: () => number; maxAttempts?: number; auth?: FakeGoogleAuth } = {}) {
+function setup(opts: { random?: () => number; maxAttempts?: number; auth?: FakeGoogleAuth; minRetryDelayMs?: number } = {}) {
   const http = new FakeHttp(new FakeClock());
   const clock = new RecordingClock();
   const auth = opts.auth ?? new FakeGoogleAuth({ connected: true });
@@ -48,6 +48,8 @@ function setup(opts: { random?: () => number; maxAttempts?: number; auth?: FakeG
     auth,
     clock,
     random: opts.random ?? (() => 1),
+    // The backoff-shape tests below look at the raw curve; the 1 s floor has its own test.
+    minRetryDelayMs: opts.minRetryDelayMs ?? 0,
     ...(opts.maxAttempts === undefined ? {} : { maxAttempts: opts.maxAttempts }),
   });
   return { http, clock, auth, api };
@@ -182,6 +184,24 @@ describe('GoogleCalendarApi requests and responses', () => {
     expect(http.requests[0]).toMatchObject({ method: 'PATCH', body: '{"summary":"new"}' });
   });
 
+  it('calendarListList returns id, summary and description and follows pages', async () => {
+    const { api, http } = setup();
+    http.on(`${BASE}/users/me/calendarList`, (req) =>
+      req.url.includes('pageToken=p2')
+        ? ok({ items: [{ id: 'marked@group.calendar.google.com', summary: 'Renamed', description: 'sbw:dedicated-calendar' }] })
+        : ok({
+            items: [{ id: 'c1', summary: 'ShopGoodwill Auctions' }, { summary: 'no id' }],
+            nextPageToken: 'p2',
+          }),
+    );
+    const out = await api.calendarListList();
+    expect(out).toEqual([
+      { id: 'c1', summary: 'ShopGoodwill Auctions' },
+      { id: 'marked@group.calendar.google.com', summary: 'Renamed', description: 'sbw:dedicated-calendar' },
+    ]);
+    expect(new URL(http.requests[0]?.url ?? '').pathname).toBe('/calendar/v3/users/me/calendarList');
+  });
+
   it('eventsListByPrivateProp encodes the filter and follows pages', async () => {
     const { api, http } = setup();
     http.on(`${BASE}/calendars/c/events`, (req) =>
@@ -276,6 +296,16 @@ describe('calendarsInsert is not retried (non-idempotent)', () => {
 });
 
 describe('backoff', () => {
+  it('by default a retry never comes sooner than 1 s (Google calls are paced at 1 request/second, T-67)', async () => {
+    const http = new FakeHttp(new FakeClock());
+    const clock = new RecordingClock();
+    const api = new GoogleCalendarApi({ http, auth: new FakeGoogleAuth({ connected: true }), clock, random: () => 0 });
+    http.on(BASE, gerr(429, 'rateLimitExceeded'), gerr(503, 'backendError'), { ...gerr(429, 'rateLimitExceeded'), headers: { 'retry-after': '0' } }, ok(rawEvent()));
+    await api.eventsInsert('c', body);
+    expect(http.requests).toHaveLength(4);
+    expect(clock.delays).toEqual([1000, 1000, 1000]);
+  });
+
   it('retries 429 with exponential delays (equal jitter) then succeeds', async () => {
     const { api, http, clock } = setup({ random: () => 1 });
     http.on(BASE, gerr(429, 'rateLimitExceeded'), gerr(429, 'rateLimitExceeded'), gerr(503, 'backendError'), ok(rawEvent()));

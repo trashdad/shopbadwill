@@ -751,7 +751,7 @@ describe('carries: DailyJob wiring', () => {
     expect(h.watches().find((w) => w.id === 'w1')?.lastError).toBeUndefined();
   });
 
-  it('settings reach the job: calendar.enabled plans calendarUpsert, run by the no-op executor that audits the skip', async () => {
+  it('settings reach the job: calendar.enabled plans calendarUpsert, run by the T-67 executor (Google not connected: a pending link, no Google request)', async () => {
     const settings = { ...defaultSettings(), calendar: { ...defaultSettings().calendar, enabled: true } };
     const h = await ready({
       settings,
@@ -762,12 +762,14 @@ describe('carries: DailyJob wiring', () => {
     const run = h.lastRun();
     expect(run?.steps.map((s) => s.kind)).toEqual(['search', 'favoritesList', 'detail', 'calendarUpsert']);
     expect(run?.status).toBe('done');
-    expect(h.audit()).toContainEqual(
-      expect.objectContaining({ kind: 'job.step.skipped', itemId: 7, details: expect.objectContaining({ step: 'calendarUpsert' }) as unknown }),
-    );
-    // A no-op skip is not a failure.
+    expect(h.audit().filter((e) => e.kind === 'job.step.skipped')).toEqual([]);
+    expect(run?.results.calendarUpserts).toEqual([7]);
     expect(runFailures(run as JobRun)).toEqual([]);
     expect(h.tracked()['7']).toMatchObject({ calendar: true, reasons: [{ kind: 'watch', id: 'w1' }], favoriteState: 'none' });
+    // Google is not connected: the event waits as a pending link, and nothing went to Google.
+    const calendar = h.areas.local.dump()[STORAGE_KEYS.calendar] as { links: Record<string, { status: string }> };
+    expect(calendar.links['7']?.status).toBe('pending');
+    expect(h.http.requests.filter((q) => q.url.includes('google'))).toEqual([]);
   });
 
   it('seenUpdates: matched and rejected items join the watch seen ring at the end of the run; a seen item is not fetched again', async () => {
@@ -1182,13 +1184,13 @@ describe('carries: saved watches (watches.save / watches.importSaved)', () => {
 });
 
 describe('carries: step-executor registry (I-07)', () => {
-  it('loads ./*.ts by import.meta.glob: favorite, search, favorites-list, detail (and T-56 notify-digest) export {kind, run}', () => {
+  it('loads ./*.ts by import.meta.glob: favorite, search, favorites-list, detail (and T-56 notify-digest, T-67 calendar-upsert) export {kind, run}', () => {
     expect(Object.keys(STEP_MODULES).sort()).toEqual(
-      expect.arrayContaining(['./detail.ts', './favorite.ts', './favorites-list.ts', './notify-digest.ts', './search.ts']),
+      expect.arrayContaining(['./calendar-upsert.ts', './detail.ts', './favorite.ts', './favorites-list.ts', './notify-digest.ts', './search.ts']),
     );
     expect(Object.keys(STEP_MODULES)).not.toContain('./index.ts');
     const registry = createStepRegistry();
-    expect([...registry.kinds].sort()).toEqual(['detail', 'favorite', 'favoritesList', 'notifyDigest', 'search']);
+    expect([...registry.kinds].sort()).toEqual(['calendarUpsert', 'detail', 'favorite', 'favoritesList', 'notifyDigest', 'search']);
     expect(registry.failed).toEqual([]);
   });
 
