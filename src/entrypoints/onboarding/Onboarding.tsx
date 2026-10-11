@@ -14,12 +14,15 @@
 //                      (§15 Q5) unless the user chooses not to favorite
 //                      (`local`), matching everything new in the search. The
 //                      preview says that once dry-run is off, every new item
-//                      is favorited on the ShopGoodwill account.
+//                      is favorited on the ShopGoodwill account. A stored
+//                      watch for the same search (T-52 identity) is reused,
+//                      never duplicated (controller ruling 2).
 //   5. Dry run         plain ToS/risk copy behind an explicit checkbox (R3), the
 //                      optional `notifications` permission requested from the
 //                      click handler through src/ui/permissions.ts (R6, I-21),
-//                      then "Dry-run it now": `job.runNow` sent only after
-//                      `settings.dryRun` is on (R1).
+//                      then "Dry-run it now": `job.runNow` sent only after the
+//                      favorites and calendar dry runs are on (R1). Bidding
+//                      dry-run is never changed (controller ruling 1).
 //
 // Onboarding itself never enables live sniping and never turns dry-run off (R3).
 import type { VNode } from 'preact';
@@ -41,7 +44,7 @@ import { Status } from '../../ui/components/Status';
 import { hasPermissions, requestPermissions } from '../../ui/permissions';
 import { summarizeQuery } from '../options/sections/watches';
 import { MATCH_ALL_RULE_ID, defaultWatchName, matchEverythingRule, queryFromUrl } from '../options/sections/watches/draft';
-import { buildFirstWatch, templateQuery, zipError } from './steps';
+import { buildFirstWatch, searchKey, templateQuery, zipError } from './steps';
 
 export interface OnboardingProps {
   client: MessagingClient;
@@ -66,6 +69,12 @@ const SIGNED_IN: ReadonlyArray<MsgReply<'health.get'>['sessionState']> = ['ok', 
 /** Stable defaults for the injected seams: fresh closures each render would re-trigger effects. */
 const NO_TAB = (): Promise<string | undefined> => Promise.resolve(undefined);
 const NOOP = (): void => undefined;
+
+/** Ruling 2: another stored watch for the same search (by T-52's identity), or null. `ownId` is this visit's watch. */
+function sameSearch(all: readonly Watch[], query: SearchQuery, ownId: string): Watch | null {
+  const key = searchKey(query);
+  return all.find((w) => w.id !== ownId && searchKey(w.query) === key) ?? null;
+}
 
 function problem(what: string, e: unknown): string {
   if (e instanceof MessagingError && e.code === 'no_handler') {
@@ -101,6 +110,8 @@ export function Onboarding(props: OnboardingProps): VNode {
   /** True saves the schema default (`sgw`). False is "don't favorite" (`local`). */
   const [favoriteOnAccount, setFavoriteOnAccount] = useState(true);
   const [watch, setWatch] = useState<Watch | null>(null);
+  /** A stored watch for the step-4 search, reused instead of creating another (ruling 2). */
+  const [existing, setExisting] = useState<Watch | null>(null);
   const [watchBusy, setWatchBusy] = useState(false);
   const [watchError, setWatchError] = useState('');
   const [tos, setTos] = useState(false);
@@ -181,6 +192,22 @@ export function Onboarding(props: OnboardingProps): VNode {
     if (step === 4) resolveSource();
   }, [step, resolveSource]);
 
+  // Ruling 2: is this search already watched? (createWatch checks again, fresh, on the click.)
+  useEffect(() => {
+    setExisting(null);
+    if (source === null) return;
+    let alive = true;
+    client.send('watches.list', undefined).then(
+      (all) => {
+        if (alive) setExisting(sameSearch(all, source.query, watchId));
+      },
+      () => undefined,
+    );
+    return () => {
+      alive = false;
+    };
+  }, [client, source, watchId]);
+
   // Move focus to the step heading on every change, for screen readers.
   useEffect(() => {
     document.getElementById('onboarding-step-heading')?.focus();
@@ -189,7 +216,10 @@ export function Onboarding(props: OnboardingProps): VNode {
   const signedIn = health !== null && SIGNED_IN.includes(health.sessionState);
   // A re-run can find a dry run already off; the copy must say so (the defaults are all on).
   const favoritesDryRunOff = settings !== null && !settings.dryRun.favorites;
-  const allDryRunOn = settings === null || (settings.dryRun.favorites && settings.dryRun.calendar && settings.dryRun.bidding);
+  /** The daily job's writes; Dry-run it now turns these on. */
+  const jobDryRunOn = settings === null || (settings.dryRun.favorites && settings.dryRun.calendar);
+  /** Never changed by onboarding (ruling 1). */
+  const biddingDryRunOn = settings === null || settings.dryRun.bidding;
 
   const saveZip = (): void => {
     const v = zip.trim();
@@ -240,6 +270,15 @@ export function Onboarding(props: OnboardingProps): VNode {
     setWatchBusy(true);
     setWatchError('');
     try {
+      // Ruling 2: never a second watch for the same search. Checked fresh here,
+      // since one may have been saved (options, another tab) after step 4 opened.
+      const same = sameSearch(await client.send('watches.list', undefined), source.query, watchId);
+      if (same !== null) {
+        setExisting(same);
+        setWatch(same);
+        setStep(5);
+        return;
+      }
       const rules = await client.send('rules.list', undefined);
       if (!rules.some((r) => r.id === MATCH_ALL_RULE_ID)) {
         await client.send('rules.save', matchEverythingRule(now()));
@@ -282,12 +321,18 @@ export function Onboarding(props: OnboardingProps): VNode {
     if (watch === null || settings === null) return;
     setDryRunState('running');
     try {
-      // R1/R3: the run goes out only while dry-run is on; onboarding turns it ON, never off.
-      // Always written, never skipped on the loaded copy: the options tab (Connect
-      // Google) may have turned a dry run off since this page read the settings.
-      const dryRun = { favorites: true, calendar: true, bidding: true };
-      await client.send('settings.set', { dryRun });
-      setSettings({ ...settings, dryRun });
+      // R1/R3: the run goes out only while the daily job's writes (favorites,
+      // calendar) are in dry-run; onboarding turns them ON, never off. Read fresh,
+      // not the copy loaded with the page: the options tab (Connect Google) may
+      // have changed a dry run since. Ruling 1: bidding is written back exactly as
+      // stored, so armed live snipes are never silently converted.
+      let current = await client.send('settings.get', undefined);
+      if (!current.dryRun.favorites || !current.dryRun.calendar) {
+        const dryRun = { ...current.dryRun, favorites: true, calendar: true };
+        await client.send('settings.set', { dryRun });
+        current = { ...current, dryRun };
+      }
+      setSettings(current);
       await client.send('job.runNow', { watchIds: [watch.id] });
       setDryRunState('done');
       setStatus({ message: 'The dry run is running. Watch the dashboard for progress.', tone: 'ok' });
@@ -312,8 +357,9 @@ export function Onboarding(props: OnboardingProps): VNode {
               {watch === null ? null : <li>First watch: "{watch.name}" — the dry run is running.</li>}
             </ul>
             <p class="sbw-hint">
-              Dry-run stays on until you turn it off. Live bidding stays off until you turn off the bidding dry run yourself
-              in options.
+              {biddingDryRunOn
+                ? 'Dry-run stays on until you turn it off. Live bidding stays off until you turn off the bidding dry run yourself in options.'
+                : 'Dry-run for favorites and calendar stays on until you turn it off. Bidding dry-run is off, as you left it: armed snipes can bid for real.'}
             </p>
             <div class="sbw-actions">
               <button
@@ -511,26 +557,46 @@ export function Onboarding(props: OnboardingProps): VNode {
                 <Card>
                   <h3>{defaultWatchName(source.query)}</h3>
                   <p data-testid="onboarding-watch-query">{summarizeQuery(source.query)}</p>
-                  <p>
-                    {!favoriteOnAccount
-                      ? 'Nothing in this search will be favorited on your ShopGoodwill account.'
-                      : favoritesDryRunOff
-                        ? "Dry-run is off for favorites right now, so from this watch's next run, every new item in this search will be favorited on your ShopGoodwill account. Dry-run it now, on the next step, turns dry-run back on."
-                        : 'Once dry-run is off, every new item in this search will be favorited on your ShopGoodwill account.'}
-                  </p>
-                  <p class="sbw-hint">
-                    It matches everything new in this search. You can add rules, sellers and price limits later in options.
-                  </p>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={!favoriteOnAccount}
-                      onChange={(e) => {
-                        setFavoriteOnAccount(!e.currentTarget.checked);
-                      }}
-                    />{' '}
-                    Don't favorite on ShopGoodwill
-                  </label>
+                  {existing !== null ? (
+                    <div>
+                      <p role="status">
+                        You already watch this search: "{existing.name}". ShopBadwill will not create another.
+                      </p>
+                      <p>
+                        {existing.favoriteMode === 'local'
+                          ? 'It does not favorite anything on your ShopGoodwill account.'
+                          : favoritesDryRunOff
+                            ? 'Dry-run is off for favorites right now, so it favorites new items on your ShopGoodwill account when it runs.'
+                            : 'Once dry-run is off, it favorites new items on your ShopGoodwill account.'}
+                      </p>
+                      {existing.enabled ? null : (
+                        <p class="sbw-warn">It is turned off, so the dry run cannot run it. Turn it on in options first.</p>
+                      )}
+                    </div>
+                  ) : (
+                    <div>
+                      <p>
+                        {!favoriteOnAccount
+                          ? 'Nothing in this search will be favorited on your ShopGoodwill account.'
+                          : favoritesDryRunOff
+                            ? "Dry-run is off for favorites right now, so from this watch's next run, every new item in this search will be favorited on your ShopGoodwill account. Dry-run it now, on the next step, turns dry-run back on."
+                            : 'Once dry-run is off, every new item in this search will be favorited on your ShopGoodwill account.'}
+                      </p>
+                      <p class="sbw-hint">
+                        It matches everything new in this search. You can add rules, sellers and price limits later in options.
+                      </p>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={!favoriteOnAccount}
+                          onChange={(e) => {
+                            setFavoriteOnAccount(!e.currentTarget.checked);
+                          }}
+                        />{' '}
+                        Don't favorite on ShopGoodwill
+                      </label>
+                    </div>
+                  )}
                 </Card>
                 <div class="sbw-actions">
                   <button
@@ -549,7 +615,7 @@ export function Onboarding(props: OnboardingProps): VNode {
                       void createWatch();
                     }}
                   >
-                    Create my first watch
+                    {existing === null ? 'Create my first watch' : 'Use this watch'}
                   </button>
                 </div>
               </div>
@@ -584,9 +650,17 @@ export function Onboarding(props: OnboardingProps): VNode {
                 <li>Automated bidding may break ShopGoodwill's terms, and your account is at risk. Real money is involved.</li>
                 <li>You keep control: every bid is capped by the max you set, and daily caps apply.</li>
                 <li>
-                  {allDryRunOn
+                  {jobDryRunOn && biddingDryRunOn
                     ? 'Dry-run is on and stays on until you turn it off yourself.'
-                    : 'Dry-run is off right now for favorites, calendar or bids. Dry-run it now turns it back on for all three, and it stays on until you turn it off yourself.'}
+                    : `${
+                        jobDryRunOn
+                          ? 'Dry-run is on for favorites and calendar and stays on until you turn it off yourself.'
+                          : 'Dry-run is off right now for favorites or calendar. Dry-run it now turns it back on for both, and it stays on until you turn it off yourself.'
+                      } ${
+                        biddingDryRunOn
+                          ? 'Bidding dry-run is on and stays on until you turn it off yourself.'
+                          : 'Bidding dry-run is off, as you set it: armed snipes can bid for real. Dry-run it now leaves it that way.'
+                      }`}
                 </li>
               </ul>
               <label>
@@ -616,6 +690,9 @@ export function Onboarding(props: OnboardingProps): VNode {
             </Card>
             <Card>
               <h3>The dry run</h3>
+              {watch === null || watch.id === watchId ? null : (
+                <p>You already watch this search, so the dry run uses "{watch.name}" as it is.</p>
+              )}
               {watch === null ? null : (
                 <p>
                   Runs "{watch.name}" now: matches are found and favorited only on paper. Nothing is written to your
@@ -625,7 +702,9 @@ export function Onboarding(props: OnboardingProps): VNode {
               <div class="sbw-actions">
                 <button
                   type="button"
-                  disabled={!tos || settings === null || watch === null || dryRunState !== 'idle'}
+                  disabled={
+                    !tos || settings === null || watch === null || dryRunState === 'running' || dryRunState === 'done'
+                  }
                   onClick={() => {
                     void dryRunNow();
                   }}

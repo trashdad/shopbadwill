@@ -17,6 +17,37 @@ export function templateQuery(): SearchQuery {
   return { searchText: '', categoryIds: [], sellerIds: [], page: 1 };
 }
 
+/** Category-navigation params a search URL carries that go stale; T-52's `watches.save` drops them. */
+const STALE_EXTRA = ['catIds', 'cln'];
+
+function canon(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canon);
+  if (typeof v === 'object' && v !== null) {
+    return Object.fromEntries(
+      Object.entries(v)
+        .filter(([, x]) => x !== undefined)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, x]) => [k, canon(x)]),
+    );
+  }
+  return v;
+}
+
+/**
+ * The identity of a search as `watches.save` stores it, the same as T-52's
+ * `queryKey` (page 1, no stale navigation params, key order and undefined
+ * fields ignored; a test pins the parity). Kept here so this page does not
+ * bundle the background job code. Two queries with the same key are the same
+ * watch (controller ruling 2: no duplicate first watches).
+ */
+export function searchKey(q: SearchQuery): string {
+  const out: Record<string, unknown> = { ...q, page: 1 };
+  const extra = Object.fromEntries(Object.entries(q.extra ?? {}).filter(([k]) => !STALE_EXTRA.includes(k)));
+  if (Object.keys(extra).length > 0) out['extra'] = extra;
+  else delete out['extra'];
+  return JSON.stringify(canon(out));
+}
+
 /** T-70 options flow: the options page opened at the Google Calendar section. */
 export function googleOptionsUrl(optionsPageUrl: string): string {
   return `${optionsPageUrl}#section-google`;

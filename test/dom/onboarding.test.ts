@@ -15,11 +15,14 @@ import type { AuthStatus } from '../../src/domain/calendar/types';
 import type { Rule } from '../../src/domain/rules/schema';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
-import { WatchSchema } from '../../src/domain/watches/schema';
+import { WatchSchema, type Watch } from '../../src/domain/watches/schema';
 import { Onboarding } from '../../src/entrypoints/onboarding/Onboarding';
+import { queryKey } from '../../src/background/handlers/watches';
+import type { SearchQuery } from '../../src/domain/types';
 import {
   buildFirstWatch,
   googleOptionsUrl,
+  searchKey,
   templateQuery,
   zipError,
 } from '../../src/entrypoints/onboarding/steps';
@@ -74,6 +77,10 @@ interface Harness {
   permissions: FakePermissions;
   openGoogle: ReturnType<typeof vi.fn>;
   openOptions: ReturnType<typeof vi.fn>;
+  /** The stored settings: settings.set merges whole top-level groups into it, like the real handler. */
+  settings: Settings;
+  /** The stored watches: watches.save upserts by id. */
+  watches: Watch[];
 }
 
 function app(
@@ -86,6 +93,10 @@ function app(
     /** When set, calendar.status reports Google as connected under this account. */
     account?: string;
     newId?: () => string;
+    /** A shared watch store, e.g. across two onboarding runs. */
+    watches?: Watch[];
+    /** job.runNow fails this many times before it succeeds. */
+    runNowFailures?: number;
   } = {},
 ): Harness {
   const fake = new FakeMessaging();
@@ -95,15 +106,22 @@ function app(
   const rulesSaved: unknown[] = [];
   const runNow: unknown[] = [];
   fake.handle('health.get', () => healthReply(healthState));
-  fake.handle('settings.get', () => opts.settings ?? defaultSettings());
+  const settings = opts.settings ?? defaultSettings();
+  const watches = opts.watches ?? [];
+  let runNowFailures = opts.runNowFailures ?? 0;
+  fake.handle('settings.get', () => settings);
   fake.handle('settings.set', (p) => {
     settingsSet.push(p);
+    Object.assign(settings, p);
     return undefined;
   });
   fake.handle('calendar.status', () => googleStatus(opts.account === undefined ? {} : { connected: true, account: opts.account }));
-  fake.handle('watches.list', () => []);
+  fake.handle('watches.list', () => watches);
   fake.handle('watches.save', (w) => {
     watchesSaved.push(w);
+    const at = watches.findIndex((x) => x.id === w.id);
+    if (at >= 0) watches[at] = w;
+    else watches.push(w);
     return undefined;
   });
   fake.handle('rules.list', () => opts.rules ?? []);
@@ -112,6 +130,10 @@ function app(
     return undefined;
   });
   fake.handle('job.runNow', (p) => {
+    if (runNowFailures > 0) {
+      runNowFailures -= 1;
+      throw new Error('None of those watches is enabled.');
+    }
     runNow.push(p);
     return undefined;
   });
@@ -129,7 +151,7 @@ function app(
       newId: opts.newId ?? (() => 'watch-1'),
     }),
   );
-  return { fake, healthState, settingsSet, watchesSaved, rulesSaved, runNow, permissions, openGoogle, openOptions };
+  return { fake, healthState, settingsSet, watchesSaved, rulesSaved, runNow, permissions, openGoogle, openOptions, settings, watches };
 }
 
 /** Walks the wizard to `step` (1-based). Steps 2-4 use the no-frills choices: skip ZIP, skip Google, create the watch. */
@@ -240,7 +262,8 @@ describe('onboarding: completing (brief test)', () => {
     const runIdx = order.lastIndexOf('job.runNow');
     expect(runIdx).toBeGreaterThan(-1);
     const before = [...h.fake.sent.slice(0, runIdx)].reverse().find((m) => m.type === 'settings.set');
-    expect(before?.payload).toEqual({ dryRun: { favorites: true, calendar: true, bidding: true } });
+    // Ruling 1: favorites and calendar only; bidding stays as the user left it (off here).
+    expect(before?.payload).toEqual({ dryRun: { favorites: true, calendar: true, bidding: false } });
 
     // Finishing never enables live sniping (R3).
     fireEvent.click(await screen.findByRole('button', { name: 'Finish' }));
@@ -609,7 +632,7 @@ describe('onboarding: no credentials are read (R2)', () => {
 });
 
 describe('onboarding: dry-run stays on (R1, R3)', () => {
-  it('turns every dry-run flag on before job.runNow and never writes snipe', async () => {
+  it('turns favorites and calendar dry-run on before job.runNow and never writes snipe', async () => {
     const h = app({
       settings: { ...defaultSettings(), dryRun: { favorites: false, calendar: true, bidding: true } },
     });
@@ -753,12 +776,12 @@ describe('onboarding: final check (Opus)', () => {
     expect(screen.queryByText(/^Once dry-run is off/)).toBeNull();
   });
 
-  it('a re-run with any dry-run off says so on the risk card, and that Dry-run it now turns it back on', async () => {
-    const h = app({ settings: { ...defaultSettings(), dryRun: { favorites: true, calendar: true, bidding: false } } });
+  it('a re-run with favorites dry-run off says Dry-run it now turns it back on for favorites and calendar', async () => {
+    const h = app({ settings: { ...defaultSettings(), dryRun: { favorites: false, calendar: true, bidding: true } } });
     await toStep(h, 5);
     expect(
       screen.getByText(
-        'Dry-run is off right now for favorites, calendar or bids. Dry-run it now turns it back on for all three, and it stays on until you turn it off yourself.',
+        'Dry-run is off right now for favorites or calendar. Dry-run it now turns it back on for both, and it stays on until you turn it off yourself. Bidding dry-run is on and stays on until you turn it off yourself.',
       ),
     ).toBeTruthy();
     expect(screen.queryByText(/Dry-run is on and stays on/)).toBeNull();
@@ -801,3 +824,144 @@ async function toStep5From3(h: Harness): Promise<void> {
     expect(h.watchesSaved).toHaveLength(1);
   });
 }
+
+describe('onboarding: ruling 1 (Dry-run it now never touches bidding dry-run)', () => {
+  it.each([
+    { loaded: false, current: false },
+    { loaded: true, current: false },
+    { loaded: false, current: true },
+  ])(
+    'bidding dry-run read as $loaded at load and $current now: it stays $current, and an armed snipe is left alone',
+    async ({ loaded, current }) => {
+      const s: Settings = { ...defaultSettings(), dryRun: { favorites: true, calendar: true, bidding: loaded } };
+      const h = app({ settings: s });
+      await toStep(h, 5);
+      // Meanwhile in options: favorites dry-run off (so a write is due) and bidding set to `current`.
+      s.dryRun = { favorites: false, calendar: true, bidding: current };
+      const snipeBefore = structuredClone(s.snipe);
+      fireEvent.click(screen.getByLabelText(/understand the risks/i));
+      fireEvent.click(screen.getByRole('button', { name: 'Dry-run it now' }));
+      await waitFor(() => {
+        expect(h.runNow).toEqual([{ watchIds: ['watch-1'] }]);
+      });
+      expect(s.dryRun).toEqual({ favorites: true, calendar: true, bidding: current });
+      const writeIdx = h.fake.sent.findIndex((m) => m.type === 'settings.set' && 'dryRun' in (m.payload as object));
+      const writes = h.fake.sent.filter((m) => m.type === 'settings.set' && 'dryRun' in (m.payload as object));
+      expect(writes).toHaveLength(1);
+      expect((writes[0]?.payload as Settings).dryRun.bidding).toBe(current);
+      expect(writeIdx).toBeLessThan(h.fake.sent.findIndex((m) => m.type === 'job.runNow'));
+      // An armed snipe changes only through snipe.* messages or the bidding/snipe settings.
+      expect(h.fake.sent.some((m) => m.type.startsWith('snipe.'))).toBe(false);
+      expect(s.snipe).toEqual(snipeBefore);
+    },
+  );
+
+  it('with bidding dry-run off, the copy says it stays off and armed snipes can bid for real', async () => {
+    const h = app({ settings: { ...defaultSettings(), dryRun: { favorites: false, calendar: false, bidding: false } } });
+    await toStep(h, 5);
+    expect(
+      screen.getByText(
+        'Dry-run is off right now for favorites or calendar. Dry-run it now turns it back on for both, and it stays on until you turn it off yourself. Bidding dry-run is off, as you set it: armed snipes can bid for real. Dry-run it now leaves it that way.',
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/all three/)).toBeNull();
+    await finish(h);
+    expect(screen.getByText(/Bidding dry-run is off, as you left it: armed snipes can bid for real\./)).toBeTruthy();
+    expect(screen.queryByText(/Live bidding stays off/)).toBeNull();
+    expect(h.settings.dryRun.bidding).toBe(false);
+  });
+});
+
+/** A stored watch for `query`, as an earlier onboarding run (or options) would have saved it. */
+function storedWatch(id: string, query: SearchQuery, over: Partial<Watch> = {}): Watch {
+  const built = buildFirstWatch(query, NOW, id);
+  if (!built.ok) throw new Error(built.error);
+  return { ...built.watch, ...over };
+}
+
+describe('onboarding: ruling 2 (no duplicate first watches)', () => {
+  it('running onboarding twice with the same search leaves exactly one watch', async () => {
+    const watches: Watch[] = [];
+    const first = app({ tab: TAB, watches, newId: () => 'watch-first' });
+    await toStep(first, 5);
+    await finish(first);
+    cleanup();
+
+    // The same search on a later visit: another results page, without the stale navigation params.
+    const again = 'https://shopgoodwill.com/categories/listing?st=pyrex&p=1&lp=5&layout=grid';
+    const second = app({ tab: again, watches, newId: () => 'watch-second' });
+    await toStep(second, 4);
+    expect(await screen.findByText(/You already watch this search/)).toBeTruthy();
+    expect(screen.queryByRole('checkbox', { name: "Don't favorite on ShopGoodwill" })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Create my first watch' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Use this watch' }));
+    await screen.findByText(/You already watch this search, so the dry run uses "pyrex" as it is\./);
+    await finish(second);
+
+    expect(watches.map((w) => w.id)).toEqual(['watch-first']);
+    expect(second.watchesSaved).toEqual([]);
+    expect(second.rulesSaved).toEqual([]);
+    expect(second.runNow).toEqual([{ watchIds: ['watch-first'] }]);
+  });
+
+  it('checks again on the click, so a watch saved meanwhile is reused, not duplicated', async () => {
+    const watches: Watch[] = [];
+    const h = app({ watches });
+    await toStep(h, 4);
+    await screen.findByRole('button', { name: 'Create my first watch' });
+    watches.push(storedWatch('elsewhere', templateQuery()));
+    fireEvent.click(screen.getByRole('button', { name: 'Create my first watch' }));
+    await screen.findByText(/You already watch this search, so the dry run uses/);
+    expect(h.watchesSaved).toEqual([]);
+    expect(watches).toHaveLength(1);
+  });
+
+  it('describes the existing watch honestly: no favoriting when local, and says when it is off', async () => {
+    const watches = [storedWatch('old', templateQuery(), { favoriteMode: 'local', enabled: false })];
+    const h = app({ watches });
+    await toStep(h, 4);
+    await screen.findByText(/You already watch this search/);
+    expect(screen.getByText('It does not favorite anything on your ShopGoodwill account.')).toBeTruthy();
+    expect(screen.getByText('It is turned off, so the dry run cannot run it. Turn it on in options first.')).toBeTruthy();
+    expect(screen.queryByText(/every new item in this search will be favorited/)).toBeNull();
+    expect(h.watchesSaved).toEqual([]);
+  });
+
+  it('a failed dry run can be tried again', async () => {
+    const h = app({ runNowFailures: 1 });
+    await toStep(h, 5);
+    fireEvent.click(screen.getByLabelText(/understand the risks/i));
+    const dry = screen.getByRole<HTMLButtonElement>('button', { name: 'Dry-run it now' });
+    fireEvent.click(dry);
+    await screen.findByText(/Could not start the dry run/);
+    await waitFor(() => {
+      expect(dry.disabled).toBe(false);
+    });
+    fireEvent.click(dry);
+    await waitFor(() => {
+      expect(h.runNow).toEqual([{ watchIds: ['watch-1'] }]);
+    });
+    expect(await screen.findByRole('button', { name: 'Finish' })).toBeTruthy();
+  });
+
+  it('searchKey matches the stored watch identity (T-52 queryKey)', () => {
+    const base: SearchQuery = { searchText: 'pyrex', categoryIds: [12], sellerIds: [], page: 1, lowPrice: 500 };
+    const pairs: Array<[SearchQuery, SearchQuery]> = [
+      [base, { ...base, page: 3 }],
+      [base, { ...base, extra: { catIds: '12', cln: '4' } }],
+      [{ ...base, extra: { foo: '1', catIds: '2' } }, { ...base, extra: { foo: '1' } }],
+      [{ ...base, extra: { foo: '1' } }, { ...base, extra: { foo: '2' } }],
+      [base, { lowPrice: 500, page: 2, sellerIds: [], categoryIds: [12], searchText: 'pyrex' }],
+      [base, { ...base, highPrice: undefined }],
+      [base, { ...base, searchText: 'Pyrex' }],
+      [base, { ...base, categoryIds: [13] }],
+      [base, { ...base, layout: 'list' }],
+      [templateQuery(), { ...templateQuery(), page: 4, extra: { cln: '1' } }],
+    ];
+    for (const [a, b] of pairs) {
+      expect(searchKey(a) === searchKey(b)).toBe(queryKey(a) === queryKey(b));
+    }
+    expect(searchKey(base)).toBe(searchKey({ ...base, page: 3, extra: { catIds: '1' } }));
+    expect(searchKey(base)).not.toBe(searchKey({ ...base, searchText: 'corelle' }));
+  });
+});
