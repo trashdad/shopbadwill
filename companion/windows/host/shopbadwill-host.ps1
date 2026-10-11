@@ -155,6 +155,13 @@ function Invoke-SbwMessage {
   }
 }
 
+function Write-SbwHostFrame {
+  param([IO.Stream]$Stdout, [object]$Message)
+  $frame = New-SbwOutboundFrame -Message $Message
+  $Stdout.Write($frame, 0, $frame.Length)
+  $Stdout.Flush()
+}
+
 # Native-messaging loop: read frames until the browser closes stdin.
 function Invoke-SbwHost {
   param([string]$ConfigPath)
@@ -162,32 +169,21 @@ function Invoke-SbwHost {
   try { $cfg = Get-SbwConfig -Path $ConfigPath }
   catch {
     [Console]::Error.WriteLine("Sbw host config error: $($_.Exception.Message)")
-    $frame = ConvertTo-SbwFrame -Message (New-SbwErrorResponse -Op $null -Error 'internal')
-    $out = [Console]::OpenStandardOutput()
-    $out.Write($frame, 0, $frame.Length)
-    $out.Flush()
+    Write-SbwHostFrame -Stdout ([Console]::OpenStandardOutput()) -Message (New-SbwErrorResponse -Op $null -Error 'internal')
     return
   }
   $stdin = [Console]::OpenStandardInput()
   $stdout = [Console]::OpenStandardOutput()
   while ($true) {
-    $lenBuf = Read-SbwBytes -Stream $stdin -Count 4
-    if ($null -eq $lenBuf) { break }   # EOF: browser closed the connection
-    $len = [BitConverter]::ToUInt32($lenBuf, 0)
-    if (-not (Test-SbwFrameLength -Length $len)) {
+    $read = Read-SbwHostFrame -Stream $stdin
+    if ($null -eq $read) { break }   # EOF: browser closed the connection
+    if ($read.Error) {
       # The stream position is no longer trustworthy: answer once and exit.
-      $frame = ConvertTo-SbwFrame -Message (New-SbwErrorResponse -Op $null -Error 'bad-request')
-      $stdout.Write($frame, 0, $frame.Length)
-      $stdout.Flush()
+      Write-SbwHostFrame -Stdout $stdout -Message (New-SbwErrorResponse -Op $null -Error 'bad-request')
       break
     }
-    $body = Read-SbwBytes -Stream $stdin -Count $len
-    if ($null -eq $body) { break }
-    $json = [Text.Encoding]::UTF8.GetString($body)
-    $resp = Invoke-SbwMessage -Json $json -Config $cfg -Now ([datetimeoffset]::UtcNow)
-    $frame = ConvertTo-SbwFrame -Message $resp
-    $stdout.Write($frame, 0, $frame.Length)
-    $stdout.Flush()
+    $resp = Invoke-SbwMessage -Json $read.Json -Config $cfg -Now ([datetimeoffset]::UtcNow)
+    Write-SbwHostFrame -Stdout $stdout -Message $resp
   }
 }
 

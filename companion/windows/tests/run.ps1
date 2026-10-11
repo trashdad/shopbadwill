@@ -23,8 +23,12 @@ if (-not $module) {
 Import-Module $module.Path -ErrorAction Stop
 
 Write-Host "Running $($tests.Count) Pester test file(s) with Pester $($module.Version)"
-# -Script is the compatible parameter name across Pester 3/4/5 (deprecated warning on 5 is fine).
-$result = Invoke-Pester -Script $tests.FullName -PassThru
+# Pester 5 removed -Script (use -Path). Pester 3.4 has -Script and not this -Path.
+if ($module.Version.Major -ge 5) {
+  $result = Invoke-Pester -Path $tests.FullName -PassThru
+} else {
+  $result = Invoke-Pester -Script $tests.FullName -PassThru
+}
 
 if ($result.FailedCount -gt 0) {
   Write-Error "Pester failures: $($result.FailedCount)"

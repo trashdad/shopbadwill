@@ -69,6 +69,45 @@ Describe 'native-messaging framing' {
     try { ConvertTo-SbwFrame @{ ok = $true; blob = $huge } | Out-Null } catch { $threw = $true }
     Assert-True $threw
   }
+  It 'turns an oversized outbound message into a small error frame' {
+    $huge = 'x' * 1049000
+    $frame = New-SbwOutboundFrame @{ ok = $true; blob = $huge }
+    Assert-True ($frame.Length -lt 256)
+    $msg = ConvertFrom-SbwFrame -FrameBytes $frame
+    Assert-Equal $msg.ok $false
+    Assert-Equal $msg.error 'bad-request'
+  }
+  It 'reads one inbound frame' {
+    $ms = New-Object IO.MemoryStream
+    $frame = ConvertTo-SbwFrame @{ op = 'list' }
+    $ms.Write($frame, 0, $frame.Length)
+    $ms.WriteByte(0x42)
+    $ms.Position = 0
+    $read = Read-SbwHostFrame -Stream $ms
+    Assert-Null $read.Error
+    Assert-Equal $read.Json '{"op":"list"}'
+    Assert-Equal $ms.Position $frame.Length
+  }
+  It 'refuses an inbound length over 1 MiB without reading a body' {
+    $ms = New-Object IO.MemoryStream
+    $len = [BitConverter]::GetBytes([uint32]1048577)
+    $ms.Write($len, 0, 4)
+    $ms.WriteByte(0x41)
+    $ms.Position = 0
+    $read = Read-SbwHostFrame -Stream $ms
+    Assert-Equal $read.Error 'bad-request'
+    Assert-Null $read.Json
+    Assert-Equal $ms.Position 4
+  }
+}
+
+Describe 'host loop uses the frame helpers' {
+  It 'replies through New-SbwOutboundFrame and reads through Read-SbwHostFrame' {
+    $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\host\shopbadwill-host.ps1'))
+    Assert-Match $src 'Read-SbwHostFrame'
+    Assert-Match $src 'New-SbwOutboundFrame'
+    Assert-NotMatch $src 'ConvertTo-SbwFrame'
+  }
 }
 
 Describe 'schedule validation (R2, verbatim)' {

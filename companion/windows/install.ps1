@@ -58,7 +58,9 @@ function Test-SbwChromeExtensionId {
 
 function Test-SbwFirefoxExtensionId {
   param([string]$Id)
-  ($Id.Length -ge 1) -and ($Id.Length -le 128) -and ($Id -cnotmatch '["&|<>^%!\s]')
+  # `*` and `?` are literal inside a character class. A wildcard must never
+  # become allowed_extensions.
+  ($Id.Length -ge 1) -and ($Id.Length -le 128) -and ($Id -cnotmatch '["&|<>^%!\s*?]')
 }
 
 function Get-SbwChromeRegKey { 'HKCU\Software\Google\Chrome\NativeMessagingHosts' }
@@ -67,6 +69,9 @@ function Get-SbwFirefoxRegKey { 'HKCU\Software\Mozilla\NativeMessagingHosts' }
 # R3: allowed_origins lists ONLY the parameterized Chrome extension id.
 function Get-SbwChromeManifest {
   param([string]$ExtensionId, [string]$LauncherPath)
+  if (-not (Test-SbwChromeExtensionId -Id $ExtensionId)) {
+    throw "Invalid Chrome extension id '$ExtensionId'."
+  }
   [pscustomobject]@{
     name            = (Get-SbwHostName)
     description     = 'ShopBadwill wake-and-launch companion (starts the browser for armed snipes)'
@@ -79,6 +84,9 @@ function Get-SbwChromeManifest {
 # R3: allowed_extensions lists ONLY the gecko id.
 function Get-SbwFirefoxManifest {
   param([string]$ExtensionId, [string]$LauncherPath)
+  if (-not (Test-SbwFirefoxExtensionId -Id $ExtensionId)) {
+    throw "Invalid Firefox extension id '$ExtensionId'."
+  }
   [pscustomobject]@{
     name               = (Get-SbwHostName)
     description        = 'ShopBadwill wake-and-launch companion (starts the browser for armed snipes)'
@@ -202,6 +210,12 @@ function Invoke-SbwInstall {
     if (-not $firefoxExePath -or -not (Test-Path -LiteralPath $firefoxExePath)) {
       throw "Firefox not found. Pass -FirefoxExe with the full path to firefox.exe."
     }
+  }
+  if ($chromeExePath -and -not (Test-SbwSafePathValue -Value $chromeExePath)) {
+    throw "Invalid Chrome executable path '$chromeExePath': pick a location without quotes, &, |, <, >, ^, % or !."
+  }
+  if ($firefoxExePath -and -not (Test-SbwSafePathValue -Value $firefoxExePath)) {
+    throw "Invalid Firefox executable path '$firefoxExePath': pick a location without quotes, &, |, <, >, ^, % or !."
   }
 
   $launcherPath = Join-Path $dataDir 'shopbadwill-host.cmd'

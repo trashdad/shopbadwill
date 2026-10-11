@@ -34,6 +34,32 @@ function ConvertFrom-SbwFrame {
   $json | ConvertFrom-Json
 }
 
+# Host replies go through this. An oversized message becomes a small error
+# frame instead of throwing out of the read loop.
+function New-SbwOutboundFrame {
+  param([object]$Message)
+  try {
+    return ConvertTo-SbwFrame -Message $Message
+  } catch {
+    return ConvertTo-SbwFrame -Message @{ ok = $false; op = $null; error = 'bad-request' }
+  }
+}
+
+# One inbound frame. $null means EOF. A length outside 1..1MiB is refused
+# before the body is read, so a hostile length cannot make us buffer it.
+function Read-SbwHostFrame {
+  param([IO.Stream]$Stream)
+  $lenBuf = Read-SbwBytes -Stream $Stream -Count 4
+  if ($null -eq $lenBuf) { return $null }
+  $len = [int64][BitConverter]::ToUInt32($lenBuf, 0)
+  if (-not (Test-SbwFrameLength -Length $len)) {
+    return @{ Error = 'bad-request'; Json = $null }
+  }
+  $body = Read-SbwBytes -Stream $Stream -Count ([int]$len)
+  if ($null -eq $body) { return $null }
+  @{ Error = $null; Json = [Text.Encoding]::UTF8.GetString($body) }
+}
+
 function Test-SbwFrameLength {
   param([long]$Length)
   ($Length -gt 0) -and ($Length -le $SbwMaxFrameBytes)

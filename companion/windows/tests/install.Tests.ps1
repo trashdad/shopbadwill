@@ -73,12 +73,22 @@ Describe 'extension id validation' {
     Assert-False (Test-SbwChromeExtensionId ('q' + ('a' * 31)))
     Assert-False (Test-SbwChromeExtensionId ('*' * 32))
   }
-  It 'Firefox gecko id: no whitespace or shell metacharacters' {
+  It 'Firefox gecko id: no whitespace, shell metacharacters, or wildcards' {
     Assert-True (Test-SbwFirefoxExtensionId 'shopbadwill@trashdad.github.io')
     Assert-False (Test-SbwFirefoxExtensionId '')
     Assert-False (Test-SbwFirefoxExtensionId 'has space@x.org')
-    foreach ($bad in @('a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', 'a"b')) {
+    foreach ($bad in @('a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', 'a"b', '*', '?', 'shop*will@trashdad.github.io', 'shop?will@trashdad.github.io')) {
       Assert-False (Test-SbwFirefoxExtensionId $bad)
+    }
+  }
+  It 'manifest builders reject a wildcard or any other id that fails validation' {
+    foreach ($bad in @('*', '?', 'chrome-extension://*/')) {
+      $chromeThrew = $false
+      try { Get-SbwChromeManifest -ExtensionId $bad -LauncherPath 'C:\d\shopbadwill-host.cmd' | Out-Null } catch { $chromeThrew = $true }
+      Assert-True $chromeThrew $bad
+      $firefoxThrew = $false
+      try { Get-SbwFirefoxManifest -ExtensionId $bad -LauncherPath 'C:\d\shopbadwill-host.cmd' | Out-Null } catch { $firefoxThrew = $true }
+      Assert-True $firefoxThrew $bad
     }
   }
 }
@@ -227,5 +237,30 @@ Describe 'safe path checks for install locations' {
     Assert-False (Test-SbwSafePathValue 'C:\a&b')
     Assert-False (Test-SbwSafePathValue 'C:\a%b')
     Assert-False (Test-SbwSafePathValue 'C:\a"b')
+  }
+  It 'checks the resolved browser executable before install writes anything' {
+    $src = Get-SbwInstallSource
+    Assert-Match $src 'Test-SbwSafePathValue -Value \$chromeExePath'
+    Assert-Match $src 'Test-SbwSafePathValue -Value \$firefoxExePath'
+  }
+}
+
+Describe 'registry scope' {
+  It 'native-messaging keys are HKCU and install/uninstall never name HKLM' {
+    Assert-Equal (Get-SbwChromeRegKey) 'HKCU\Software\Google\Chrome\NativeMessagingHosts'
+    Assert-Equal (Get-SbwFirefoxRegKey) 'HKCU\Software\Mozilla\NativeMessagingHosts'
+    foreach ($rel in @('..\install.ps1', '..\uninstall.ps1')) {
+      $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot $rel))
+      Assert-NotMatch $src 'HKLM' $rel
+    }
+  }
+}
+
+Describe 'Pester runner' {
+  It 'uses -Path on Pester 5 and -Script on earlier Pester' {
+    $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run.ps1'))
+    Assert-Match $src '\$module\.Version\.Major -ge 5'
+    Assert-Match $src 'Invoke-Pester -Path'
+    Assert-Match $src 'Invoke-Pester -Script'
   }
 }

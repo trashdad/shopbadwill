@@ -11,8 +11,10 @@ Standard Chrome/Firefox native messaging on stdio:
 - Request: 4-byte unsigned little-endian byte length, then that many bytes of
   UTF-8 JSON.
 - Response: same framing, exactly one response per request.
-- Maximum frame size: 1 MiB (the host refuses larger lengths with an error
-  response and exits).
+- Maximum frame size: 1 MiB in both directions. A request length over 1 MiB
+  is refused with an error response, without reading the body, and the host
+  exits. A response that would exceed 1 MiB is replaced by a small
+  `{ok:false, error:'bad-request'}` frame; the host does not crash.
 - The host processes requests until the browser closes stdin, then exits.
 - Anything the host writes to stderr is for debugging only (Chrome's
   `--enable-logging`); responses live exclusively on stdout.

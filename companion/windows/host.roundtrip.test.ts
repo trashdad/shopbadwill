@@ -288,10 +288,42 @@ describe.skipIf(process.platform !== 'win32')(
     expect(after.tasks).toEqual([]);
   });
 
+  it('answers malformed JSON with invalid-json and stays up', async () => {
+    const body = Buffer.from('{', 'utf8');
+    const header = Buffer.alloc(4);
+    header.writeUInt32LE(body.length, 0);
+    const pending = client.read();
+    child.stdin.write(Buffer.concat([header, body]));
+    const resp = await pending;
+    expect(resp.ok).toBe(false);
+    expect(resp.error).toBe('invalid-json');
+    const list = (await client.send({ op: 'list' })) as WakeResponse;
+    expect(list.ok).toBe(true);
+  });
+
   it('exits cleanly when stdin closes', async () => {
     const code = await client.close();
     expect(code).toBe(0);
   });
+
+  it('refuses an inbound frame larger than 1 MiB without waiting for a body', async () => {
+    const child2 = spawnHost();
+    const client2 = connect(child2);
+    const header = Buffer.alloc(4);
+    header.writeUInt32LE(1_048_577, 0);
+    const pending = client2.read();
+    child2.stdin.write(header);
+    const resp = await pending;
+    expect(resp.ok).toBe(false);
+    expect(resp.error).toBe('bad-request');
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child2.once('error', reject);
+      child2.once('exit', (exitCode) => {
+        resolve(exitCode);
+      });
+    });
+    expect(code).toBe(0);
+  }, 30_000);
 
   it('answers a corrupt frame with ok:false and exits', async () => {
     // A fresh host instance: the main one already exited in the previous test.
