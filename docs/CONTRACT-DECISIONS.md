@@ -576,3 +576,15 @@ The Timing page's awake chart needs the persisted heartbeat history. No existing
 **Tests.** `test/contract/types/messages.test.ts`, `test/contract/types/examples/Msg/timing.awake.{valid,invalid}.json`, `test/unit/background/timing-awake.test.ts`, and `test/dom/timing-section.test.ts`.
 
 **Follow-up for the next PLAN edit.** Add `timing.awake` to PLAN §3.12 and contracts.md.
+
+## T-90: `settings.set` never changes `snipe.completedDryRuns`
+
+Source: T-90 final check (Opus). A behaviour rule on an existing message, like `killSwitch` (T-36 R3). No schema or protocol change.
+
+`settings.set` replaces whole top-level groups. A page that edits one `snipe` field must send the whole `snipe` group, and that group carries `completedDryRuns`. A copy loaded before the last dry runs were counted would roll the count back. A crafted group could raise it and open the live-bidding gate early. `applySettingsPatch` now keeps `current.snipe.completedDryRuns`, whatever the patch says. The dry-run counter (`src/background/jobs/dry-run-counter.ts`) is the only writer. The kept count is in `next` before the `settings.set` interceptors run, so T-102's live gate judges the real count. The handler and the counter both take the `sbw:settings` lock, so the two cannot interleave.
+
+The Timing page's Apply also reads the settings fresh (`settings.get`) just before it writes, so it does not send back stale caps or other `snipe` fields either.
+
+**Tests.** `test/integration/background-main.test.ts` ("settings.set never changes completedDryRuns") and `test/dom/timing-section.test.ts` ("Apply re-reads the settings first").
+
+**Follow-up for the next PLAN edit.** Note the rule beside `killSwitch` in PLAN §3.12 (`settings.set`) and contracts.md.
