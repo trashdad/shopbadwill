@@ -51,7 +51,8 @@ function Invoke-SbwSchedule {
     if (-not (Test-Path -LiteralPath ([string]$browserCfg.exePath))) {
       return New-SbwErrorResponse -Op 'schedule' -Error 'browser-not-found'
     }
-    $browserArgs = Get-SbwBrowserArgs -Browser ([string]$Msg.browser) -Profile ([string]$Msg.profile)
+    # Launch the installed spelling, not whatever case the message used.
+    $browserArgs = Get-SbwBrowserArgs -Browser ([string]$Msg.browser) -Profile ([string]$browserCfg.profile)
     $cmd = Get-SbwLaunchCommand -ExePath ([string]$browserCfg.exePath) -BrowserArgs $browserArgs
     $xml = New-SbwTaskXml -TaskName $taskName -WakeAtUtc $wt.value -Execute $cmd.Execute `
       -Arguments $cmd.Arguments -UserId "$env:USERDOMAIN\$env:USERNAME"
@@ -69,7 +70,7 @@ function Invoke-SbwSchedule {
       taskName = $taskName
       wakeAtUtc = $wakeIso
       browser  = [string]$Msg.browser
-      profile  = [string]$Msg.profile
+      profile  = [string]$browserCfg.profile
     }
     Write-SbwState -DataDir ([string]$Config.dataDir) -Rows $rows
     return New-SbwOkResponse -Op 'schedule' @{ taskName = $taskName; wakeAtUtc = $wakeIso }

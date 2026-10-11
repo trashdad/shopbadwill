@@ -35,24 +35,40 @@ function Get-SbwBrowserArgs {
   ,@('-P', $Profile)
 }
 
-# cmd.exe /c start <detached>: the wake task's Exec action must return
-# immediately, otherwise the ExecutionTimeLimit would kill a long-running
-# browser. Returns @{ Execute = <cmd.exe path>; Arguments = <serialized args> }.
-function Get-SbwQuotedArg {
-  param([string]$S)
-  '"' + $S.Replace('"', '""') + '"'
+# CommandLineToArgvW quoting for one argv element. Task Scheduler's Exec
+# Arguments is one string; the browser parses it. Quote only when the element
+# is empty or contains whitespace or a quote. A backslash is literal except
+# before a quote, where every backslash is doubled and the quote is escaped.
+function ConvertTo-SbwArgvToken {
+  param([string]$Arg)
+  if ($null -eq $Arg) { $Arg = '' }
+  if ($Arg.Length -gt 0 -and $Arg -notmatch '[\s"]') { return $Arg }
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.Append('"')
+  $slashes = 0
+  foreach ($ch in $Arg.ToCharArray()) {
+    if ($ch -eq '\') { $slashes++; continue }
+    if ($ch -eq '"') {
+      if ($slashes -gt 0) { [void]$sb.Append([char]92, ($slashes * 2)) }
+      [void]$sb.Append('\"')
+      $slashes = 0
+      continue
+    }
+    if ($slashes -gt 0) { [void]$sb.Append([char]92, $slashes); $slashes = 0 }
+    [void]$sb.Append($ch)
+  }
+  if ($slashes -gt 0) { [void]$sb.Append([char]92, ($slashes * 2)) }
+  [void]$sb.Append('"')
+  $sb.ToString()
 }
 
-function Get-SbwCmdExe {
-  if (-not [string]::IsNullOrWhiteSpace($env:ComSpec)) { return $env:ComSpec }
-  Join-Path $env:SystemRoot 'System32\cmd.exe'
-}
-
+# Exec action: the configured browser executable, and only its profile
+# arguments. Nothing here is a shell. Returns @{ Execute; Arguments }.
 function Get-SbwLaunchCommand {
   param([string]$ExePath, [string[]]$BrowserArgs)
-  $parts = @('/c', 'start', '""', (Get-SbwQuotedArg -S $ExePath))
-  foreach ($a in $BrowserArgs) { $parts += (Get-SbwQuotedArg -S $a) }
-  @{ Execute = (Get-SbwCmdExe); Arguments = ($parts -join ' ') }
+  $tokens = @()
+  foreach ($a in @($BrowserArgs)) { $tokens += (ConvertTo-SbwArgvToken -Arg ([string]$a)) }
+  @{ Execute = $ExePath; Arguments = ($tokens -join ' ') }
 }
 
 # schtasks command argument arrays (R2): create from generated XML, cancel,
@@ -76,7 +92,8 @@ function Get-SbwQueryArgs {
 #   - one-off TimeTrigger at the LOCAL wall-clock of wakeAtUtc, EndBoundary +1 h
 #     (a machine waking much later has missed the snipe anyway);
 #   - WakeToRun (the wake timer), StartWhenAvailable, battery-tolerant;
-#   - Exec action = cmd.exe /c start <browser> <profile args> (detached launch);
+#   - Exec action = the configured browser plus its profile arguments only;
+#   - ExecutionTimeLimit PT0S so the scheduler does not kill that browser;
 #   - DeleteExpiredTaskAfter PT10M so fired/orphaned tasks delete themselves;
 #   - InteractiveToken / LeastPrivilege principal for the current user.
 function New-SbwTaskXml {
@@ -101,7 +118,7 @@ function New-SbwTaskXml {
   $settings.StartWhenAvailable = $true
   $settings.DisallowStartIfOnBatteries = $false
   $settings.StopIfGoingOnBatteries = $false
-  $settings.ExecutionTimeLimit = 'PT30M'
+  $settings.ExecutionTimeLimit = 'PT0S'
   $settings.DeleteExpiredTaskAfter = 'PT10M'
   $settings.MultipleInstances = 2   # TASK_INSTANCES_IGNORE_NEW
 

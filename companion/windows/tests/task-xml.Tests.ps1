@@ -35,36 +35,55 @@ Describe 'Get-SbwBrowserArgs' {
 }
 
 Describe 'Get-SbwLaunchCommand' {
-  It 'wraps the browser in cmd /c start and quotes every element' {
+  It 'launches the configured browser itself, never a shell' {
     $cmd = Get-SbwLaunchCommand -ExePath 'C:\Program Files\Chrome\chrome.exe' -BrowserArgs @('--profile-directory=Default')
-    Assert-True ($cmd.Execute -like '*cmd.exe')
-    Assert-Equal $cmd.Arguments '/c start "" "C:\Program Files\Chrome\chrome.exe" "--profile-directory=Default"'
+    Assert-Equal $cmd.Execute 'C:\Program Files\Chrome\chrome.exe'
+    Assert-Equal $cmd.Arguments '--profile-directory=Default'
+    Assert-NotMatch $cmd.Execute 'cmd\.exe'
+    Assert-NotMatch $cmd.Arguments '(?<![A-Za-z0-9])/c(?![A-Za-z0-9])'
   }
-  It 'quotes a whole argument with a space so it stays one argv element' {
+  It 'quotes an argument that contains whitespace so it stays one argv element' {
     $cmd = Get-SbwLaunchCommand -ExePath 'C:\Chrome\chrome.exe' -BrowserArgs @('--profile-directory=Profile 1')
-    Assert-Equal $cmd.Arguments '/c start "" "C:\Chrome\chrome.exe" "--profile-directory=Profile 1"'
+    Assert-Equal $cmd.Execute 'C:\Chrome\chrome.exe'
+    Assert-Equal $cmd.Arguments '"--profile-directory=Profile 1"'
   }
-  It 'firefox name profile: two separate quoted elements' {
+  It 'keeps firefox -P and the profile name as two argv elements' {
     $cmd = Get-SbwLaunchCommand -ExePath 'C:\Program Files\Mozilla Firefox\firefox.exe' -BrowserArgs @('-P', 'My Profile')
-    Assert-Equal $cmd.Arguments '/c start "" "C:\Program Files\Mozilla Firefox\firefox.exe" "-P" "My Profile"'
+    Assert-Equal $cmd.Execute 'C:\Program Files\Mozilla Firefox\firefox.exe'
+    Assert-Equal $cmd.Arguments '-P "My Profile"'
+  }
+  It 'doubles trailing backslashes inside a quoted argument' {
+    $cmd = Get-SbwLaunchCommand -ExePath 'C:\Chrome\chrome.exe' -BrowserArgs @('--user-data-dir=C:\Program Files\data\')
+    Assert-Equal $cmd.Arguments '"--user-data-dir=C:\Program Files\data\\"'
+  }
+  It 'escapes an embedded quote and the backslashes in front of it' {
+    $cmd = Get-SbwLaunchCommand -ExePath 'C:\Chrome\chrome.exe' -BrowserArgs @('a\"b')
+    Assert-Equal $cmd.Arguments '"a\\\"b"'
+  }
+  It 'quotes an empty argument' {
+    $cmd = Get-SbwLaunchCommand -ExePath 'C:\Chrome\chrome.exe' -BrowserArgs @('')
+    Assert-Equal $cmd.Arguments '""'
   }
 }
 
+# File scope, not inside Describe: Pester 5 does not see functions defined in a
+# Describe body (no BeforeAll on Pester 3.4).
+function Get-SbwTestWakeUtc {
+  [datetimeoffset]::Parse('2026-10-20T06:15:00.000Z')
+}
+function Get-SbwTestLaunch {
+  Get-SbwLaunchCommand -ExePath 'C:\Program Files\Chrome\chrome.exe' -BrowserArgs @('--profile-directory=Default')
+}
+function Get-SbwTestXmlText {
+  $launch = Get-SbwTestLaunch
+  New-SbwTaskXml -TaskName 'ShopBadwill-test' -WakeAtUtc (Get-SbwTestWakeUtc) `
+    -Execute $launch.Execute -Arguments $launch.Arguments -UserId 'MYDOM\me'
+}
+function Get-SbwTestXml {
+  [xml](Get-SbwTestXmlText)
+}
+
 Describe 'New-SbwTaskXml' {
-  # Fixtures live in functions: variables assigned in a Describe body are not
-  # reliably visible to It blocks under Pester 5 (discovery vs run).
-  function Get-SbwTestXmlText {
-    $wakeUtc = [datetimeoffset]::Parse('2026-10-20T06:15:00.000Z')
-    New-SbwTaskXml -TaskName 'ShopBadwill-test' -WakeAtUtc $wakeUtc `
-      -Execute 'C:\Windows\System32\cmd.exe' -Arguments '/c start "" "C:\Chrome\chrome.exe" "--profile-directory=Default"' `
-      -UserId 'MYDOM\me'
-  }
-  function Get-SbwTestXml {
-    [xml](Get-SbwTestXmlText)
-  }
-  function Get-SbwTestWakeUtc {
-    [datetimeoffset]::Parse('2026-10-20T06:15:00.000Z')
-  }
 
   It 'generates parseable Task 1.2 XML' {
     $xmlText = Get-SbwTestXmlText
@@ -81,8 +100,8 @@ Describe 'New-SbwTaskXml' {
     Assert-Equal ([string](Get-SbwTestXml).Task.Settings.DisallowStartIfOnBatteries) 'false'
     Assert-Equal ([string](Get-SbwTestXml).Task.Settings.StopIfGoingOnBatteries) 'false'
   }
-  It 'caps the action runtime and lets the OS delete the expired task' {
-    Assert-Equal ([string](Get-SbwTestXml).Task.Settings.ExecutionTimeLimit) 'PT30M'
+  It 'does not kill the browser and lets the OS delete the expired task' {
+    Assert-Equal ([string](Get-SbwTestXml).Task.Settings.ExecutionTimeLimit) 'PT0S'
     Assert-Equal ([string](Get-SbwTestXml).Task.Settings.DeleteExpiredTaskAfter) 'PT10M'
     Assert-Equal ([string](Get-SbwTestXml).Task.Settings.MultipleInstancesPolicy) 'IgnoreNew'
   }
@@ -93,14 +112,79 @@ Describe 'New-SbwTaskXml' {
     Assert-Equal ([string](Get-SbwTestXml).Task.Triggers.TimeTrigger.EndBoundary) $wakeUtc.ToLocalTime().AddHours(1).ToString('yyyy-MM-dd\THH:mm:ss')
     Assert-Equal ([string](Get-SbwTestXml).Task.Triggers.TimeTrigger.Enabled) 'true'
   }
-  It 'runs the launch command as the Exec action' {
-    Assert-Equal ([string](Get-SbwTestXml).Task.Actions.Exec.Command) 'C:\Windows\System32\cmd.exe'
-    Assert-Equal ([string](Get-SbwTestXml).Task.Actions.Exec.Arguments) '/c start "" "C:\Chrome\chrome.exe" "--profile-directory=Default"'
+  It 'runs the configured browser as the Exec action' {
+    $xml = Get-SbwTestXml
+    Assert-Equal ([string]$xml.Task.Actions.Exec.Command) 'C:\Program Files\Chrome\chrome.exe'
+    Assert-Equal ([string]$xml.Task.Actions.Exec.Arguments) '--profile-directory=Default'
+    $text = Get-SbwTestXmlText
+    Assert-NotMatch $text 'cmd\.exe'
+    Assert-NotMatch $text '(?<![A-Za-z0-9])/c(?![A-Za-z0-9])'
+    Assert-NotMatch $text 'Invoke-Expression'
+    Assert-NotMatch $text 'HighestAvailable'
+    Assert-NotMatch $text '<Password>'
   }
   It 'runs as the interactive, least-privileged current user' {
     Assert-Equal ([string](Get-SbwTestXml).Task.Principals.Principal.LogonType) 'InteractiveToken'
     Assert-Equal ([string](Get-SbwTestXml).Task.Principals.Principal.RunLevel) 'LeastPrivilege'
     Assert-Equal ([string](Get-SbwTestXml).Task.Principals.Principal.UserId) 'MYDOM\me'
+  }
+}
+
+function Remove-SbwPsComments {
+  param([string]$Text)
+  $sb = New-Object System.Text.StringBuilder
+  $i = 0
+  $n = $Text.Length
+  $inBlock = $false
+  $inSingle = $false
+  $inDouble = $false
+  while ($i -lt $n) {
+    $c = $Text[$i]
+    $next = if ($i + 1 -lt $n) { $Text[$i + 1] } else { [char]0 }
+    if ($inBlock) {
+      if ($c -eq '#' -and $next -eq '>') { $inBlock = $false; $i += 2; continue }
+      $i++; continue
+    }
+    if ($inSingle) {
+      [void]$sb.Append($c)
+      if ($c -eq "'" -and $next -eq "'") { [void]$sb.Append($next); $i += 2; continue }
+      if ($c -eq "'") { $inSingle = $false }
+      $i++; continue
+    }
+    if ($inDouble) {
+      [void]$sb.Append($c)
+      if ($c -eq '`') {
+        if ($i + 1 -lt $n) { [void]$sb.Append($Text[$i + 1]); $i += 2; continue }
+      }
+      if ($c -eq '"' -and $next -eq '"') { [void]$sb.Append($next); $i += 2; continue }
+      if ($c -eq '"') { $inDouble = $false }
+      $i++; continue
+    }
+    if ($c -eq '<' -and $next -eq '#') { $inBlock = $true; $i += 2; continue }
+    if ($c -eq '#') {
+      while ($i -lt $n -and $Text[$i] -ne "`n") { $i++ }
+      continue
+    }
+    if ($c -eq "'") { $inSingle = $true; [void]$sb.Append($c); $i++; continue }
+    if ($c -eq '"') { $inDouble = $true; [void]$sb.Append($c); $i++; continue }
+    [void]$sb.Append($c)
+    $i++
+  }
+  $sb.ToString()
+}
+
+Describe 'production scripts do not shell out' {
+  It 'host, install, and uninstall contain no Invoke-Expression, iex, cmd /c, or ComSpec' {
+    $files = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '..\host') -Filter '*.ps1' -File)
+    $files += Get-Item -LiteralPath (Join-Path $PSScriptRoot '..\install.ps1')
+    $files += Get-Item -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1')
+    foreach ($f in $files) {
+      $code = Remove-SbwPsComments -Text ([IO.File]::ReadAllText($f.FullName))
+      Assert-NotMatch $code 'Invoke-Expression' $f.Name
+      Assert-NotMatch $code '(?i)(?<![A-Za-z0-9_])iex(?![A-Za-z0-9_])' $f.Name
+      Assert-NotMatch $code '(?<![A-Za-z0-9])/c(?![A-Za-z0-9])' $f.Name
+      Assert-NotMatch $code 'ComSpec' $f.Name
+    }
   }
 }
 

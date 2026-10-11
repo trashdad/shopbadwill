@@ -15,7 +15,7 @@ leaves the browser.
   `%LOCALAPPDATA%\ShopBadwill\companion\`.
 - When a snipe is armed, the extension asks the host to `schedule`; the host
   registers a one-off `ShopBadwill-<id>` task (`WakeToRun`,
-  `StartWhenAvailable`) whose action launches the browser detached with your
+  `StartWhenAvailable`) whose action launches the configured browser with your
   profile. `cancel` removes it; `list` reports it. Protocol:
   `companion/windows/PROTOCOL.md`.
 - Fired/orphaned tasks delete themselves (`DeleteExpiredTaskAfter PT10M`,

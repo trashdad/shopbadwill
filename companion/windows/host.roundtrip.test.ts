@@ -113,6 +113,7 @@ describe.skipIf(process.platform !== 'win32')(
   () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'sbw-companion-'));
   const fakeSchtasks = path.join(tmp, 'fake-schtasks.cmd');
+  const fakeBrowser = path.join(tmp, 'fake-browser.exe');
   const schtasksLog = path.join(tmp, 'schtasks.log');
   const dataDir = path.join(tmp, 'data');
   const configPath = path.join(tmp, 'config.json');
@@ -133,6 +134,9 @@ describe.skipIf(process.platform !== 'win32')(
     // and always exits 0. The host never sees the real schtasks.
     const fake = `@echo off\r\n>>"${schtasksLog}" echo %*\r\nexit /b 0\r\n`;
     writeFileSync(fakeSchtasks, fake, 'ascii');
+    // Empty file: the host only Test-Path's it. schtasks is the stub above, so
+    // nothing launches this path.
+    writeFileSync(fakeBrowser, '');
     writeFileSync(
       configPath,
       JSON.stringify(
@@ -140,11 +144,8 @@ describe.skipIf(process.platform !== 'win32')(
           version: 1,
           dataDir,
           schtasksPath: fakeSchtasks,
-          chrome: { exePath: process.env.ComSpec ?? 'C:\\Windows\\System32\\cmd.exe', profile: 'Default' },
-          firefox: {
-            exePath: process.env.ComSpec ?? 'C:\\Windows\\System32\\cmd.exe',
-            profile: 'default-release',
-          },
+          chrome: { exePath: fakeBrowser, profile: 'Default' },
+          firefox: { exePath: fakeBrowser, profile: 'default-release' },
         },
         null,
         2,
@@ -181,7 +182,7 @@ describe.skipIf(process.platform !== 'win32')(
       snipeId: 'test123',
       wakeAtUtc,
       browser: 'chrome',
-      profile: 'Default',
+      profile: 'default',
     })) as WakeResponse;
     expect(resp.ok).toBe(true);
     expect(resp.op).toBe('schedule');
@@ -193,13 +194,23 @@ describe.skipIf(process.platform !== 'win32')(
     expect(log).toContain('/Create /TN ShopBadwill-test123 /XML');
     expect(log).toContain('/F');
 
-    // The generated XML (written next to state.json) carries the wake settings.
+    // The generated XML (written next to state.json) carries the wake settings
+    // and launches the configured browser, using the configured profile spelling.
     const xmlPath = path.join(dataDir, 'ShopBadwill-test123.xml');
     expect(existsSync(xmlPath)).toBe(true);
     const xml = readFileSync(xmlPath, 'utf16le');
     expect(xml).toContain('<WakeToRun>true</WakeToRun>');
     expect(xml).toContain('<StartWhenAvailable>true</StartWhenAvailable>');
-    expect(xml).toContain('--profile-directory=Default');
+    expect(xml).toContain(`<Command>${fakeBrowser}</Command>`);
+    expect(xml).toContain('<Arguments>--profile-directory=Default</Arguments>');
+    expect(xml).not.toContain('--profile-directory=default');
+    expect(xml).not.toMatch(/<Arguments>[^<]*\/c/);
+    expect(xml).toContain('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
+    expect(xml).toContain('<DeleteExpiredTaskAfter>PT10M</DeleteExpiredTaskAfter>');
+    expect(xml).toContain('<LogonType>InteractiveToken</LogonType>');
+    expect(xml).toContain('<RunLevel>LeastPrivilege</RunLevel>');
+    expect(xml).not.toContain('HighestAvailable');
+    expect(xml).not.toContain('<Password>');
   });
 
   it('list now reports the scheduled task with the prefixed name', async () => {

@@ -8,7 +8,8 @@
 # ---- stubs replacing io.ps1 side effects (definition order matters: later wins) ----
 function Invoke-SchTasks {
   param([string]$SchTasksPath, [string[]]$ArgList)
-  $script:sbwCalls += (@($ArgList) -join ' ')
+  # One nested array per call. A joined string would hide a concatenated command.
+  $script:sbwCalls += ,(@($ArgList))
   if ($ArgList -ccontains '/Query' -and $script:sbwQueryMissing) {
     return @{ ExitCode = 1; Output = 'ERROR: The system cannot find the file specified.' }
   }
@@ -35,12 +36,18 @@ function Write-SbwXmlFile {
   (Join-Path $DataDir "$TaskName.xml")
 }
 
+# Empty file so Test-Path succeeds. The host must not execute it; schtasks is stubbed.
+$script:sbwFakeBrowser = Join-Path ([IO.Path]::GetTempPath()) 'sbw-t110-fake-browser.exe'
+if (-not (Test-Path -LiteralPath $script:sbwFakeBrowser)) {
+  [IO.File]::WriteAllText($script:sbwFakeBrowser, '')
+}
+
 function New-SbwTestConfig {
   [pscustomobject]@{
     dataDir      = 'C:\fake-data'
-    schtasksPath = 'C:\Windows\System32\schtasks.exe'
-    chrome       = [pscustomobject]@{ exePath = (Join-Path $env:SystemRoot 'System32\cmd.exe'); profile = 'Default' }
-    firefox      = [pscustomobject]@{ exePath = (Join-Path $env:SystemRoot 'System32\cmd.exe'); profile = 'default-release' }
+    schtasksPath = 'C:\sbw-no-such\schtasks.exe'
+    chrome       = [pscustomobject]@{ exePath = $script:sbwFakeBrowser; profile = 'Default' }
+    firefox      = [pscustomobject]@{ exePath = $script:sbwFakeBrowser; profile = 'default-release' }
   }
 }
 
@@ -69,11 +76,33 @@ Describe 'host schedule dispatch' {
     Assert-Equal $resp.taskName 'ShopBadwill-abc-123'
     Assert-Equal $resp.wakeAtUtc '2026-10-10T13:00:00.000Z'
     Assert-Equal $script:sbwCalls.Count 1
-    Assert-Equal $script:sbwCalls[0] '/Create /TN ShopBadwill-abc-123 /XML C:\fake-data\ShopBadwill-abc-123.xml /F'
+    Assert-ArrayEqual $script:sbwCalls[0] @('/Create', '/TN', 'ShopBadwill-abc-123', '/XML', 'C:\fake-data\ShopBadwill-abc-123.xml', '/F')
     Assert-Equal $script:sbwState.Count 1
     Assert-Equal $script:sbwState[0].snipeId 'abc-123'
-    Assert-Match $script:sbwXml '<WakeToRun>true</WakeToRun>'
-    Assert-Match $script:sbwXml '--profile-directory=Default'
+    Assert-Equal $script:sbwState[0].profile 'Default'
+    $xml = [xml]$script:sbwXml
+    Assert-Equal ([string]$xml.Task.Settings.WakeToRun) 'true'
+    Assert-Equal ([string]$xml.Task.Actions.Exec.Command) $script:sbwFakeBrowser
+    Assert-Equal ([string]$xml.Task.Actions.Exec.Arguments) '--profile-directory=Default'
+    Assert-Equal ([string]$xml.Task.Settings.ExecutionTimeLimit) 'PT0S'
+    Assert-Equal ([string]$xml.Task.Settings.DeleteExpiredTaskAfter) 'PT10M'
+    Assert-Equal ([string]$xml.Task.Principals.Principal.LogonType) 'InteractiveToken'
+    Assert-Equal ([string]$xml.Task.Principals.Principal.RunLevel) 'LeastPrivilege'
+    Assert-NotMatch $script:sbwXml 'HighestAvailable'
+    Assert-NotMatch $script:sbwXml '<Password>'
+    Assert-NotMatch $script:sbwXml 'cmd\.exe'
+    Assert-NotMatch ([string]$xml.Task.Actions.Exec.Arguments) '(?<![A-Za-z0-9])/c(?![A-Za-z0-9])'
+  }
+  It 'launches the configured profile spelling, not the message case variant' {
+    Reset-SbwFakes
+    $cfg = New-SbwTestConfig
+    $json = '{"op":"schedule","snipeId":"abc-123","wakeAtUtc":"2026-10-10T13:00:00.000Z","browser":"chrome","profile":"default"}'
+    $resp = Invoke-SbwMessage -Json $json -Config $cfg -Now (Get-SbwTestNow)
+    Assert-Equal $resp.ok $true
+    $xml = [xml]$script:sbwXml
+    Assert-Equal ([string]$xml.Task.Actions.Exec.Arguments) '--profile-directory=Default'
+    Assert-NotMatch ([string]$xml.Task.Actions.Exec.Arguments) '--profile-directory=default'
+    Assert-Equal $script:sbwState[0].profile 'Default'
   }
   It 're-scheduling the same snipe overwrites its own state row' {
     Reset-SbwFakes
@@ -138,20 +167,19 @@ Describe 'host cancel dispatch' {
     Assert-Equal $resp.ok $true
     Assert-Equal $resp.taskName 'ShopBadwill-s1'
     Assert-Equal $script:sbwState.Count 0
-    Assert-Equal $script:sbwCalls[1] '/Delete /TN ShopBadwill-s1 /F'
+    Assert-ArrayEqual $script:sbwCalls[1] @('/Delete', '/TN', 'ShopBadwill-s1', '/F')
   }
   It 'cancel of an unknown snipe is idempotent (task already gone)' {
     Reset-SbwFakes
     $script:sbwDeleteMissing = $true
     $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"nope"}' -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
     Assert-Equal $resp.ok $true
-    Assert-Equal $script:sbwCalls[0] '/Delete /TN ShopBadwill-nope /F'
+    Assert-ArrayEqual $script:sbwCalls[0] @('/Delete', '/TN', 'ShopBadwill-nope', '/F')
   }
   It 'cancel never touches a non-prefixed task name' {
     Reset-SbwFakes
     $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"a"}' -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
-    Assert-Equal $script:sbwCalls[0] '/Delete /TN ShopBadwill-a /F'
-    Assert-NotMatch $script:sbwCalls[0] '(/TN a )'
+    Assert-ArrayEqual $script:sbwCalls[0] @('/Delete', '/TN', 'ShopBadwill-a', '/F')
   }
   It 'reports a real delete failure' {
     Reset-SbwFakes
@@ -193,7 +221,11 @@ Describe 'host list dispatch' {
     Assert-Equal $resp.tasks.Count 0
     Assert-Equal $script:sbwState.Count 0
     foreach ($call in $script:sbwCalls) {
-      if ($call -like '/Query*') { Assert-Match $call '/Query /TN ShopBadwill-' }
+      $parts = @($call)
+      if ($parts -ccontains '/Query') {
+        Assert-ArrayEqual $parts @('/Query', '/TN', $parts[2], '/FO', 'CSV', '/NH')
+        Assert-Match ([string]$parts[2]) '^ShopBadwill-[A-Za-z0-9_-]{1,64}$'
+      }
     }
   }
   It 'ignores a poisoned state row and reports only the computed ShopBadwill- name' {
@@ -208,7 +240,7 @@ Describe 'host list dispatch' {
     Assert-Equal $resp.tasks[0].snipeId 'kept'
     Assert-Equal $resp.tasks[0].taskName 'ShopBadwill-kept'
     Assert-Equal $script:sbwCalls.Count 1
-    Assert-Equal $script:sbwCalls[0] '/Query /TN ShopBadwill-kept /FO CSV /NH'
+    Assert-ArrayEqual $script:sbwCalls[0] @('/Query', '/TN', 'ShopBadwill-kept', '/FO', 'CSV', '/NH')
   }
 }
 

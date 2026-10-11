@@ -86,7 +86,9 @@ Always `ShopBadwill-<snipeId>`. `cancel` and `list` (and
 
 At `wakeAtUtc` (local wall clock; a machine that wakes later still fires via
 `StartWhenAvailable`, within a 1 h window) the one-off task with `WakeToRun`
-launches the configured browser detached with the profile arguments:
+launches the configured browser executable directly. The task's Exec `Command`
+is that executable and `Arguments` are only the profile arguments below (Task
+Scheduler requires one Arguments string; it is not a shell command):
 
 - Chrome, profile name: `--profile-directory=<name>`
 - Chrome, profile path: `--user-data-dir=<path>` (a value containing `\`, `/`
@@ -94,7 +96,9 @@ launches the configured browser detached with the profile arguments:
 - Firefox, profile name: `-P <name>`
 - Firefox, profile path: `-profile <path>`
 
-Fired and orphaned tasks delete themselves (`DeleteExpiredTaskAfter PT10M`,
-`EndBoundary` = wake + 1 h). The task runs as the interactive, least-privilege
-current user and is allowed to start on battery (whether a wake timer actually
-fires on battery is a power-plan setting, see `docs/COMPANION.md`).
+`ExecutionTimeLimit` is `PT0S` (unlimited) so Task Scheduler does not kill the
+browser. Fired and orphaned tasks still delete themselves
+(`DeleteExpiredTaskAfter PT10M`, `EndBoundary` = wake + 1 h). The task runs as
+the interactive, least-privilege current user, with no stored password and
+without highest privileges, and is allowed to start on battery (whether a wake
+timer actually fires on battery is a power-plan setting, see `docs/COMPANION.md`).
