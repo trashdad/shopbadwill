@@ -49,6 +49,8 @@ export { MessagingError, type MessagingErrorCode } from './errors';
 export interface ClientPort {
   onMessage: { addListener(l: (m: unknown) => void): void; removeListener(l: (m: unknown) => void): void };
   disconnect(): void;
+  /** Optional so older fakes still fit; real ports have it. */
+  onDisconnect?: { addListener(l: () => void): void; removeListener(l: () => void): void };
 }
 type BroadcastListener = (message: unknown, sender: { id?: string; tab?: unknown }) => undefined | boolean;
 export interface ClientRuntime {
@@ -58,7 +60,18 @@ export interface ClientRuntime {
   onMessage: { addListener(l: BroadcastListener): void; removeListener(l: BroadcastListener): void };
 }
 
-export function createMessagingClient(runtime: ClientRuntime): MessagingClient {
+/**
+ * `connect` with the optional `onDisconnect` callback. The frozen port type
+ * (src/ports/messaging.ts) has two parameters; the real client and the fake
+ * accept the third, and callers that need it cast to this.
+ */
+export type ConnectWithDisconnect = <P extends PortName>(
+  name: P,
+  onTick: (t: PortTick<P>) => void,
+  onDisconnect?: () => void,
+) => () => void;
+
+export function createMessagingClient(runtime: ClientRuntime): MessagingClient & { connect: ConnectWithDisconnect } {
   return {
     async send<K extends MsgType>(type: K, payload: MsgPayload<K>): Promise<MsgReply<K>> {
       const body = payload === undefined ? { type } : { type, payload };
@@ -91,15 +104,20 @@ export function createMessagingClient(runtime: ClientRuntime): MessagingClient {
       return reply.data as MsgReply<K>;
     },
 
-    connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void): () => void {
+    connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void, onDisconnect?: () => void): () => void {
       const port = runtime.connect({ name });
       const listener = (m: unknown): void => {
         const tick = PortTickSchemas[name].safeParse(m);
         if (tick.success) onTick(tick.data as PortTick<P>); // a malformed tick is dropped
       };
       port.onMessage.addListener(listener);
+      const gone = (): void => {
+        onDisconnect?.();
+      };
+      if (onDisconnect !== undefined) port.onDisconnect?.addListener(gone);
       return () => {
         port.onMessage.removeListener(listener);
+        port.onDisconnect?.removeListener(gone);
         port.disconnect();
       };
     },
