@@ -85,6 +85,7 @@ function app(
     permissions?: FakePermissions;
     /** When set, calendar.status reports Google as connected under this account. */
     account?: string;
+    newId?: () => string;
   } = {},
 ): Harness {
   const fake = new FakeMessaging();
@@ -125,8 +126,7 @@ function app(
       openOptions,
       getActiveTabUrl: () => Promise.resolve(opts.tab),
       now: () => NOW,
-      newId: () => 'watch-1',
-      timeZone: 'America/New_York',
+      newId: opts.newId ?? (() => 'watch-1'),
     }),
   );
   return { fake, healthState, settingsSet, watchesSaved, rulesSaved, runNow, permissions, openGoogle, openOptions };
@@ -246,17 +246,6 @@ describe('onboarding: completing (brief test)', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Finish' }));
     await screen.findByText(/You're all set/);
     expect(h.fake.sent.some((m) => m.type === 'settings.set' && 'snipe' in (m.payload as Record<string, unknown>))).toBe(false);
-  });
-
-  it('sends no dry-run rewrite when dry-run is already on', async () => {
-    const h = app();
-    await toStep(h, 5);
-    fireEvent.click(screen.getByLabelText(/understand the risks/i));
-    fireEvent.click(screen.getByRole('button', { name: 'Dry-run it now' }));
-    await waitFor(() => {
-      expect(h.runNow).toEqual([{ watchIds: ['watch-1'] }]);
-    });
-    expect(h.settingsSet.some((p) => 'dryRun' in p)).toBe(false);
   });
 
   it('does not re-save the match-everything rule when it already exists', async () => {
@@ -662,3 +651,153 @@ describe('onboarding: notification request timing (R6)', () => {
     expect(h.permissions.requested).toEqual([{ permissions: ['notifications'] }]);
   });
 });
+
+/** From step 5: ticks the risk checkbox, starts the dry run and clicks Finish. */
+async function finish(h: Harness): Promise<void> {
+  fireEvent.click(screen.getByLabelText(/understand the risks/i));
+  fireEvent.click(screen.getByRole('button', { name: 'Dry-run it now' }));
+  await waitFor(() => {
+    expect(h.runNow).toHaveLength(1);
+  });
+  fireEvent.click(await screen.findByRole('button', { name: 'Finish' }));
+  await screen.findByText("You're all set.");
+}
+
+const ALL_DRY = { dryRun: { favorites: true, calendar: true, bidding: true } };
+
+describe('onboarding: final check (Opus)', () => {
+  it('re-asserts dry-run before job.runNow even when it was on at load (options may have turned it off since)', async () => {
+    const s = defaultSettings();
+    const h = app({ settings: s });
+    await toStep(h, 5);
+    // Meanwhile, in the options tab Connect Google opened, the favorites dry run is turned off.
+    s.dryRun = { favorites: false, calendar: true, bidding: true };
+    fireEvent.click(screen.getByLabelText(/understand the risks/i));
+    fireEvent.click(screen.getByRole('button', { name: 'Dry-run it now' }));
+    await waitFor(() => {
+      expect(h.runNow).toEqual([{ watchIds: ['watch-1'] }]);
+    });
+    const runIdx = h.fake.sent.findIndex((m) => m.type === 'job.runNow');
+    const dryIdx = h.fake.sent.findIndex((m) => m.type === 'settings.set' && JSON.stringify(m.payload) === JSON.stringify(ALL_DRY));
+    expect(dryIdx).toBeGreaterThan(-1);
+    expect(dryIdx).toBeLessThan(runIdx);
+  });
+
+  it('going Back and creating the watch again updates the same watch instead of adding a second one', async () => {
+    let n = 0;
+    const h = app({
+      newId: () => {
+        n += 1;
+        return `watch-${String(n)}`;
+      },
+    });
+    await toStep(h, 5);
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: "Don't favorite on ShopGoodwill" }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create my first watch' }));
+    await waitFor(() => {
+      expect(h.watchesSaved).toHaveLength(2);
+    });
+    const [first, second] = h.watchesSaved.map((w) => WatchSchema.parse(w));
+    expect(second?.id).toBe(first?.id);
+    expect(second?.favoriteMode).toBe('local');
+    await finish(h);
+    expect(h.runNow).toEqual([{ watchIds: [first?.id] }]);
+  });
+
+  it('the summary says the ZIP was skipped when one was typed and then skipped', async () => {
+    const h = app();
+    await toStep(h, 2);
+    fireEvent.input(screen.getByLabelText('Home ZIP (optional)'), { target: { value: '98122' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Skip' }));
+    const skip = await screen.findByRole<HTMLButtonElement>('button', { name: 'Skip for now' });
+    await waitFor(() => {
+      expect(skip.disabled).toBe(false);
+    });
+    fireEvent.click(skip);
+    await screen.findByText(/\.ics downloads/);
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Create my first watch' }));
+    await waitFor(() => {
+      expect(h.watchesSaved).toHaveLength(1);
+    });
+    await finish(h);
+    expect(h.settingsSet.some((p) => 'homeZip' in p)).toBe(false);
+    expect(screen.getByText('Home ZIP: skipped.')).toBeTruthy();
+    expect(screen.queryByText(/98122/)).toBeNull();
+  });
+
+  it('moves focus to each new heading, the summary included', async () => {
+    const h = app();
+    await toStep(h, 2);
+    await waitFor(() => {
+      expect(document.activeElement?.textContent).toBe('Home ZIP (optional)');
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Skip' }));
+    await toStep5From3(h);
+    await waitFor(() => {
+      expect(document.activeElement?.textContent).toBe('Dry-run it now');
+    });
+    await finish(h);
+    await waitFor(() => {
+      expect(document.activeElement?.textContent).toBe("You're all set.");
+    });
+  });
+
+  it('a re-run with favorites dry-run off says favoriting starts at the watch\'s next run', async () => {
+    const h = app({ settings: { ...defaultSettings(), dryRun: { favorites: false, calendar: true, bidding: true } } });
+    await toStep(h, 4);
+    await screen.findByText(
+      "Dry-run is off for favorites right now, so from this watch's next run, every new item in this search will be favorited on your ShopGoodwill account. Dry-run it now, on the next step, turns dry-run back on.",
+    );
+    expect(screen.queryByText(/^Once dry-run is off/)).toBeNull();
+  });
+
+  it('a re-run with any dry-run off says so on the risk card, and that Dry-run it now turns it back on', async () => {
+    const h = app({ settings: { ...defaultSettings(), dryRun: { favorites: true, calendar: true, bidding: false } } });
+    await toStep(h, 5);
+    expect(
+      screen.getByText(
+        'Dry-run is off right now for favorites, calendar or bids. Dry-run it now turns it back on for all three, and it stays on until you turn it off yourself.',
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Dry-run is on and stays on/)).toBeNull();
+  });
+
+  it('skipping Google on a re-run with the calendar on says it is now off, not that it stays off', async () => {
+    const base = defaultSettings();
+    const h = app({ settings: { ...base, calendar: { ...base.calendar, enabled: true } } });
+    await toStep(h, 3);
+    const skip = await screen.findByRole<HTMLButtonElement>('button', { name: 'Skip for now' });
+    await waitFor(() => {
+      expect(skip.disabled).toBe(false);
+    });
+    fireEvent.click(skip);
+    await screen.findByText(/^Google Calendar reminders are off\./);
+    expect(screen.queryByText(/stay off/)).toBeNull();
+    expect(h.settingsSet).toEqual([{ calendar: { ...base.calendar, enabled: false, icsFallback: true } }]);
+  });
+
+  it('the summary claims only what the code does about live bidding', async () => {
+    const h = app();
+    await toStep(h, 5);
+    await finish(h);
+    expect(screen.getByText(/Live bidding stays off until you turn off the bidding dry run yourself in options\./)).toBeTruthy();
+    expect(screen.queryByText(/practice/)).toBeNull();
+  });
+});
+
+/** From the calendar step: skip Google, continue, create the watch. */
+async function toStep5From3(h: Harness): Promise<void> {
+  const skip = await screen.findByRole<HTMLButtonElement>('button', { name: 'Skip for now' });
+  await waitFor(() => {
+    expect(skip.disabled).toBe(false);
+  });
+  fireEvent.click(skip);
+  await screen.findByText(/\.ics downloads/);
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Create my first watch' }));
+  await waitFor(() => {
+    expect(h.watchesSaved).toHaveLength(1);
+  });
+}

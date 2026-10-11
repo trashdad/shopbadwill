@@ -77,7 +77,8 @@ function problem(what: string, e: unknown): string {
 export function Onboarding(props: OnboardingProps): VNode {
   const { client } = props;
   const now = props.now ?? Date.now;
-  const newId = props.newId ?? (() => crypto.randomUUID());
+  // One id per visit: going Back and creating the watch again updates it, never adds a second.
+  const [watchId] = useState(() => (props.newId ?? (() => crypto.randomUUID()))());
   const getActiveTabUrl = props.getActiveTabUrl ?? NO_TAB;
   const openGoogle = props.openGoogleOptions ?? NOOP;
   const openOptions = props.openOptions ?? NOOP;
@@ -91,6 +92,8 @@ export function Onboarding(props: OnboardingProps): VNode {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsError, setSettingsError] = useState('');
   const [zip, setZip] = useState('');
+  /** The ZIP actually stored, for the summary: a typed-then-skipped ZIP was never saved. */
+  const [savedZip, setSavedZip] = useState('');
   const [zipErr, setZipErr] = useState<string | undefined>(undefined);
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [calNote, setCalNote] = useState('');
@@ -184,6 +187,9 @@ export function Onboarding(props: OnboardingProps): VNode {
   }, [step, done]);
 
   const signedIn = health !== null && SIGNED_IN.includes(health.sessionState);
+  // A re-run can find a dry run already off; the copy must say so (the defaults are all on).
+  const favoritesDryRunOff = settings !== null && !settings.dryRun.favorites;
+  const allDryRunOn = settings === null || (settings.dryRun.favorites && settings.dryRun.calendar && settings.dryRun.bidding);
 
   const saveZip = (): void => {
     const v = zip.trim();
@@ -203,6 +209,7 @@ export function Onboarding(props: OnboardingProps): VNode {
     client.send('settings.set', { homeZip: v }).then(
       () => {
         setZipErr(undefined);
+        setSavedZip(v);
         setStep(3);
       },
       (e: unknown) => {
@@ -219,7 +226,7 @@ export function Onboarding(props: OnboardingProps): VNode {
       () => {
         setSettings({ ...settings, calendar });
         setCalNote(
-          'Calendar reminders stay off. You can still add single auctions to your calendar: the dashboard offers .ics downloads.',
+          'Google Calendar reminders are off. You can still add single auctions to your calendar: the dashboard offers .ics downloads.',
         );
       },
       (e: unknown) => {
@@ -240,7 +247,7 @@ export function Onboarding(props: OnboardingProps): VNode {
       const built = buildFirstWatch(
         source.query,
         now(),
-        newId(),
+        watchId,
         favoriteOnAccount ? DEFAULT_WATCH_FAVORITE_MODE : 'local',
       );
       if (!built.ok) {
@@ -276,12 +283,11 @@ export function Onboarding(props: OnboardingProps): VNode {
     setDryRunState('running');
     try {
       // R1/R3: the run goes out only while dry-run is on; onboarding turns it ON, never off.
-      const d = settings.dryRun;
-      if (!d.favorites || !d.calendar || !d.bidding) {
-        const dryRun = { favorites: true, calendar: true, bidding: true };
-        await client.send('settings.set', { dryRun });
-        setSettings({ ...settings, dryRun });
-      }
+      // Always written, never skipped on the loaded copy: the options tab (Connect
+      // Google) may have turned a dry run off since this page read the settings.
+      const dryRun = { favorites: true, calendar: true, bidding: true };
+      await client.send('settings.set', { dryRun });
+      setSettings({ ...settings, dryRun });
       await client.send('job.runNow', { watchIds: [watch.id] });
       setDryRunState('done');
       setStatus({ message: 'The dry run is running. Watch the dashboard for progress.', tone: 'ok' });
@@ -296,16 +302,18 @@ export function Onboarding(props: OnboardingProps): VNode {
       <div class="sbw-onboarding">
         <main id="sbw-main">
           <Card>
-            <h2>You're all set.</h2>
+            <h2 id="onboarding-step-heading" tabIndex={-1}>
+              You're all set.
+            </h2>
             <ul class="sbw-checks">
               <li>Signed in to ShopGoodwill.</li>
-              <li>Home ZIP: {zip.trim() === '' ? 'skipped' : zip.trim()}.</li>
+              <li>Home ZIP: {savedZip === '' ? 'skipped' : savedZip}.</li>
               <li>Calendar: {calNote === '' ? 'as you left it.' : '.ics downloads.'}</li>
               {watch === null ? null : <li>First watch: "{watch.name}" — the dry run is running.</li>}
             </ul>
             <p class="sbw-hint">
-              Live sniping stays off until you enable it in options and finish its dry-run practice. Dry-run stays on until
-              you turn it off.
+              Dry-run stays on until you turn it off. Live bidding stays off until you turn off the bidding dry run yourself
+              in options.
             </p>
             <div class="sbw-actions">
               <button
@@ -504,9 +512,11 @@ export function Onboarding(props: OnboardingProps): VNode {
                   <h3>{defaultWatchName(source.query)}</h3>
                   <p data-testid="onboarding-watch-query">{summarizeQuery(source.query)}</p>
                   <p>
-                    {favoriteOnAccount
-                      ? 'Once dry-run is off, every new item in this search will be favorited on your ShopGoodwill account.'
-                      : 'Nothing in this search will be favorited on your ShopGoodwill account.'}
+                    {!favoriteOnAccount
+                      ? 'Nothing in this search will be favorited on your ShopGoodwill account.'
+                      : favoritesDryRunOff
+                        ? "Dry-run is off for favorites right now, so from this watch's next run, every new item in this search will be favorited on your ShopGoodwill account. Dry-run it now, on the next step, turns dry-run back on."
+                        : 'Once dry-run is off, every new item in this search will be favorited on your ShopGoodwill account.'}
                   </p>
                   <p class="sbw-hint">
                     It matches everything new in this search. You can add rules, sellers and price limits later in options.
@@ -573,7 +583,11 @@ export function Onboarding(props: OnboardingProps): VNode {
               <ul class="sbw-checks">
                 <li>Automated bidding may break ShopGoodwill's terms, and your account is at risk. Real money is involved.</li>
                 <li>You keep control: every bid is capped by the max you set, and daily caps apply.</li>
-                <li>Dry-run is on and stays on until you turn it off yourself.</li>
+                <li>
+                  {allDryRunOn
+                    ? 'Dry-run is on and stays on until you turn it off yourself.'
+                    : 'Dry-run is off right now for favorites, calendar or bids. Dry-run it now turns it back on for all three, and it stays on until you turn it off yourself.'}
+                </li>
               </ul>
               <label>
                 <input
