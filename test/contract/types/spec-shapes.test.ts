@@ -413,8 +413,8 @@ interface SpecSnipe {
   armedAt: EpochMs;
   fireAt?: EpochMs;
   wakeAlarm?: string;
-  // T-80 contract change: `reply` (docs/CONTRACT-DECISIONS.md).
-  attempt: { sentAt?: EpochMs; idempotencyKey?: string; ambiguous?: boolean; reply?: SpecBidResult };
+  // T-80 contract change: `reply`; T-80b adds `notSent` (docs/CONTRACT-DECISIONS.md).
+  attempt: { sentAt?: EpochMs; idempotencyKey?: string; ambiguous?: boolean; reply?: SpecBidResult; notSent?: boolean };
   measured?: { offsetMs?: number; rttMs?: number; firedAt?: EpochMs; responseAt?: EpochMs };
   groupId?: string;
   history: Array<{ at: EpochMs; from: SpecSnipeState; to: SpecSnipeState; why: string }>;
@@ -434,6 +434,8 @@ type SpecSnipeEvent =
   | { type: 'result'; now: EpochMs; result: SpecBidResult }
   | { type: 'ambiguous'; now: EpochMs }
   | { type: 'post-read'; now: EpochMs; detail: SpecItemDetail }
+  | { type: 'post-read-failed'; now: EpochMs }
+  | { type: 'not-sent'; now: EpochMs; reason: string }
   | { type: 'preflight-failed'; now: EpochMs; reason: string }
   | { type: 'apply-fallback'; now: EpochMs; mode: 'early-proxy' | 'skip' };
 // §3.9 fixes the Effect kinds and `snipeId`; T-02 adds the per-kind payloads.

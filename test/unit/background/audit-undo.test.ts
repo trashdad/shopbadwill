@@ -3,7 +3,8 @@ import { createMessagingClient, type ClientRuntime } from '../../../src/messagin
 import { UNDOABLE_KINDS } from '../../../src/ui/activity/undoable';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { createAuditHandlers, createUndoExecutors, SCAN_BATCH } from '../../../src/background/handlers/audit';
+import type { BackgroundContext } from '../../../src/background/context';
+import { createAuditHandlers, createUndoExecutors, SCAN_BATCH, wiredUndoExecutors } from '../../../src/background/handlers/audit';
 import { unfavoriteRef } from '../../../src/background/jobs/steps/favorite';
 import { Repo } from '../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
@@ -162,8 +163,11 @@ describe('audit.list cost', () => {
 });
 
 describe('undoable kinds', () => {
-  it('the UI list matches the wired executors', () => {
-    expect([...UNDOABLE_KINDS].sort()).toEqual(Object.keys(createUndoExecutors({ api, repo })).sort());
+  it('the UI list matches the executors register() wires (T-58 + T-67 deleteEvent)', () => {
+    // The map is built from ctx lazily: building it reads ctx.api and ctx.repo only.
+    const wired = wiredUndoExecutors({ api, repo } as unknown as BackgroundContext);
+    expect([...UNDOABLE_KINDS].sort()).toEqual(Object.keys(wired).sort());
+    expect(Object.keys(wired)).toContain('deleteEvent');
   });
 });
 

@@ -1,6 +1,6 @@
 import type { GcalEvent, GcalEventBody } from '../../../src/domain/calendar/types';
 import { CalendarApiError, type CalendarApiErrorCode } from '../../../src/ports/errors';
-import type { CalendarApi } from '../../../src/ports/calendar';
+import type { CalendarApi, CalendarListRow } from '../../../src/ports/calendar';
 
 export type CalendarApiMethod = keyof CalendarApi;
 
@@ -12,7 +12,7 @@ export type CalendarApiMethod = keyof CalendarApi;
  */
 export class FakeCalendarApi implements CalendarApi {
   readonly calls: Array<{ method: CalendarApiMethod; args: unknown[] }> = [];
-  private readonly calendars = new Map<string, { id: string; summary: string; timeZone: string }>();
+  private readonly calendars = new Map<string, { id: string; summary: string; timeZone: string; description?: string }>();
   private readonly events = new Map<string, Map<string, GcalEvent>>();
   private readonly failures = new Map<CalendarApiMethod, CalendarApiError[]>();
   private calSeq = 0;
@@ -35,17 +35,28 @@ export class FakeCalendarApi implements CalendarApi {
     return structuredClone([...(this.events.get(calendarId)?.values() ?? [])]);
   }
 
-  calendarsInsert(summary: string, timeZone: string): Promise<{ id: string }> {
-    return this.run('calendarsInsert', [summary, timeZone], () => {
+  calendarsInsert(summary: string, timeZone: string, description?: string): Promise<{ id: string }> {
+    return this.run('calendarsInsert', [summary, timeZone, description], () => {
       this.calSeq += 1;
       const id = `fake-calendar-${String(this.calSeq)}@group.calendar.test`;
-      this.calendars.set(id, { id, summary, timeZone });
+      this.calendars.set(id, { id, summary, timeZone, ...(description === undefined ? {} : { description }) });
       return { id };
     });
   }
 
   calendarListGet(calendarId: string): Promise<{ id: string } | null> {
     return this.run('calendarListGet', [calendarId], () => (this.calendars.has(calendarId) ? { id: calendarId } : null));
+  }
+
+  calendarListList(): Promise<CalendarListRow[]> {
+    return this.run('calendarListList', [], () =>
+      [...this.calendars.values()].map((c) => ({
+        id: c.id,
+        summary: c.summary,
+        accessRole: 'owner',
+        ...(c.description === undefined ? {} : { description: c.description }),
+      })),
+    );
   }
 
   eventsInsert(calendarId: string, body: GcalEventBody & { id: string }): Promise<GcalEvent> {

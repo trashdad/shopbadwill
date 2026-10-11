@@ -1,10 +1,13 @@
 // `pnpm lint:webext`: runs `web-ext lint` on the built Firefox extension
 // (.output/firefox-mv3) and fails on ANY warning or error, with one exception:
-// the single UNSAFE_VAR_ASSIGNMENT / innerHTML warning that points at Preact's
-// own dangerouslySetInnerHTML handling inside the chunk that contains the Preact
-// runtime. That is the same allowlist entry as scripts/check-prod-bundle.ts and
-// uses the same detector, so a first-party innerHTML (or a second Preact one)
-// still fails. Notices are printed but do not fail the run.
+// the UNSAFE_VAR_ASSIGNMENT / innerHTML warning that points at Preact's own
+// dangerouslySetInnerHTML handling inside a bundle that contains the Preact
+// runtime, at most ONE per bundle file. Pages share one Preact chunk; the SGW
+// content script (T-32) inlines its own copy (content scripts cannot import
+// shared chunks), so a build has at most one such file per surface. That is the
+// same allowlist entry as scripts/check-prod-bundle.ts (also per file) and uses
+// the same detector, so a first-party innerHTML (or a second Preact one in the
+// same file) still fails. Notices are printed but do not fail the run.
 //
 //   pnpm build:firefox && pnpm lint:webext [-- --self-hosted]
 // Extra CLI args are forwarded to `web-ext lint` (the release workflow passes --self-hosted).
@@ -14,7 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { allowedInnerHtmlOffsets } from './check-prod-bundle';
 
-interface LintMessage {
+export interface LintMessage {
   code?: string;
   message?: string;
   file?: string;
@@ -28,7 +31,8 @@ interface LintReport {
   notices: LintMessage[];
 }
 
-const MAX_ALLOWED_PREACT_WARNINGS = 1;
+/** Allowlisted Preact innerHTML warnings per bundle file. */
+const MAX_ALLOWED_PREACT_WARNINGS_PER_FILE = 1;
 // web-ext reports the column of the assignment's member expression, a couple of
 // characters before the `innerHTML` property name.
 const COLUMN_SLACK_BEFORE = 4;
@@ -66,6 +70,31 @@ async function isPreactInnerHtmlWarning(m: LintMessage): Promise<boolean> {
   );
 }
 
+/**
+ * Splits web-ext warnings into the allowlisted Preact runtime ones (at most
+ * MAX_ALLOWED_PREACT_WARNINGS_PER_FILE per bundle file, as judged by
+ * `isPreactWarning`) and failures. A warning without a file never qualifies.
+ */
+export async function splitWarnings(
+  warnings: readonly LintMessage[],
+  isPreactWarning: (m: LintMessage) => Promise<boolean>,
+): Promise<{ allowed: LintMessage[]; failures: LintMessage[] }> {
+  const allowed: LintMessage[] = [];
+  const failures: LintMessage[] = [];
+  const perFile = new Map<string, number>();
+  for (const warning of warnings) {
+    const file = warning.file;
+    const used = file === undefined ? 0 : (perFile.get(file) ?? 0);
+    if (file !== undefined && used < MAX_ALLOWED_PREACT_WARNINGS_PER_FILE && (await isPreactWarning(warning))) {
+      perFile.set(file, used + 1);
+      allowed.push(warning);
+    } else {
+      failures.push(warning);
+    }
+  }
+  return { allowed, failures };
+}
+
 async function main(): Promise<void> {
   const webExtCli = path.join(root, 'node_modules', 'web-ext', 'bin', 'web-ext.js');
   const result = spawnSync(
@@ -84,16 +113,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const failures: LintMessage[] = [...report.errors];
-  let allowed = 0;
-  for (const warning of report.warnings) {
-    if (allowed < MAX_ALLOWED_PREACT_WARNINGS && (await isPreactInnerHtmlWarning(warning))) {
-      allowed += 1;
-      console.log(`lint:webext: allowlisted (Preact runtime) ${describe(warning)}`);
-    } else {
-      failures.push(warning);
-    }
-  }
+  const split = await splitWarnings(report.warnings, isPreactInnerHtmlWarning);
+  const failures: LintMessage[] = [...report.errors, ...split.failures];
+  const allowed = split.allowed.length;
+  for (const warning of split.allowed) console.log(`lint:webext: allowlisted (Preact runtime) ${describe(warning)}`);
   for (const notice of report.notices) console.log(`lint:webext: notice ${describe(notice)}`);
 
   if (failures.length > 0) {

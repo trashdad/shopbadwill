@@ -25,9 +25,20 @@
 //   live bid stays open (exposure) until the outcome read settles it.
 // - One reply per attempt: `result` records SGW's reply on `attempt.reply`;
 //   a second `result`, or one after `ambiguous` (and vice versa), is refused.
+// - A sent snipe settles one of three ways (T-80b R1/R2): the `post-read`
+//   outcome read; `post-read-failed` when the runner gives up reading it
+//   (resolves through classifyOutcome with the reply and no ItemDetail:
+//   "Unconfirmed … check ShopGoodwill", never "Not bid"); or `not-sent` when
+//   bid.ts proved nothing went out (BidNotSentError: resolves as "No bid was
+//   sent (…)", never through the judge path, and the proof is recorded on
+//   `attempt.notSent`).
 // - A dry run walks the same states. Its `fire` emits a `measure` read and a
 //   `bid.dry-run` audit entry in place of `placeBid`, and the measure read's
-//   `post-read` resolves it as 'dry-run' (C4).
+//   `post-read` resolves it as 'dry-run' (C4). If that read never arrives,
+//   `post-read-failed` in `firing` resolves it as 'dry-run' with an unconfirmed
+//   result (the dry-run measure failed; the title still says "Dry run"). The
+//   same event in `firing` is refused for a live snipe: nothing has been
+//   sent, so there is nothing to give up on.
 // - Every outcome and its copy come from T-87's `classifyOutcome` (I-18),
 //   pre-bid ends included (its `abort` reasons).
 //
@@ -159,6 +170,8 @@ function rejectAll(reason: RejectReason): { readonly [E in SnipeEventType]: Tran
     result: r,
     ambiguous: r,
     'post-read': r,
+    'post-read-failed': r,
+    'not-sent': r,
     'preflight-failed': r,
     'apply-fallback': r,
   };
@@ -195,6 +208,8 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
     'post-read': reject('not-sent'),
+    'post-read-failed': reject('not-sent'),
+    'not-sent': reject('not-firing'),
     'preflight-failed': guarded(['resolved', 'fallback-applied'], ['invalid-event']),
     'apply-fallback': accept('resolved', 'fallback-applied'),
   },
@@ -207,6 +222,8 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
     'post-read': reject('not-sent'),
+    'post-read-failed': reject('not-sent'),
+    'not-sent': reject('not-sent'),
   },
   waking: {
     arm: reject('already-armed'),
@@ -219,6 +236,8 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
     'post-read': reject('not-sent'),
+    'post-read-failed': reject('not-sent'),
+    'not-sent': reject('not-firing'),
     'preflight-failed': reject('step-passed'),
     'apply-fallback': accept('resolved', 'fallback-applied'),
   },
@@ -234,6 +253,8 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
     'post-read': reject('not-sent'),
+    'post-read-failed': reject('not-sent'),
+    'not-sent': reject('not-firing'),
     'preflight-failed': reject('step-passed'),
     'apply-fallback': accept('resolved', 'fallback-applied'),
   },
@@ -245,15 +266,25 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     sent: guarded(['sent'], ['dry-run', 'already-sent', 'invalid-event']),
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
-    // Only a dry run's measure read: a live firing snipe has sent nothing to settle.
+    // Only a dry run's measure read. A live firing snipe has sent nothing, so
+    // both the read and a give-up are refused (`not-sent`).
     'post-read': guarded(['resolved'], ['not-sent', 'invalid-event']),
+    'post-read-failed': guarded(['resolved'], ['not-sent']),
+    'not-sent': reject('not-sent'),
   },
-  // R3: after sent, only the reply, the ambiguity and the outcome read. No disarm (I3).
+  // R3: after sent, only the reply, the ambiguity, the outcome read, and the
+  // two T-80b events that settle a sent snipe without an ItemDetail. No disarm (I3).
   sent: {
     ...rejectAll('already-sent'),
     result: guarded(['sent', 'resolved'], ['dry-run', 'duplicate']),
     ambiguous: guarded(['sent'], ['dry-run', 'duplicate']),
     'post-read': guarded(['resolved'], ['invalid-event']),
+    // T-80b R1: the runner gave up on the outcome read; settle with the reply
+    // (or none) and no ItemDetail.
+    'post-read-failed': guarded(['resolved'], ['dry-run']),
+    // T-80b R2: bid.ts proved nothing was sent. Refused once a reply or the
+    // ambiguity is recorded (the bid may have registered after all).
+    'not-sent': guarded(['resolved'], ['dry-run', 'duplicate']),
   },
   resolved: rejectAll('terminal'),
   killed: rejectAll('terminal'),
@@ -297,6 +328,8 @@ const AUDIT_KIND: Readonly<Record<SnipeEventType, string>> = {
   result: 'bid.result',
   ambiguous: 'bid.ambiguous',
   'post-read': 'snipe.post-read',
+  'post-read-failed': 'snipe.post-read-failed',
+  'not-sent': 'bid.not-sent',
   'preflight-failed': 'snipe.preflight-failed',
   'apply-fallback': 'snipe.apply-fallback',
 };
@@ -362,8 +395,12 @@ function audit(s: Snipe, kind: string, details: Details): AuditEffect {
   return { kind: 'audit', snipeId: s.id, entry: { actor: 'snipe', kind, itemId: s.itemId, ref: s.id, details, dryRun: s.dryRun } };
 }
 
-function outcomeContext(ctx: ReduceContext, abort?: AbortReason): OutcomeContext {
-  return { userTz: ctx.timeZone ?? DEFAULT_TIME_ZONE, ...(abort !== undefined ? { abort } : {}) };
+function outcomeContext(ctx: ReduceContext, abort?: AbortReason, abortDetail?: string): OutcomeContext {
+  return {
+    userTz: ctx.timeZone ?? DEFAULT_TIME_ZONE,
+    ...(abort !== undefined ? { abort } : {}),
+    ...(abortDetail !== undefined ? { abortDetail } : {}),
+  };
 }
 
 // ── Outcomes ────────────────────────────────────────────────────────────────
@@ -453,7 +490,13 @@ function invalidSnipe(s: Snipe, now: EpochMs): string | null {
   const endMs = isoMs(s.endTime);
   if (!Number.isFinite(endMs)) return 'The auction end time is not a valid instant.';
   if (now >= endMs) return 'The auction has already ended.';
-  if (s.attempt.sentAt !== undefined || s.attempt.idempotencyKey !== undefined || s.attempt.reply !== undefined) {
+  // T-80b: `notSent` too. A stale proof would keep this attempt's Unconfirmed outcome out of spentToday (R4).
+  if (
+    s.attempt.sentAt !== undefined ||
+    s.attempt.idempotencyKey !== undefined ||
+    s.attempt.reply !== undefined ||
+    s.attempt.notSent !== undefined
+  ) {
     return 'A draft must not carry a send attempt (the arm handler resets it).';
   }
   return null;
@@ -648,6 +691,45 @@ function onPostRead(s: Snipe, e: Extract<SnipeEvent, { type: 'post-read' }>, ctx
   return { ...done, details: { ...details, ...done.details } };
 }
 
+/** T-80b R1: the runner gave up on the outcome read; settle with the reply (or none) and no ItemDetail. */
+function onPostReadFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'post-read-failed' }>, ctx: ReduceContext): Handled {
+  if (s.state === 'firing') {
+    // The dry run's measure read never arrived. A live snipe here has not been
+    // sent: accepting this would settle a bid that may still go out.
+    if (!s.dryRun) return refuse('not-sent');
+    return settled(
+      s,
+      e,
+      'resolved',
+      classifyOutcome(s, null, null, { ...outcomeContext(ctx), dryRunMeasureFailed: true }),
+      'post-read failed: dry-run measure',
+    );
+  }
+  if (s.dryRun) return refuse('dry-run');
+  // The recorded reply, like the post-read path; an ambiguous send has none, so
+  // its send evidence still leads classifyOutcome to "Unconfirmed".
+  const reply = s.attempt.ambiguous === true ? null : (s.attempt.reply ?? null);
+  const done = settled(s, e, 'resolved', classifyOutcome(s, reply, null, outcomeContext(ctx)), 'post-read failed');
+  return done;
+}
+
+/** T-80b R2: bid.ts proved nothing was sent; never the judge path, no money effect. */
+function onNotSent(s: Snipe, e: Extract<SnipeEvent, { type: 'not-sent' }>, ctx: ReduceContext): Handled {
+  if (s.dryRun) return refuse('dry-run');
+  if (hasAnswer(s)) return refuse('duplicate');
+  // The proof survives a restart: classifyOutcome and spentToday (R4) read it.
+  const proven: Snipe = { ...s, attempt: { ...s.attempt, notSent: true } };
+  const reason = clip(e.reason);
+  const done = settled(
+    proven,
+    e,
+    'resolved',
+    classifyOutcome(proven, null, null, outcomeContext(ctx, 'network', reason)),
+    `not-sent: ${reason}`,
+  );
+  return { ...done, details: { reason, ...done.details } };
+}
+
 function onPreflightFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'preflight-failed' }>, caps: CapsResult, ctx: ReduceContext): Handled {
   const reason = PREFLIGHT_REASONS.find((r) => r === e.reason);
   if (reason === undefined) return refuse('invalid-event', `Unknown preflight reason '${clip(e.reason, 40)}'.`);
@@ -702,6 +784,10 @@ function handle(s: Snipe, e: SnipeEvent, caps: CapsResult, ctx: ReduceContext): 
       return onAmbiguous(s, e);
     case 'post-read':
       return onPostRead(s, e, ctx);
+    case 'post-read-failed':
+      return onPostReadFailed(s, e, ctx);
+    case 'not-sent':
+      return onNotSent(s, e, ctx);
     case 'preflight-failed':
       return onPreflightFailed(s, e, caps, ctx);
     case 'apply-fallback':

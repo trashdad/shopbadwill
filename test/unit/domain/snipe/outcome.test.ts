@@ -402,3 +402,121 @@ describe('T-87c: no-bid abort reasons', () => {
     });
   }
 });
+
+describe('T-80b: not-sent proof and the unconfirmed post-read-failed copy', () => {
+  it('abort network with a detail says plainly "No bid was sent (…)"', () => {
+    const r = classifyOutcome(snipe({ attempt: { sentAt: END_MS - 8000, notSent: true } }), null, null, {
+      abort: 'network',
+      abortDetail: 'the bid modal could not be read',
+    });
+    expect(r.outcome).toBe('network');
+    expect(r.notify.message).toMatch(/^No bid was sent \(the bid modal could not be read\)/);
+    expect(r.notify.message).toContain('not an outbid');
+    expect(r.notify.message).not.toContain('may have been placed');
+    expect(r.notify.message).not.toContain('Unconfirmed');
+    expect(r.stamp).toBeNull();
+    expect(r.report.outcome).toBe('network');
+  });
+
+  it('abort network without a detail still says "No bid was sent"', () => {
+    const r = classifyOutcome(snipe({ attempt: {}, measured: undefined }), null, null, { abort: 'network' });
+    expect(r.notify.message).toMatch(/^No bid was sent\./);
+    expect(r.stamp).toBeNull();
+  });
+
+  it('attempt.notSent forces the abort path even though sentAt is recorded', () => {
+    const r = classifyOutcome(snipe({ attempt: { sentAt: END_MS - 8000, notSent: true } }), null, null, {
+      abort: 'network',
+      abortDetail: 'nothing was sent',
+    });
+    expect(r.outcome).toBe('network');
+    expect(r.notify.message).toMatch(/^No bid was sent/);
+    expect(r.notify.message).not.toContain('may have been placed');
+    // No abort note: the bid provably never went out, it was not "stopped".
+    expect(r.notify.message).not.toContain('Stopped');
+  });
+
+  it('without the notSent proof, sentAt still routes to the judge path (Unconfirmed)', () => {
+    const r = classifyOutcome(snipe({ attempt: { sentAt: END_MS - 8000 } }), null, null, { abort: 'network' });
+    expect(r.notify.message).toContain('Unconfirmed');
+    expect(r.notify.message).not.toMatch(/^No bid was sent/);
+  });
+
+  it('a failed dry-run measure is Unconfirmed, and does not claim a bid may have been placed', () => {
+    const r = classifyOutcome(snipe({ dryRun: true, state: 'firing', attempt: {} }), null, null, {
+      dryRunMeasureFailed: true,
+    });
+    expect(r.outcome).toBe('dry-run');
+    expect(r.final).toBe(false);
+    expect(r.stamp).toBeNull();
+    // Like every dry-run outcome, the title says "Dry run". The "Unconfirmed"
+    // heading is the live one: it means a real bid may be out (Opus final check).
+    expect(r.notify.title).toBe('Dry run: Blue vase');
+    expect(r.notify.message).toContain('dry-run measure failed');
+    expect(r.notify.message).toMatch(/unconfirmed/i);
+    expect(r.notify.message).toContain('Would have bid $20.00');
+    expect(r.notify.message).not.toContain('may have been placed');
+    expect(r.notify.message).not.toMatch(/No bid was sent|Not bid/);
+    expect(r.detail).toContain('dry-run measure failed');
+  });
+
+  it('a dry run with no post and no measure-failed flag still says the item could not be read', () => {
+    const r = classifyOutcome(snipe({ dryRun: true, attempt: {}, measured: undefined }), null, null);
+    expect(r.outcome).toBe('dry-run');
+    expect(r.notify.title).toMatch(/^Dry run:/);
+    expect(r.notify.message).toContain('could not be read');
+    expect(r.notify.message).not.toContain('dry-run measure failed');
+  });
+});
+
+// T-80b post-read-failed judges a sent snipe with no ItemDetail at all (the
+// runner gave up reading it, about 7 days on). The copy must not claim a re-read
+// that never happened, nor an auction "still open" (Opus final check).
+describe('T-80b: a sent snipe judged with no read at all', () => {
+  const unk = bid('rejected-unknown', { rawStatus: 200, rawResult: 77, messageText: 'weird reply' });
+
+  it.each([
+    ['no reply (lost response)', snipe(), null],
+    ['an ambiguous send', snipe({ attempt: { sentAt: END_MS - 8000, ambiguous: true } }), null],
+    ['an unrecognised reply', snipe(), unk],
+  ] as const)('%s: Unconfirmed, says the item could not be read, never "re-reading"', (_label, s, reply) => {
+    const r = classifyOutcome(s, reply, null);
+    expect(r.outcome).toBe('network');
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).toMatch(/^Unconfirmed: the bid may have been placed/);
+    expect(r.notify.message).toContain('Check ShopGoodwill');
+    expect(r.notify.message).toContain('the item could not be read');
+    expect(r.notify.message).not.toContain('re-reading');
+    expect(r.stamp).toBeNull();
+  });
+
+  it('an accepted, leading reply: not final, no "auction still open", no re-read claimed', () => {
+    const r = classifyOutcome(snipe(), bid('accepted', { isHighBidder: true }), null);
+    expect(r.outcome).toBe('won');
+    expect(r.final).toBe(false);
+    expect(r.stamp).toBeNull();
+    expect(r.notify.title).toMatch(/^Leading:/);
+    expect(r.notify.message).toMatch(/^Leading when the bid went in/);
+    expect(r.notify.message).not.toMatch(/^Won/);
+    expect(r.notify.message).toContain('the item could not be read');
+    expect(r.notify.message).not.toContain('still open');
+    expect(r.notify.message).not.toContain('re-reading');
+  });
+
+  it('an outbid reply: outbid when the bid went in, no "auction still open"', () => {
+    const r = classifyOutcome(snipe(), bid('outbid', { isHighBidder: false }), null);
+    expect(r.outcome).toBe('outbid');
+    expect(r.notify.title).toMatch(/^Outbid:/);
+    expect(r.notify.message).toMatch(/^Outbid when the bid went in \(your max \$20\.00\)\./);
+    expect(r.notify.message).toContain('the item could not be read');
+    expect(r.notify.message).not.toContain('still open');
+    expect(r.notify.message).not.toContain('Currently outbid');
+    expect(r.stamp).toBeNull();
+  });
+
+  it('with a read, the open-auction copy is unchanged', () => {
+    const open = detail({ isClosed: false, serverTime: new Date(END_MS - 2000).toISOString(), isHighBidder: true, currentPrice: 1800 });
+    expect(classifyOutcome(snipe(), bid('accepted'), open).notify.message).toContain('Leading (auction still open) at $18.00');
+    expect(classifyOutcome(snipe(), null, detail({ currentPrice: 1500 })).notify.message).toContain('re-reading the item');
+  });
+});

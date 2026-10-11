@@ -102,7 +102,6 @@ These are every place where §3 (v1.1) was ambiguous or incomplete and I chose t
 
     `DEFAULT_FAVORITE_WITHIN_HOURS` is 6 (§1.8). `WatchSchema` uses `DEFAULT_WATCH_FAVORITE_MODE` (`'sgw'`) as its default.
 
-
 ## Review fix round 1 (amendments to the decisions above)
 
 **Commit:** `b037ae8 fix(contracts): review round 1 — Messaging port, adapter storage access, freeze minors (T-02)` (on top of `32129a9`).
@@ -187,7 +186,6 @@ $ tsx scripts/run-vitest.ts contract -- test/contract/types
 > vitest run --project contract test/contract/types
 
  RUN  v4.1.11 C:/tools/shopbadwill-wt/T-02
-
 
  Test Files  7 passed (7)
       Tests  281 passed (281)
@@ -434,3 +432,201 @@ A schema failure flagged by the API but not yet stored (`flagSchemaFailure`) is 
 **Tests.** `test/integration/background-main.test.ts` (T-30b block), `test/dom/options-google.test.ts` (sticky failures).
 
 **Follow-up for the next PLAN edit.** Add `health.clearSticky` to PLAN §3.12 and the `sticky` field to the `health.get` reply; add the feature scoping to §3.3.
+
+## T-67: CalendarSink, calendar sync job, `deleteEvent` undo, `sbw:calendarSync`
+
+Source: T-67 (provisional: S-5 pending, so the recreate strategy is `bump-generation`).
+
+**Undo ref.** A real `calendar.insert` audit entry carries `undo: { kind: 'deleteEvent', ref: 'deleteEvent:<itemId>:<eventId>' }` (e.g. `deleteEvent:9000001:sbv9000001g0`; `parseDeleteEventRef` in `src/adapters/google/calendar-sink.ts` accepts only `/^deleteEvent:(\d+):([a-v0-9]{5,1024})$/`). The executor (`createCalendarUndoExecutors`, `src/background/handlers/calendar.ts`, merged into T-58's map by `wiredUndoExecutors` in `handlers/audit.ts`; the activity UI's `UNDOABLE_KINDS` includes `deleteEvent` and a unit test pins it to those keys) first sets `tracked[itemId].calendar = false`, so a sync running meanwhile cannot put the event back, then deletes the event through the sink (ownership guard, kill switch, dry-run, health and cooldown gates apply). A refusal restores the flag and is "not now: ..."; the entry stays not done. Google not connected (or needing a reconnect) is refused before any Google call. A second run is a no-op (the link is `deleted`). Turning the item's calendar back on later inserts a fresh generation (`bump-generation`); the cancelled id is never reused. A dry-run `calendar.insert` has no `undo`.
+
+**Ownership guard.** The sink patches, stamps or deletes an event only when `extendedProperties.private.sbwItemId !== ''`, equals the item, and the event id equals `eventIdFor(itemId, generation)`, on our dedicated calendar. It reads the event first (one GET) to check. A failing check is audited `calendar.refused`, the event is not written, and the link is set to `error` (patch/stamp) or `deleted` (delete).
+
+**Dedicated calendar lookup.** Before `calendars.insert`, `ensureCalendar` calls `calendarList.list` (`CalendarApi.calendarListList`, rows carry `accessRole` and `primary`) and adopts an existing calendar only when ALL hold: its description contains `sbw:dedicated-calendar` (written on every insert), `accessRole === 'owner'`, and it is not the primary calendar (`primary: true` or id `primary`). The summary alone never qualifies (Opus check, T-67): a user calendar, or one shared with the user, may carry the same name, and the adopted calendar is where every later write goes. No build ever created our calendar without the marker. That covers a crash between insert and saving the id, and a deleted saved calendar when a marked leftover is still listed. Google's published scope list for `calendarList.list` does not include `calendar.app.created` (it does for `calendarList.get`); a 403 `insufficient-scope` on the list falls through to insert and does not raise the reconnect notice. A 429 or other error still halts. Adoption is audited as `calendar.adopted`.
+
+**Pacing (R4).** The sink's `RequestLimiter` starts each Calendar port call at least 1 s after the previous one ENDED. `GoogleCalendarApi` (T-64) waits at least `minRetryDelayMs` (default 1000 ms) before any internal retry, whatever the backoff or Retry-After says. Together no two Calendar requests from the sync start less than 1 s apart. The one exception is T-62's `authorizedHttp`: a 401 refreshes the token and resends that request once at once.
+
+**`sbw:calendarSync` (storage.local).** Bookkeeping the frozen `CalendarLink` has no room for: `retries` per item (reconciler backoff), `cooldownUntil`/`cooldownCount` (after a 403/429, exponential 60 s to 1 h), `noticeDay` (one reconnect notice per local day), `sinkHashes` (ReminderSink change detection), `dryRunSeen` (dry-run audit de-duplication). Not a Repo key: the sink owns it.
+
+**Pending links.** While Google is disconnected (or needs a reconnect) desired events are stored as `status: 'pending'` links with `calendarId: 'pending'`; when the calendar is created they are re-homed to its real id and inserted.
+
+**Stable description.** Sync drops the `Current price:` line from the event description (the price changes every bid and would patch the event each time). `calendar.ics` keeps it.
+
+**ReminderSink (I-34).** `registerReminderSink(sink)` and `ReminderSink { name, upsert(event), remove(itemId) }` are exported from `src/background/jobs/calendar-sync.ts`. Sinks are fed from the desired set (open items only), independent of Google, changed events only, and not at all in dry-run or under the kill switch.
+
+**Late add (I-18).** An insert whose event ends in under 60 minutes (T-56's `isLateAdd`) sends one local notification, id `sbw:notify:late:<itemId>`, and appends the same `notify.late-add` audit entry T-56 uses, so the two never double-alert.
+
+## T-80b contract change: `post-read-failed` and `not-sent` events, `Snipe.attempt.notSent`
+
+Approved by the controller (T-80b rulings R1–R5) and made in `task/T-80b`.
+
+**Why.** The T-84 runner retries the post-read for a sent snipe with a bound (about 7 days), then gives up and tells the user "Unconfirmed: check the item" — but the reducer had no event to settle `sent` without an ItemDetail, so the snipe kept counting in the caps' exposure forever. And a bid that provably never went out (`bid.ts` threw `BidNotSentError` after `sent` was dispatched) could only be recorded as `ambiguous`, so the post-read judge could label it "outbid" when the bid had never registered.
+
+**Changes.**
+
+1. **New event `post-read-failed`** (`{ type: 'post-read-failed', now }`), accepted in `sent`. It resolves the snipe through `classifyOutcome(snipe, attempt.reply ?? null, null, ctx)` — with no post-read the outcome is "Unconfirmed: the bid may have been placed … check ShopGoodwill", never "Not bid". Terminal, emits the usual notify/audit effects and no money effect. See the review correction below for the dry-run `firing` exception.
+2. **New event `not-sent`** (`{ type: 'not-sent', now, reason }`), accepted only in `sent` and only when no reply and no ambiguity are recorded (else `duplicate`). The runner dispatches it when `bid.ts` throws `BidNotSentError`. It resolves through `classifyOutcome` with abort `network` and copy "No bid was sent (reason). This is not an outbid." — never the judge path. Terminal, no money effect.
+3. **`Snipe.attempt.notSent?: boolean`** (`src/domain/snipe/types.ts`). The `not-sent` handler records the proof on the attempt, so it survives a restart. `classifyOutcome` treats it as overriding the send evidence (the abort path wins over the judge path), and `spentToday` reads it (R4).
+4. **`OutcomeContext.abortDetail?: string`** (`src/domain/snipe/outcome.ts`): the text after "No bid was sent". The abort-`network` copy is now "No bid was sent (…). This is not an outbid."
+5. **Spend accounting (R4, `src/domain/snipe/caps.ts`).** An Unconfirmed outcome (`network` with send evidence: `sentAt` or `ambiguous`) counts toward `spentToday` at the ceiling (max bid plus known shipping/handling), because the bid may have been placed. A proven `not-sent` does not count.
+
+**Migration.** None. `notSent` is optional, so `sbw:meta.schemaVersion` stays 1; snipes stored before this change have no flag.
+
+**Tests.** `test/contract/types/spec-shapes.test.ts` mirrors both events and `notSent`. The reducer table, the fast-check properties and the spend tests are in `test/unit/domain/snipe/`.
+
+**Follow-up for the next PLAN edit.** Add both events to PLAN §3.9's event list, `notSent` to `Snipe.attempt`, and the R4 rule to the caps text; update `contracts.md`.
+
+**Review correction (Grok).** `post-read-failed` is also accepted in `firing` when `snipe.dryRun` is true, and never when it is false. A dry run whose measure read fails forever would otherwise stay in `firing` with no settle path. That settlement is outcome `dry-run`, heading Unconfirmed, copy that the dry-run measure failed — not "the bid may have been placed", and not "No bid was sent". No money effect. A live snipe in `firing` is still refused with `not-sent`. No schema change and no migration.
+
+**Final check correction (Opus).** Three changes, all additive. No schema change and no migration.
+
+1. **The dry-run give-up keeps its title.** A dry run settled by `post-read-failed` in `firing` is titled "Dry run", like every other dry-run outcome. The review correction above had it titled "Unconfirmed". The result is still unconfirmed (`final: false`, copy "the dry-run measure failed, so the result is unconfirmed"). "Unconfirmed" stays the live heading for a bid that may be out. The flag is `OutcomeContext.dryRunMeasureFailed?: boolean` in `src/domain/snipe/outcome.ts`; it is additive and ignored for a live snipe.
+2. **A settlement with no read says so.** When `classifyOutcome` judges a sent snipe with no ItemDetail (`post-read-failed` in `sent`), the copy now says that the item could not be read. Three phrases change:
+   - "this comes from re-reading the item" no longer appears, because nothing was read;
+   - "leading; auction still open" becomes "leading when the bid went in";
+   - "Currently outbid (auction still open; …)" becomes "Outbid when the bid went in".
+
+   Outcomes, `final`, stamps and the with-a-read copy are unchanged.
+3. **No stale proof on a draft.** `reduce(arm)` refuses a draft that carries `attempt.notSent` (`invalid-snipe`), as it already refused `sentAt`, the key and a `reply`. A stale proof would keep the next attempt's Unconfirmed outcome out of `spentToday` (R4).
+
+## T-32 contract change: `rules.disable`
+
+Approved by the controller in the T-32 review (fix round 1, ruling on concern 1).
+
+**Change.** A new message, `rules.disable { ruleId: string (min 1) }`, with no reply. It is in the `content` sender group (`MSG_SENDER['rules.disable'] = 'content'`), so content scripts may send it, and, like every content type, extension pages may too. `src/background/handlers/rules.ts` accepts both sender classes; it does not call `requireContent`.
+
+**Why.** The overlay's undo is "local re-show + optional 'disable rule'" (T-32 card). Before this change, a content script had no way to turn a rule off: `rules.save` and `audit.undo` are UI-only.
+
+**Handler rules.**
+- The rule's `enabled` becomes false and `updatedAt` is set to now. Nothing else changes.
+- An audit entry is written: `{ actor: 'user', kind: 'rule.disabled', ref: ruleId, details: { ruleId, name, from: 'content' | 'ui' }, undo: { kind: 'disableRule', ref: ruleId } }`. This is the T-58 format ("disableRule undo ref = rule id"), so the activity log's undo re-enables the rule.
+- `rules.changed` is broadcast.
+- An already disabled rule is a no-op: no audit, no broadcast. An unknown rule id is an error. Content senders get the router's generic "internal error".
+- The overlay sends it only from a trusted click (`event.isTrusted`) in the Why? dialog, which lives in a closed shadow root.
+
+**Tests.**
+- `test/contract/types/messages.test.ts`: the union, the sender group, and the payload type.
+- `test/contract/types/examples/Msg/rules.disable.{valid,invalid}.json`: the example pair.
+- `test/unit/background/rules-disable.test.ts`: the handler, with both senders, the audit undo round trip, the no-op, the unknown rule, and an empty id.
+- `test/dom/overlay.test.ts`: the trusted-click check.
+
+**Follow-up for the next PLAN edit.** Add `rules.disable` to PLAN §3.12 (content → background) and §2.4 rule 3, and to contracts.md.
+
+## T-84 contract change: optional storage key `sbw:snipeRunner`
+
+Source: controller ruling on T-84 concern 5.
+
+The snipe runner keeps its effect outbox and per-snipe bookkeeping in `sbw:snipeRunner`, and writes that record in the same `storage.local.set` as `sbw:snipes`. That is what makes the state and the outbox atomic. The key was private. It is now a storage record.
+
+`STORAGE_KEYS.snipeRunner = 'sbw:snipeRunner'` (area `local`, `SnipeRunnerRecordSchema`): `{ version: 1, entries: Record<SnipeId, { outbox: Effect[], preflightAt?, preflightNotBefore?, atRisk?, readFailures?, lastReadAt?, unconfirmedAt? }> }`. `outbox` is the reducer's effects, in order. The bookkeeping fields are the runner's own (when preflight ran, an AuthHealth warning, outcome-read retries, the Unconfirmed alert).
+
+Optional. A profile with no record is "nothing pending". No migration, and `sbw:meta.schemaVersion` stays 1.
+
+An invalid record fail-closes. The runner parses it with `SnipeRunnerRecordSchema` and, on failure, treats the outbox as empty. Nothing is replayed, so a corrupt record cannot send a bid. The repo quarantines the record if something reads it through `find`.
+
+**Tests.** `test/contract/types/storage.test.ts`, `test/contract/types/examples/SnipeRunnerRecord.*.json`, and the snipe-runner integration test that corrupts the record and expects no PlaceBid.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-84: `verdictNow(feature, { ignoreDryRun: true })`
+
+Source: controller ruling on T-84 concern 4.
+
+A dry-run snipe has to ask "would live bidding be allowed?" without the dry-run condition, so its fallback audit can say "would have placed" only when a live snipe would have been allowed to send. `Switches.verdictNow` stopped at `dryRun[feature]` before health and the session, and the runner kept a private copy of the health check. That copy missed a schema failure `flagSchemaFailure` had recorded but T-30 had not stored yet.
+
+`verdictNow(feature, { ignoreDryRun: true })` skips only that one condition. Kill, storage repair, health (including T-30b sticky scoping and a pending flagged failure) and the session check are unchanged. `writesAllowed` and `view` never pass the option, so a dry run still blocks a real write. The runner uses this verdict for a dry-run snipe's `writesAllowed` and for its window anomaly check, and no longer mirrors `healthFailing`.
+
+**Tests.** `test/integration/background-main.test.ts` ("verdictNow ignoreDryRun") and `test/integration/snipe-runner.test.ts` (a pending `placeBid` failure does not audit "would have placed"; a favorites-only pending failure still does).
+
+## T-69: the `sbw:ntfy` storage key and the ntfy ReminderSink
+
+Source: T-69 (controller ruling R7 authorises this additive storage change).
+
+**`sbw:ntfy` (storage.local, optional).** One new Repo key (R7): `{ status?: 'disabled' | 'needs-permission'; items: Record<ItemId, { fingerprint: string; entries: Array<{ seq; leadMin; fireAt; status: 'scheduled' | 'deferred' }> }> }`. The schema is module-private in `src/domain/storage/schema.ts` (an exported `*Schema` would join the frozen schema surface of `test/contract/types/examples.test.ts`), and only the `NtfyState` type is exported. The change is additive: `schemaVersion` stays 1 and `STORAGE_RECORDS` gains `sbw:ntfy` → local. An invalid record is quarantined by the Repo and reads as empty, so it can never cause a resend storm — the seqs are deterministic (`sbw-<itemId>-<leadMin>-<gen>`), so a re-publish overwrites on ntfy instead of duplicating. `test/contract/types/storage.test.ts` lists the key (LOCAL_KEYS + sample).
+
+**Sink.** `src/adapters/ntfy/ntfy-sink.ts` implements T-67's `ReminderSink { name: 'ntfy', upsert(event), remove(itemId) }`; `src/background/jobs/ntfy-reminders.ts` registers it with `registerReminderSink` (self-registering job module; `main.ts`, `calendar-sync.ts` and `wxt.config.ts` untouched). No alarm of its own: the sink is fed by calendar sync's `feedSinks`. feedSinks records an item's hash once `upsert` resolves, and the sink never rejects, so an unchanged item is offered only once. The job module therefore runs `NtfySink.reconcile`, one idempotent pass that re-offers every open event and removes stored items that are no longer open. It runs after every job run (R1's daily re-call: deferred reminders, and anything a 429/5xx cut short), at startup, when the ntfy settings group changes (turned on, new topic), and on a scheduler tick only while `sbw:ntfy.status` is `needs-permission` and the host permission is now granted. A pass makes no request and no write when nothing is owed, and no request while the gate is closed. Calls for one item are serialized, so calendar sync and the pass never double-publish. The wire shape (`POST` plain text with `X-Title`/`X-Click`/`X-Tags: hourglass`/`X-Delay`/`X-Sequence-ID`, `DELETE /<topic>/<seq>`) is isolated in one function and marked provisional — must be checked live. Pacing: at most 1 request/s; a 429/5xx backs off and gives up for that sync; failures never throw into calendar sync. A 429 while cancelling an end-time change keeps the old fingerprint and every seq not yet cancelled, so the next upsert retries instead of forgetting them. The topic is a 128-bit secret: generated lowercase base32, prefixed `sbw-`; never logged, audited or put in an error message, and masked to its last 4 characters outside the options field. Messages carry only the item title, the end time in the user's zone, the lead and the item link.
+
+**Options cancel (review ruling).** Turning phone push off, or generating a new topic, runs from the options click path while the host permission is still granted: DELETE each stored `scheduled` seq on the old topic (paced, `https://ntfy.sh` only), then clear `sbw:ntfy`, then save. Deferred seqs were never sent and are not deleted. If a DELETE fails, phone push is still turned off and the page says already-scheduled pushes may still arrive; the stored seqs are kept. A failed regenerate keeps the old topic. `parseNtfyState` reads a missing or invalid record as empty.
+
+**Follow-up for the next PLAN edit.** Add the `sbw:ntfy` key to PLAN §2.3's storage table.
+
+## T-90 contract change: optional storage key `sbw:dryRunCounted`
+
+Source: controller ruling on T-90 concern 4.
+
+The dry-run counter keeps the snipe ids it has already counted in `sbw:dryRunCounted`, so a replayed completion event does not increment `settings.snipe.completedDryRuns` twice. The key was module-private. It is now a storage record, the same kind of optional bookkeeping as `sbw:snipeRunner` and `sbw:ntfy`.
+
+`STORAGE_KEYS.dryRunCounted = 'sbw:dryRunCounted'` (area `local`). The schema is module-private (an exported `*Schema` would join the locked example list): `{ version: 1, counted: Record<SnipeId, EpochMs> }`. `counted` maps a snipe id to when it was counted.
+
+Optional and additive. A profile with no record has counted nothing. No migration, and `sbw:meta.schemaVersion` stays 1.
+
+Invalid data parses to the empty record `{ version: 1, counted: {} }` through `parseDryRunCounted` (missing or unreadable). A typed `repo.find` quarantines an invalid record and returns undefined, which is that empty record. The counter does not read the key through `find`. It reads the raw bytes and, when a record is present but invalid, refuses the increment and leaves the bytes in place. Adopting the empty parse would drop the idempotency set, and a replay could count again. Over-counting is the direction that opens the live-bidding gate early.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, the sample, invalid parses to empty) and `test/unit/background/dry-run-counter.test.ts` (refuse on a corrupt record; `repo.find` quarantines).
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-90 contract change: `timing.awake`
+
+Source: controller ruling on T-90 concern 1. Additive. No other protocol change.
+
+The Timing page's awake chart needs the persisted heartbeat history. No existing message carries `sbw:awake`.
+
+`timing.awake` is a UI signal (empty request). The reply is `STORAGE_RECORDS[STORAGE_KEYS.awake].schema`, which is `EpochMs[]`: the stored history, or an empty array when nothing is stored. A content script is refused (`forbidden`), same as every other UI message. The handler is read only (T-90 final check): it reads the raw bytes and validates them with that schema, so an invalid record answers `[]` and is left in place. The heartbeat job quarantines it under its own `sbw:awake` lock on its next beat. A `repo.get` here would quarantine outside that lock, and its remove could delete a history the heartbeat had just written.
+
+**Tests.** `test/contract/types/messages.test.ts`, `test/contract/types/examples/Msg/timing.awake.{valid,invalid}.json`, `test/unit/background/timing-awake.test.ts`, and `test/dom/timing-section.test.ts`.
+
+**Follow-up for the next PLAN edit.** Add `timing.awake` to PLAN §3.12 and contracts.md.
+
+## T-90: `settings.set` never changes `snipe.completedDryRuns`
+
+Source: T-90 final check (Opus). A behaviour rule on an existing message, like `killSwitch` (T-36 R3). No schema or protocol change.
+
+`settings.set` replaces whole top-level groups. A page that edits one `snipe` field must send the whole `snipe` group, and that group carries `completedDryRuns`. A copy loaded before the last dry runs were counted would roll the count back. A crafted group could raise it and open the live-bidding gate early. `applySettingsPatch` now keeps `current.snipe.completedDryRuns`, whatever the patch says. The dry-run counter (`src/background/jobs/dry-run-counter.ts`) is the only writer. The kept count is in `next` before the `settings.set` interceptors run, so T-102's live gate judges the real count. The handler and the counter both take the `sbw:settings` lock, so the two cannot interleave.
+
+The Timing page's Apply also reads the settings fresh (`settings.get`) just before it writes, so it does not send back stale caps or other `snipe` fields either.
+
+**Tests.** `test/integration/background-main.test.ts` ("settings.set never changes completedDryRuns") and `test/dom/timing-section.test.ts` ("Apply re-reads the settings first").
+
+**Follow-up for the next PLAN edit.** Note the rule beside `killSwitch` in PLAN §3.12 (`settings.set`) and contracts.md.
+
+## T-57 contract change: landedCost.get reply and `sbw:quoteCache`
+
+Approved by the controller (T-57 rulings R1, R2) and made in `task/T-57`.
+
+### R1: the `landedCost.get` reply value
+
+**Before:** `MsgReplySchemas['landedCost.get']` was `record(ItemId, Cents | null)`, which cannot carry the brief's `pickup` flag.
+
+**Change** (`src/messaging/protocol.ts`): the reply is now `record(ItemId, { shipping: Cents; handling: Cents; pickup: boolean } | null)`.
+
+- The badge computes landed = the card's current price + shipping + handling.
+- Pickup-only items answer `{ shipping: 0, handling: 0, pickup: true }` with no SGW request.
+- The entry schema is module-private (`LandedCostQuoteSchema`); only the type `LandedCostQuote` is exported, so the locked schema surface in `test/contract/types/examples.test.ts` is unchanged.
+- `test/contract/types/messages.test.ts` pins the new reply type and validation examples. No other consumer of the reply existed (the handler and the badge are new in T-57). The request payload's TypeScript type stays `{ itemIds: ItemId[] }`; the runtime zod schema caps `itemIds` at 40 (R5).
+
+### R2: the `sbw:quoteCache` storage key
+
+**Change** (`src/domain/storage/schema.ts`, plus the Repo default in `src/domain/storage/repo.ts`): one new optional key `STORAGE_KEYS.quoteCache = 'sbw:quoteCache'` (area `local`), `record(ItemId, { shipping, handling, zip-hash, fetchedAt })`.
+
+- `zip-hash` is the HMAC-SHA-256 hex of the home ZIP under the per-install salt `sbw:quoteSalt` (below): the ZIP itself is never stored, and a ZIP change misses the cache.
+- The 24 h TTL runs from `fetchedAt` (readers compute it; the record has no `expiresAt`).
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration. An invalid record parses to empty (the Repo default `{}` after quarantine).
+- The entry schema is module-private (`QuoteCacheEntrySchema`), like `SgwSessionRejectionSchema`, so the locked example list is unchanged; `test/contract/types/storage.test.ts` pins the new key, its area and a sample value.
+
+### `sbw:quoteSalt`: the per-install key for `zip-hash` (T-57 final check)
+
+Source: T-57 final check (Opus). The controller's check asked for a salted or keyed hash, kept in local storage, with any new key optional and additive.
+
+A plain SHA-256 of a 5-digit ZIP is reversible: there are only 100 000 ZIPs, so a table of every hash recovers the ZIP from the cache. The hash is now keyed.
+
+**Change** (`src/domain/storage/schema.ts`): one new optional key `STORAGE_KEYS.quoteSalt = 'sbw:quoteSalt'` (area `local`). The value is 32 random bytes as lowercase hex (`/^[0-9a-f]{64}$/`). The schema is module-private, so the locked example list is unchanged.
+
+- `zip-hash` = HMAC-SHA-256(key = the salt, message = the trimmed ZIP), as hex. The handler and the `quote` step share the helper (`zipHashFor` in `src/background/handlers/landed-cost.ts`), so they read each other's entries.
+- The salt is made on the first quote, under the key's Repo lock, so concurrent first uses agree on one salt. No salt is made while the feature is off, the kill switch is on, or the ZIP is invalid.
+- An invalid record is quarantined by the Repo and a fresh salt is made. The old cache entries then miss and expire within 24 h.
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration.
+- **Limit.** The salt and the cache live in the same `storage.local`. The salt defeats a precomputed table and links nothing across installs. It does not stop someone who can read this profile's storage, but they can also read `settings.homeZip` there.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, its area, a sample value, rejected values) and `test/unit/background/landed-cost.test.ts` ("ZIP hash privacy: a per-install salt").
+
+**Follow-up for the next PLAN edit.** Add `sbw:quoteCache` and `sbw:quoteSalt` to PLAN §2.3 and the new reply shape to §3.12 and contracts.md.

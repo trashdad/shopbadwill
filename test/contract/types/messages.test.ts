@@ -31,6 +31,7 @@ import {
   MsgSchema,
   PORT_NAMES,
   PortTickSchemas,
+  type LandedCostQuote,
   type Msg,
   type MsgEnvelope,
   type MsgPayload,
@@ -42,8 +43,9 @@ import type { RequestScheduler } from '../../../src/ports/request-scheduler';
 const MSG_DIR = path.join(import.meta.dirname, 'examples', 'Msg');
 
 // §3.12, grouped by its comments. §2.4 rule 3: content scripts may send only
-// the `content` group (page.*, ui.openSnipe, rules.evaluate, landedCost.get,
-// quick.*).
+// the `content` group (page.*, ui.openSnipe, rules.evaluate, rules.disable,
+// landedCost.get, quick.*). `rules.disable` is the T-32 contract change
+// (docs/CONTRACT-DECISIONS.md); extension pages may send content types too.
 const EXPECTED = {
   content: [
     'page.listings',
@@ -52,6 +54,7 @@ const EXPECTED = {
     'page.domHealth',
     'ui.openSnipe',
     'rules.evaluate',
+    'rules.disable',
     'landedCost.get',
     'quick.hideSeller',
     'quick.hideKeyword',
@@ -83,6 +86,7 @@ const EXPECTED = {
     'snipe.arm',
     'snipe.disarm',
     'snipe.list',
+    'timing.awake',
     'kill.set',
     'health.get',
     'health.clearSticky',
@@ -109,6 +113,7 @@ const WITH_REPLY = [
   'snipe.prepare',
   'snipe.arm',
   'snipe.list',
+  'timing.awake',
   'health.get',
   'audit.list',
 ];
@@ -194,7 +199,8 @@ describe('replies', () => {
 
   it('types replies as §3.12 declares them', () => {
     expectTypeOf<MsgReply<'rules.evaluate'>>().toEqualTypeOf<MatchResult[]>();
-    expectTypeOf<MsgReply<'landedCost.get'>>().toEqualTypeOf<Record<ItemId, Cents | null>>();
+    // T-57 contract change (R1): the reply value now carries shipping, handling and pickup.
+    expectTypeOf<MsgReply<'landedCost.get'>>().toEqualTypeOf<Record<ItemId, LandedCostQuote | null>>();
     expectTypeOf<MsgReply<'settings.get'>>().toEqualTypeOf<Settings>();
     expectTypeOf<MsgReply<'rules.list'>>().toEqualTypeOf<Rule[]>();
     expectTypeOf<MsgReply<'rules.preview'>>().toEqualTypeOf<{ matched: number; total: number; ids: ItemId[] }>();
@@ -212,6 +218,7 @@ describe('replies', () => {
     }>();
     expectTypeOf<MsgReply<'snipe.arm'>>().toEqualTypeOf<Snipe>();
     expectTypeOf<MsgReply<'snipe.list'>>().toEqualTypeOf<Snipe[]>();
+    expectTypeOf<MsgReply<'timing.awake'>>().toEqualTypeOf<EpochMs[]>();
     expectTypeOf<MsgReply<'health.get'>>().toEqualTypeOf<{
       sgw: HealthReport | null;
       session: SgwSessionRecord['expiresAt'] | null;
@@ -227,9 +234,29 @@ describe('replies', () => {
   });
 
   it('validates a reply against its schema', () => {
-    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 1299, '279250058': null }).success).toBe(true);
-    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 12.99 }).success).toBe(false);
+    // T-57 (R1): entries are { shipping, handling, pickup } or null.
+    expect(
+      MsgReplySchemas['landedCost.get'].safeParse({
+        '279250057': { shipping: 499, handling: 100, pickup: false },
+        '279250058': { shipping: 0, handling: 0, pickup: true },
+        '279250059': null,
+      }).success,
+    ).toBe(true);
+    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 1299 }).success).toBe(false);
+    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': { shipping: 499, handling: 100 } }).success).toBe(false);
     expect(MsgReplySchemas['job.status'].safeParse(null).success).toBe(true);
+    // timing.awake is the persisted sbw:awake history (epoch ms), or an empty array.
+    expect(MsgReplySchemas['timing.awake'].safeParse([]).success).toBe(true);
+    expect(MsgReplySchemas['timing.awake'].safeParse([1_791_400_000_000]).success).toBe(true);
+    expect(MsgReplySchemas['timing.awake'].safeParse([-1]).success).toBe(false);
+    expect(MsgReplySchemas['timing.awake'].safeParse({ beats: [] }).success).toBe(false);
+  });
+
+  it('rejects landedCost.get when itemIds is longer than 40 (R5)', () => {
+    const ids = Array.from({ length: 41 }, (_, i) => i + 1);
+    const result = MsgEnvelopeSchema.safeParse({ v: 1, reqId: 'r-cap', type: 'landedCost.get', payload: { itemIds: ids } });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain('43004');
   });
 });
 
@@ -244,6 +271,7 @@ type SpecMsg =
     }
   | { type: 'ui.openSnipe'; payload: { itemId: ItemId } }
   | { type: 'rules.evaluate'; payload: { listings: Listing[] } }
+  | { type: 'rules.disable'; payload: { ruleId: string } }
   | { type: 'landedCost.get'; payload: { itemIds: ItemId[] } }
   | { type: 'quick.hideSeller'; payload: { sellerId: number; sellerName: string } }
   | { type: 'quick.hideKeyword'; payload: { term: string } }
@@ -273,6 +301,7 @@ type SpecMsg =
   | { type: 'snipe.arm'; payload: { snipe: Omit<Snipe, 'state' | 'history' | 'armedAt'>; typedConfirmation?: string } }
   | { type: 'snipe.disarm'; payload: { id: string } }
   | { type: 'snipe.list' }
+  | { type: 'timing.awake' }
   | { type: 'kill.set'; payload: { on: boolean } }
   | { type: 'health.get' }
   | { type: 'health.clearSticky'; payload: { endpoint: string } }
@@ -306,6 +335,7 @@ describe('payload types', () => {
       writesAllowed: Record<string, boolean>;
     }>();
     expectTypeOf<MsgPayload<'settings.get'>>().toEqualTypeOf<undefined>();
+    expectTypeOf<MsgPayload<'timing.awake'>>().toEqualTypeOf<undefined>();
     expectTypeOf<Extract<Msg, { type: 'favorites.sync' }>>().toEqualTypeOf<{ type: 'favorites.sync' }>();
   });
 });

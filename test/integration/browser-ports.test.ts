@@ -118,6 +118,18 @@ describe('BrowserHttp', () => {
     expect(err).toBeInstanceOf(HttpNetworkError);
     expect(err).toMatchObject({ beforeSend: false });
   });
+
+  it('sends cache no-store so a GET cannot be replayed from the HTTP cache', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}', { status: 200 }));
+    await new BrowserHttp({ fetch: fetchFn }).send({
+      url: 'https://buyerapi.shopgoodwill.com/api/ItemDetail/GetItemDetailModelByItemId/1',
+      method: 'GET',
+      timeoutMs: 1000,
+      credentials: 'omit',
+    });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({ cache: 'no-store' });
+  });
 });
 
 describe('BrowserNotifier', () => {

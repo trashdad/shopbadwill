@@ -342,12 +342,16 @@ describe('T-36 brief', () => {
     }
 
     // A new module in the map is registered with the context, and its handler serves.
+    // (T-57 registered landedCost.get for real, the last content type no built-in
+    // module served, so the probe stands in for that module: the map leaves
+    // ./landed-cost.ts out and the probe registers landedCost.get with a valid reply.)
     const handlerProbe = vi.fn((ctx: BackgroundContext) => {
-      ctx.router.register('ui.openSnipe', () => undefined);
+      ctx.router.register('landedCost.get', () => ({}));
     });
     const jobProbe = vi.fn();
+    const otherHandlers = Object.fromEntries(Object.entries(HANDLER_MODULES).filter(([file]) => file !== './landed-cost.ts'));
     const h = boot({
-      handlerModules: { ...HANDLER_MODULES, './new-feature.ts': { register: handlerProbe } },
+      handlerModules: { ...otherHandlers, './new-feature.ts': { register: handlerProbe } },
       jobModules: { ...JOB_MODULES, './new-job.ts': { register: jobProbe } },
     });
     const ctx = await h.handle.ready;
@@ -360,7 +364,7 @@ describe('T-36 brief', () => {
         failed: [],
       }),
     );
-    expect(await h.send('ui.openSnipe', { itemId: 1 }, CONTENT)).toEqual({ ok: true });
+    expect(await h.send('landedCost.get', { itemIds: [1] }, CONTENT)).toEqual({ ok: true, reply: {} });
     // The pre-existing modules registered too (T-53, T-58).
     expect((await h.send('audit.list', { limit: 5 })).ok).toBe(true);
   });
@@ -419,6 +423,36 @@ describe('T-36 brief', () => {
     await h.ok('settings.set', { considerateMode: 'tight' });
     expect((h.areas.local.dump()[STORAGE_KEYS.settings] as Settings).considerateMode).toBe('tight');
     expect(seen).toHaveLength(2);
+  });
+
+  it('settings.set never changes completedDryRuns (T-90): a stale snipe group cannot roll it back, a crafted one cannot raise it', async () => {
+    const seeded = defaultSettings();
+    seeded.snipe.completedDryRuns = 3;
+    const judged: number[] = [];
+    const gate: BackgroundModule = {
+      register: (ctx) => {
+        ctx.interceptors.settingsSet.add((change) => {
+          judged.push(change.next.snipe.completedDryRuns);
+          return undefined;
+        });
+      },
+    };
+    const h = boot({
+      seed: { [STORAGE_KEYS.settings]: seeded },
+      handlerModules: { ...HANDLER_MODULES, './zz-live-gate.ts': gate },
+    });
+    await h.handle.ready;
+    const stored = (): Settings['snipe'] => (h.areas.local.dump()[STORAGE_KEYS.settings] as Settings).snipe;
+
+    // A page loaded before the last dry runs were counted sends its whole snipe group back.
+    await h.ok('settings.set', { snipe: { ...defaultSettings().snipe, defaultLeadMs: 10_500 } });
+    expect(stored().defaultLeadMs).toBe(10_500);
+    expect(stored().completedDryRuns).toBe(3);
+    // A crafted group cannot open the live gate early.
+    await h.ok('settings.set', { snipe: { ...stored(), completedDryRuns: 99 } });
+    expect(stored().completedDryRuns).toBe(3);
+    // The settings.set interceptors (T-102's live gate) judge the real count.
+    expect(judged).toEqual([3, 3]);
   });
 
   it('page.token reaches SessionAdapter.observe', async () => {
@@ -1523,5 +1557,94 @@ describe('T-30b: feature-scoped sticky blocking and the audited resume', () => {
     const ctx2 = await h2.handle.ready;
     expect((await ctx2.switches.writesAllowed('favorites')).ok).toBe(true);
     expect((await ctx2.switches.writesAllowed('bidding')).ok).toBe(false);
+  });
+});
+
+describe('verdictNow ignoreDryRun (T-84)', () => {
+  const dryBidding = liveSettings({ dryRun: { favorites: false, calendar: false, bidding: true } });
+  const at = T0;
+  const sticky = (endpoint: string, detail: string): HealthReport => ({
+    ok: false,
+    checkedAt: at,
+    configVersion: 'test',
+    checks: [{ name: 'detail-schema', ok: false, detail }],
+  });
+  const probe = (endpoint: string) => ({
+    probedAt: at,
+    lastGoodProbeAt: {},
+    sticky: [{ endpoint, at, detail: 'drift' }],
+  });
+
+  it('skips only the dry-run condition; writesAllowed and the view still report it', async () => {
+    const h = boot({ seed: { [STORAGE_KEYS.settings]: dryBidding } });
+    const ctx = await h.handle.ready;
+    expect(ctx.switches.verdictNow('bidding')).toEqual({ ok: false, why: 'dry run' });
+    expect(ctx.switches.verdictNow('bidding', { ignoreDryRun: false })).toEqual({ ok: false, why: 'dry run' });
+    expect(ctx.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: true });
+    expect(ctx.switches.verdictNow('favorites', { ignoreDryRun: true })).toEqual({ ok: true });
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: false, why: 'dry run' });
+    expect(ctx.switches.view().writesAllowed.bidding).toBe(false);
+  });
+
+  it('still fails closed on kill, health, a pending flag, session, storage and startup', async () => {
+    const h = boot({ seed: { [STORAGE_KEYS.settings]: dryBidding } });
+    const ctx = await h.handle.ready;
+    await h.ok('kill.set', { on: true });
+    expect(ctx.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: false, why: 'kill switch is on' });
+    await h.ok('kill.set', { on: false });
+
+    await h.areas.local.set({ [STORAGE_KEYS.healthReport]: report(false, h.clock.now()) });
+    expect(ctx.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: false, why: 'health check failed' });
+    expect(ctx.switches.verdictNow('favorites', { ignoreDryRun: true })).toEqual({ ok: false, why: 'health check failed' });
+    await h.areas.local.set({ [STORAGE_KEYS.healthReport]: report(true, h.clock.now() + 1) });
+
+    ctx.switches.flagSchemaFailure({ endpoint: 'placeBid', message: 'drift', at: h.clock.now() });
+    expect(ctx.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: false, why: 'health check failed' });
+    expect(ctx.switches.verdictNow('favorites', { ignoreDryRun: true })).toEqual({ ok: true });
+    expect(await ctx.switches.writesAllowed('bidding')).toEqual({ ok: false, why: 'dry run' });
+
+    const loggedOut = boot({ seed: { [STORAGE_KEYS.settings]: dryBidding } });
+    const out = await loggedOut.handle.ready;
+    await loggedOut.areas.local.remove([STORAGE_KEYS.sgwSession]);
+    expect(out.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: false, why: 'SGW session is logged-out' });
+    expect(out.switches.verdictNow('calendar', { ignoreDryRun: true })).toEqual({ ok: true });
+
+    const broken = boot({
+      bare: true,
+      seed: { [STORAGE_KEYS.meta]: 'garbage', [STORAGE_KEYS.rules]: 'not an array', [STORAGE_KEYS.settings]: dryBidding },
+    });
+    const bad = await broken.handle.ready;
+    expect(bad.switches.verdictNow('bidding', { ignoreDryRun: true }).why).toContain('storage needs repair');
+
+    const early = boot();
+    expect(early.handle.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({
+      ok: false,
+      why: 'starting: the switch state is not loaded yet',
+    });
+  });
+
+  it('keeps T-30b sticky scoping when the dry-run condition is ignored', async () => {
+    const favorites = boot({
+      seed: {
+        [STORAGE_KEYS.settings]: dryBidding,
+        [STORAGE_KEYS.healthReport]: sticky('addFavorite', 'sticky schema failure: addFavorite: drift'),
+        [STORAGE_KEYS.healthProbe]: probe('addFavorite'),
+      },
+    });
+    const fav = await favorites.handle.ready;
+    expect(fav.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: true });
+    expect(fav.switches.verdictNow('favorites', { ignoreDryRun: true })).toEqual({ ok: false, why: 'health check failed' });
+
+    const bidding = boot({
+      seed: {
+        [STORAGE_KEYS.settings]: dryBidding,
+        [STORAGE_KEYS.healthReport]: sticky('placeBid', 'sticky schema failure: placeBid: drifted'),
+        [STORAGE_KEYS.healthProbe]: probe('placeBid'),
+      },
+    });
+    const bid = await bidding.handle.ready;
+    expect(bid.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: false, why: 'health check failed' });
+    expect(bid.switches.verdictNow('favorites', { ignoreDryRun: true })).toEqual({ ok: true });
+    expect(bid.switches.verdictNow('calendar', { ignoreDryRun: true })).toEqual({ ok: true });
   });
 });

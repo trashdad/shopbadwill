@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-31",
+  "type": "rules.disable",
+  "payload": {
+    "ruleId": "quick:seller:555837"
+  }
+}

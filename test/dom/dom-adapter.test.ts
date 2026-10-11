@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { createDomAdapter, type DiscoveryReport } from '../../src/adapters/sgw/dom-adapter';
+import { createDomAdapter, type DiscoveryReport, type StubSpec } from '../../src/adapters/sgw/dom-adapter';
 import { SGW_CONFIG_VERSION } from '../../src/adapters/sgw/config';
 import type { Decoration } from '../../src/ports/sgw-dom';
 import { decorationUi, shadowRootForTest } from '../../src/content/ui/stub';
@@ -416,5 +416,89 @@ describe('pageKind', () => {
       expect(dom.pageKind(`https://shopgoodwill.com${path}`)).toBe(name.startsWith('item') ? 'item' : 'search');
       expect(load(name).documentElement).toBeTruthy();
     }
+  });
+});
+
+// T-32 fix round 1 (controller ruling): settings.overlay.hideStyle 'dim'.
+describe("hideStyle 'dim'", () => {
+  const hide = { kind: 'hide', ruleId: 'r1', ruleName: 'No junk' } as const;
+
+  function setup(name = 'search-grid-logged-out', style: { current: 'collapse' | 'dim' } = { current: 'dim' }) {
+    const doc = load(name);
+    const specs: StubSpec[] = [];
+    const ui = {
+      createLabel: (d: Document, spec: Parameters<typeof decorationUi.createLabel>[1]) => decorationUi.createLabel(d, spec),
+      createStub(d: Document, spec: StubSpec): Element {
+        specs.push(spec);
+        return decorationUi.createStub(d, spec);
+      },
+    };
+    const dom = createDomAdapter({ ui, hideStyle: () => style.current });
+    const card = dom.discoverCards(doc)[0];
+    if (card === undefined) throw new Error('no card');
+    return { doc, dom, card, specs, style };
+  }
+
+  it('dims the card (opacity about 0.3) instead of collapsing it; the stub is told to be a compact chip', () => {
+    const { doc, dom, card, specs } = setup();
+    dom.applyDecoration(card, hide);
+    const style = card.root.getAttribute('style') ?? '';
+    expect(style).toMatch(/opacity:\s*0\.3/);
+    expect(style).not.toContain('display:none');
+    expect(style).not.toContain('pointer-events');
+    expect(card.root.getAttribute('data-sbw-hidden')).toBe('dim');
+    expect(doc.querySelectorAll('[data-sbw-stub]')).toHaveLength(1);
+    expect(card.root.previousElementSibling?.hasAttribute('data-sbw-stub')).toBe(true);
+    expect(specs.map((s) => s.style)).toEqual(['dim']);
+    // Idempotent.
+    dom.applyDecoration(card, hide);
+    expect(specs).toHaveLength(1);
+  });
+
+  it("Show restores full opacity; clear restores the DOM byte-identically", () => {
+    const { doc, dom, card, specs } = setup();
+    const before = doc.body.outerHTML;
+    dom.applyDecoration(card, hide);
+    specs[0]?.onShow();
+    expect(card.root.getAttribute('style') ?? '').not.toMatch(/opacity/);
+    dom.clearDecoration(card);
+    expect(doc.body.outerHTML).toBe(before);
+  });
+
+  it('collapse keeps today\'s behaviour, and switching the style re-applies (one stub, never both)', () => {
+    const { doc, dom, card, specs, style } = setup('search-list-logged-in', { current: 'collapse' });
+    dom.applyDecoration(card, hide);
+    expect(card.root.getAttribute('style')).toContain('display:none');
+    expect(card.root.getAttribute('data-sbw-hidden')).toBe('1');
+    expect(specs.map((s) => s.style)).toEqual(['collapse']);
+    style.current = 'dim';
+    dom.applyDecoration(card, hide);
+    expect(card.root.getAttribute('style')).not.toContain('display:none');
+    expect(card.root.getAttribute('style')).toMatch(/opacity:\s*0\.3/);
+    expect(doc.querySelectorAll('[data-sbw-stub]')).toHaveLength(1);
+    expect(specs.map((s) => s.style)).toEqual(['collapse', 'dim']);
+  });
+
+  it('degraded (rank 2) cards still never hide: no dim, a "Would hide" chip instead', () => {
+    const doc = load('search-grid-logged-out');
+    for (const el of Array.from(doc.querySelectorAll('app-home-product-items'))) unwrap(el);
+    for (const el of Array.from(doc.querySelectorAll('.feat-item'))) el.classList.remove('feat-item', 'feat-item-list');
+    const dom = createDomAdapter({ ui: decorationUi, hideStyle: () => 'dim' });
+    const card = dom.discoverCards(doc)[0];
+    if (card === undefined) throw new Error('no card');
+    dom.applyDecoration(card, hide);
+    expect(card.root.getAttribute('style') ?? '').not.toMatch(/opacity/);
+    expect(card.root.hasAttribute('data-sbw-hidden')).toBe(false);
+    expect(doc.querySelectorAll('[data-sbw-stub]')).toHaveLength(0);
+    expect(doc.querySelectorAll('[data-sbw-label]')).toHaveLength(1);
+  });
+
+  it('without the option, hide collapses as before', () => {
+    const doc = load('search-grid-logged-out');
+    const dom = createDomAdapter({ ui: decorationUi });
+    const card = dom.discoverCards(doc)[0];
+    if (card === undefined) throw new Error('no card');
+    dom.applyDecoration(card, hide);
+    expect(card.root.getAttribute('style')).toContain('display:none');
   });
 });

@@ -6,6 +6,7 @@ import type { Settings } from '../../../../domain/settings/schema';
 import { describeError } from '../../../../ui/components/describeError';
 import { Card } from '../../../../ui/components/Field';
 import { Status } from '../../../../ui/components/Status';
+import { Switch } from '../../../../ui/components/Switch';
 import type { SectionDef, SectionProps } from '../../registry';
 import {
   CLIENT_ID_RE,
@@ -53,6 +54,9 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
   const [authUnavailable, setAuthUnavailable] = useState(false);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [offerEnable, setOfferEnable] = useState(false);
+  /** Latest calendar on/off save. An older reply must not sync or overwrite a newer click. */
+  const calendarWrite = useRef(0);
   const [msg, setMsg] = useState<Msg>({ message: '', tone: 'ok' });
   const [settings, setSettings] = useState<Settings | null>(null);
   const [reminders, setReminders] = useState<string[]>(DEFAULT_REMINDERS.map(String));
@@ -113,6 +117,10 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
       const status = await client.send('calendar.connect', undefined);
       setAuth(status);
       setAuthUnavailable(false);
+      // Never turn calendar events on silently. The prompt renders only once settings
+      // are known to be off, including when settings.get finishes after this connect.
+      // A failed settings.get leaves settings null, so the prompt stays hidden.
+      if (status.connected) setOfferEnable(true);
       setMsg(
         status.connected
           ? { message: 'Connected to Google Calendar.', tone: 'ok' }
@@ -130,6 +138,7 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
 
   const disconnect = async (): Promise<void> => {
     setConfirming(false);
+    setOfferEnable(false);
     setBusy(true);
     try {
       await client.send('calendar.disconnect', undefined);
@@ -171,8 +180,64 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
     saveCalendar({ reminders: parsed }, 'reminders');
   };
 
+  /**
+   * T-70b: the calendar on/off toggle. Turning it off only stops future syncs;
+   * it never deletes events (that is the per-event audit undo). Turning it on
+   * saves `calendar.enabled` first, so the sync it then starts sees it on.
+   *
+   * settings.set replaces the whole calendar group, so the payload is the group
+   * last read with only `enabled` changed. Mode, reminders and icsFallback stay.
+   * The reminders editor is what forces `mode: 'dedicated'` (T-62).
+   */
+  const setCalendarEnabled = (on: boolean, afterSaved?: () => void): void => {
+    if (settings === null) {
+      setModeMsg({ message: 'Could not save calendar events: your settings have not loaded.', tone: 'error' });
+      return;
+    }
+    const gen = ++calendarWrite.current;
+    const base = settings;
+    const next = { ...base.calendar, enabled: on };
+    client.send('settings.set', { calendar: next }).then(
+      () => {
+        if (gen !== calendarWrite.current) return;
+        setSettings({ ...base, calendar: next });
+        afterSaved?.();
+        if (on) {
+          setModeMsg({ message: 'Calendar events are on. Syncing your auctions now...', tone: 'ok' });
+          client.send('calendar.syncNow', undefined).catch((e: unknown) => {
+            if (gen !== calendarWrite.current) return;
+            setModeMsg({ message: `Calendar events are on, but the sync could not start. ${describeError(e)}`, tone: 'error' });
+          });
+        } else {
+          // Turning off sends no DELETE, ntfy's included, so pushes ntfy.sh already holds still fire.
+          setModeMsg({
+            message:
+              'Calendar sync is off. Existing events stay on your calendar; delete them with Undo in Activity. Phone pushes already scheduled still arrive unless you turn off Phone push.',
+            tone: 'ok',
+          });
+        }
+      },
+      (e: unknown) => {
+        if (gen !== calendarWrite.current) return;
+        setModeMsg({ message: `Could not save calendar events. ${describeError(e)}`, tone: 'error' });
+      },
+    );
+  };
+
   const expiresAt = auth?.refreshTokenExpiresAt;
   const testingWarning = auth?.connected === true && expiresAt !== undefined && expiresAt <= now() + TESTING_WINDOW_MS;
+
+  const calendarToggleOff = settings === null || auth === null || !auth.connected;
+  const calendarToggleHint =
+    auth === null
+      ? authUnavailable
+        ? 'Could not check Google, so this stays off. Reload the page to try again.'
+        : 'Checking Google...'
+      : !auth.connected
+        ? 'Connect Google first'
+        : settings === null
+          ? 'Could not read your settings, so this stays off. Reload the page to try again.'
+          : 'Adds auction ends to your calendar.';
 
   return (
     <div class="sbw-google">
@@ -256,6 +321,21 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
               <dt>Last error</dt>
               <dd>{auth.lastError === undefined ? 'None' : ERROR_HINTS[auth.lastError]}</dd>
             </dl>
+            {offerEnable && auth.connected && settings?.calendar.enabled === false ? (
+              <div role="group" aria-label="Turn on calendar events" class="sbw-actions">
+                <p>Calendar events are still off. One click turns them on:</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCalendarEnabled(true, () => {
+                      setOfferEnable(false);
+                    });
+                  }}
+                >
+                  Turn on calendar events now?
+                </button>
+              </div>
+            ) : null}
             {testingWarning ? (
               <p class="sbw-warn" role="note">
                 <strong>Warning:</strong> Your Google app is in Testing mode, so Google signs you out every 7 days. Open Google Cloud console → OAuth consent screen → Publish app.
@@ -321,6 +401,18 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
       <Card>
         <h3>Calendar</h3>
         <Status message={modeMsg.message} tone={modeMsg.tone} />
+        <Switch
+          id="g-calendar-enabled"
+          label="Add auction ends to Google Calendar"
+          hint={calendarToggleHint}
+          checked={settings?.calendar.enabled === true}
+          disabled={calendarToggleOff}
+          onChange={(v) => {
+            setCalendarEnabled(v, () => {
+              setOfferEnable(false);
+            });
+          }}
+        />
         <fieldset class="sbw-inline-fieldset">
           <legend>Which calendar</legend>
           <label>
