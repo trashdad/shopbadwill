@@ -271,3 +271,55 @@ Describe 'companion host' {
     }
   }
 }
+
+# The real io.ps1 (no stubs). install.ps1 writes config.json as UTF-8 without a
+# BOM; Windows PowerShell 5.1 reads such a file as ANSI unless told otherwise,
+# which garbles a profile under C:\Users\<non-ASCII name>. Non-ASCII characters
+# are built with [char] because this file itself has no BOM.
+Describe 'companion host io' {
+  BeforeAll {
+    . "$PSScriptRoot\test-helpers.ps1"
+    . "$PSScriptRoot\..\host\io.ps1"
+
+    function Get-SbwTestUserDir {
+      'C:\Users\Jos' + [char]0xE9 + [char]0x4E2D
+    }
+  }
+
+  Context 'config and state are read as UTF-8' {
+    It 'reads non-ASCII paths from config.json exactly as install wrote them' {
+      $tmp = New-TestTempDir
+      try {
+        $u = Get-SbwTestUserDir
+        $cfg = [ordered]@{
+          version      = 1
+          dataDir      = "$u\AppData\Local\ShopBadwill\companion"
+          schtasksPath = 'C:\Windows\System32\schtasks.exe'
+          chrome       = [pscustomobject]@{ exePath = "$u\AppData\Local\Google\Chrome\Application\chrome.exe"; profile = "$u\Chrome Data" }
+        }
+        $p = Join-Path $tmp 'config.json'
+        [IO.File]::WriteAllText($p, ($cfg | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+        $back = Get-SbwConfig -Path $p
+        Assert-Equal $back.dataDir "$u\AppData\Local\ShopBadwill\companion"
+        Assert-Equal $back.chrome.exePath "$u\AppData\Local\Google\Chrome\Application\chrome.exe"
+        Assert-Equal $back.chrome.profile "$u\Chrome Data"
+      } finally {
+        Remove-TestTempDir $tmp
+      }
+    }
+    It 'round-trips a non-ASCII profile through state.json' {
+      $tmp = New-TestTempDir
+      try {
+        $u = Get-SbwTestUserDir
+        Write-SbwState -DataDir $tmp -Rows @([pscustomobject]@{
+            snipeId = 'a'; taskName = 'ShopBadwill-a'; wakeAtUtc = '2026-10-10T13:00:00.000Z'; browser = 'chrome'; profile = "$u\Chrome Data"
+          })
+        $rows = @(Read-SbwState -DataDir $tmp)
+        Assert-Equal $rows.Count 1
+        Assert-Equal $rows[0].profile "$u\Chrome Data"
+      } finally {
+        Remove-TestTempDir $tmp
+      }
+    }
+  }
+}

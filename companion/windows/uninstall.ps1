@@ -95,7 +95,7 @@ function Invoke-SbwSchtasks {
 function Get-SbwStateTaskNames {
   param([string]$StatePath)
   if (-not (Test-Path -LiteralPath $StatePath)) { return }
-  $rows = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+  $rows = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
   if ($null -eq $rows -or $null -eq $rows.tasks) { return }
   foreach ($t in @($rows.tasks)) {
     if ($null -eq $t) { continue }

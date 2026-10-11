@@ -11,7 +11,9 @@ function Get-SbwConfig {
   if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
     throw "Sbw config not found: $Path"
   }
-  $cfg = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+  # UTF-8 explicitly: install.ps1 writes it without a BOM, and Windows
+  # PowerShell 5.1 would otherwise decode it as ANSI (non-ASCII paths break).
+  $cfg = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
   foreach ($k in @('dataDir', 'schtasksPath')) {
     if ($cfg.PSObject.Properties.Name -cnotcontains $k -or [string]::IsNullOrWhiteSpace([string]$cfg.$k)) {
       throw "Sbw config is missing required field '$k'"
@@ -26,7 +28,7 @@ function Read-SbwState {
   param([string]$DataDir)
   $p = Join-Path $DataDir 'state.json'
   if (-not (Test-Path -LiteralPath $p)) { return }
-  $rows = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
+  $rows = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
   if ($null -eq $rows -or $null -eq $rows.tasks) { return }
   foreach ($t in @($rows.tasks)) { $t }
 }
