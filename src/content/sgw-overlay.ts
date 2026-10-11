@@ -461,7 +461,12 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     }
   }
 
-  function ensureTools(card: AdapterCardHandle, result: MatchResult | null, t: number): void {
+  function ensureTools(
+    card: AdapterCardHandle,
+    result: MatchResult | null,
+    shown: 'hide' | 'highlight' | null,
+    t: number,
+  ): void {
     let ui = tools.get(card.root);
     if (ui !== undefined && !card.root.contains(ui.host)) {
       ui.destroy();
@@ -485,6 +490,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
           itemId: card.itemId,
           listing: listings.get(card.itemId) ?? null,
           result,
+          shown,
           ruleName,
           settings,
           client,
@@ -496,22 +502,25 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     });
   }
 
-  function renderWhy(card: AdapterCardHandle, result: MatchResult | null): void {
+  function renderWhy(card: AdapterCardHandle, result: MatchResult | null, shown: 'hide' | 'highlight' | null): void {
     const ui = whys.get(card.root);
-    if (ui === undefined || result === null || !ui.host.isConnected) return;
+    if (ui === undefined || result === null || shown === null || !ui.host.isConnected) return;
     const title = listings.get(card.itemId)?.title ?? null;
     safe(() => {
-      ui.render(h(Why, { result, ruleName, title, client }));
+      ui.render(h(Why, { result, shown, ruleName, title, client }));
     });
   }
 
   function applyAll(): void {
     const t = now();
     for (const card of cards) {
-      const shown = shownResult(card.itemId);
-      const deco = decorationFor(shown);
+      const entry = shownResult(card.itemId);
+      const deco = decorationFor(entry);
       // Why? explains decorated cards only (never a watch-only or dropped match).
-      const result = deco.kind === 'hide' || deco.kind === 'highlight' ? (shown?.result ?? null) : null;
+      // `kind` is the decoration on the card, which can differ from result.decision
+      // while a stale hide has fallen back to an enabled highlight.
+      const kind = deco.kind === 'hide' || deco.kind === 'highlight' ? deco.kind : null;
+      const result = kind === null ? null : (entry?.result ?? null);
       const prev = decorated.get(card.root);
       if (prev !== undefined && prev.card.itemId !== card.itemId) {
         // The site reused this card for another item.
@@ -536,8 +545,8 @@ export function startOverlay(deps: OverlayDeps): Overlay {
       ) {
         safe(() => revealers.get(card.root)?.());
       }
-      ensureTools(card, result, t);
-      renderWhy(card, result);
+      ensureTools(card, result, kind, t);
+      renderWhy(card, result, kind);
     }
     const present = new Set(cards.map((c) => c.root));
     for (const [root, d] of decorated) {

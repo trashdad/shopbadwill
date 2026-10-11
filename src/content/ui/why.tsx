@@ -10,9 +10,14 @@
 // it and return focus to the Why? button.
 //
 // The button and the dialog are separate components (fix round 2): the card
-// tools render the dialog OUTSIDE their hover/focus panel, so the dialog never
-// depends on that panel being visible (a hidden ancestor would leave an inert,
-// invisible modal). `Why` is the two together, for hosts without such a panel.
+// tools render the dialog outside their hover/focus panel. Fix round 3 mounts
+// that dialog in its own closed shadow on the document, outside the card, so a
+// collapsed card (`display:none`) cannot hide an open modal and leave the page
+// inert. `Why` is the button and dialog together, for the stub (already outside
+// the card).
+//
+// The heading follows `shown` (the decoration on the card). A stale MatchResult
+// can still say `hide` after the overlay has switched the card to a highlight.
 import type { Ref, VNode } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 
@@ -22,6 +27,8 @@ import { describeError } from '../../ui/components/describeError';
 
 export interface WhyProps {
   result: MatchResult;
+  /** The decoration on the card. The heading follows this, not `result.decision`. */
+  shown: 'hide' | 'highlight';
   /** Display name of a rule id. */
   ruleName: (ruleId: string) => string;
   /** The listing title from the page's own data, when known (untrusted: text only). */
@@ -65,7 +72,7 @@ export function WhyButton(props: { open: boolean; onToggle: () => void; buttonRe
 }
 
 /** The modal dialog: mounting it opens it. `onDone` runs once, after it closed (however that happened). */
-export function WhyDialog({ result, ruleName, title, client, onDone }: WhyProps & { onDone: () => void }): VNode {
+export function WhyDialog({ result, shown, ruleName, title, client, onDone }: WhyProps & { onDone: () => void }): VNode {
   const [status, setStatus] = useState('');
   const dialog = useRef<HTMLDialogElement>(null);
   const finished = useRef(false);
@@ -81,6 +88,13 @@ export function WhyDialog({ result, ruleName, title, client, onDone }: WhyProps 
       }
     }
     focusables(d)[0]?.focus();
+    return () => {
+      // The host is going away while the modal is open (card removed, overlay
+      // stopped). Leave the top layer. `onDone` already ran if the user closed it.
+      if (!d.open) return;
+      finished.current = true;
+      d.close();
+    };
   }, []);
 
   const finish = (): void => {
@@ -148,7 +162,7 @@ export function WhyDialog({ result, ruleName, title, client, onDone }: WhyProps 
     >
       <div class="pop-body">
         <p id="sbw-why-h" class="pop-h">
-          {HEADING[result.decision]}
+          {HEADING[shown]}
         </p>
         {title === null ? null : <p class="pop-title">{title}</p>}
         {result.matched.map((m) => (

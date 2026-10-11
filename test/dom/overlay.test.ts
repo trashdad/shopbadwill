@@ -186,6 +186,31 @@ function button(root: ParentNode, action: string): HTMLButtonElement {
   if (b === null) throw new Error(`no button ${action}`);
   return b;
 }
+/** Every open `<dialog>`, including those in closed shadow roots. */
+function openDialogs(root: ParentNode = document): HTMLDialogElement[] {
+  const out: HTMLDialogElement[] = [];
+  const visit = (node: ParentNode): void => {
+    for (const d of Array.from(node.querySelectorAll('dialog'))) {
+      if (d instanceof HTMLDialogElement && d.open) out.push(d);
+    }
+    for (const el of Array.from(node.querySelectorAll('*'))) {
+      const sr = el.shadowRoot ?? uiRootForTest(el) ?? shadowRootForTest(el);
+      if (sr != null) visit(sr);
+    }
+  };
+  visit(root);
+  return out;
+}
+/** An ancestor (shadow hosts included) is `display:none` or `hidden`. */
+function insideHidden(el: Element): boolean {
+  let n: Node | null = el;
+  while (n !== null) {
+    if (n instanceof HTMLElement && (n.hidden || /display:\s*none/i.test(n.getAttribute('style') ?? ''))) return true;
+    const parent: Node | null = n.parentNode;
+    n = parent instanceof ShadowRoot ? parent.host : parent;
+  }
+  return false;
+}
 function sentOf(m: FakeMessaging, type: string): unknown[] {
   return m.sent.filter((s) => s.type === type).map((s) => s.payload);
 }
@@ -366,9 +391,13 @@ describe('tap input (untrusted)', () => {
     const tools = toolsRoot(s.ids[1] ?? 0);
     click(button(tools, 'why'), true);
     await tick();
-    expect(norm(tools.querySelector('[role="dialog"]')?.textContent)).toContain(evil);
+    const toolsDialog = openDialogs().find((d) => d.getRootNode() !== why);
+    expect(norm(toolsDialog?.textContent)).toContain(evil);
+    const toolsDialogRoot = toolsDialog?.getRootNode();
 
-    for (const r of [why, tools, pageRoot()]) expect(r.querySelector('script, img, b')).toBeNull();
+    for (const r of [why, tools, pageRoot(), ...(toolsDialogRoot instanceof ShadowRoot ? [toolsDialogRoot] : [])]) {
+      expect(r.querySelector('script, img, b')).toBeNull();
+    }
     expect(document.querySelectorAll('script').length).toBe(0);
     expect((window as unknown as { __sbwPwned?: number }).__sbwPwned).toBeUndefined();
   });
@@ -564,7 +593,8 @@ describe('Why? popover', () => {
     const tools = toolsRoot(b);
     click(button(tools, 'why'), true);
     await tick();
-    expect(Array.from(tools.querySelectorAll('[role="dialog"] li[data-reason]')).map((li) => li.textContent)).toEqual([
+    const toolsDialog = openDialogs().find((d) => d.getRootNode() !== stub);
+    expect(Array.from(toolsDialog?.querySelectorAll('li[data-reason]') ?? []).map((li) => li.textContent)).toEqual([
       'bids: 0 (at most 1)',
     ]);
   });
@@ -1218,22 +1248,32 @@ describe('fix round 2', () => {
     expect(tools()?.classList.contains('open')).toBe(false);
     click(button(root, 'why'), true);
     await tick();
-    const dialog = root.querySelector('dialog');
-    expect(dialog?.open).toBe(true);
-    // Its visibility never depends on the hover/focus panel...
-    expect(dialog?.closest('.panel')).toBeNull();
+    const dialog = openDialogs()[0];
+    if (dialog === undefined) throw new Error('no dialog');
+    expect(dialog.open).toBe(true);
+    // Its visibility never depends on the hover/focus panel or the card...
+    expect(dialog.closest('.panel')).toBeNull();
+    expect(insideHidden(dialog)).toBe(false);
+    const dialogHost = dialog.getRootNode();
+    expect(dialogHost).toBeInstanceOf(ShadowRoot);
+    if (!(dialogHost instanceof ShadowRoot)) throw new Error('dialog is not in a shadow root');
+    expect(cardRoot(id).contains(dialogHost.host)).toBe(false);
+    expect(dialogHost.host.shadowRoot).toBeNull();
     // ...and the panel (with the Why? button focus returns to) is forced visible meanwhile.
     expect(tools()?.classList.contains('open')).toBe(true);
     expect(button(root, 'why').getAttribute('aria-expanded')).toBe('true');
     // Clicking plain text inside the dialog keeps it open.
-    const heading = dialog?.querySelector('.pop-h');
+    const heading = dialog.querySelector('.pop-h');
     if (heading == null) throw new Error('no heading');
     click(heading, true);
     await tick();
-    expect(root.querySelector('dialog')?.open).toBe(true);
+    expect(dialog.open).toBe(true);
     // Closing releases the panel and returns focus to Why?.
-    click(button(root, 'close-why'), true);
+    const dialogRoot = dialog.getRootNode();
+    if (!(dialogRoot instanceof ShadowRoot || dialogRoot instanceof Document)) throw new Error('dialog has no root');
+    click(button(dialogRoot, 'close-why'), true);
     await tick();
+    expect(openDialogs()).toEqual([]);
     expect(root.querySelector('dialog')).toBeNull();
     expect(tools()?.classList.contains('open')).toBe(false);
     expect(root.activeElement).toBe(button(root, 'why'));
@@ -1318,5 +1358,54 @@ describe('fix round 2', () => {
     expect(count('[data-sbw-stub], [data-sbw-tools]')).toBe(0);
     expect(sentOf(s.m, 'rules.evaluate')).toEqual([]);
     expect(sentOf(s.m, 'page.listings')).toHaveLength(1);
+  });
+});
+
+describe('fix round 3', () => {
+  it('an open tools Why? stays visible when its card is collapsed', async () => {
+    const s = await setup();
+    const id = s.ids[0] ?? 0;
+    s.decide(id, HIDE);
+    await s.feed();
+    click(stubShow(id), true);
+    await tick();
+    expect(isHidden(id)).toBe(false);
+    click(button(toolsRoot(id), 'why'), true);
+    await tick();
+    expect(openDialogs()).toHaveLength(1);
+
+    click(button(pageRoot(), 'hide-again'), true);
+    await tick();
+    expect(isHidden(id)).toBe(true);
+    const open = openDialogs();
+    // The modal is still there, and no ancestor (the collapsed card) hides it.
+    expect(open).toHaveLength(1);
+    const dialog = open[0];
+    if (dialog === undefined) throw new Error('no dialog');
+    expect(insideHidden(dialog)).toBe(false);
+    const root = dialog.getRootNode();
+    if (!(root instanceof ShadowRoot || root instanceof Document)) throw new Error('dialog has no root');
+    click(button(root, 'close-why'), true);
+    await tick();
+    expect(openDialogs()).toEqual([]);
+    expect(document.querySelector('sbw-why-modal')).toBeNull();
+  });
+
+  it('the Why? heading names the decoration on the card when a stale hide has fallen back to highlight', async () => {
+    const s = await setup({ retryMs: 60_000 });
+    const id = s.ids[0] ?? 0;
+    s.decideAll(id, 'hide', [HIDE, HL]);
+    await s.feed();
+    expect(isHidden(id)).toBe(true);
+    s.fail.add('rules.evaluate');
+    await s.storage.set({ 'sbw:rules': [{ ...HIDE, enabled: false }, HL] });
+    await vi.waitFor(() => {
+      expect(isHidden(id)).toBe(false);
+    });
+    expect(cardRoot(id).hasAttribute('data-sbw-highlight')).toBe(true);
+    click(button(toolsRoot(id), 'why'), true);
+    await tick();
+    const dialog = openDialogs()[0];
+    expect(norm(dialog?.querySelector('.pop-h')?.textContent)).toBe('Why this listing is highlighted');
   });
 });
