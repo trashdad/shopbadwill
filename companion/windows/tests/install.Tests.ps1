@@ -424,6 +424,18 @@ Describe 'companion install and uninstall' {
       Assert-NotMatch $doc 'Revert to the stock plan values'
       Assert-NotMatch (Get-SbwUninstallSource) 'powercfg'
     }
+    It 'USER STEPS use the repo checkout, not a worker worktree' {
+      $doc = Get-SbwCompanionDoc
+      Assert-NotMatch $doc 'shopbadwill-wt'
+      Assert-Match $doc ([regex]::Escape("`$R = 'C:\tools\shopbadwill'"))
+    }
+    It 'explains the private host copy, its ACL check, and the signed-in requirement' {
+      $doc = Get-SbwCompanionDoc
+      Assert-Match $doc ([regex]::Escape('%LOCALAPPDATA%\ShopBadwill\companion\host'))
+      Assert-Match $doc 'icacls "\$env:LOCALAPPDATA\\ShopBadwill\\companion"'
+      Assert-Match $doc 'Re-run install\.ps1 after you update'
+      Assert-Match $doc 'signed in'
+    }
   }
 
   Context 'Pester runner' {

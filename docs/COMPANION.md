@@ -13,7 +13,10 @@ leaves the browser.
   `com.shopbadwill.companion` as a subkey of `HKCU\Software\Google\Chrome\NativeMessagingHosts`
   and/or `HKCU\Software\Mozilla\NativeMessagingHosts` (the subkey's default value is the
   manifest path) and writes the config to
-  `%LOCALAPPDATA%\ShopBadwill\companion\`.
+  `%LOCALAPPDATA%\ShopBadwill\companion\`. It also copies the host scripts to
+  `%LOCALAPPDATA%\ShopBadwill\companion\host\`; the browser runs that private
+  copy, never the checkout. Re-run install.ps1 after you update the repo, or
+  the browser keeps running the old host.
 - When a snipe is armed, the extension asks the host to `schedule`; the host
   registers a one-off `ShopBadwill-<id>` task (`WakeToRun`,
   `StartWhenAvailable`) whose action launches the configured browser with your
@@ -22,6 +25,10 @@ leaves the browser.
 - Fired/orphaned tasks delete themselves (`DeleteExpiredTaskAfter PT10M`,
   1 h `EndBoundary` window). `uninstall.ps1` removes every task named
   `ShopBadwill-<snipeId>`, both host subkeys, and the data dir.
+- The task runs as you, with your interactive logon and no stored password.
+  So it fires only while you are signed in: asleep, hibernated or locked is
+  fine. After a restart that leaves the PC at the sign-in screen (for
+  example a Windows Update restart), nothing launches until you sign in.
 
 ## Power-plan guidance (from S-8 verdicts, provisional)
 
@@ -62,7 +69,7 @@ unattended option.
 2. Open a normal (non-admin) PowerShell and set:
 
    ```powershell
-   $R = 'C:\tools\shopbadwill-wt\T-110'          # the checkout folder (repo root after merge)
+   $R = 'C:\tools\shopbadwill'                    # your ShopBadwill checkout (repo root)
    ```
 
 3. Pick your profile. `chrome://version` shows **Profile Path**; the folder
@@ -112,12 +119,14 @@ network-up time precisely.
 ## USER STEP 3: uninstall
 
 ```powershell
-$R = 'C:\tools\shopbadwill-wt\T-110'
+$R = 'C:\tools\shopbadwill'
 powershell -ExecutionPolicy Bypass -File "$R\companion\windows\uninstall.ps1"     # append -WhatIf for a dry run
 ```
 
 It deletes only tasks named `ShopBadwill-<snipeId>`, removes both host subkeys
-and the data dir. It never changes power settings. Restart the browsers afterwards.
+and the data dir (with the private host copy). It never changes power settings.
+Restart the browsers afterwards. If you installed with `-DataDir`, pass the same
+`-DataDir` to uninstall.ps1.
 
 ## Security notes
 
@@ -131,6 +140,20 @@ and the data dir. It never changes power settings. Restart the browsers afterwar
   never a concatenated shell string, never `Invoke-Expression`.
 - The host manifests allow ONLY the extension IDs given at install (never a
   wildcard). Nothing here needs admin rights; everything is per-user (HKCU).
+- Who can swap the host: the browser finds it through your HKCU key, then the
+  manifest, launcher, config and host copy in
+  `%LOCALAPPDATA%\ShopBadwill\companion`. That folder inherits your profile's
+  permissions: only you, SYSTEM and Administrators can write it. A web page
+  cannot reach the host at all (only the extension IDs above can), and the
+  launcher names no path outside that folder except the system PowerShell.
+  Keep the default data dir. Never point `-DataDir` at a folder other users
+  can write; folders created at the root of `C:\` (such as `C:\tools`) give
+  every signed-in user Modify. To check, run this; it should list only you,
+  `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators`:
+
+  ```powershell
+  icacls "$env:LOCALAPPDATA\ShopBadwill\companion"
+  ```
 
 ## Troubleshooting
 
