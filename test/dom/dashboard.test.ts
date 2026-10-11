@@ -85,6 +85,7 @@ function setup(opts: { watches?: Watch[]; rules?: Rule[]; status?: JobRun | null
   m.handle('tracked.list', () => []);
   m.handle('health.get', () => healthReply());
   m.handle('audit.list', () => []);
+  m.handle('calendar.status', () => healthReply().google);
   const opened: string[] = [];
   const sections = loadSections({ ...builtinModules, ...(opts.extra ?? {}) });
   render(
@@ -202,8 +203,8 @@ describe('dashboard sections', () => {
     expect(order[0]).toBe('Extra');
   });
 
-  it('registers the four built-in sections and rejects a malformed or duplicate one', () => {
-    expect(loadSections(builtinModules).map((s) => s.id)).toEqual(['watches', 'matches', 'health', 'activity']);
+  it('registers the built-in sections (T-67 adds calendar) and rejects a malformed or duplicate one', () => {
+    expect(loadSections(builtinModules).map((s) => s.id)).toEqual(['watches', 'matches', 'health', 'activity', 'calendar']);
     expect(() => loadSections({ './x': {} })).toThrow(/valid "section"/);
     const dup = (builtinModules['./sections/health/index.tsx'] as { section: SectionDef }).section;
     expect(() => loadSections({ ...builtinModules, './y': { section: dup } })).toThrow(/duplicate/);

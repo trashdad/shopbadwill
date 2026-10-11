@@ -4,16 +4,12 @@
 // Google at all. Every control is a native button; results use role="status" or
 // role="alert".
 import type { VNode } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 
 import type { AuthStatus } from '../../../../domain/calendar/types';
-import type { MessagingClient } from '../../../../ports/messaging';
 import { describeError } from '../../../components/describeError';
-
-/** The slice of the shell's SectionProps this section reads. */
-interface CalendarSectionProps {
-  client: MessagingClient;
-}
+import { ErrorAlert, LoadNotice, useLoad } from '../../parts';
+import type { SectionDef, SectionProps } from '../../registry';
 
 export function describeStatus(s: AuthStatus): string {
   if (!s.configured && !s.connected) return 'Google Calendar is not set up. Add your OAuth client in the options page first.';
@@ -34,19 +30,14 @@ function download(ics: string): void {
   URL.revokeObjectURL(url);
 }
 
-function CalendarSection(props: CalendarSectionProps): VNode {
+export function CalendarSection(props: SectionProps): VNode {
   const { client } = props;
-  const [status, setStatus] = useState<AuthStatus | undefined>();
+  // A missing handler reads as "unavailable", like every other section (T-54's useLoad).
+  const [status, refresh] = useLoad(() => client.send('calendar.status', undefined), [client]);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-
-  const refresh = (): void => {
-    client.send('calendar.status', undefined).then(setStatus, (e: unknown) => {
-      setError(describeError(e));
-    });
-  };
-  useEffect(refresh, []);
+  const connected = status.kind === 'ok' && status.value.connected;
 
   const act = async (label: string, fn: () => Promise<void>): Promise<void> => {
     setBusy(true);
@@ -65,7 +56,7 @@ function CalendarSection(props: CalendarSectionProps): VNode {
 
   return (
     <div>
-      <p>{status === undefined ? 'Checking Google Calendar…' : describeStatus(status)}</p>
+      {status.kind === 'ok' ? <p>{describeStatus(status.value)}</p> : <LoadNotice state={status} what="Calendar status" />}
       <p class="sbw-muted">Reminders go off 60, 15 and 5 minutes before an auction ends, on your own "ShopGoodwill Auctions" calendar.</p>
       <div>
         <button
@@ -81,7 +72,7 @@ function CalendarSection(props: CalendarSectionProps): VNode {
         </button>{' '}
         <button
           type="button"
-          disabled={busy || status?.connected !== true}
+          disabled={busy || !connected}
           onClick={() => void act('Disconnected.', () => client.send('calendar.disconnect', undefined).then(() => undefined))}
         >
           Disconnect
@@ -89,7 +80,7 @@ function CalendarSection(props: CalendarSectionProps): VNode {
         <button
           type="button"
           disabled={busy}
-          onClick={() => void act('Sync started.', () => client.send('calendar.syncNow', undefined).then(() => undefined))}
+          onClick={() => void act('Sync finished.', () => client.send('calendar.syncNow', undefined).then(() => undefined))}
         >
           Sync now
         </button>{' '}
@@ -109,14 +100,9 @@ function CalendarSection(props: CalendarSectionProps): VNode {
       </div>
       <p class="sbw-muted">The .ics file works without Google. Google may ignore its reminders when you import it; Apple and Outlook keep them.</p>
       {note === '' ? null : <p role="status">{note}</p>}
-      {error === '' ? null : (
-        <p role="alert" class="sbw-error">
-          <strong>Problem: </strong>
-          {error}
-        </p>
-      )}
+      <ErrorAlert message={error} />
     </div>
   );
 }
 
-export const section = { id: 'calendar', title: 'Calendar', order: 50, Component: CalendarSection };
+export const section: SectionDef = { id: 'calendar', title: 'Calendar', order: 50, Component: CalendarSection };
