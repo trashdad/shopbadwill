@@ -4,6 +4,11 @@
 // dry run, keyed by snipe id, so a replayed event never double-counts — live
 // sniping is gated on this number, so an over-count is the dangerous direction.
 //
+// What counts. The seam fires when a dry run goes firing → resolved. That is
+// outcome `dry-run`, including a measure read that failed. A live snipe, a
+// kill, and an abort never have that outcome, and `noteDryRunComplete` ignores
+// them even if the seam were to deliver one.
+//
 // Storage. The counted snipe ids live at the module-private key
 // `sbw:dryRunCounted` (storage.local), written through the raw Storage port —
 // not a Repo key, like T-67's `sbw:calendarSync` ("bookkeeping the frozen
@@ -17,6 +22,7 @@
 import { z } from 'zod';
 
 import type { Settings } from '../../domain/settings/schema';
+import type { Snipe } from '../../domain/snipe/types';
 import type { Repo } from '../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import type { Clock } from '../../ports/clock';
@@ -38,6 +44,18 @@ const CountedRecordSchema = z.object({
 type CountedRecord = z.infer<typeof CountedRecordSchema>;
 
 export type CountResult = 'counted' | 'already' | 'refused';
+/** `ignored`: not a completed dry run (live, killed, or aborted). Nothing is stored. */
+export type NoteResult = CountResult | 'ignored';
+
+/**
+ * The runner's completion event is a dry run that went `firing` → `resolved`
+ * with outcome `dry-run`. That includes a measure read that never arrived
+ * (`post-read-failed` still settles as dry-run). A live snipe, a kill
+ * (`killed`), and an abort (skipped, ended, cap-blocked, …) do not.
+ */
+export function countsAsCompletedDryRun(snipe: Snipe): boolean {
+  return snipe.dryRun === true && snipe.state === 'resolved' && snipe.outcome === 'dry-run';
+}
 
 export interface DryRunCounterDeps {
   repo: Pick<Repo, 'update' | 'withLock'>;
@@ -92,6 +110,15 @@ export function countDryRun(deps: DryRunCounterDeps, id: string): Promise<CountR
   });
 }
 
+/**
+ * Counts one completion event. Live, killed and aborted snipes are ignored
+ * and do not touch storage. A completed dry run goes through `countDryRun`.
+ */
+export function noteDryRunComplete(deps: DryRunCounterDeps, snipe: Snipe): Promise<NoteResult> {
+  if (!countsAsCompletedDryRun(snipe)) return Promise.resolve('ignored');
+  return countDryRun(deps, snipe.id);
+}
+
 /** T-36 self-registration (I-01): subscribes to the runner's dry-run completion event. */
 export function register(ctx: BackgroundContext): void {
   const deps: DryRunCounterDeps = {
@@ -106,7 +133,9 @@ export function register(ctx: BackgroundContext): void {
     },
   };
   snipeSeams(ctx).onDryRunComplete((snipe) => {
-    void countDryRun(deps, snipe.id).catch((e: unknown) => {
+    // Return the promise: the runner awaits the listener, so the increment
+    // is stored before the worker moves on. A thrown count is logged here.
+    return noteDryRunComplete(deps, snipe).catch((e: unknown) => {
       deps.log?.(`dry-run counter: counting the completed dry run ${snipe.id} failed`, e);
     });
   });

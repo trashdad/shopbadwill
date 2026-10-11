@@ -4,9 +4,10 @@
 // replayed event must not double-count (R5).
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { countDryRun, DRY_RUN_COUNTED_CAP, DRY_RUN_COUNTED_KEY, type DryRunCounterDeps } from '../../../src/background/jobs/dry-run-counter';
+import { countDryRun, DRY_RUN_COUNTED_CAP, DRY_RUN_COUNTED_KEY, noteDryRunComplete, type DryRunCounterDeps } from '../../../src/background/jobs/dry-run-counter';
 import { defaultSettings } from '../../../src/domain/settings/defaults';
 import type { Settings } from '../../../src/domain/settings/schema';
+import type { Snipe, SnipeOutcome } from '../../../src/domain/snipe/types';
 import { Repo } from '../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
 import { FakeClock } from '../../fakes/ports/fake-clock';
@@ -36,6 +37,27 @@ beforeEach(async () => {
 });
 
 const completed = async (): Promise<number> => (await repo.get(STORAGE_KEYS.settings)).snipe.completedDryRuns;
+
+const END = NOW + 2 * 3_600_000;
+
+/** A snipe the runner's dry-run completion event would hand the counter. */
+const dry = (over: Partial<Snipe> = {}): Snipe => ({
+  id: 's1',
+  itemId: 700000001,
+  title: 'Pyrex bowl',
+  endTime: new Date(END).toISOString(),
+  endTimeAtArm: new Date(END).toISOString(),
+  maxBid: 5000,
+  leadMs: 8000,
+  fallback: 'early-proxy',
+  dryRun: true,
+  state: 'resolved',
+  outcome: 'dry-run',
+  armedAt: NOW,
+  attempt: {},
+  history: [],
+  ...over,
+});
 
 describe('countDryRun (R1)', () => {
   it('increments completedDryRuns exactly once per completed dry run', async () => {
@@ -113,5 +135,46 @@ describe('countDryRun (R1)', () => {
     expect(await countDryRun(deps, 's1')).toBe('counted');
     expect(noted).toHaveLength(1);
     expect(noted[0]?.snipe.completedDryRuns).toBe(1);
+  });
+});
+
+describe('noteDryRunComplete (which outcomes count)', () => {
+  it('counts a completed dry run exactly once, and a replay does not', async () => {
+    expect(await noteDryRunComplete(deps, dry({ id: 's1' }))).toBe('counted');
+    expect(await completed()).toBe(1);
+    expect(await noteDryRunComplete(deps, dry({ id: 's2' }))).toBe('counted');
+    expect(await completed()).toBe(2);
+    expect(await noteDryRunComplete(deps, dry({ id: 's1' }))).toBe('already');
+    restart();
+    expect(await noteDryRunComplete(deps, dry({ id: 's1' }))).toBe('already');
+    expect(await completed()).toBe(2);
+  });
+
+  it('counts a dry run whose measure read failed (the outcome is still dry-run)', async () => {
+    // post-read-failed settles firing → resolved as dry-run, with no responseAt.
+    expect(await noteDryRunComplete(deps, dry({ measured: { firedAt: NOW } }))).toBe('counted');
+    expect(await completed()).toBe(1);
+  });
+
+  it('never counts a live snipe', async () => {
+    expect(await noteDryRunComplete(deps, dry({ dryRun: false, outcome: 'won' }))).toBe('ignored');
+    expect(await noteDryRunComplete(deps, dry({ id: 'live-late', dryRun: false, outcome: 'late' }))).toBe('ignored');
+    expect(await completed()).toBe(0);
+    expect(await storage.local.get(DRY_RUN_COUNTED_KEY)).toBeUndefined();
+  });
+
+  it('never counts a killed dry run', async () => {
+    expect(await noteDryRunComplete(deps, dry({ state: 'killed', outcome: 'killed' }))).toBe('ignored');
+    expect(await noteDryRunComplete(deps, dry({ id: 'k2', state: 'firing', outcome: 'killed' }))).toBe('ignored');
+    expect(await completed()).toBe(0);
+  });
+
+  it('never counts an aborted dry run', async () => {
+    const aborted: SnipeOutcome[] = ['skipped', 'ended', 'extended', 'cap-blocked', 'auth', 'network'];
+    for (const outcome of aborted) {
+      expect(await noteDryRunComplete(deps, dry({ id: outcome, outcome }))).toBe('ignored');
+    }
+    expect(await completed()).toBe(0);
+    expect(await storage.local.get(DRY_RUN_COUNTED_KEY)).toBeUndefined();
   });
 });

@@ -206,6 +206,20 @@ describe('soakSummary', () => {
     expect(s.recommendedLeadMs).toBe(6000);
   });
 
+  it('counts a fire error of exactly 1000 ms as on time and 1001 ms as off time', () => {
+    const mk = (id: string, error: number, dryRun = true) =>
+      snipe({
+        id,
+        dryRun,
+        fireAt: end - 8000,
+        measured: { firedAt: end - 8000 + error },
+      });
+    const s = soakSummary([mk('on', 1000), mk('early', -1000), mk('off', 1001), mk('live', 0, false)]);
+    expect(s.firesAttempted).toBe(3);
+    expect(s.onTime).toBe(2);
+    expect(s.offTime).toBe(1);
+  });
+
   it('computes a real recommendation between the clamps', () => {
     const mk = (id: string, latency: number) =>
       snipe({ id, fireAt: end - 8000, measured: { firedAt: end - 8000, responseAt: end - 8000 + latency } });
