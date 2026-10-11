@@ -13,7 +13,7 @@ import { AuditEntrySchema } from '../audit/types';
 import { CalendarLinkSchema } from '../calendar/types';
 import { RuleSchema } from '../rules/schema';
 import { SettingsSchema } from '../settings/schema';
-import { SnipeIdSchema, SnipeSchema } from '../snipe/types';
+import { EffectSchema, SnipeIdSchema, SnipeSchema } from '../snipe/types';
 import {
   CentsSchema,
   ClockSampleSchema,
@@ -44,6 +44,8 @@ export const STORAGE_KEYS = {
   favoritesCache: 'sbw:favoritesCache',
   jobRuns: 'sbw:jobRuns',
   calendar: 'sbw:calendar',
+  /** Optional (T-69): what the ntfy ReminderSink has scheduled, per item. */
+  ntfy: 'sbw:ntfy',
   snipes: 'sbw:snipes',
   auditMeta: 'sbw:auditMeta',
   sgwSession: 'sbw:sgwSession',
@@ -60,6 +62,12 @@ export const STORAGE_KEYS = {
   healthReport: 'sbw:healthReport',
   /** Optional (T-30): probe bookkeeping for SgwHealth; local so it survives a restart. */
   healthProbe: 'sbw:healthProbe',
+  /**
+   * Optional (T-84): the snipe runner's effect outbox and per-snipe bookkeeping.
+   * Written in the same `storage.local.set` as `sbw:snipes`. Absent means nothing
+   * is pending. No migration; `schemaVersion` stays 1.
+   */
+  snipeRunner: 'sbw:snipeRunner',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -132,6 +140,46 @@ export type CalendarState = z.infer<typeof CalendarStateSchema>;
 /** `sbw:audit:<chunk>`. */
 export const AuditChunkSchema = z.array(AuditEntrySchema);
 export type AuditChunk = z.infer<typeof AuditChunkSchema>;
+
+/**
+ * `sbw:ntfy` (T-69, optional): what the ntfy ReminderSink has scheduled, per
+ * item. Module-private schema (an exported *Schema would join the locked list
+ * in test/contract/types/examples.test.ts). The change is additive and
+ * `schemaVersion` stays 1. An invalid record is quarantined by the Repo and
+ * reads as empty, so it can never cause a resend storm: the seqs are
+ * deterministic, so a re-publish overwrites rather than duplicates.
+ */
+const NtfyStateSchema = z.object({
+  /** Why the sink made no requests the last time it ran; absent when it ran. */
+  status: z.enum(['disabled', 'needs-permission']).optional(),
+  items: z.record(
+    ItemIdSchema,
+    z.object({
+      /** Stable identity of the event the entries belong to: end time, generation, reminder minutes. */
+      fingerprint: z.string().min(1),
+      entries: z.array(
+        z.object({
+          /** `sbw-<itemId>-<leadMin>-<gen>`; deterministic, so a re-publish overwrites. */
+          seq: z.string().min(1),
+          leadMin: z.number().int().nonnegative(),
+          fireAt: EpochMsSchema,
+          status: z.enum(['scheduled', 'deferred']),
+        }),
+      ),
+    }),
+  ),
+});
+export type NtfyState = z.infer<typeof NtfyStateSchema>;
+
+/**
+ * Missing or invalid `sbw:ntfy` reads as empty. Callers that cannot see the
+ * Repo (the options page) use this so a bad record cannot be treated as a list
+ * of messages to send again.
+ */
+export function parseNtfyState(raw: unknown): NtfyState {
+  const parsed = NtfyStateSchema.safeParse(raw);
+  return parsed.success ? parsed.data : { items: {} };
+}
 
 /** `sbw:auditMeta`: ring bookkeeping. */
 export const AuditMetaSchema = z.object({
@@ -221,6 +269,37 @@ export const HealthProbeSchema = z.object({
 });
 export type HealthProbe = z.infer<typeof HealthProbeSchema>;
 
+/**
+ * One snipe's row in `sbw:snipeRunner`. Not exported: an exported `*Schema`
+ * joins the locked example list, and the record schema is the contract.
+ */
+const SnipeRunnerEntrySchema = z.object({
+  /** Effects of accepted events not yet executed, in order. */
+  outbox: z.array(EffectSchema),
+  /** When the T-15 min preflight ran. */
+  preflightAt: EpochMsSchema.optional(),
+  /** The preflight was "not due" (the end moved later): not before this. */
+  preflightNotBefore: EpochMsSchema.optional(),
+  /** An AuthHealth failure before T-15 min (the preflight decides). */
+  atRisk: z.string().optional(),
+  /** Failed outcome (or dry-run measure) reads, and when the last one was tried. */
+  readFailures: z.number().int().nonnegative().optional(),
+  lastReadAt: EpochMsSchema.optional(),
+  /** When the user was told the outcome is unconfirmed. */
+  unconfirmedAt: EpochMsSchema.optional(),
+});
+
+/**
+ * `sbw:snipeRunner` (T-84). Optional. The runner writes this shape and reads it
+ * back with the same schema. A record that fails it is not replayed: no outbox
+ * means no money effect leaves on restart.
+ */
+export const SnipeRunnerRecordSchema = z.object({
+  version: z.literal(1),
+  entries: z.record(SnipeIdSchema, SnipeRunnerEntrySchema),
+});
+export type SnipeRunnerRecord = z.infer<typeof SnipeRunnerRecordSchema>;
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -256,6 +335,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.favoritesCache]: { area: 'local', schema: FavoritesCacheSchema },
   [STORAGE_KEYS.jobRuns]: { area: 'local', schema: z.array(JobRunSchema) },
   [STORAGE_KEYS.calendar]: { area: 'local', schema: CalendarStateSchema },
+  [STORAGE_KEYS.ntfy]: { area: 'local', schema: NtfyStateSchema },
   [STORAGE_KEYS.snipes]: { area: 'local', schema: z.record(SnipeIdSchema, SnipeSchema) },
   [STORAGE_KEYS.auditMeta]: { area: 'local', schema: AuditMetaSchema },
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },
@@ -270,6 +350,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.runtimeHealth]: { area: 'session', schema: HealthReportSchema },
   [STORAGE_KEYS.healthReport]: { area: 'local', schema: HealthReportSchema },
   [STORAGE_KEYS.healthProbe]: { area: 'local', schema: HealthProbeSchema },
+  [STORAGE_KEYS.snipeRunner]: { area: 'local', schema: SnipeRunnerRecordSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;
