@@ -21,7 +21,7 @@ import {
 import type { AuthHealth } from '../../../src/background/jobs/snipe-runner';
 import { defaultSettings } from '../../../src/domain/settings/defaults';
 import type { Settings } from '../../../src/domain/settings/schema';
-import { isoMs, SESSION_MARGIN_AFTER_END_MS } from '../../../src/domain/snipe/preflight';
+import { SESSION_MARGIN_AFTER_END_MS } from '../../../src/domain/snipe/preflight';
 import type { Snipe } from '../../../src/domain/snipe/types';
 import { Repo } from '../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
@@ -483,9 +483,10 @@ describe('T-91 auth-health: alarm names and the register() seam', () => {
       {
         get(target, prop, receiver) {
           if (prop === 'api' || prop === 'http' || prop === 'scheduler' || prop === 'calendarApi' || prop === 'sgwClock') {
-            touched.push(String(prop));
+            touched.push(prop);
           }
-          return Reflect.get(target, prop, receiver);
+          const value: unknown = Reflect.get(target, prop, receiver);
+          return value;
         },
       },
     );
@@ -535,10 +536,10 @@ describe('T-91 auth-health: alarm names and the register() seam', () => {
     let healthRuns = 0;
     const fetches: string[] = [];
     const origFetch = globalThis.fetch;
-    globalThis.fetch = ((input: unknown) => {
+    globalThis.fetch = (input: unknown) => {
       fetches.push(String(input));
       return Promise.reject(new Error('SGW fetch'));
-    }) as typeof fetch;
+    };
     const health = {
       last: () => Promise.resolve(healthLast),
       run: () => {
