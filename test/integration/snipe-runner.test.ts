@@ -627,6 +627,10 @@ async function arm(w: Worker, over: Partial<Snipe> = {}, typedConfirmation?: str
   return w.ok<Snipe>('snipe.arm', { snipe: armPayload(over), ...(typedConfirmation === undefined ? {} : { typedConfirmation }) });
 }
 
+function completedDryRuns(shared: Shared): number {
+  return (shared.areas.local.dump()[STORAGE_KEYS.settings] as Settings).snipe.completedDryRuns;
+}
+
 function stored(shared: Shared, id = 's1'): Snipe {
   const all = shared.areas.local.dump()[STORAGE_KEYS.snipes] as Record<string, Snipe> | undefined;
   const s = all?.[id];
@@ -1310,6 +1314,46 @@ describe('dry run (C4)', () => {
     expect(s.measured?.responseAt).toBeDefined();
     expect(done).toHaveLength(1);
     expect(done[0]).toMatchObject({ id: 's1', outcome: 'dry-run' });
+    await flush(8);
+    expect(completedDryRuns(shared)).toBe(1);
+  });
+
+  it('a completed dry run increments completedDryRuns once, and a restart does not count it again', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const first = await boot(shared);
+    await arm(first.w);
+    await runTo(shared, END + 2 * MIN);
+    await flush(8);
+    expect(stored(shared)).toMatchObject({ state: 'resolved', outcome: 'dry-run', dryRun: true });
+    expect(completedDryRuns(shared)).toBe(1);
+
+    first.w.kill();
+    await boot(shared);
+    await runTo(shared, END + 4 * MIN);
+    await flush(8);
+    expect(completedDryRuns(shared)).toBe(1);
+  });
+
+  it('a killed dry run does not increment completedDryRuns', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w } = await boot(shared);
+    await arm(w);
+    await w.ok('snipe.disarm', { id: 's1' });
+    await runTo(shared, END + 2 * MIN);
+    await flush(8);
+    expect(stored(shared)).toMatchObject({ state: 'killed', dryRun: true });
+    expect(completedDryRuns(shared)).toBe(0);
+  });
+
+  it('a live snipe does not increment completedDryRuns', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END + 2 * MIN);
+    await flush(8);
+    expect(stored(shared).dryRun).toBe(false);
+    expect(stored(shared).state).toBe('resolved');
+    expect(completedDryRuns(shared)).toBe(0);
   });
 
   it('dry run: a pending placeBid schema failure is the live health verdict, so the fallback is not "would have placed"', async () => {
@@ -1620,6 +1664,31 @@ describe('snipe handlers', () => {
     await expect(arm(d.w, { id: 's3', maxBid: 4000 })).rejects.toThrow(/Type the amount/);
     const ok = await arm(d.w, { id: 's3', maxBid: 4000 }, '$40');
     expect(ok.maxBid).toBe(4000);
+  });
+
+  it('snipe.arm refuses one cent over the per-item cap and over the daily cap still remaining', async () => {
+    const withCaps = (caps: Partial<Settings['snipe']['caps']>): Settings => {
+      const s = settingsWith({ live: true });
+      s.snipe.caps = { ...s.snipe.caps, ...caps };
+      return s;
+    };
+
+    // The item's next bid is $11.00. Exactly $15.00 is the cap; $15.01 is not.
+    const perItem = makeShared({ settings: withCaps({ perItemMax: 1500, perDayMax: 100_000, openExposureMax: 200_000 }) });
+    const itemWorker = await boot(perItem);
+    await expect(arm(itemWorker.w, { maxBid: 1501 })).rejects.toThrow(/per-item/);
+    const atItemCap = await arm(itemWorker.w, { maxBid: 1500 });
+    expect(atItemCap.maxBid).toBe(1500);
+
+    // Estimates ride on the draft. $15.00 + $4.00 shipping + $1.00 handling is
+    // the $20.00 day; one extra cent of bid does not fit. maxBid alone is under
+    // the day, so a check that ignores shipping would let it through.
+    const perDay = makeShared({ settings: withCaps({ perItemMax: 50_000, perDayMax: 2000, openExposureMax: 200_000 }) });
+    const dayWorker = await boot(perDay);
+    const estimates = { estShipping: 400, estHandling: 100 };
+    await expect(arm(dayWorker.w, { maxBid: 1501, ...estimates })).rejects.toThrow(/per-day/);
+    const atDayCap = await arm(dayWorker.w, { maxBid: 1500, ...estimates });
+    expect(atDayCap.maxBid).toBe(1500);
   });
 
   it('snipe.disarm: before the fire it kills; after `sent` the reducer refuses it (a bid may be out)', async () => {

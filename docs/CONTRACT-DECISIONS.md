@@ -548,3 +548,43 @@ Source: T-69 (controller ruling R7 authorises this additive storage change).
 **Options cancel (review ruling).** Turning phone push off, or generating a new topic, runs from the options click path while the host permission is still granted: DELETE each stored `scheduled` seq on the old topic (paced, `https://ntfy.sh` only), then clear `sbw:ntfy`, then save. Deferred seqs were never sent and are not deleted. If a DELETE fails, phone push is still turned off and the page says already-scheduled pushes may still arrive; the stored seqs are kept. A failed regenerate keeps the old topic. `parseNtfyState` reads a missing or invalid record as empty.
 
 **Follow-up for the next PLAN edit.** Add the `sbw:ntfy` key to PLAN §2.3's storage table.
+
+## T-90 contract change: optional storage key `sbw:dryRunCounted`
+
+Source: controller ruling on T-90 concern 4.
+
+The dry-run counter keeps the snipe ids it has already counted in `sbw:dryRunCounted`, so a replayed completion event does not increment `settings.snipe.completedDryRuns` twice. The key was module-private. It is now a storage record, the same kind of optional bookkeeping as `sbw:snipeRunner` and `sbw:ntfy`.
+
+`STORAGE_KEYS.dryRunCounted = 'sbw:dryRunCounted'` (area `local`). The schema is module-private (an exported `*Schema` would join the locked example list): `{ version: 1, counted: Record<SnipeId, EpochMs> }`. `counted` maps a snipe id to when it was counted.
+
+Optional and additive. A profile with no record has counted nothing. No migration, and `sbw:meta.schemaVersion` stays 1.
+
+Invalid data parses to the empty record `{ version: 1, counted: {} }` through `parseDryRunCounted` (missing or unreadable). A typed `repo.find` quarantines an invalid record and returns undefined, which is that empty record. The counter does not read the key through `find`. It reads the raw bytes and, when a record is present but invalid, refuses the increment and leaves the bytes in place. Adopting the empty parse would drop the idempotency set, and a replay could count again. Over-counting is the direction that opens the live-bidding gate early.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, the sample, invalid parses to empty) and `test/unit/background/dry-run-counter.test.ts` (refuse on a corrupt record; `repo.find` quarantines).
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-90 contract change: `timing.awake`
+
+Source: controller ruling on T-90 concern 1. Additive. No other protocol change.
+
+The Timing page's awake chart needs the persisted heartbeat history. No existing message carries `sbw:awake`.
+
+`timing.awake` is a UI signal (empty request). The reply is `STORAGE_RECORDS[STORAGE_KEYS.awake].schema`, which is `EpochMs[]`: the stored history, or an empty array when nothing is stored. A content script is refused (`forbidden`), same as every other UI message. The handler is read only (T-90 final check): it reads the raw bytes and validates them with that schema, so an invalid record answers `[]` and is left in place. The heartbeat job quarantines it under its own `sbw:awake` lock on its next beat. A `repo.get` here would quarantine outside that lock, and its remove could delete a history the heartbeat had just written.
+
+**Tests.** `test/contract/types/messages.test.ts`, `test/contract/types/examples/Msg/timing.awake.{valid,invalid}.json`, `test/unit/background/timing-awake.test.ts`, and `test/dom/timing-section.test.ts`.
+
+**Follow-up for the next PLAN edit.** Add `timing.awake` to PLAN §3.12 and contracts.md.
+
+## T-90: `settings.set` never changes `snipe.completedDryRuns`
+
+Source: T-90 final check (Opus). A behaviour rule on an existing message, like `killSwitch` (T-36 R3). No schema or protocol change.
+
+`settings.set` replaces whole top-level groups. A page that edits one `snipe` field must send the whole `snipe` group, and that group carries `completedDryRuns`. A copy loaded before the last dry runs were counted would roll the count back. A crafted group could raise it and open the live-bidding gate early. `applySettingsPatch` now keeps `current.snipe.completedDryRuns`, whatever the patch says. The dry-run counter (`src/background/jobs/dry-run-counter.ts`) is the only writer. The kept count is in `next` before the `settings.set` interceptors run, so T-102's live gate judges the real count. The handler and the counter both take the `sbw:settings` lock, so the two cannot interleave.
+
+The Timing page's Apply also reads the settings fresh (`settings.get`) just before it writes, so it does not send back stale caps or other `snipe` fields either.
+
+**Tests.** `test/integration/background-main.test.ts` ("settings.set never changes completedDryRuns") and `test/dom/timing-section.test.ts` ("Apply re-reads the settings first").
+
+**Follow-up for the next PLAN edit.** Note the rule beside `killSwitch` in PLAN §3.12 (`settings.set`) and contracts.md.
