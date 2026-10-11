@@ -103,8 +103,9 @@ export function register(ctx: BackgroundContext): void {
         const id = `sgw-saved-${String(s.id)}`;
         const query = savedWatchQuery(s.query);
         const key = queryKey(query);
-        if (invalidSearchParams(query).length > 0) unsearchable.push(s.id);
-        if (ids.has(id) || keys.has(key) || invalidSearchParams(query).length > 0) {
+        const invalid = invalidSearchParams(query);
+        if (invalid.length > 0) unsearchable.push(s.id);
+        if (ids.has(id) || keys.has(key) || invalid.length > 0) {
           result.skipped++;
           continue;
         }

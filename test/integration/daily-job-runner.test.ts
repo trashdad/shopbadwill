@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeBrowser } from 'wxt/testing/fake-browser';
 
+import { localDay } from '../../src/adapters/sgw/request-scheduler';
 import type { BackgroundContext, RuntimePort } from '../../src/background/context';
 import { HANDLER_MODULES } from '../../src/background/handlers/index';
 import { JOB_MODULES } from '../../src/background/jobs/index';
@@ -37,7 +38,7 @@ import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { STORAGE_KEYS, STORAGE_LIMITS } from '../../src/domain/storage/schema';
 import type { AuditEntry } from '../../src/domain/audit/types';
-import type { SgwSessionRecord, TrackedItem } from '../../src/domain/types';
+import { DEFAULT_LANES, type SgwSessionRecord, type TrackedItem } from '../../src/domain/types';
 import type { JobRun, Watch } from '../../src/domain/watches/schema';
 import { PORT_NAMES } from '../../src/messaging/protocol';
 import type { HttpRequest } from '../../src/ports/http';
@@ -135,6 +136,16 @@ const RULE_ALL = priceRule('r-all', 1_000_000);
 const RULE_NONE = priceRule('r-none', 1);
 /** Matches the $5 rows only. */
 const RULE_CHEAP = priceRule('r-cheap', 600);
+/** Needs the item detail: search rows carry no seller state. The open-item fixture is in IL. */
+const RULE_IL: Rule = {
+  id: 'r-il',
+  name: 'r-il',
+  enabled: true,
+  action: 'watch',
+  all: [{ kind: 'location', mode: 'include', states: ['IL'] }],
+  createdAt: T0 - DAY,
+  updatedAt: T0 - DAY,
+};
 
 function watch(id: string, over: Partial<Watch> = {}): Watch {
   return {
@@ -266,6 +277,8 @@ interface BootOptions {
   site?: Partial<Site>;
   /** Host permissions granted (default: both SGW origins). */
   granted?: boolean;
+  /** Host origins to grant. Overrides `granted` (use one origin to prove both are required). */
+  origins?: string[];
   /** API permissions granted (e.g. the optional 'notifications'). */
   permissions?: string[];
   /** Skip seeding storage (a restart over existing storage). */
@@ -331,7 +344,7 @@ function boot(opts: BootOptions = {}) {
   const alarms = new FakeAlarms(clock);
   const notifier = new FakeNotifier();
   const permissions = new FakePermissions({
-    origins: opts.granted === false ? [] : [...SGW_HOST_ORIGINS],
+    origins: opts.origins ?? (opts.granted === false ? [] : [...SGW_HOST_ORIGINS]),
     permissions: opts.permissions ?? [],
   });
   const fb = makeBrowser();
@@ -540,6 +553,21 @@ describe('T-52 brief', () => {
     expect(h.sent).toEqual([]);
   });
 
+  it('one SGW host origin is not enough: the run is skipped', async () => {
+    const h = await ready({
+      watches: [watch('w1', { nextRunAt: T0 - MIN })],
+      origins: ['https://shopgoodwill.com/*'],
+    });
+    await h.advance(2 * TICK);
+    expect(h.sent).toEqual([]);
+    expect(h.runs()).toEqual([]);
+    expect(h.notifier.sent).toEqual([expect.objectContaining({ id: PERMISSION_NOTIFICATION_ID })]);
+    expect(h.audit()).toContainEqual(
+      expect.objectContaining({ actor: 'daily-job', kind: 'job.skipped', details: expect.objectContaining({ reason: 'host-permission' }) as unknown }),
+    );
+    expect(h.watches()[0]).toMatchObject({ nextRunAt: NEXT_SLOT, lastError: expect.stringContaining('permission') as unknown });
+  });
+
   it('a host permission revoked mid-run fails the run at the next step', async () => {
     const full = (_text: string, page: number): HttpStep => ok(searchReply(rows(page * 1000, 40), 400));
     const h = await ready({ watches: [watch('w1', { nextRunAt: T0 - MIN, maxPages: 3 })], site: { search: full } });
@@ -661,6 +689,19 @@ describe('R3: one run at a time', () => {
     expect(h.watches().find((w) => w.id === 'w2')?.nextRunAt).toBe(NEXT_SLOT);
     expect(await h.send('job.runNow', { watchIds: ['w3'] })).toMatchObject({ ok: false });
   });
+
+  it('a tick during a Run now drain is busy and takes no background step', async () => {
+    const full = (_text: string, page: number): HttpStep => ok(searchReply(rows(page * 1000, 40), 80));
+    const h = await ready({ watches: [watch('w1', { maxPages: 2 })], site: { search: full } });
+    expect(await h.send('job.runNow', {})).toEqual({ ok: true });
+    // The drain is waiting out the interactive gap, so a tick must not start a background step.
+    expect(await runnerFor(h.ctx).tick()).toBe('busy');
+    expect(h.ctx.scheduler.stats().lanes.background.usedToday).toBe(0);
+    await h.advance(10 * SEC, 100);
+    expect(h.lastRun()?.status).toBe('done');
+    expect(h.ctx.scheduler.stats().lanes.background.usedToday).toBe(0);
+    expect(h.ctx.scheduler.stats().lanes.interactive.usedToday).toBeGreaterThan(0);
+  });
 });
 
 // ── R4: carries ─────────────────────────────────────────────────────────────
@@ -725,6 +766,68 @@ describe('carries: DailyJob wiring', () => {
     h.ctx.scheduler.resume();
     await h.advance(3 * TICK + 10 * SEC);
     expect(h.lastRun()).toMatchObject({ status: 'done' });
+    expect(h.lastRun()?.results.errors).toEqual([]);
+  });
+
+  it('an exhausted background budget executes no step and consumes no retry', async () => {
+    const budget = DEFAULT_LANES.background.dailyBudget;
+    const h = await ready({
+      watches: [watch('w1', { nextRunAt: T0 - MIN })],
+      seed: { [STORAGE_KEYS.requestBudget]: { day: localDay(T0), used: { background: budget } } },
+    });
+    expect(h.ctx.scheduler.stats().lanes.background).toMatchObject({ usedToday: budget, budget });
+    expect(await runnerFor(h.ctx).tick()).toBe('paused');
+    await h.advance(4 * TICK);
+    expect(h.sent).toEqual([]);
+    expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 0 });
+    expect(h.lastRun()?.results.errors).toEqual([]);
+  });
+
+  it('a scheduler pause while a request is queued does not run the step or burn a retry', async () => {
+    const full = (_text: string, page: number): HttpStep => ok(searchReply(rows(page * 1000, 40), 80));
+    const h = await ready({ watches: [watch('w1', { nextRunAt: T0 - MIN, maxPages: 2 })], site: { search: full } });
+    await h.advance(TICK);
+    expect(h.sgw('search')).toHaveLength(1);
+    expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 1 });
+
+    // The background gap (120 s) holds the next search in the scheduler queue.
+    const step = runnerFor(h.ctx).tick();
+    await flush();
+    expect(h.sgw('search')).toHaveLength(1);
+    h.ctx.scheduler.pause('while queued');
+    expect(await step).toBe('not-run');
+    expect(h.sgw('search')).toHaveLength(1);
+    expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 1 });
+    expect(h.lastRun()?.results.errors).toEqual([]);
+  });
+
+  it('a queued request refused because the lane entered backoff is not a failed retry', async () => {
+    const h = await ready({
+      watches: [watch('w1', { nextRunAt: T0 - MIN })],
+      site: {
+        search: (text) => (text === 'blocker' ? { status: 500, bodyText: 'oops', latencyMs: 5 * SEC } : ok(searchReply(rows(1, 1), 1))),
+      },
+    });
+    expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 0 });
+    const blocker = h.ctx.api
+      .search({ searchText: 'blocker', categoryIds: [], sellerIds: [], page: 1 }, 'background')
+      .then(
+        () => 'sent' as const,
+        () => 'refused' as const,
+      );
+    await flush();
+    expect(h.http.pending).toBe(1);
+    expect(h.sgw('search').map((s) => s.searchText)).toEqual(['blocker']);
+
+    const step = runnerFor(h.ctx).tick();
+    await flush();
+    // Still queued behind the in-flight 500. Nothing for the watch has left.
+    expect(h.sgw('search').map((s) => s.searchText)).toEqual(['blocker']);
+    await h.advance(5 * SEC);
+    expect(await blocker).toBe('refused');
+    expect(await step).toBe('not-run');
+    expect(h.sgw('search').map((s) => s.searchText)).toEqual(['blocker']);
+    expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 0 });
     expect(h.lastRun()?.results.errors).toEqual([]);
   });
 
@@ -884,6 +987,29 @@ describe('carries: favorites (writes through T-53)', () => {
     });
   });
 
+  it('Run now sends one late-add alert when notifyDigest is the next step', async () => {
+    // Local mode plans no favorite, so the detail step's match is followed at once by notifyDigest.
+    // A fire-and-forget late-add hook then races the digest's own sendLateAdds.
+    const endsSoon = '2026-10-10T08:40:00';
+    const site: Partial<Site> = {
+      search: () => ok(searchReply([{ ...row(7, 5), endTime: endsSoon }], 1)),
+      detail: (itemId) => ok({ ...(detailReply(itemId) as object), endTime: endsSoon }),
+    };
+    const h = await ready({
+      watches: [watch('w1', { ruleIds: [RULE_IL.id], notify: true, favoriteMode: 'local' })],
+      rules: [RULE_ALL, RULE_NONE, RULE_CHEAP, RULE_IL],
+      site,
+      permissions: ['notifications'],
+    });
+    expect(await h.send('job.runNow', {})).toEqual({ ok: true });
+    await h.advance(15 * SEC, 100);
+    const run = h.lastRun();
+    expect(run?.status).toBe('done');
+    expect(run?.steps.map((s) => s.kind)).toEqual(['search', 'favoritesList', 'detail', 'notifyDigest']);
+    expect(h.notifier.sent.filter((n) => n.id === 'sbw:notify:late:7')).toHaveLength(1);
+    expect(h.audit().filter((e) => e.kind === 'notify.late-add' && e.itemId === 7)).toHaveLength(1);
+  });
+
   it(`retries planned from desired() are capped at ${String(MAX_FAVORITE_RETRIES_PER_RUN)} per run, soonest-ending first`, async () => {
     const tracked: Record<number, TrackedItem> = {};
     for (let i = 0; i < MAX_FAVORITE_RETRIES_PER_RUN + 5; i++) {
@@ -973,6 +1099,20 @@ describe('carries: saved watches (watches.save / watches.importSaved)', () => {
     // Idempotent: the same saved searches again add nothing.
     expect(await h.reply('watches.importSaved')).toEqual({ imported: 0, skipped: 3 });
     expect(h.watches()).toHaveLength(1);
+  });
+
+  it('re-importing a saved search after its watch query was edited does not duplicate it', async () => {
+    const h = await ready();
+    const q = (searchText: string): Watch['query'] => ({ searchText, categoryIds: [], sellerIds: [], page: 1 });
+    vi.spyOn(h.ctx.api, 'savedSearches').mockResolvedValue([{ id: 1, name: 'pyrex', query: q('pyrex') }]);
+    expect(await h.reply('watches.importSaved')).toEqual({ imported: 1, skipped: 0 });
+    const saved = h.watches()[0];
+    expect(saved?.id).toBe('sgw-saved-1');
+    await h.reply('watches.save', { ...saved, query: q('pyrex bowls') });
+    expect(h.watches()).toEqual([expect.objectContaining({ id: 'sgw-saved-1', query: q('pyrex bowls') })]);
+    expect(await h.reply('watches.importSaved')).toEqual({ imported: 0, skipped: 1 });
+    expect(h.watches()).toHaveLength(1);
+    expect(h.watches()[0]?.query.searchText).toBe('pyrex bowls');
   });
 });
 

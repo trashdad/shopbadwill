@@ -19,7 +19,9 @@
 //   notification + audit) and the RequestScheduler state. A pause, a backoff
 //   on the lane or a spent budget executes nothing and uses no retry (T-51
 //   carry); once it ends, a run T-51 paused is resume()d. An executor that
-//   throws SgwApiError `paused`/`budget` sent nothing: the step stays.
+//   throws SgwApiError `paused`/`budget`, or a retryable error with no HTTP
+//   status while the lane is now blocked (a queued request refused locally
+//   once the lane entered backoff), sent nothing: the step stays.
 // - Planning happens only under reconcile() or runNow() and sends nothing
 //   (R2): the first SGW request comes from a tick or the runNow drain.
 // - Side effects of a step (on commit): newly matched items become
@@ -34,8 +36,11 @@
 //   gets the run and the new item ids, so T-56's late-add alert (sendLateAdds,
 //   which applies isLateAdd, the only late-add rule) fires at once instead of
 //   with the end-of-run digest. register(ctx) subscribes sendLateAdds; a
-//   runner built without register has no subscriber. A subscriber runs
-//   outside the run lock; its failure is logged, never thrown.
+//   runner built without register has no subscriber. step() awaits them
+//   (allSettled) after the run lock is released and before it resolves, so a
+//   Run now drain cannot start the next step (notifyDigest's own sendLateAdds)
+//   until the hook has written its audit row. A subscriber's failure is
+//   logged, never thrown.
 // - Favorites: at most one favorite step per item per run (a later one is a
 //   policy skip). desired() (T-53) adds a favorite step for every tracked item
 //   it says 'add' to (failed or not yet favorited, sgw-late window open) to
@@ -87,7 +92,7 @@ const RETRYABLE: ReadonlySet<SgwApiErrorKind> = new Set<SgwApiErrorKind>(['rate-
  * - 'idle': no active run;
  * - 'busy': a step or a runNow drain is in progress (tick only);
  * - 'paused': the RequestScheduler is paused, or the lane is backing off or out of budget;
- * - 'not-run': the executor was refused before sending (SgwApiError paused/budget);
+ * - 'not-run': the executor was refused before sending (SgwApiError paused/budget, or a local backoff refusal);
  * - 'no-permission': the host permission is missing (the run failed);
  * - 'conflict': another runner advanced the run first (compare-and-set lost).
  */
@@ -196,6 +201,25 @@ function watchesOf(run: JobRun, watches: readonly Watch[]): Set<string> {
 function noteNames(note: string | undefined, watchId: string): boolean {
   return (note ?? '').split('; ').some((seg) => seg.startsWith(`${watchId}: `));
 }
+
+/** Enabled non-local watches named on a tracked item, in reason order. These may favorite it on SGW. */
+function sgwFavoriteWatches(item: TrackedItem, byId: ReadonlyMap<string, Watch>): Watch[] {
+  const out: Watch[] = [];
+  for (const reason of item.reasons) {
+    if (reason.kind !== 'watch' || reason.id === undefined) continue;
+    const watch = byId.get(reason.id);
+    if (watch !== undefined && watch.enabled && watch.favoriteMode !== 'local') out.push(watch);
+  }
+  return out;
+}
+
+/** What one step did, and the subscriber work step() settles after releasing the run lock. */
+interface SettledStep {
+  result: StepResult;
+  pending: readonly Promise<unknown>[];
+}
+
+const settled = (result: StepResult, pending: readonly Promise<unknown>[] = []): SettledStep => ({ result, pending });
 
 function auditDetails(run: JobRun): Record<string, string | number | boolean | null> {
   return {
@@ -320,8 +344,7 @@ export class DailyJobRunner {
       const since = runs.at(-1)?.startedAt ?? 0;
       const byId = new Map(inputs.watches.map((w) => [w.id, w]));
       const candidates = (await this.favoriteAdds(inputs, now)).filter(({ item }) => {
-        const watches = item.reasons.flatMap((r) => (r.kind === 'watch' && r.id !== undefined ? [byId.get(r.id)] : []));
-        const usable = watches.filter((w): w is Watch => w !== undefined && w.enabled && w.favoriteMode !== 'local');
+        const usable = sgwFavoriteWatches(item, byId);
         if (usable.length === 0 || usable.some((w) => w.favoriteMode === 'sgw')) return false;
         const opensAt = Math.max(...usable.map((w) => endMs(item.endTime) - (w.favoriteWithinHours ?? DEFAULT_FAVORITE_WITHIN_HOURS) * HOUR_MS));
         return opensAt > since && opensAt <= now;
@@ -376,7 +399,11 @@ export class DailyJobRunner {
   private async step(lane: Lane): Promise<StepResult> {
     this.stepping++;
     try {
-      return await this.exclusive(() => this.stepOnce(lane));
+      const done = await this.exclusive(() => this.stepOnce(lane));
+      // After the run lock, before step() resolves: a drain must not start the
+      // next step (often notifyDigest) until these subscribers have settled.
+      await Promise.allSettled(done.pending);
+      return done.result;
     } catch (e) {
       this.log('daily job: a step failed', e);
       return 'idle';
@@ -396,28 +423,28 @@ export class DailyJobRunner {
     return this.draining;
   }
 
-  private async stepOnce(lane: Lane): Promise<StepResult> {
+  private async stepOnce(lane: Lane): Promise<SettledStep> {
     const stored = activeRun(await this.ctx.repo.get(STORAGE_KEYS.jobRuns));
-    if (stored === undefined) return 'idle';
+    if (stored === undefined) return settled('idle');
     if (!(await this.hostPermitted())) {
       await this.failRun(stored, 'host permission for shopgoodwill.com was revoked');
       await this.reportNoPermission({ runId: stored.id });
-      return 'no-permission';
+      return settled('no-permission');
     }
-    if (this.laneBlocked(lane)) return 'paused';
+    if (this.laneBlocked(lane)) return settled('paused');
     // The scheduler is not paused (any more): a run T-51 paused carries on.
     const before = resume(stored);
     const inputs = await this.inputs();
     const job = this.dailyJob(inputs);
     const step = job.next(before);
-    if (step === null) return 'idle';
+    if (step === null) return settled('idle');
 
     let outcome: StepOutcome;
     if (step.kind === 'favorite' && before.steps.slice(0, before.cursor).some((s) => s.kind === 'favorite' && s.itemId === step.itemId)) {
       outcome = { kind: 'error', message: `${FAVORITE_SKIP_PREFIX}already handled in this run`, retryable: false };
     } else {
       const executed = await this.execute(step, before, lane);
-      if (executed === 'not-run') return 'not-run';
+      if (executed === 'not-run') return settled('not-run');
       outcome = executed;
     }
     const after = job.apply(before, step, outcome);
@@ -427,12 +454,12 @@ export class DailyJobRunner {
     });
     if (!ok) {
       this.log(`daily job: run ${stored.id} changed while step ${String(stored.cursor)} ran; this result was dropped`);
-      return 'conflict';
+      return settled('conflict');
     }
     const matched = after.results.newMatches.filter((id) => !before.results.newMatches.includes(id));
-    if (matched.length > 0) this.emitNewMatches(after, matched);
+    const pending = matched.length > 0 ? this.emitNewMatches(after, matched) : [];
     if (finished(after)) await this.audit({ actor: 'daily-job', kind: 'job.run.done', details: auditDetails(after) });
-    return 'stepped';
+    return settled('stepped', pending);
   }
 
   /** RequestScheduler gate: a pause, a backoff on the lane or a spent budget executes nothing (and uses no retry). */
@@ -452,6 +479,9 @@ export class DailyJobRunner {
     } catch (e) {
       if (e instanceof SgwApiError) {
         if (e.kind === 'paused' || e.kind === 'budget') return 'not-run';
+        // Queued, then refused locally: the lane entered backoff and nothing was sent
+        // (no HTTP status). A real 429/5xx carries a status and still counts as a retry.
+        if (e.status === undefined && RETRYABLE.has(e.kind) && this.laneBlocked(lane)) return 'not-run';
         return { kind: 'error', message: e.message, retryable: RETRYABLE.has(e.kind) };
       }
       this.log(`daily job: the ${step.kind} executor threw`, e);
@@ -568,8 +598,7 @@ export class DailyJobRunner {
     for (const d of desired(Object.values(tracked), inputs.watches, now, cache.items)) {
       const item = tracked[d.itemId];
       if (d.action !== 'add' || item === undefined) continue;
-      const watches = item.reasons.flatMap((r) => (r.kind === 'watch' && r.id !== undefined ? [byId.get(r.id)] : []));
-      const usable = watches.filter((w): w is Watch => w !== undefined && w.enabled && w.favoriteMode !== 'local');
+      const usable = sgwFavoriteWatches(item, byId);
       const pick = usable.find((w) => w.favoriteMode === 'sgw') ?? usable[0];
       if (pick !== undefined) out.push({ item, step: { kind: 'favorite', itemId: item.itemId, watchId: pick.id } });
     }
@@ -702,14 +731,16 @@ export class DailyJobRunner {
     }
   }
 
-  private emitNewMatches(run: JobRun, itemIds: ItemId[]): void {
-    for (const cb of [...this.newMatchHooks]) {
-      void Promise.resolve()
+  /** Starts each subscriber. The caller awaits these after the run lock is released. Failures are logged, never thrown. */
+  private emitNewMatches(run: JobRun, itemIds: ItemId[]): Promise<void>[] {
+    return [...this.newMatchHooks].map((cb) =>
+      Promise.resolve()
         .then(() => cb(structuredClone(run), [...itemIds]))
+        .then(() => undefined)
         .catch((e: unknown) => {
           this.log('daily job: a new-matches subscriber failed', e);
-        });
-    }
+        }),
+    );
   }
 
   private publish(run: JobRun): void {
