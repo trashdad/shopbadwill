@@ -1,6 +1,12 @@
-// T-32: one card's tools row, rendered in the card's closed shadow root:
-// the registered badges, Why? (when a rule matched) and the quick actions.
+// T-32: one card's tools, rendered in the card's closed shadow root: the
+// registered badges, Why? (when a rule matched) and the quick actions.
+//
+// Fix round 1: the row takes no layout space (the host is zero-height; see
+// TOOLS_CSS), so fixed-height cards keep their "Quick Bid" line. Only a small
+// handle shows; the panel opens on hover, on keyboard focus, or when the
+// handle is pressed.
 import { Component, type ComponentChildren, type VNode } from 'preact';
+import { useState } from 'preact/hooks';
 
 import type { MatchResult } from '../../domain/rules/schema';
 import type { Settings } from '../../domain/settings/schema';
@@ -40,6 +46,7 @@ class BadgeBoundary extends Component<{ id: string; children?: ComponentChildren
 }
 
 export function CardTools(p: CardToolsProps): VNode {
+  const [open, setOpen] = useState(false);
   const badgeProps: CardBadgeProps = {
     itemId: p.itemId,
     listing: p.listing,
@@ -49,16 +56,31 @@ export function CardTools(p: CardToolsProps): VNode {
     now: p.now,
   };
   return (
-    <div class="tools">
-      {p.badges.map((b) => (
-        <BadgeBoundary key={b.id} id={b.id}>
-          <b.Component {...badgeProps} />
-        </BadgeBoundary>
-      ))}
-      {p.result !== null && p.result.decision !== 'none' ? (
-        <Why result={p.result} ruleName={p.ruleName} title={p.listing?.title ?? null} />
-      ) : null}
-      <QuickActions itemId={p.itemId} listing={p.listing} quickFavorite={p.settings.overlay.quickFavorite} client={p.client} />
+    <div class={open ? 'tools open' : 'tools'}>
+      <button
+        type="button"
+        class="handle"
+        data-action="tools"
+        aria-expanded={open}
+        aria-label="ShopBadwill tools for this listing"
+        title="ShopBadwill"
+        onClick={() => {
+          setOpen(!open);
+        }}
+      >
+        SBW
+      </button>
+      <div class="panel" role="group" aria-label="ShopBadwill">
+        {p.badges.map((b) => (
+          <BadgeBoundary key={b.id} id={b.id}>
+            <b.Component {...badgeProps} />
+          </BadgeBoundary>
+        ))}
+        {p.result !== null && p.result.decision !== 'none' ? (
+          <Why result={p.result} ruleName={p.ruleName} title={p.listing?.title ?? null} client={p.client} />
+        ) : null}
+        <QuickActions itemId={p.itemId} listing={p.listing} quickFavorite={p.settings.overlay.quickFavorite} client={p.client} />
+      </div>
     </div>
   );
 }

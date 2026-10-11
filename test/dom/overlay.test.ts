@@ -15,6 +15,7 @@ import { NONCE_ATTR, TAP_SOURCE } from '../../src/content/api-tap.main';
 import { startOverlay, type Overlay } from '../../src/content/sgw-overlay';
 import { BADGES, loadBadges, type CardBadge } from '../../src/content/ui/badge-registry';
 import { uiRootForTest } from '../../src/content/ui/shadow';
+import { PAGE_CSS, TOOLS_CSS } from '../../src/content/ui/styles';
 import { shadowRootForTest } from '../../src/content/ui/stub';
 import type { MatchResult, Rule } from '../../src/domain/rules/schema';
 import { defaultSettings } from '../../src/domain/settings/defaults';
@@ -114,6 +115,7 @@ function tapSearch(o: Overlay, body: unknown, url = SEARCH_API): void {
 // ── events ──────────────────────────────────────────────────────────────────
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 function click(el: Element, isTrusted: boolean): void {
   const ev = new MouseEvent('click', { bubbles: true, composed: true, cancelable: true });
@@ -207,6 +209,11 @@ interface SetupOpts {
   rules?: Rule[];
   badges?: readonly CardBadge[];
   settleMs?: number;
+  noReplyMs?: number;
+  debounceMs?: number;
+  retryMs?: number;
+  /** Raw `sbw:settings` record (overrides `settings`), e.g. an invalid one. */
+  rawSettings?: unknown;
   /** Runs on the loaded fixture before the overlay starts. */
   prepare?: () => void;
 }
@@ -216,7 +223,10 @@ async function setup(opts: SetupOpts = {}) {
   opts.prepare?.();
   const loc = { href: opts.url ?? SEARCH_URL };
   const storage = new FakeStorage();
-  storage.seed({ 'sbw:settings': opts.settings ?? defaultSettings(), 'sbw:rules': opts.rules ?? [HIDE, HL] });
+  storage.seed({
+    'sbw:settings': 'rawSettings' in opts ? opts.rawSettings : (opts.settings ?? defaultSettings()),
+    'sbw:rules': opts.rules ?? [HIDE, HL],
+  });
   const decisions = new Map<number, MatchResult>();
   /** Message types whose background handler throws. */
   const fail = new Set<string>();
@@ -236,15 +246,17 @@ async function setup(opts: SetupOpts = {}) {
   m.handle('quick.track', ack('quick.track'));
   m.handle('quick.hideSeller', ack('quick.hideSeller'));
   m.handle('quick.hideKeyword', ack('quick.hideKeyword'));
+  m.handle('rules.disable', ack('rules.disable'));
   const overlay = startOverlay({
     win: window,
     messaging: m,
     storage,
     getUrl: () => loc.href,
     now: () => NOW,
-    debounceMs: 10,
+    debounceMs: opts.debounceMs ?? 10,
     settleMs: opts.settleMs ?? 40,
-    retryMs: 30,
+    noReplyMs: opts.noReplyMs ?? 60,
+    retryMs: opts.retryMs ?? 30,
     badges: opts.badges ?? [],
   });
   current = overlay;
@@ -584,11 +596,16 @@ describe('keyboard', () => {
     const root = stubWhyRoot(id);
     const why = button(root, 'why');
     expect(tabbables(root)).toContain(why);
+    const showModal = vi.spyOn(HTMLDialogElement.prototype, 'showModal');
     why.focus();
     pressEnter(why);
     await tick();
     const dialog = root.querySelector<HTMLElement>('[role="dialog"]');
     expect(dialog).not.toBeNull();
+    // A native modal <dialog> (top layer, inert page, native Escape).
+    expect(dialog).toBeInstanceOf(HTMLDialogElement);
+    expect((dialog as HTMLDialogElement).open).toBe(true);
+    expect(showModal).toHaveBeenCalledTimes(1);
     expect(why.getAttribute('aria-expanded')).toBe('true');
     // Focus moved into the dialog.
     expect(dialog?.contains(root.activeElement)).toBe(true);
@@ -606,6 +623,40 @@ describe('keyboard', () => {
     expect(root.querySelector('[role="dialog"]')).toBeNull();
     expect(root.activeElement).toBe(why);
     expect(why.getAttribute('aria-expanded')).toBe('false');
+
+    // The browser closing it natively (Escape via 'cancel', or close()) syncs the state too.
+    pressEnter(why);
+    await tick();
+    const again = root.querySelector('dialog');
+    expect(again?.open).toBe(true);
+    again?.close();
+    await tick();
+    expect(root.querySelector('[role="dialog"]')).toBeNull();
+    expect(why.getAttribute('aria-expanded')).toBe('false');
+    expect(root.activeElement).toBe(why);
+  });
+
+  it('"Disable rule" in the Why? dialog sends rules.disable on a trusted click only', async () => {
+    const s = await setup();
+    const id = s.ids[0] ?? 0;
+    s.decide(id, HIDE);
+    await s.feed();
+    const root = stubWhyRoot(id);
+    click(button(root, 'why'), true);
+    await tick();
+    const disable = button(root, 'disable-rule');
+    expect(disable.getAttribute('data-rule-id')).toBe('r-hide');
+    disable.click();
+    click(disable, false);
+    await tick();
+    expect(sentOf(s.m, 'rules.disable')).toEqual([]);
+    click(disable, true);
+    await vi.waitFor(() => {
+      expect(sentOf(s.m, 'rules.disable')).toEqual([{ ruleId: 'r-hide' }]);
+    });
+    await vi.waitFor(() => {
+      expect(norm(root.querySelector('[data-why-status]')?.textContent)).toMatch(/turned off/i);
+    });
   });
 });
 
@@ -704,13 +755,37 @@ describe('page lifecycle', () => {
     expect(isHidden(s.ids[0] ?? 0)).toBe(true);
     await new Promise((r) => setTimeout(r, 40));
     expect(s.overlay.scanCount).toBe(scans);
-    // Five quick page mutations: one debounced scan.
-    for (let i = 0; i < 5; i++) gridContainer().append(document.createElement('div'));
+  });
+
+  it('debounces page mutations: several, each in its own task and closer than debounceMs, give one scan', async () => {
+    const s = await setup({ debounceMs: 80 });
+    await s.feed();
+    await sleep(150);
+    const scans = s.overlay.scanCount;
+    for (let i = 0; i < 5; i++) {
+      gridContainer().append(document.createElement('div'));
+      await sleep(15);
+    }
+    expect(s.overlay.scanCount).toBe(scans); // still quiet: every gap was shorter than debounceMs
     await vi.waitFor(() => {
       expect(s.overlay.scanCount).toBe(scans + 1);
     });
-    await new Promise((r) => setTimeout(r, 40));
+    await sleep(200);
     expect(s.overlay.scanCount).toBe(scans + 1);
+  });
+
+  it('a page that never stops changing is still scanned at least every maxWait (4 x debounceMs)', async () => {
+    const s = await setup({ debounceMs: 80 });
+    await s.feed();
+    await sleep(150);
+    const scans = s.overlay.scanCount;
+    const end = Date.now() + 1000;
+    while (Date.now() < end) {
+      gridContainer().append(document.createElement('div'));
+      await sleep(30);
+    }
+    // ~1 s of mutations 30 ms apart: a plain debounce would not have scanned yet.
+    expect(s.overlay.scanCount - scans).toBeGreaterThanOrEqual(2);
   });
 
   it('disconnects the observer on pagehide and resumes on a bfcache pageshow', async () => {
@@ -846,11 +921,15 @@ describe('selector drift', () => {
     for (const id of s.ids) s.decide(id, HIDE);
     tapSearch(s.overlay, searchBody(s.ids));
     await s.overlay.scan();
-    // Not before the page had time to settle.
+    // Not before the page had time to settle: no banner and no early zero-card health report.
     expect(pageRoot().querySelector('[role="alert"]')).toBeNull();
+    expect(sentOf(s.m, 'page.domHealth')).toEqual([]);
     await vi.waitFor(() => {
       expect(norm(pageRoot().querySelector('[role="alert"]')?.textContent)).toBe('SGW layout changed, filters paused');
     });
+    // Folded into the pill (never a box over SGW's header).
+    expect(pageRoot().querySelector('[role="alert"]')?.closest('.pill')).not.toBeNull();
+    expect(pageRoot().querySelectorAll('.pill')).toHaveLength(1);
     expect(count('[data-sbw-stub], [data-sbw-label], [data-sbw-tools]')).toBe(0);
     expect(sentOf(s.m, 'page.domHealth')).toEqual([
       { url: SEARCH_URL, configVersion: SGW_CONFIG_VERSION, pageKind: 'search', cardsFound: 0, fallbackUsed: false },
@@ -867,6 +946,43 @@ describe('selector drift', () => {
     await new Promise((r) => setTimeout(r, 80));
     await s.overlay.scan();
     expect(pageRoot().querySelector('[role="alert"]')).toBeNull();
+    // An empty search is not drift: no zero-card health report either.
+    expect(sentOf(s.m, 'page.domHealth')).toEqual([]);
+  });
+
+  it('with no search reply yet, the zero-card verdict waits for the reply or noReplyMs, not just settleMs', async () => {
+    const s = await setup({
+      settleMs: 40,
+      noReplyMs: 400,
+      prepare: () => {
+        gridContainer().replaceChildren();
+      },
+    });
+    await sleep(150); // past settleMs, before noReplyMs
+    await s.overlay.scan();
+    expect(pageRoot().querySelector('[role="alert"]')).toBeNull();
+    expect(sentOf(s.m, 'page.domHealth')).toEqual([]);
+    await vi.waitFor(() => {
+      expect(norm(pageRoot().querySelector('[role="alert"]')?.textContent)).toBe('SGW layout changed, filters paused');
+    });
+    expect(sentOf(s.m, 'page.domHealth')).toEqual([
+      { url: SEARCH_URL, configVersion: SGW_CONFIG_VERSION, pageKind: 'search', cardsFound: 0, fallbackUsed: false },
+    ]);
+  });
+
+  it('a search reply arriving after settle (before noReplyMs) decides the verdict at once', async () => {
+    const s = await setup({
+      settleMs: 40,
+      noReplyMs: 5000,
+      prepare: () => {
+        gridContainer().replaceChildren();
+      },
+    });
+    await sleep(100);
+    expect(pageRoot().querySelector('[role="alert"]')).toBeNull();
+    tapSearch(s.overlay, searchBody(s.ids));
+    await s.overlay.scan();
+    expect(norm(pageRoot().querySelector('[role="alert"]')?.textContent)).toBe('SGW layout changed, filters paused');
   });
 });
 
@@ -933,5 +1049,142 @@ describe('static checks', () => {
     const sink = /\b(innerHTML|outerHTML|insertAdjacentHTML|dangerouslySetInnerHTML|createContextualFragment)\b|document\.write/;
     const offenders = sources.filter((f) => sink.test(readFileSync(f, 'utf8').replace(/\/\/.*$/gm, '')));
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('fix round 1: settings fail closed, memory, layout, dim', () => {
+  it('kill switch fails closed: unreadable settings at start pause the overlay until good settings arrive', async () => {
+    const s = await setup({ rawSettings: { schemaVersion: 1, junk: true } });
+    s.decide(s.ids[0] ?? 0, HIDE);
+    await s.feed();
+    expect(count('[data-sbw-stub], [data-sbw-tools]')).toBe(0);
+    expect(sentOf(s.m, 'rules.evaluate')).toEqual([]);
+    expect(barText()).toBe('ShopBadwill paused (settings unreadable)');
+    // The tap still feeds the background.
+    expect(sentOf(s.m, 'page.listings')).toHaveLength(1);
+    await s.storage.set({ 'sbw:settings': defaultSettings() });
+    await vi.waitFor(() => {
+      expect(isHidden(s.ids[0] ?? 0)).toBe(true);
+    });
+  });
+
+  it('absent settings (nothing stored yet) mean the defaults, not a pause', async () => {
+    const s = await setup({ rawSettings: undefined });
+    s.decide(s.ids[0] ?? 0, HIDE);
+    await s.feed();
+    expect(isHidden(s.ids[0] ?? 0)).toBe(true);
+  });
+
+  it('an unreadable settings change keeps the last good settings, unless it says the kill switch is on', async () => {
+    const s = await setup();
+    s.decide(s.ids[0] ?? 0, HIDE);
+    await s.feed();
+    await s.storage.set({ 'sbw:settings': { schemaVersion: 2, overlay: 'a newer shape' } });
+    await s.overlay.scan();
+    expect(isHidden(s.ids[0] ?? 0)).toBe(true);
+    expect(barText()).toBe('1 hidden · Show');
+    await s.storage.set({ 'sbw:settings': { schemaVersion: 2, killSwitch: true } });
+    await vi.waitFor(() => {
+      expect(barText()).toBe('ShopBadwill paused (kill switch)');
+    });
+    expect(count('[data-sbw-stub], [data-sbw-tools]')).toBe(0);
+  });
+
+  it('evicting a listing also drops its evaluation', async () => {
+    const s = await setup();
+    await s.feed();
+    expect(s.overlay.memory()).toEqual({ listings: 40, results: 40, failed: 0 });
+    const others = Array.from({ length: 1000 }, (_, i) => 100_000_000 + i);
+    tapSearch(s.overlay, searchBody(others));
+    await s.overlay.scan();
+    expect(s.overlay.memory()).toEqual({ listings: 1000, results: 0, failed: 0 });
+  });
+
+  it('evicting a listing also drops its failure record', async () => {
+    const s = await setup({ retryMs: 60_000 });
+    s.fail.add('rules.evaluate');
+    await s.feed();
+    expect(s.overlay.memory()).toEqual({ listings: 40, results: 0, failed: 40 });
+    const others = Array.from({ length: 1000 }, (_, i) => 100_000_000 + i);
+    tapSearch(s.overlay, searchBody(others));
+    await s.overlay.scan();
+    expect(s.overlay.memory()).toEqual({ listings: 1000, results: 0, failed: 0 });
+  });
+
+  it('the tools row takes no card height: a small handle; the panel opens on hover, focus or the handle', async () => {
+    expect(TOOLS_CSS).toMatch(/:host\s*\{[^}]*height:\s*0/);
+    const s = await setup({ badges: BADGES });
+    await s.feed();
+    const root = toolsRoot(s.ids[0] ?? 0);
+    const handle = button(root, 'tools');
+    expect(handle.getAttribute('aria-expanded')).toBe('false');
+    expect(root.querySelector('.panel [data-badge="end-time"]')).not.toBeNull();
+    expect(root.querySelector('.panel button[data-action="actions"]')).not.toBeNull();
+    click(handle, true);
+    await tick();
+    expect(handle.getAttribute('aria-expanded')).toBe('true');
+    expect(root.querySelector('.tools')?.classList.contains('open')).toBe(true);
+  });
+
+  it('the pill sits bottom-left (clear of SGW\'s bottom-right controls) and collapses to a small dot and back', async () => {
+    expect(PAGE_CSS).toMatch(/\.pill\s*\{[^}]*\bleft:\s*12px/);
+    expect(PAGE_CSS).not.toMatch(/\.pill\s*\{[^}]*\bright:/);
+    const s = await setup();
+    s.decide(s.ids[0] ?? 0, HIDE);
+    await s.feed();
+    click(button(pageRoot(), 'collapse-pill'), true);
+    await tick();
+    const dot = button(pageRoot(), 'expand-pill');
+    expect(dot.getAttribute('aria-label')).toBe('ShopBadwill: 1 hidden. Show the status');
+    expect(pageRoot().querySelector('button[data-action="show-all"]')).toBeNull();
+    // Still collapsed after a re-render.
+    await s.overlay.scan();
+    expect(pageRoot().querySelector('button[data-action="expand-pill"]')).not.toBeNull();
+    click(dot, true);
+    await tick();
+    expect(barText()).toBe('1 hidden · Show');
+  });
+
+  it("hideStyle 'dim': the card stays, faded, under a 'Hidden by <rule> · Show' chip; count and undo work", async () => {
+    const dim = defaultSettings();
+    dim.overlay.hideStyle = 'dim';
+    const s = await setup({ settings: dim });
+    const id = s.ids[1] ?? 0;
+    s.decide(id, HIDE);
+    await s.feed();
+    expect(isHidden(id)).toBe(false);
+    expect(cardRoot(id).getAttribute('style') ?? '').toMatch(/opacity:\s*0\.3/);
+    const chip = closedRoot(stubRow(id)?.querySelector('[data-sbw-chip]'));
+    expect(norm(chip.querySelector('[role="note"]')?.textContent)).toBe('Hidden by No pyrex · Show');
+    expect(stubRow(id)?.querySelector('[data-sbw-why]')).not.toBeNull();
+    expect(barText()).toBe('1 hidden · Show');
+    click(button(chip, 'show-card'), true);
+    await tick();
+    expect(cardRoot(id).getAttribute('style') ?? '').not.toMatch(/opacity/);
+    expect(barText()).toBe('1 shown · Hide again');
+  });
+
+  it("switching hideStyle to 'dim' in settings re-applies the hides", async () => {
+    const s = await setup();
+    const id = s.ids[1] ?? 0;
+    s.decide(id, HIDE);
+    await s.feed();
+    expect(isHidden(id)).toBe(true);
+    const dim = defaultSettings();
+    dim.overlay.hideStyle = 'dim';
+    const states: string[] = [];
+    const mo = new MutationObserver(() => {
+      states.push(cardRoot(id).getAttribute('style') ?? '');
+    });
+    mo.observe(cardRoot(id), { attributes: true, attributeFilter: ['style'] });
+    await s.storage.set({ 'sbw:settings': dim });
+    await vi.waitFor(() => {
+      expect(cardRoot(id).getAttribute('style') ?? '').toMatch(/opacity:\s*0\.3/);
+    });
+    mo.disconnect();
+    expect(isHidden(id)).toBe(false);
+    expect(count('[data-sbw-stub]')).toBe(1);
+    // Straight from collapsed to dimmed: the card is never shown plainly in between.
+    expect(states.filter((st) => !/display:\s*none|opacity/.test(st))).toEqual([]);
   });
 });

@@ -1,13 +1,19 @@
 // T-32: the "Why?" button and its dialog. Lists, per matched rule, each
-// MatchReason.detail exactly as the rules engine wrote it. Every string (the
-// listing title from the page, rule names, details) is rendered as text.
-// The dialog is modal: focus moves in when it opens, Tab and Shift+Tab wrap
-// inside it, and Escape (or Close, or the backdrop) closes it and returns focus
-// to the Why? button.
+// MatchReason.detail exactly as the rules engine wrote it, and offers
+// "Disable rule" (rules.disable, trusted clicks only; the activity log can undo
+// it). Every string (the listing title from the page, rule names, details) is
+// rendered as text.
+//
+// A native modal <dialog> (fix round 1): top layer, the page behind it inert,
+// Escape handled by the browser ('cancel' -> 'close'). Focus moves in when it
+// opens, Tab and Shift+Tab wrap inside it, and Escape, Close or a click on the
+// backdrop close it and return focus to the Why? button.
 import type { VNode } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 
 import type { MatchResult } from '../../domain/rules/schema';
+import type { MessagingClient } from '../../ports/messaging';
+import { describeError } from '../../ui/components/describeError';
 
 export interface WhyProps {
   result: MatchResult;
@@ -15,6 +21,8 @@ export interface WhyProps {
   ruleName: (ruleId: string) => string;
   /** The listing title from the page's own data, when known (untrusted: text only). */
   title: string | null;
+  /** For "Disable rule"; null hides that control. */
+  client: MessagingClient | null;
 }
 
 const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])';
@@ -36,18 +44,35 @@ function activeIn(el: Element | null): Element | null {
   return root instanceof ShadowRoot || root instanceof Document ? root.activeElement : null;
 }
 
-export function Why({ result, ruleName, title }: WhyProps): VNode {
+export function Why({ result, ruleName, title, client }: WhyProps): VNode {
   const [open, setOpen] = useState(false);
+  const [status, setStatus] = useState('');
   const button = useRef<HTMLButtonElement>(null);
-  const dialog = useRef<HTMLDivElement>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
 
   useLayoutEffect(() => {
-    if (open) focusables(dialog.current)[0]?.focus();
+    const d = dialog.current;
+    if (!open || d === null) return;
+    if (!d.open) {
+      try {
+        d.showModal();
+      } catch {
+        d.setAttribute('open', ''); // not connected yet, or no modal support: still usable
+      }
+    }
+    focusables(d)[0]?.focus();
   }, [open]);
 
-  const close = (): void => {
+  /** Runs once the dialog is closed, however that happened. */
+  const finish = (): void => {
     setOpen(false);
+    setStatus('');
     button.current?.focus();
+  };
+  const close = (): void => {
+    const d = dialog.current;
+    if (d?.open === true) d.close(); // fires 'close' -> finish
+    else finish();
   };
 
   const onKeyDown = (e: KeyboardEvent): void => {
@@ -76,6 +101,19 @@ export function Why({ result, ruleName, title }: WhyProps): VNode {
     }
   };
 
+  const disable = (e: MouseEvent, ruleId: string): void => {
+    if (!e.isTrusted || client === null) return;
+    setStatus('…');
+    client.send('rules.disable', { ruleId }).then(
+      () => {
+        setStatus(`Rule turned off: ${ruleName(ruleId)}. You can undo this in ShopBadwill's activity log.`);
+      },
+      (err: unknown) => {
+        setStatus(`Not done: ${describeError(err)}`);
+      },
+    );
+  };
+
   const unknown = result.unknownConditions;
   return (
     <span class="why">
@@ -92,9 +130,18 @@ export function Why({ result, ruleName, title }: WhyProps): VNode {
         Why?
       </button>
       {open ? (
-        <>
-          <div class="backdrop" onClick={close} />
-          <div ref={dialog} class="pop" role="dialog" aria-modal="true" aria-labelledby="sbw-why-h" onKeyDown={onKeyDown}>
+        <dialog
+          ref={dialog}
+          class="pop"
+          role="dialog"
+          aria-labelledby="sbw-why-h"
+          onKeyDown={onKeyDown}
+          onClose={finish}
+          onClick={(e) => {
+            if (e.target === dialog.current) close(); // the backdrop
+          }}
+        >
+          <div class="pop-body">
             <p id="sbw-why-h" class="pop-h">
               {HEADING[result.decision]}
             </p>
@@ -111,6 +158,18 @@ export function Why({ result, ruleName, title }: WhyProps): VNode {
                     </li>
                   ))}
                 </ul>
+                {client === null ? null : (
+                  <button
+                    type="button"
+                    data-action="disable-rule"
+                    data-rule-id={m.ruleId}
+                    onClick={(e) => {
+                      disable(e, m.ruleId);
+                    }}
+                  >
+                    Disable rule
+                  </button>
+                )}
               </div>
             ))}
             {unknown > 0 ? (
@@ -119,11 +178,14 @@ export function Why({ result, ruleName, title }: WhyProps): VNode {
                 that data). An unknown condition never hides a listing.
               </p>
             ) : null}
+            <p class="status" role="status" data-why-status="">
+              {status}
+            </p>
             <button type="button" data-action="close-why" onClick={close}>
               Close
             </button>
           </div>
-        </>
+        </dialog>
       ) : null}
     </span>
   );

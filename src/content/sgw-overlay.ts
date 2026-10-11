@@ -23,6 +23,11 @@
 //    MutationObserver that ignores our own nodes; SPA navigation through
 //    onLocationChange (the entrypoint wires `wxt:locationchange`).
 //  - Selector health goes to the background once per page and per change.
+//    Zero parsed cards count (banner + health report) only once the page has
+//    settled AND either the tap's search reply said there were results or no
+//    reply came within NO_REPLY_MS; an empty search is never drift.
+//  - Settings fail closed: an unreadable record keeps the last good settings
+//    (honouring a readable `killSwitch: true`), and with none the overlay pauses.
 //
 // Settings and rule names are read (never written) from storage.local: content
 // scripts may not send `settings.get`/`rules.list` (PLAN §2.4).
@@ -57,6 +62,8 @@ export const OVERLAY_TIMING = Object.freeze({
   debounceMs: 250,
   /** How long after a page starts before "zero cards" counts as a layout change. */
   settleMs: 5000,
+  /** Without a search reply from the tap, how long before "zero cards" counts anyway. */
+  noReplyMs: 15_000,
   /** First retry after a failed rules.evaluate (the background may be restarting); doubles up to retryMaxMs. */
   retryMs: 5000,
   retryMaxMs: 60_000,
@@ -92,6 +99,7 @@ export interface OverlayDeps {
   now?: () => number;
   debounceMs?: number;
   settleMs?: number;
+  noReplyMs?: number;
   retryMs?: number;
   nonce?: string;
 }
@@ -103,6 +111,8 @@ export interface Overlay {
   readonly ready: Promise<void>;
   /** Scans run so far (for tests and diagnostics). */
   readonly scanCount: number;
+  /** Sizes of the in-memory caches (diagnostics). */
+  memory(): { listings: number; results: number; failed: number };
   /** Re-scans now; resolves when the page is decorated (joins a scan in progress). */
   scan(): Promise<void>;
   /** SPA navigation (`wxt:locationchange`). */
@@ -116,6 +126,8 @@ interface PageState {
   /** Items the user re-showed on this page (kept across re-renders). */
   revealedIds: Set<ItemId>;
   settled: boolean;
+  /** No search reply came within noReplyMs. */
+  replyWaitOver: boolean;
   /** Cards found by the last scan of this page; null before the first. */
   cardsFound: number | null;
   /** Rows in the last tap search reply seen on this page; null when none. */
@@ -132,6 +144,7 @@ const newPage = (url: string): PageState => ({
   url,
   revealedIds: new Set(),
   settled: false,
+  replyWaitOver: false,
   cardsFound: null,
   lastSearchCount: null,
   healthKey: null,
@@ -193,9 +206,15 @@ function searchContext(url: string, observedAt: number, authenticated: boolean):
   return { observedAt, authenticated, query };
 }
 
-function parseSettings(raw: unknown): Settings {
+type SettingsRead = { kind: 'ok'; settings: Settings } | { kind: 'invalid'; killSwitch: boolean };
+
+/** Absent means defaults (nothing stored yet); an unreadable record still reports a readable `killSwitch: true`. */
+function readSettings(raw: unknown): SettingsRead {
+  if (raw === undefined) return { kind: 'ok', settings: defaultSettings() };
   const r = SettingsSchema.safeParse(raw);
-  return r.success ? r.data : defaultSettings();
+  if (r.success) return { kind: 'ok', settings: r.data };
+  const kill = typeof raw === 'object' && raw !== null && (raw as Record<string, unknown>)['killSwitch'] === true;
+  return { kind: 'invalid', killSwitch: kill };
 }
 
 function parseRules(raw: unknown): Map<string, Rule> {
@@ -224,6 +243,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   const debounceMs = deps.debounceMs ?? OVERLAY_TIMING.debounceMs;
   const maxWaitMs = debounceMs * 4;
   const settleMs = deps.settleMs ?? OVERLAY_TIMING.settleMs;
+  const noReplyMs = deps.noReplyMs ?? OVERLAY_TIMING.noReplyMs;
   const retryMs = deps.retryMs ?? OVERLAY_TIMING.retryMs;
   const badges = deps.badges ?? BADGES;
   const mountPageUi = deps.mountPageUi ?? defaultMountPageUi(doc);
@@ -240,14 +260,25 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   const live = (): boolean => !stopped && !suspended;
 
   let settings = defaultSettings();
+  /** A good settings record has been read (absent counts: defaults). */
+  let settingsGood = false;
+  /** No good settings to fall back on: the overlay pauses (fail closed). */
+  let settingsUnreadable = false;
+  /** The last record was unreadable but said `killSwitch: true`. */
+  let rawKill = false;
   /** From a `switches.changed` broadcast, until the next settings read. */
   let killOverride: boolean | null = null;
+  let pillCollapsed = false;
   let rules = new Map<string, Rule>();
   let tokenSeen = false;
 
   const listings = new Map<ItemId, Listing>();
-  /** Evaluations, valid while generation and the listing's observedAt are unchanged. */
-  const results = new Map<ItemId, { observedAt: number; result: MatchResult }>();
+  /**
+   * Evaluations by listing (observedAt). One from an older generation (rules or
+   * settings changed since) is still shown until the re-evaluation answers, so
+   * a change never flashes hidden cards back into view.
+   */
+  const results = new Map<ItemId, { observedAt: number; gen: number; result: MatchResult }>();
   /** Listings (by observedAt) whose evaluation failed in this generation: not retried until new data or rules. */
   const failed = new Map<ItemId, number>();
   const inflight = new Set<ItemId>();
@@ -270,8 +301,10 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   let firstPendingAt = 0;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  let noReplyTimer: ReturnType<typeof setTimeout> | undefined;
 
   const dom = createDomAdapter({
+    hideStyle: () => settings.overlay.hideStyle,
     ui: createOverlayDecorationUi({
       current: () => applying,
       stubCreated(card, reveal, why) {
@@ -292,8 +325,30 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     const name = rules.get(id)?.name.trim() ?? '';
     return name === '' ? 'Unnamed rule' : name;
   };
-  const killed = (): boolean => killOverride ?? settings.killSwitch;
-  const activeOn = (kind: string): boolean => settings.overlay.enabled && !killed() && kind === 'search';
+  const killed = (): boolean => killOverride ?? (rawKill || settings.killSwitch);
+  const activeOn = (kind: string): boolean =>
+    settings.overlay.enabled && !settingsUnreadable && !killed() && kind === 'search';
+
+  function applySettings(read: SettingsRead): void {
+    if (read.kind === 'ok') {
+      settings = read.settings;
+      settingsGood = true;
+      settingsUnreadable = false;
+      rawKill = false;
+    } else {
+      // Keep the last good settings; with none, pause.
+      rawKill = read.killSwitch;
+      settingsUnreadable = !settingsGood;
+    }
+    killOverride = null;
+  }
+
+  /** Zero parsed cards on this search page count as a layout change (banner, health report). */
+  function zeroVerdict(): boolean {
+    const p = page;
+    if (p.cardsFound !== 0 || !p.settled || p.lastSearchCount === 0) return false;
+    return p.lastSearchCount !== null || p.replyWaitOver;
+  }
 
   function send<K extends 'page.token' | 'page.listings' | 'page.domHealth'>(type: K, payload: MsgPayload<K>): void {
     try {
@@ -305,7 +360,8 @@ export function startOverlay(deps: OverlayDeps): Overlay {
 
   // ── results ──────────────────────────────────────────────────────────────
 
-  function freshResult(id: ItemId): MatchResult | null {
+  /** The result for the listing as it is now (possibly from an older generation), or null. */
+  function shownResult(id: ItemId): MatchResult | null {
     const entry = results.get(id);
     const listing = listings.get(id);
     return entry !== undefined && listing !== undefined && entry.observedAt === listing.observedAt ? entry.result : null;
@@ -313,7 +369,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
 
   function needsEval(id: ItemId): boolean {
     const listing = listings.get(id);
-    if (listing === undefined || inflight.has(id) || freshResult(id) !== null) return false;
+    if (listing === undefined || inflight.has(id)) return false;
+    const entry = results.get(id);
+    if (entry !== undefined && entry.observedAt === listing.observedAt && entry.gen === generation) return false;
     return failed.get(id) !== listing.observedAt;
   }
 
@@ -329,7 +387,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
       const byId = new Map(reply.map((r) => [r.itemId, r]));
       for (const l of batch) {
         const result: MatchResult = byId.get(l.itemId) ?? { itemId: l.itemId, decision: 'none', matched: [], unknownConditions: 0 };
-        results.set(l.itemId, { observedAt: l.observedAt, result });
+        results.set(l.itemId, { observedAt: l.observedAt, gen, result });
       }
       evaluateFailed = false;
       retryDelay = retryMs;
@@ -430,14 +488,14 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     if (ui === undefined || result === null || !ui.host.isConnected) return;
     const title = listings.get(card.itemId)?.title ?? null;
     safe(() => {
-      ui.render(h(Why, { result, ruleName, title }));
+      ui.render(h(Why, { result, ruleName, title, client }));
     });
   }
 
   function applyAll(): void {
     const t = now();
     for (const card of cards) {
-      const result = freshResult(card.itemId);
+      const result = shownResult(card.itemId);
       const deco = decorationFor(result);
       const prev = decorated.get(card.root);
       if (prev !== undefined && prev.card.itemId !== card.itemId) {
@@ -533,8 +591,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   function view(): PageView {
     if (!settings.overlay.enabled) return { kind: 'off' };
     if (killed()) return { kind: 'idle', text: 'ShopBadwill paused (kill switch)' };
+    if (settingsUnreadable) return { kind: 'idle', text: 'ShopBadwill paused (settings unreadable)' };
     if (dom.pageKind(page.url) !== 'search') return { kind: 'idle', text: 'ShopBadwill ready' };
-    if (page.settled && page.cardsFound === 0 && page.lastSearchCount !== 0) return { kind: 'banner' };
+    if (zeroVerdict()) return { kind: 'banner' };
     let hidden = 0;
     let shown = 0;
     for (const { card, deco } of decorated.values()) {
@@ -552,14 +611,30 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     const container = pageContainer;
     if (container === null || stopped) return;
     safe(() => {
-      render(h(PageStatus, { view: view(), onShowAll: showAll, onHideAgain: hideAgain }), container);
+      render(
+        h(PageStatus, {
+          view: view(),
+          collapsed: pillCollapsed,
+          onShowAll: showAll,
+          onHideAgain: hideAgain,
+          onCollapse: () => {
+            pillCollapsed = true;
+            renderPage();
+          },
+          onExpand: () => {
+            pillCollapsed = false;
+            renderPage();
+          },
+        }),
+        container,
+      );
     });
   }
 
   // ── health ───────────────────────────────────────────────────────────────
 
   function reportHealth(url: string, kind: string, report: DiscoveryReport | null): void {
-    if (report === null || (report.count === 0 && !page.settled)) return;
+    if (report === null || (report.count === 0 && !zeroVerdict())) return;
     const fallbackUsed = report.rank !== null && report.rank > 0;
     const key = `${String(report.count)}|${String(fallbackUsed)}|${report.configVersion}`;
     if (key === page.healthKey) return;
@@ -569,15 +644,32 @@ export function startOverlay(deps: OverlayDeps): Overlay {
 
   // ── scanning ─────────────────────────────────────────────────────────────
 
-  function startSettle(): void {
+  function clearPageTimers(): void {
     if (settleTimer !== undefined) clearTimeout(settleTimer);
+    if (noReplyTimer !== undefined) clearTimeout(noReplyTimer);
+    settleTimer = undefined;
+    noReplyTimer = undefined;
+  }
+
+  /** The page's clocks: settleMs, then (without a search reply) noReplyMs; a zero-card page re-scans at each. */
+  function startSettle(): void {
+    clearPageTimers();
     const p = page;
+    const rescanIfEmpty = (): void => {
+      if (p.cardsFound === null || p.cardsFound === 0) void scan();
+    };
     settleTimer = setTimeout(() => {
       settleTimer = undefined;
       if (stopped || p !== page) return;
       p.settled = true;
-      if (p.cardsFound === null || p.cardsFound === 0) void scan();
+      rescanIfEmpty();
     }, settleMs);
+    noReplyTimer = setTimeout(() => {
+      noReplyTimer = undefined;
+      if (stopped || p !== page) return;
+      p.replyWaitOver = true;
+      rescanIfEmpty();
+    }, noReplyMs);
   }
 
   function beginPage(url: string): void {
@@ -685,9 +777,12 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   function remember(l: Listing): void {
     listings.delete(l.itemId);
     listings.set(l.itemId, l);
-    if (listings.size > MAX_LISTINGS) {
+    while (listings.size > MAX_LISTINGS) {
       const oldest = listings.keys().next();
-      if (oldest.done !== true) listings.delete(oldest.value);
+      if (oldest.done === true) break;
+      listings.delete(oldest.value);
+      results.delete(oldest.value);
+      failed.delete(oldest.value);
     }
   }
 
@@ -726,12 +821,13 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   }
 
   async function loadSettings(): Promise<void> {
+    let read: SettingsRead;
     try {
-      settings = parseSettings(await storage.get(STORAGE_KEYS.settings));
+      read = readSettings(await storage.get(STORAGE_KEYS.settings));
     } catch {
-      settings = defaultSettings();
+      read = { kind: 'invalid', killSwitch: false };
     }
-    killOverride = null;
+    applySettings(read);
   }
 
   async function loadRules(): Promise<void> {
@@ -742,10 +838,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     }
   }
 
-  /** Rules or settings changed: every evaluation is stale. */
+  /** Rules or settings changed: every evaluation is stale (still shown until re-evaluated). */
   function bump(): void {
     generation += 1;
-    results.clear();
     failed.clear();
     evaluateFailed = false;
     void scan();
@@ -770,10 +865,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   const offStorage = storage.onChanged((changes) => {
     const s = changes[STORAGE_KEYS.settings];
     const r = changes[STORAGE_KEYS.rules];
-    if (s !== undefined) {
-      settings = parseSettings(s.newValue);
-      killOverride = null;
-    }
+    if (s !== undefined) applySettings(readSettings(s.newValue));
     if (r !== undefined) rules = parseRules(r.newValue);
     if (s !== undefined || r !== undefined) bump();
   });
@@ -828,6 +920,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     get scanCount() {
       return scans;
     },
+    memory() {
+      return { listings: listings.size, results: results.size, failed: failed.size };
+    },
     scan,
     onLocationChange(url) {
       if (stopped) return;
@@ -843,7 +938,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
       observer.disconnect();
       clearDebounce();
       clearRetry();
-      if (settleTimer !== undefined) clearTimeout(settleTimer);
+      clearPageTimers();
       win.removeEventListener('message', onMessage);
       win.removeEventListener('pagehide', onPageHide);
       win.removeEventListener('pageshow', onPageShow);
