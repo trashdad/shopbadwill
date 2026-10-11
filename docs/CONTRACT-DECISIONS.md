@@ -552,3 +552,15 @@ Invalid data parses to the empty record `{ version: 1, counted: {} }` through `p
 **Tests.** `test/contract/types/storage.test.ts` (the key, the sample, invalid parses to empty) and `test/unit/background/dry-run-counter.test.ts` (refuse on a corrupt record; `repo.find` quarantines).
 
 **Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-90 contract change: `timing.awake`
+
+Source: controller ruling on T-90 concern 1. Additive. No other protocol change.
+
+The Timing page's awake chart needs the persisted heartbeat history. No existing message carries `sbw:awake`.
+
+`timing.awake` is a UI signal (empty request). The reply is `STORAGE_RECORDS[STORAGE_KEYS.awake].schema`, which is `EpochMs[]`: the stored history, or an empty array when nothing is stored. A content script is refused (`forbidden`), same as every other UI message. The handler reads through `repo.get`, so an invalid record is quarantined and the reply is `[]`.
+
+**Tests.** `test/contract/types/messages.test.ts`, `test/contract/types/examples/Msg/timing.awake.{valid,invalid}.json`, `test/unit/background/timing-awake.test.ts`, and `test/dom/timing-section.test.ts`.
+
+**Follow-up for the next PLAN edit.** Add `timing.awake` to PLAN §3.12 and contracts.md.
