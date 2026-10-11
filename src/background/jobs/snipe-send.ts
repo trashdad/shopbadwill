@@ -11,10 +11,11 @@
 //   request MAY have left. Make ONE proof read on lane `snipe`
 //   (`api.itemDetail`):
 //   - our bid present (`isHighBidder === true`) → result accepted, never resend;
-//   - provably nothing changed (not the high bidder and zero bids on the item:
-//     if any bid had registered, `numBids` would be at least 1) AND
-//     `serverNow()` shows at least `PROOF_RESEND_MIN_TIME_LEFT_MS` (2 s) before
-//     the end → resend ONCE, same amount, same key;
+//   - provably nothing changed (not the high bidder, zero bids, and no bid in
+//     the history: a visible bid means one registered, so a zero count beside
+//     it is not proof) AND `serverNow()` shows at least
+//     `PROOF_RESEND_MIN_TIME_LEFT_MS` (2 s) before the end → resend ONCE, the
+//     same max, the same key;
 //   - under 2 s left, or the read failed or is inconclusive → no resend,
 //     ambiguous. NEVER not-sent on this path.
 // - R3. Once any request of the attempt MAY have left, the strategy never
@@ -23,15 +24,15 @@
 //   first request is still unaccounted for).
 // - R4. At most TWO PlaceBid wire sends per attempt. The second only after a
 //   `BidNotSentError` first, or a no-change proof read with ≥ 2 s left. Both
-//   sends carry exactly `req.amount` (`snipe.maxBid`) and the same
-//   `idempotencyKey`, so exposure never exceeds the max.
+//   sends carry exactly `snipe.maxBid` and the same `idempotencyKey`. A request
+//   whose amount is not that max sends nothing.
 // - R6. Any resolved reply, including `rejected-unknown`, is a `result`; the
 //   classifier handles it. It is never a reason to resend.
 //
 // Worker death between persist and send (R5) is the runner's own path: the
 // restart finds `sent {key}` stored with no reply, marks the attempt ambiguous
 // and settles it through the outcome read, without calling this strategy.
-import { bidMayHaveBeenSent } from '../../adapters/sgw/bid';
+import { BidNotSentError, bidMayHaveBeenSent } from '../../adapters/sgw/bid';
 import { isoMs } from '../../domain/snipe/preflight';
 import type { BidResult, ItemDetail } from '../../domain/types';
 import type { BackgroundContext } from '../context';
@@ -51,7 +52,7 @@ const SNIPE_LANE = 'snipe' as const;
 
 function placeBid(req: SendRequest, deps: SendDeps): Promise<BidResult> {
   return deps.api.placeBid(
-    { itemId: req.snipe.itemId, sellerId: req.sellerId, bidAmount: req.amount, quantity: 1 },
+    { itemId: req.snipe.itemId, sellerId: req.sellerId, bidAmount: req.snipe.maxBid, quantity: 1 },
     { idempotencyKey: req.idempotencyKey, timeoutMs: req.timeoutMs },
   );
 }
@@ -62,12 +63,14 @@ function bidPresent(detail: ItemDetail): boolean {
 }
 
 /**
- * The proof read proves nothing of ours registered: with zero bids on the item
- * no bid of anyone's (ours included) has landed, so both the price and the bid
- * count are unchanged from before the send. `isHighBidder !== true` per R2.
+ * The proof read proves nothing registered. `numBids` is SGW's `numberOfBids`,
+ * which counts every bid, including ones later retracted (those are dropped
+ * from `bidHistory`). A truthful zero therefore cannot sit beside a visible
+ * bid. A history row means some bid registered, so the zero is not proof and
+ * the read is inconclusive. `isHighBidder !== true` per the accepted C2 subset.
  */
 function nothingChanged(detail: ItemDetail): boolean {
-  return detail.isHighBidder !== true && detail.numBids === 0;
+  return detail.isHighBidder !== true && detail.numBids === 0 && detail.bidHistory.length === 0;
 }
 
 /**
@@ -91,7 +94,10 @@ function acceptedFromProof(detail: ItemDetail, deps: SendDeps): BidResult {
 async function resolveAmbiguous(req: SendRequest, deps: SendDeps, error: unknown): Promise<SendOutcome> {
   let detail: ItemDetail;
   try {
-    detail = await deps.api.itemDetail(req.snipe.itemId, SNIPE_LANE);
+    // Lane `snipe` is the fresh authenticated read (it bypasses the detail
+    // cache and carries the bearer). maxAgeMs 0 is the same rule for any
+    // other lane: a stored detail must not decide a resend.
+    detail = await deps.api.itemDetail(req.snipe.itemId, SNIPE_LANE, { maxAgeMs: 0 });
   } catch {
     // The read failed: no resend, and never a not-sent claim (R3).
     return { kind: 'ambiguous', error };
@@ -112,10 +118,18 @@ async function resolveAmbiguous(req: SendRequest, deps: SendDeps, error: unknown
 
 /**
  * The idempotent send (T-101). One PlaceBid, plus exactly one retry under
- * R1's or R2's proof; every send carries `req.amount` and `req.idempotencyKey`.
+ * R1's or R2's proof; every send carries `snipe.maxBid` and `req.idempotencyKey`.
  */
 export const IDEMPOTENT_SEND_STRATEGY: SendStrategy = {
   async send(req, deps) {
+    // The wire amount is the snipe max. A request that names another amount
+    // is damaged: send nothing rather than bid it.
+    if (req.amount !== req.snipe.maxBid) {
+      return {
+        kind: 'not-sent',
+        error: new BidNotSentError('schema', 'placeBid: amount is not snipe.maxBid; nothing was sent'),
+      };
+    }
     const endMs = isoMs(req.snipe.endTime);
     try {
       return { kind: 'result', result: await placeBid(req, deps) };

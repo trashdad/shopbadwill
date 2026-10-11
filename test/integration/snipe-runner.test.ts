@@ -1116,7 +1116,9 @@ describe('money safety carries', () => {
     shared.http.on(MODAL_URL, { status: 500, latencyMs: LATENCY });
     await runTo(shared, END + 10 * MIN);
     expect(shared.sgw.placeBids).toHaveLength(0);
-    // The default strategy does not retry: one modal read, and no PlaceBid byte.
+    // ShowBidModal's 500 is a BidNotSentError, so the idempotent strategy retries
+    // once. That 500 puts the snipe lane in backoff, and the retry's ShowBidModal
+    // is refused before a request is built. One modal read on the wire, no PlaceBid.
     expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(1);
     expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
     const s = stored(shared);

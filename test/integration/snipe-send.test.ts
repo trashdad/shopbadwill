@@ -26,29 +26,37 @@ import { BidNotSentError } from '../../src/adapters/sgw/bid';
 import type { BackgroundContext, BackgroundModule, RuntimePort } from '../../src/background/context';
 import { HANDLER_MODULES } from '../../src/background/handlers/index';
 import { JOB_MODULES } from '../../src/background/jobs/index';
-import { IDEMPOTENT_SEND_STRATEGY, PROOF_RESEND_MIN_TIME_LEFT_MS } from '../../src/background/jobs/snipe-send';
+import { IDEMPOTENT_SEND_STRATEGY, PROOF_RESEND_MIN_TIME_LEFT_MS, register } from '../../src/background/jobs/snipe-send';
 import {
   DEFAULT_SEND_STRATEGY,
   MIN_TIME_LEFT_TO_SEND_MS,
   snipeSeams,
   type SendOutcome,
   type SendRequest,
+  type SendStrategy,
 } from '../../src/background/jobs/snipe-runner';
+import { SgwApiAdapter } from '../../src/adapters/sgw/api-adapter';
+import { SgwClockAdapter } from '../../src/adapters/sgw/clock-adapter';
+import { SGW_API_BASE } from '../../src/adapters/sgw/config';
+import { SgwRequestScheduler } from '../../src/adapters/sgw/request-scheduler';
 import { startBackground, type BackgroundBrowser, type BackgroundHandle } from '../../src/background/main';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Snipe } from '../../src/domain/snipe/types';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
-import { BidResultSchema, type Cents, type ItemDetail } from '../../src/domain/types';
+import { BidResultSchema, type Cents, type ItemDetail, type Lane, type LaneConfig } from '../../src/domain/types';
 import { HttpNetworkError, HttpTimeoutError, SgwApiError } from '../../src/ports/errors';
 import type { KeepAlive } from '../../src/ports/keep-alive';
 import type { SgwApi } from '../../src/ports/sgw-api';
+import { loadFixture } from '../contract/sgw/fixtures';
 import { FakeAlarms } from '../fakes/ports/fake-alarms';
+import { FakeAuditLog } from '../fakes/ports/fake-audit-log';
 import { FakeClock } from '../fakes/ports/fake-clock';
 import { FakeHttp } from '../fakes/ports/fake-http';
 import { FakeKeepAwake } from '../fakes/ports/fake-keepawake';
 import { FakeNotifier } from '../fakes/ports/fake-notifier';
 import { FakePermissions } from '../fakes/ports/fake-permissions';
-import { FakeStorageAreas } from '../fakes/ports/fake-storage';
+import { FakeStorage, FakeStorageAreas } from '../fakes/ports/fake-storage';
+import { FakeSwitches } from '../fakes/ports/fake-switches';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -136,7 +144,7 @@ function makeDetail(over: Partial<ItemDetail> = {}): ItemDetail {
 // ── The scripted SgwApi ──────────────────────────────────────────────────────
 
 type PlaceKind = 'ok' | 'not-sent' | 'ambiguous' | 'paused';
-type ProofKind = 'present' | 'no-change' | 'inconclusive' | 'fails';
+type ProofKind = 'present' | 'no-change' | 'inconclusive' | 'fails' | 'history';
 
 interface WireSend {
   amount: Cents;
@@ -162,10 +170,17 @@ const REJECTED_UNKNOWN = {
   observedAt: T0,
 };
 
-function scriptedApi(script: Script, log: string[], sends: WireSend[], clock: FakeClock): SgwApi {
+function scriptedApi(
+  script: Script,
+  log: string[],
+  sends: WireSend[],
+  clock: FakeClock,
+  proofOpts: Array<{ maxAgeMs?: number } | undefined> = [],
+): SgwApi {
   const api = {
-    itemDetail(itemId: number, lane: string): Promise<ItemDetail> {
+    itemDetail(itemId: number, lane: string, opts?: { maxAgeMs?: number }): Promise<ItemDetail> {
       log.push('itemDetail');
+      proofOpts.push(opts);
       expect(itemId).toBe(ITEM);
       expect(lane).toBe('snipe');
       if (script.proof === 'fails') return Promise.reject(new HttpNetworkError('SGW unreachable'));
@@ -174,7 +189,15 @@ function scriptedApi(script: Script, log: string[], sends: WireSend[], clock: Fa
           ? makeDetail({ isHighBidder: true, numBids: 1 })
           : script.proof === 'no-change'
             ? makeDetail({ isHighBidder: false, numBids: 0 })
-            : makeDetail({ isHighBidder: false, numBids: 3 });
+            : script.proof === 'history'
+              ? makeDetail({
+                  isHighBidder: false,
+                  numBids: 0,
+                  bidHistory: [
+                    { amount: 1000, time: new Date(T0).toISOString(), timeRaw: '2026-10-10T08:00:00', bidderMasked: 'b****r' },
+                  ],
+                })
+              : makeDetail({ isHighBidder: false, numBids: 3 });
       return Promise.resolve(detail);
     },
     placeBid(
@@ -353,7 +376,8 @@ describe('T-101 brief', () => {
     const clock = new FakeClock(T0);
     const log: string[] = [];
     const sends: WireSend[] = [];
-    const api = scriptedApi({ place: ['ambiguous', 'ok'], proof: 'no-change' }, log, sends, clock);
+    const proofOpts: Array<{ maxAgeMs?: number } | undefined> = [];
+    const api = scriptedApi({ place: ['ambiguous', 'ok'], proof: 'no-change' }, log, sends, clock, proofOpts);
     const deps = makeDeps(api, clock, () => END - PROOF_RESEND_MIN_TIME_LEFT_MS);
 
     const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), deps);
@@ -366,6 +390,8 @@ describe('T-101 brief', () => {
     // The second wire send came only after the proof read.
     expect(log.indexOf('itemDetail')).toBeGreaterThan(-1);
     expect(log.indexOf('itemDetail')).toBeLessThan(log.lastIndexOf('placeBid'));
+    // Fresh: the caller forbids a cached detail. Lane snipe is asserted in the script.
+    expect(proofOpts).toEqual([{ maxAgeMs: 0 }]);
   });
 
   it('with 1 s left → no resend, ambiguous (the runner resolves it as network / Unconfirmed)', async () => {
@@ -552,6 +578,207 @@ describe('T-101 rulings', () => {
   it('R0: the module registers itself through the jobs glob', () => {
     expect(Object.keys(JOB_MODULES)).toContain('./snipe-send.ts');
   });
+
+  it('R0: register(ctx) installs this strategy on the runner seams', () => {
+    const ctx = {} as BackgroundContext;
+    const seams = snipeSeams(ctx);
+    let installed: SendStrategy | undefined;
+    const real = seams.setSendStrategy.bind(seams);
+    seams.setSendStrategy = (s) => {
+      installed = s;
+      real(s);
+    };
+    register(ctx);
+    expect(installed).toBe(IDEMPOTENT_SEND_STRATEGY);
+  });
+
+  it('refuses the send when amount is not snipe.maxBid: nothing is placed', async () => {
+    const clock = new FakeClock(T0);
+    const sends: WireSend[] = [];
+    const api = scriptedApi({ place: ['ok'], proof: 'fails' }, [], sends, clock);
+    const deps = makeDeps(api, clock, () => END - 10 * SEC);
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest({ amount: MAX + 50 }), deps);
+
+    expect(outcome.kind).toBe('not-sent');
+    expect(sends).toHaveLength(0);
+  });
+
+  it('R1: the 1.5 s check reads serverNow() after the first send returns, not a value captured before it', async () => {
+    const clock = new FakeClock(END - 10 * SEC); // local clock still has 10 s; the decision must not use it
+    let left = 10 * SEC;
+    let calls = 0;
+    const api = {
+      itemDetail: () => Promise.reject(new Error('a provably unsent bid has no proof read')),
+      placeBid: () => {
+        calls += 1;
+        // The first attempt is over. Server time has moved inside the 1.5 s floor.
+        left = MIN_TIME_LEFT_TO_SEND_MS - 1;
+        return Promise.reject(new BidNotSentError('network', 'placeBid: nothing was sent'));
+      },
+    } as unknown as SgwApi;
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), makeDeps(api, clock, () => END - left));
+
+    expect(outcome.kind).toBe('not-sent');
+    expect(calls).toBe(1);
+  });
+
+  it('R2: the 2 s check reads serverNow() after the proof read, immediately before a resend', async () => {
+    const clock = new FakeClock(T0); // two hours on the local clock
+    let left = 10 * SEC;
+    let calls = 0;
+    const api = {
+      itemDetail: () => {
+        left = PROOF_RESEND_MIN_TIME_LEFT_MS - 1;
+        return Promise.resolve(makeDetail({ isHighBidder: false, numBids: 0, bidHistory: [] }));
+      },
+      placeBid: () => {
+        calls += 1;
+        if (calls === 1) return Promise.reject(new HttpTimeoutError(1000));
+        return Promise.resolve({ ...REJECTED_UNKNOWN, observedAt: clock.now() });
+      },
+    } as unknown as SgwApi;
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), makeDeps(api, clock, () => END - left));
+
+    expect(outcome.kind).toBe('ambiguous');
+    expect(calls).toBe(1);
+  });
+
+  it('R2: numBids 0 beside a visible bid is not "nothing changed": no resend', async () => {
+    const clock = new FakeClock(T0);
+    const log: string[] = [];
+    const sends: WireSend[] = [];
+    const proofOpts: Array<{ maxAgeMs?: number } | undefined> = [];
+    const api = scriptedApi({ place: ['ambiguous', 'ok'], proof: 'history' }, log, sends, clock, proofOpts);
+    const deps = makeDeps(api, clock, () => END - 10 * SEC);
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), deps);
+
+    expect(outcome.kind).toBe('ambiguous');
+    expect(sends).toHaveLength(1);
+    expect(log.filter((x) => x === 'itemDetail')).toHaveLength(1);
+    expect(proofOpts).toEqual([{ maxAgeMs: 0 }]);
+  });
+
+  it('R2: isHighBidder true is present even when numBids is 0: accepted, no resend', async () => {
+    const clock = new FakeClock(T0);
+    let calls = 0;
+    const api = {
+      itemDetail: () => Promise.resolve(makeDetail({ isHighBidder: true, numBids: 0, bidHistory: [] })),
+      placeBid: () => {
+        calls += 1;
+        return Promise.reject(new HttpTimeoutError(1000));
+      },
+    } as unknown as SgwApi;
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), makeDeps(api, clock, () => END - 10 * SEC));
+
+    expect(outcome).toMatchObject({ kind: 'result', result: { kind: 'accepted', isHighBidder: true } });
+    expect(calls).toBe(1);
+  });
+});
+
+// ── The proof read goes through the real adapter (cache, bearer, write gate) ─
+
+const API_BASE = SGW_API_BASE;
+const ZERO_GAP: LaneConfig = { minIntervalMs: 0, jitterMs: 0, maxConcurrent: 1, dailyBudget: 1000 };
+const FAST_LANES: Record<Lane, LaneConfig> = {
+  interactive: ZERO_GAP,
+  background: ZERO_GAP,
+  snipe: ZERO_GAP,
+  canary: ZERO_GAP,
+};
+
+function rawDetail(over: { numberOfBids: number; high: boolean; clearBids: boolean }): Record<string, unknown> {
+  const raw = loadFixture<Record<string, unknown> & { bidHistory: Record<string, unknown> }>('item-detail-open');
+  raw.itemId = ITEM;
+  raw.sellerId = SELLER;
+  raw.numberOfBids = over.numberOfBids;
+  raw.bidHistory.isHighBidderLogIn = over.high;
+  raw.bidHistory.auctionClosed = false;
+  raw.isItemEndTimeExpire = false;
+  if (over.clearBids) raw.bidHistory.bidComplete = [];
+  return raw;
+}
+
+const httpJson = (body: unknown): { status: number; bodyText: string } => ({ status: 200, bodyText: JSON.stringify(body) });
+
+/** The real SgwApiAdapter over FakeHttp. Lane gaps are zero so the fake clock does not have to move. */
+function realStack(): { api: SgwApiAdapter; http: FakeHttp; clock: FakeClock; kill: () => void } {
+  const clock = new FakeClock(T0);
+  const http = new FakeHttp(clock);
+  const switches = new FakeSwitches();
+  let killed = false;
+  const api = new SgwApiAdapter({
+    scheduler: new SgwRequestScheduler({ clock, http, storage: new FakeStorage(), random: () => 0, lanes: FAST_LANES }),
+    clock,
+    session: {
+      current: () => Promise.resolve({ bearer: 'aaaa.bbbb.cccc', expiresAt: T0 + 30 * DAY, buyerId: '42' }),
+      reportRejected: () => Promise.resolve(),
+    },
+    switches,
+    writesAllowedNow: () => (killed ? { ok: false, why: 'kill switch' } : { ok: true }),
+    audit: new FakeAuditLog(clock),
+    health: { flagSchemaFailure: () => undefined, onSchemaOk: () => undefined },
+    sgwClock: new SgwClockAdapter(clock),
+  });
+  return {
+    api,
+    http,
+    clock,
+    kill: () => {
+      killed = true;
+      switches.killAll('kill switch');
+    },
+  };
+}
+
+describe('the proof read on the real adapter', () => {
+  it('is a fresh authenticated snipe-lane read: a cached anonymous zero-bid detail cannot cause a resend', async () => {
+    const live = realStack();
+    live.http.on(`${API_BASE}ItemDetail/`, httpJson(rawDetail({ numberOfBids: 0, high: false, clearBids: true })));
+    const cached = await live.api.itemDetail(ITEM, 'interactive');
+    expect(cached).toMatchObject({ numBids: 0, isHighBidder: null });
+
+    live.http.on(`${API_BASE}ItemDetail/`, httpJson(rawDetail({ numberOfBids: 1, high: true, clearBids: false })));
+    let placeCalls = 0;
+    const api = {
+      itemDetail: (itemId: number, lane: Lane, opts?: { maxAgeMs?: number }) => live.api.itemDetail(itemId, lane, opts),
+      placeBid: () => {
+        placeCalls += 1;
+        return Promise.reject(new HttpTimeoutError(1000));
+      },
+    } as unknown as SgwApi;
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), makeDeps(api, live.clock, () => END - 5 * SEC));
+
+    expect(outcome).toMatchObject({ kind: 'result', result: { kind: 'accepted', isHighBidder: true } });
+    expect(placeCalls).toBe(1);
+    const details = live.http.requests.filter((r) => r.url.includes('ItemDetail/'));
+    expect(details).toHaveLength(2);
+    expect(details[0]?.headers?.Authorization).toBeUndefined();
+    expect(details[1]?.headers?.Authorization).toBe('Bearer aaaa.bbbb.cccc');
+  });
+
+  it('a kill between an ambiguous send and the resend: the write gate throws before any byte, result ambiguous', async () => {
+    const live = realStack();
+    live.http.on(`${API_BASE}ItemBid/ShowBidModal`, httpJson({ sellerId: SELLER, minimumBid: 11 }));
+    live.http.on(`${API_BASE}ItemBid/PlaceBid`, { error: new HttpTimeoutError(20_000) });
+    live.http.on(`${API_BASE}ItemDetail/`, () => {
+      live.kill();
+      return httpJson(rawDetail({ numberOfBids: 0, high: false, clearBids: true }));
+    });
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), makeDeps(live.api, live.clock, () => END - 5 * SEC));
+
+    expect(outcome.kind).toBe('ambiguous');
+    const urls = live.http.requests.map((r) => r.url);
+    expect(urls.filter((u) => u.includes('ItemBid/PlaceBid'))).toHaveLength(1);
+    expect(urls.filter((u) => u.includes('ItemBid/ShowBidModal'))).toHaveLength(1);
+    expect(urls.filter((u) => u.includes('ItemDetail/'))).toHaveLength(1);
+  });
 });
 
 // ── R4: the invariant as a property ──────────────────────────────────────────
@@ -577,7 +804,7 @@ interface PropScript {
 
 const arbScript: fc.Arbitrary<PropScript> = fc.record({
   first: fc.constantFrom<PlaceKind>('ok', 'not-sent', 'ambiguous'),
-  proof: fc.constantFrom<ProofKind>('present', 'no-change', 'inconclusive', 'fails'),
+  proof: fc.constantFrom<ProofKind>('present', 'no-change', 'inconclusive', 'fails', 'history'),
   retry: fc.constantFrom<PlaceKind>('ok', 'not-sent', 'ambiguous'),
   timeLeftMs: fc.integer({ min: 0, max: 4000 }),
   maxBid: fc.integer({ min: 100, max: 5000 }),
@@ -613,13 +840,18 @@ describe('R4: the idempotent-send invariant as a property', () => {
         const sends: WireSend[] = [];
         const api = scriptedApi({ place: [script.first, script.retry], proof: script.proof }, log, sends, clock);
         const deps = makeDeps(api, clock, () => END - script.timeLeftMs);
-        const req = makeRequest({ amount: script.maxBid, idempotencyKey: script.key });
+        const req = makeRequest({
+          amount: script.maxBid,
+          idempotencyKey: script.key,
+          snipe: sentSnipe({ maxBid: script.maxBid }),
+        });
 
         const outcome = await IDEMPOTENT_SEND_STRATEGY.send(req, deps);
 
         // The invariant: at most two wire sends, each exactly the max and the key.
         expect(sends.length).toBeLessThanOrEqual(2);
         for (const send of sends) {
+          expect(send.amount).toBe(req.snipe.maxBid);
           expect(send.amount).toBe(script.maxBid);
           expect(send.key).toBe(script.key);
           expect(send.timeoutMs).toBe(req.timeoutMs);
