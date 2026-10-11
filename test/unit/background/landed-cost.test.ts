@@ -223,6 +223,17 @@ describe('landedCost.get handler', () => {
     expect(quoteCalls()).toHaveLength(MAX_QUOTE_REQUESTS_PER_PAGE_VIEW); // nothing new was sent
   });
 
+  it('allows exactly 40 spread over several messages (each request counted once); the 41st is refused', async () => {
+    for (let id = 1; id <= 41; id++) seedQuote(id);
+    for (let first = 1; first <= 40; first += 10) {
+      const ids = Array.from({ length: 10 }, (_, i) => first + i);
+      expect(Object.values(await get(ids)).every((q) => q !== null)).toBe(true);
+    }
+    expect(quoteCalls()).toHaveLength(40);
+    await expect(handlers.get([41], { sender: CONTENT, senderClass: 'content' })).rejects.toMatchObject({ kind: 'budget' });
+    expect(quoteCalls()).toHaveLength(40);
+  });
+
   it('refuses a whole message when it would need more than the page-view remainder, sending nothing', async () => {
     for (let id = 1; id <= 26; id++) seedQuote(id);
     await get(Array.from({ length: 26 }, (_, i) => i + 1));
@@ -849,6 +860,8 @@ describe('landed-cost badge', () => {
     });
     // 10 + 20 + 30 cents. Summing the dollar amounts 0.10 + 0.20 + 0.30 is not 0.60 in binary floating point.
     expect(badgeLine({ shipping: 20, handling: 30, pickup: false }, 10)?.text).toBe('Landed $0.60');
+    // (29.99 + 8.99 + 0.57) * 100 is 3954.9999999999995 in floating point: a dollar sum that truncates shows $39.54.
+    expect(badgeLine({ shipping: 899, handling: 57, pickup: false }, 2999)?.text).toBe('Landed $39.55');
     expect(badgeLine(null, 1299)).toBeNull();
     expect(JSON.stringify(badgeLine({ shipping: 20, handling: 30, pickup: false }, 10))).not.toContain(ZIP);
   });
