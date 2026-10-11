@@ -42,6 +42,9 @@ const TOKEN_FIXTURES: [token: string, code: string][] = [
   ['__scenario', 'const s = state.__scenario;'],
   ['sbw:test', 'port.onMessage("sbw:test:state", h);'],
   ['sgw.test', 'const host = "sgw.test";'],
+  // T-39: the base-URL hook's fetch wrapper, which carries no `sbw:test` string
+  // when it is bundled without the hook endpoint.
+  ['sbw.test', 'var m = Symbol.for(`sbw.testHooks.baseUrl.fetch`);'],
   ['innerHTML', 'el.innerHTML = userText;'],
   ['eval(', 'eval("1+1");'],
   ['new Function', 'const f = new Function("return 1");'],
