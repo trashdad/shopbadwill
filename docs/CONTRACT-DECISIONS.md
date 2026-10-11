@@ -608,9 +608,25 @@ Approved by the controller (T-57 rulings R1, R2) and made in `task/T-57`.
 
 **Change** (`src/domain/storage/schema.ts`, plus the Repo default in `src/domain/storage/repo.ts`): one new optional key `STORAGE_KEYS.quoteCache = 'sbw:quoteCache'` (area `local`), `record(ItemId, { shipping, handling, zip-hash, fetchedAt })`.
 
-- `zip-hash` is the SHA-256 hex of the home ZIP: the ZIP itself is never stored, and a ZIP change misses the cache.
+- `zip-hash` is the HMAC-SHA-256 hex of the home ZIP under the per-install salt `sbw:quoteSalt` (below): the ZIP itself is never stored, and a ZIP change misses the cache.
 - The 24 h TTL runs from `fetchedAt` (readers compute it; the record has no `expiresAt`).
 - Additive and optional, so `schemaVersion` stays 1 and there is no migration. An invalid record parses to empty (the Repo default `{}` after quarantine).
 - The entry schema is module-private (`QuoteCacheEntrySchema`), like `SgwSessionRejectionSchema`, so the locked example list is unchanged; `test/contract/types/storage.test.ts` pins the new key, its area and a sample value.
 
-**Follow-up for the next PLAN edit.** Add `sbw:quoteCache` to PLAN §2.3 and the new reply shape to §3.12 and contracts.md.
+### `sbw:quoteSalt`: the per-install key for `zip-hash` (T-57 final check)
+
+Source: T-57 final check (Opus). The controller's check asked for a salted or keyed hash, kept in local storage, with any new key optional and additive.
+
+A plain SHA-256 of a 5-digit ZIP is reversible: there are only 100 000 ZIPs, so a table of every hash recovers the ZIP from the cache. The hash is now keyed.
+
+**Change** (`src/domain/storage/schema.ts`): one new optional key `STORAGE_KEYS.quoteSalt = 'sbw:quoteSalt'` (area `local`). The value is 32 random bytes as lowercase hex (`/^[0-9a-f]{64}$/`). The schema is module-private, so the locked example list is unchanged.
+
+- `zip-hash` = HMAC-SHA-256(key = the salt, message = the trimmed ZIP), as hex. The handler and the `quote` step share the helper (`zipHashFor` in `src/background/handlers/landed-cost.ts`), so they read each other's entries.
+- The salt is made on the first quote, under the key's Repo lock, so concurrent first uses agree on one salt. No salt is made while the feature is off, the kill switch is on, or the ZIP is invalid.
+- An invalid record is quarantined by the Repo and a fresh salt is made. The old cache entries then miss and expire within 24 h.
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration.
+- **Limit.** The salt and the cache live in the same `storage.local`. The salt defeats a precomputed table and links nothing across installs. It does not stop someone who can read this profile's storage, but they can also read `settings.homeZip` there.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, its area, a sample value, rejected values) and `test/unit/background/landed-cost.test.ts` ("ZIP hash privacy: a per-install salt").
+
+**Follow-up for the next PLAN edit.** Add `sbw:quoteCache` and `sbw:quoteSalt` to PLAN §2.3 and the new reply shape to §3.12 and contracts.md.

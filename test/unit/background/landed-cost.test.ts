@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { Window } from 'happy-dom';
 import { h, render } from 'preact';
 import { act } from 'preact/test-utils';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { BackgroundContext } from '../../../src/background/context';
 import {
@@ -22,6 +22,8 @@ import {
   isValidZip,
   MAX_QUOTE_REQUESTS_PER_PAGE_VIEW,
   QUOTE_CACHE_TTL_MS,
+  quoteSalt,
+  register,
   type LandedCostHandlers,
 } from '../../../src/background/handlers/landed-cost';
 import quoteExecutor, { executeQuoteStep } from '../../../src/background/jobs/steps/quote';
@@ -31,7 +33,7 @@ import { defaultSettings } from '../../../src/domain/settings/defaults';
 import type { Settings } from '../../../src/domain/settings/schema';
 import { Repo } from '../../../src/domain/storage/repo';
 import { STORAGE_KEYS, type QuoteCacheEntry } from '../../../src/domain/storage/schema';
-import type { ItemId, Listing } from '../../../src/domain/types';
+import type { ItemId, Lane, Listing, RequestSchedulerStats } from '../../../src/domain/types';
 import type { JobRun, JobStep } from '../../../src/domain/watches/schema';
 import type { LandedCostQuote } from '../../../src/messaging/protocol';
 import { SgwApiError } from '../../../src/ports/errors';
@@ -92,6 +94,19 @@ const seedQuote = (id: ItemId, zip: string = ZIP, shipping = 500, handling = 100
 };
 const cache = (): Promise<Record<ItemId, QuoteCacheEntry>> => repo.get(STORAGE_KEYS.quoteCache);
 const env = (type: string, payload: unknown, reqId = `r-${type}`): Record<string, unknown> => ({ v: 1, reqId, type, payload });
+
+/** The keyed ZIP hash under this install's stored salt (`sbw:quoteSalt`). */
+const storedZipHash = async (zip: string, r: Repo = repo): Promise<string> => {
+  const salt = await r.find(STORAGE_KEYS.quoteSalt);
+  if (salt === undefined) throw new Error('no quote salt stored yet');
+  return hashZip(zip, salt);
+};
+
+/** Unkeyed SHA-256 hex: what anyone can tabulate for all 100 000 five-digit ZIPs. */
+const plainSha256 = async (text: string): Promise<string> => {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+};
 
 beforeEach(async () => {
   clock = new FakeClock(T0);
@@ -172,7 +187,7 @@ describe('landedCost.get handler', () => {
     expect(stored[1]).toEqual({
       shipping: 500,
       handling: 100,
-      'zip-hash': await hashZip(ZIP),
+      'zip-hash': await storedZipHash(ZIP),
       fetchedAt: T0,
     });
     expect(JSON.stringify(stored)).not.toContain(ZIP);
@@ -194,7 +209,7 @@ describe('landedCost.get handler', () => {
     expect(await get([1])).toEqual({ 1: { shipping: 900, handling: 25, pickup: false } });
     expect(quoteCalls()).toHaveLength(2);
     const stored = await cache();
-    expect(stored[1]).toMatchObject({ 'zip-hash': await hashZip(ZIP2) });
+    expect(stored[1]).toMatchObject({ 'zip-hash': await storedZipHash(ZIP2) });
     expect(JSON.stringify(stored)).not.toContain(ZIP2);
   });
 
@@ -383,6 +398,290 @@ describe('landedCost.get handler', () => {
   });
 });
 
+const contentGet = async (ids: ItemId[], sender: RouterSender = CONTENT, via: Router = router): Promise<QuoteReply> => {
+  const r = await via.handle(env('landedCost.get', { itemIds: ids }), sender);
+  if (!r.ok) throw new Error(JSON.stringify(r));
+  return r.reply as QuoteReply;
+};
+const tabSender = (tab: number, url: string = URL_A): RouterSender => ({ id: EXT_ID, url, tab: { id: tab } });
+
+const stepRun = (id: string): JobRun => ({
+  id,
+  trigger: 'scheduled',
+  startedAt: T0,
+  status: 'running',
+  steps: [],
+  cursor: 0,
+  results: { newMatches: [], favorited: [], calendarUpserts: [], errors: [] },
+  candidates: [],
+});
+
+describe('ZIP hash privacy: a per-install salt (sbw:quoteSalt)', () => {
+  it('stores a keyed hash, not the plain SHA-256 of the ZIP, so a table of 5-digit ZIPs cannot reverse it', async () => {
+    seedQuote(1);
+    await contentGet([1]);
+    const salt = await repo.find(STORAGE_KEYS.quoteSalt);
+    expect(salt).toMatch(/^[0-9a-f]{64}$/);
+    expect(salt).not.toContain(ZIP);
+    const stored = (await cache())[1];
+    expect(stored?.['zip-hash']).toMatch(/^[0-9a-f]{64}$/);
+    expect(stored?.['zip-hash']).not.toBe(await plainSha256(ZIP));
+    expect(stored?.['zip-hash']).toBe(await hashZip(ZIP, salt ?? ''));
+  });
+
+  it('two installs with the same ZIP store different hashes', async () => {
+    seedQuote(1);
+    await contentGet([1]);
+    const otherRepo = new Repo(new FakeStorageAreas(), clock);
+    const s = defaultSettings();
+    s.features.landedCost = true;
+    s.homeZip = ZIP;
+    await otherRepo.set(STORAGE_KEYS.settings, s);
+    const other = createLandedCostHandlers({ api, repo: otherRepo, clock, pages: { findItem: () => undefined } });
+    await other.get([1], { sender: tabSender(9), senderClass: 'content' });
+    const mine = (await cache())[1]?.['zip-hash'];
+    const theirs = (await otherRepo.get(STORAGE_KEYS.quoteCache))[1]?.['zip-hash'];
+    expect(mine).toMatch(/^[0-9a-f]{64}$/);
+    expect(theirs).toMatch(/^[0-9a-f]{64}$/);
+    expect(theirs).not.toBe(mine);
+  });
+
+  it('creates the salt once: concurrent first use and the quote step share it', async () => {
+    seedQuote(1);
+    seedQuote(2);
+    await Promise.all([contentGet([1], tabSender(1)), contentGet([2], tabSender(2))]);
+    const stored = await cache();
+    expect(stored[1]?.['zip-hash']).toBe(stored[2]?.['zip-hash']);
+    const salt = await repo.find(STORAGE_KEYS.quoteSalt);
+    expect(await quoteSalt(repo)).toBe(salt);
+    // The quote step reads the handler's entry: same salt, same hash, no request.
+    const deps = {
+      api,
+      repo,
+      audit: createAuditLog(repo),
+      switches: new FakeSwitches(),
+      lane: 'background' as Lane,
+      run: stepRun('run-s'),
+      ctx: {} as unknown as BackgroundContext,
+    };
+    expect(await executeQuoteStep({ kind: 'quote', itemId: 1 }, deps)).toEqual({ kind: 'quote', quote: { shipping: 500, handling: 100 } });
+    expect(quoteCalls()).toHaveLength(2);
+  });
+
+  it('an invalid stored salt is replaced by a fresh one; the old entries miss and a real quote is fetched', async () => {
+    seedQuote(1);
+    await contentGet([1]);
+    const before = await repo.find(STORAGE_KEYS.quoteSalt);
+    await repo.setRaw(STORAGE_KEYS.quoteSalt, `zip ${ZIP}`);
+    expect(await contentGet([1])).toEqual({ 1: { shipping: 500, handling: 100, pickup: false } });
+    expect(quoteCalls()).toHaveLength(2);
+    const after = await repo.find(STORAGE_KEYS.quoteSalt);
+    expect(after).toMatch(/^[0-9a-f]{64}$/);
+    expect(after).not.toBe(before);
+    expect((await cache())[1]?.['zip-hash']).toBe(await hashZip(ZIP, after ?? ''));
+  });
+
+  it('makes no salt while the feature is off', async () => {
+    await setSettings({ landedCost: false, homeZip: ZIP });
+    await contentGet([1]);
+    expect(await repo.getRaw(STORAGE_KEYS.quoteSalt)).toBeUndefined();
+  });
+});
+
+describe('page-view budget memory', () => {
+  it('a tab that moves to a new URL forgets its old page view', async () => {
+    for (let i = 1; i <= 50; i++) {
+      seedQuote(i);
+      await contentGet([i], tabSender(3, `${URL_A}&p=${String(i)}`));
+    }
+    expect(handlers.pageViewsTracked()).toBe(1);
+  });
+
+  it('keeps at most 20 page views across tabs: closed tabs fall off, oldest first', async () => {
+    for (let tab = 1; tab <= 100; tab++) {
+      seedQuote(tab);
+      await contentGet([tab], tabSender(tab));
+    }
+    expect(handlers.pageViewsTracked()).toBe(20);
+  });
+
+  it('a message that sends nothing adds no page view', async () => {
+    await setSettings({ landedCost: false, homeZip: ZIP });
+    await contentGet([1], tabSender(5));
+    expect(handlers.pageViewsTracked()).toBe(0);
+  });
+});
+
+describe('register(ctx): the live kill switch and read-gate probes', () => {
+  const laneStats = (over: Partial<RequestSchedulerStats['lanes']> = {}, paused?: RequestSchedulerStats['paused']): RequestSchedulerStats => {
+    const lane = { usedToday: 0, budget: 300, nextAllowedAt: T0 };
+    const stats: RequestSchedulerStats = {
+      lanes: {
+        interactive: { ...lane },
+        background: { ...lane, budget: 120 },
+        snipe: { ...lane, budget: 80 },
+        canary: { ...lane, budget: 4 },
+        ...over,
+      },
+      cacheHits: 0,
+    };
+    if (paused !== undefined) stats.paused = paused;
+    return stats;
+  };
+
+  const boot = (stats: () => RequestSchedulerStats, killSwitch = false): Router => {
+    const r = createRouter({
+      runtimeId: EXT_ID,
+      getURL: (p) => `chrome-extension://${EXT_ID}/${p}`,
+      isQuickFavoriteEnabled: () => false,
+      log: () => undefined,
+    });
+    const ctx = {
+      api,
+      repo,
+      clock,
+      pages: { findItem: (id: ItemId) => pages.get(id) },
+      switches: { view: () => ({ killSwitch }) },
+      scheduler: { stats },
+      router: r,
+    } as unknown as BackgroundContext;
+    register(ctx);
+    return r;
+  };
+
+  it('an open gate quotes on the interactive lane', async () => {
+    seedQuote(1);
+    expect(await contentGet([1], CONTENT, boot(() => laneStats()))).toEqual({ 1: { shipping: 500, handling: 100, pickup: false } });
+    expect(quoteArgs()).toEqual([[1, ZIP, 'interactive']]);
+  });
+
+  it('the in-memory kill switch: no request', async () => {
+    seedQuote(1);
+    expect(await contentGet([1], CONTENT, boot(() => laneStats(), true))).toEqual({ 1: null });
+    expect(quoteCalls()).toEqual([]);
+  });
+
+  it('interactive lane in backoff: no request; once the backoff has passed, it quotes', async () => {
+    seedQuote(1);
+    let backoffUntil = T0 + 60_000;
+    const r = boot(() => laneStats({ interactive: { usedToday: 0, budget: 300, nextAllowedAt: T0, backoffUntil } }));
+    expect(await contentGet([1], CONTENT, r)).toEqual({ 1: null });
+    expect(quoteCalls()).toEqual([]);
+    backoffUntil = T0;
+    expect(await contentGet([1], CONTENT, r)).toEqual({ 1: { shipping: 500, handling: 100, pickup: false } });
+    expect(quoteCalls()).toHaveLength(1);
+  });
+
+  it('a spent interactive budget, a scheduler pause, or a throwing probe: no request', async () => {
+    seedQuote(1);
+    const spent = laneStats({ interactive: { usedToday: 300, budget: 300, nextAllowedAt: T0 } });
+    const paused = laneStats({}, { until: null, reason: 'manual' });
+    const blocked: Array<() => RequestSchedulerStats> = [
+      () => spent,
+      () => paused,
+      () => {
+        throw new Error('stats unavailable');
+      },
+    ];
+    for (const stats of blocked) expect(await contentGet([1], CONTENT, boot(stats))).toEqual({ 1: null });
+    expect(quoteCalls()).toEqual([]);
+  });
+
+  it('a background-lane backoff does not block the interactive handler', async () => {
+    seedQuote(1);
+    const stats = laneStats({ background: { usedToday: 0, budget: 120, nextAllowedAt: T0, backoffUntil: T0 + 60_000 } });
+    expect(await contentGet([1], CONTENT, boot(() => stats))).toEqual({ 1: { shipping: 500, handling: 100, pickup: false } });
+  });
+
+  it('the quote step: a background-lane backoff or spent budget refuses with paused and sends nothing', async () => {
+    seedQuote(101);
+    const deps = (stats: RequestSchedulerStats): Parameters<typeof executeQuoteStep>[1] => ({
+      api,
+      repo,
+      audit: createAuditLog(repo),
+      switches: new FakeSwitches(),
+      lane: 'background',
+      run: stepRun('run-g'),
+      ctx: { scheduler: { stats: () => stats } } as unknown as BackgroundContext,
+    });
+    const backoff = laneStats({ background: { usedToday: 0, budget: 120, nextAllowedAt: T0, backoffUntil: T0 + 1 } });
+    const spent = laneStats({ background: { usedToday: 120, budget: 120, nextAllowedAt: T0 } });
+    for (const stats of [backoff, spent]) {
+      await expect(executeQuoteStep({ kind: 'quote', itemId: 101 }, deps(stats))).rejects.toMatchObject({ kind: 'paused' });
+    }
+    expect(quoteCalls()).toEqual([]);
+    // Only the background lane gates the step: an interactive backoff does not.
+    const interactiveOnly = laneStats({ interactive: { usedToday: 0, budget: 300, nextAllowedAt: T0, backoffUntil: T0 + 1 } });
+    expect(await executeQuoteStep({ kind: 'quote', itemId: 101 }, deps(interactiveOnly))).toEqual({
+      kind: 'quote',
+      quote: { shipping: 500, handling: 100 },
+    });
+  });
+});
+
+describe('homeZip never reaches a log', () => {
+  const logged: string[] = [];
+  const text = (a: unknown): string => {
+    if (a instanceof Error) return `${a.name} ${a.message} ${a.stack ?? ''} ${JSON.stringify(a)}`;
+    if (typeof a === 'string') return a;
+    try {
+      return JSON.stringify(a);
+    } catch {
+      return String(a);
+    }
+  };
+
+  beforeEach(() => {
+    logged.length = 0;
+    for (const m of ['log', 'info', 'warn', 'error', 'debug', 'trace'] as const) {
+      vi.spyOn(console, m).mockImplementation((...args: unknown[]) => {
+        logged.push(args.map(text).join(' '));
+      });
+    }
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('across a quote, a failed quote, cache hits, a page-budget refusal, a scheduler refusal and the quote step', async () => {
+    const r = createRouter({
+      runtimeId: EXT_ID,
+      getURL: (p) => `chrome-extension://${EXT_ID}/${p}`,
+      isQuickFavoriteEnabled: () => false,
+      log: (message, error) => {
+        logged.push(`${message} ${text(error)}`);
+      },
+    });
+    const h = createLandedCostHandlers({ api, repo, clock, pages: { findItem: () => undefined } });
+    r.register('landedCost.get', (payload, hctx) => h.get(payload.itemIds, hctx));
+    for (let id = 1; id <= 40; id++) seedQuote(id);
+    api.failNext('shippingQuote', 'network');
+    await contentGet(Array.from({ length: 40 }, (_, i) => i + 1), CONTENT, r);
+    await contentGet([2, 3], CONTENT, r); // cache hits
+    expect((await r.handle(env('landedCost.get', { itemIds: [41] }), CONTENT)).ok).toBe(false); // page budget
+    const realQuote = api.shippingQuote.bind(api);
+    api.shippingQuote = () => Promise.reject(new SgwApiError('budget', `lane spent for ${ZIP}`));
+    expect((await r.handle(env('landedCost.get', { itemIds: [50] }), tabSender(8))).ok).toBe(false);
+    api.shippingQuote = () => Promise.reject(new SgwApiError('network', `no route to ${ZIP}`));
+    expect(await contentGet([51], tabSender(10), r)).toEqual({ 51: null });
+    const deps = {
+      api,
+      repo,
+      audit: createAuditLog(repo),
+      switches: new FakeSwitches(),
+      lane: 'background' as Lane,
+      run: stepRun('run-l'),
+      ctx: {} as unknown as BackgroundContext,
+    };
+    await executeQuoteStep({ kind: 'quote', itemId: 77 }, deps).catch(() => undefined);
+    api.shippingQuote = realQuote;
+    seedQuote(78);
+    await executeQuoteStep({ kind: 'quote', itemId: 78 }, deps);
+    expect(logged.some((line) => line.includes('landedCost.get'))).toBe(true); // the router did log the refusals
+    for (const line of logged) expect(line).not.toContain(ZIP);
+  });
+});
+
 describe('quote step executor', () => {
   const step: JobStep = { kind: 'quote', itemId: 101 };
   const run: JobRun = {
@@ -430,7 +729,7 @@ describe('quote step executor', () => {
     seedQuote(101);
     expect(await executeQuoteStep(step, deps())).toEqual({ kind: 'quote', quote: { shipping: 500, handling: 100 } });
     expect(quoteArgs()).toEqual([[101, ZIP, 'background']]);
-    expect(await cache()).toMatchObject({ 101: { shipping: 500, handling: 100, 'zip-hash': await hashZip(ZIP) } });
+    expect(await cache()).toMatchObject({ 101: { shipping: 500, handling: 100, 'zip-hash': await storedZipHash(ZIP) } });
     const [entry] = await audit.list({ limit: 5 });
     expect(entry).toMatchObject({ actor: 'daily-job', kind: 'quote.fetched', itemId: 101 });
     expect(JSON.stringify(await audit.exportJson())).not.toContain(ZIP);
@@ -524,11 +823,16 @@ describe('shared helpers', () => {
     expect(isValidZip('')).toBe(false);
   });
 
-  it('hashZip is a 64-hex SHA-256 that differs per ZIP', async () => {
-    const a = await hashZip(ZIP);
+  it('hashZip is a 64-hex keyed hash that differs per ZIP and per salt, and is not the plain SHA-256', async () => {
+    const saltA = 'a1'.repeat(32);
+    const saltB = 'b2'.repeat(32);
+    const a = await hashZip(ZIP, saltA);
     expect(a).toMatch(/^[0-9a-f]{64}$/);
-    expect(await hashZip(ZIP)).toBe(a);
-    expect(await hashZip(ZIP2)).not.toBe(a);
+    expect(await hashZip(ZIP, saltA)).toBe(a);
+    expect(await hashZip(` ${ZIP} `, saltA)).toBe(a);
+    expect(await hashZip(ZIP2, saltA)).not.toBe(a);
+    expect(await hashZip(ZIP, saltB)).not.toBe(a);
+    expect(a).not.toBe(await plainSha256(ZIP));
     expect(a).not.toContain(ZIP);
   });
 });
@@ -677,6 +981,90 @@ describe('landed-cost badge', () => {
       expect(chips.map((chip) => chip.textContent)).toEqual(['Landed $0.60', 'Pickup only']);
       for (const chip of chips) expect(chip.childElementCount).toBe(0);
       expect(host.innerHTML).not.toContain(ZIP);
+    } finally {
+      render(null, host);
+      flushLandedCostBatch(client);
+      globalThis.document = prevDocument;
+      globalThis.IntersectionObserver = prevObserver;
+      window.close();
+    }
+  });
+
+  it('renders nothing, observes nothing and sends nothing when the feature or the badge toggle is off; turning it off hides a shown badge', async () => {
+    const window = new Window();
+    const prevDocument = globalThis.document;
+    const prevObserver = globalThis.IntersectionObserver;
+    const observed: Element[] = [];
+    const callbacks: Array<(entries: Array<{ isIntersecting: boolean }>) => void> = [];
+    class FakeObserver {
+      constructor(cb: (entries: Array<{ isIntersecting: boolean }>) => void) {
+        callbacks.push(cb);
+      }
+      observe(target: Element): void {
+        observed.push(target);
+      }
+      disconnect(): void {
+        /* nothing to release */
+      }
+      unobserve(): void {
+        /* unused */
+      }
+      takeRecords(): [] {
+        return [];
+      }
+    }
+    globalThis.document = window.document as unknown as Document;
+    globalThis.IntersectionObserver = FakeObserver as unknown as typeof IntersectionObserver;
+    const doc = window.document;
+    const host = doc.createElement('div');
+    doc.body.appendChild(host);
+    const card = doc.createElement('article');
+    const sent: ItemId[][] = [];
+    const client: MessagingClient = {
+      send: (_type, payload) => {
+        const ids = (payload as { itemIds: ItemId[] }).itemIds;
+        sent.push(ids);
+        const reply: Record<ItemId, LandedCostQuote | null> = {};
+        for (const id of ids) reply[id] = { shipping: 500, handling: 100, pickup: false };
+        return Promise.resolve(reply as never);
+      },
+      connect: () => () => undefined,
+      onBroadcast: () => () => undefined,
+    };
+    const mount = (settings: Settings): Promise<void> =>
+      act(() => {
+        render(
+          h(badge.Component, { itemId: 5, listing: listing(5, { currentPrice: 1299 }), settings, client, cardRoot: card as unknown as Element, now: T0 }),
+          host,
+        );
+      });
+    const featureOff = defaultSettings(); // features.landedCost is false by default
+    const toggleOff = defaultSettings();
+    toggleOff.features.landedCost = true;
+    toggleOff.overlay.landedCostBadges = false;
+    const on = defaultSettings();
+    on.features.landedCost = true;
+    try {
+      for (const settings of [featureOff, toggleOff]) {
+        await mount(settings);
+        await act(async () => {
+          for (const cb of callbacks) cb([{ isIntersecting: true }]);
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+        expect(observed).toEqual([]);
+        expect(sent).toEqual([]);
+        expect(host.textContent).toBe('');
+        render(null, host);
+      }
+      await mount(on);
+      await act(async () => {
+        for (const cb of callbacks) cb([{ isIntersecting: true }]);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(sent).toEqual([[5]]);
+      expect(host.textContent).toBe('Landed $18.99');
+      await mount(featureOff);
+      expect(host.textContent).toBe('');
     } finally {
       render(null, host);
       flushLandedCostBatch(client);

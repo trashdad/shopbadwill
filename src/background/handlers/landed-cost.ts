@@ -12,12 +12,16 @@
 // - A pickup-only item (from the page's own `page.listings` data) answers
 //   `{ shipping: 0, handling: 0, pickup: true }` with no request (R1).
 // - Otherwise quotes come from the 24 h `sbw:quoteCache` (keyed by item, the
-//   ZIP stored only as its SHA-256 hash: a ZIP change misses the cache, R2),
-//   or from `SgwApi.shippingQuote` on lane `interactive` (R3).
+//   ZIP stored only as its HMAC-SHA-256 under the per-install `sbw:quoteSalt`
+//   key: a ZIP change misses the cache, and a table of the 100 000 ZIPs cannot
+//   reverse the hash, R2), or from `SgwApi.shippingQuote` on lane
+//   `interactive` (R3).
 // - At most 40 quote requests per page view (the sending tab plus the page
 //   URL): the reservation is made synchronously, so concurrent messages can
 //   never overspend, and the 41st request is refused with SgwApiError('budget')
 //   before anything is sent. Cached quotes are never re-fetched within 24 h.
+//   The budget lives in memory: one page view per tab (a new URL drops the
+//   old one), at most MAX_PAGE_VIEWS in all (closed tabs fall off, oldest first).
 // - `homeZip` is personal (R4): it is only ever passed to `shippingQuote` and
 //   hashed for the cache; it is never logged, audited, stored or put in an
 //   error. A scheduler `budget` error whose message contains the ZIP is
@@ -65,10 +69,40 @@ export function isValidZip(zip: string): boolean {
   return US_ZIP.test(zip.trim());
 }
 
-/** SHA-256 hex of the ZIP (R2: the hash is stored, never the ZIP). */
-export async function hashZip(zip: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(zip.trim()));
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+const toHex = (bytes: Uint8Array): string => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+
+/**
+ * HMAC-SHA-256 hex of the ZIP under the per-install salt (R2: the hash is
+ * stored, never the ZIP). Keyed, because the 5-digit ZIP space is small: a
+ * plain SHA-256 could be reversed with a table of every ZIP.
+ */
+export async function hashZip(zip: string, salt: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(salt), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return toHex(new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(zip.trim()))));
+}
+
+/**
+ * The per-install salt (`sbw:quoteSalt`): 32 random bytes as hex, made on the
+ * first quote. Created under the key's lock, so concurrent first uses agree on
+ * one salt. An invalid record is quarantined by the Repo and replaced; the old
+ * cache entries then simply miss.
+ */
+export async function quoteSalt(repo: Repo): Promise<string> {
+  const found = await repo.find(STORAGE_KEYS.quoteSalt);
+  if (found !== undefined) return found;
+  return repo.withLock(STORAGE_KEYS.quoteSalt, async () => {
+    const again = await repo.find(STORAGE_KEYS.quoteSalt);
+    if (again !== undefined) return again;
+    const salt = toHex(crypto.getRandomValues(new Uint8Array(32)));
+    await repo.set(STORAGE_KEYS.quoteSalt, salt);
+    return salt;
+  });
+}
+
+/** The cache's `zip-hash` for this install and ZIP. */
+export async function zipHashFor(repo: Repo, zip: string): Promise<string> {
+  return hashZip(zip, await quoteSalt(repo));
 }
 
 /** The shipping + handling part of a cached quote (no pickup flag, R2's record shape). */
@@ -183,6 +217,8 @@ export interface LandedCostDeps {
 
 export interface LandedCostHandlers {
   get(itemIds: readonly ItemId[], hctx: HandlerContext): Promise<Record<ItemId, LandedCostQuote | null>>;
+  /** Page views the budget remembers (bounded by MAX_PAGE_VIEWS). */
+  pageViewsTracked(): number;
 }
 
 export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandlers {
@@ -236,7 +272,7 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
         return reply;
       }
 
-      const zipHash = await hashZip(g.zip);
+      const zipHash = await zipHashFor(repo, g.zip);
       const now = clock.now();
       const needed: ItemId[] = [];
       for (const id of ids) {
@@ -302,6 +338,7 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
       }
       return reply;
     },
+    pageViewsTracked: () => sent.size,
   };
 }
 

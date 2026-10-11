@@ -14,13 +14,14 @@
 // `ctx.scheduler.stats` exists; unit tests that pass an empty ctx are unchanged.
 //
 // A fetched quote is audited `quote.fetched` for the item (R4: never the ZIP;
-// the cache stores only the ZIP's hash). Other errors propagate to the runner
+// the cache stores only the ZIP's keyed hash, under the same per-install salt
+// as the handler). Other errors propagate to the runner
 // after the ZIP is stripped from the message. The runner maps paused/budget
 // to "not run" and retryable kinds to a paused run.
 import { STORAGE_KEYS } from '../../../domain/storage/schema';
 import type { RequestSchedulerStats } from '../../../domain/types';
 import { SgwApiError } from '../../../ports/errors';
-import { isValidZip, hashZip, readCachedQuote, writeCachedQuote, type CachedQuote } from '../../handlers/landed-cost';
+import { isValidZip, readCachedQuote, writeCachedQuote, zipHashFor, type CachedQuote } from '../../handlers/landed-cost';
 import type { JobStep, StepOutcome } from '../../../domain/watches/schema';
 import type { StepDeps } from './index';
 
@@ -86,7 +87,7 @@ export async function executeQuoteStep(step: JobStep, deps: StepDeps): Promise<S
     return { kind: 'quote', quote: null }; // feature off or kill switch: no request (R3, R6)
   }
 
-  const zipHash = await hashZip(zip);
+  const zipHash = await zipHashFor(repo, zip);
   const now = repo.now();
   const cached = await readCachedQuote(repo, step.itemId, zipHash, now);
   if (cached !== undefined) {
