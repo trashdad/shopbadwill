@@ -399,11 +399,12 @@ describe('kill switch: disarm-all (R1, R2, R6)', () => {
 
   it('the Alt+Shift+K shortcut path (setKill with source shortcut) disarms the same way', async () => {
     const shared = makeShared({ snipes: { a1: armedSnipe('a1') } });
-    const { ctx } = await boot(shared);
-    // main.ts's command listener calls switches.setKill(true, 'shortcut'); disarm-all
-    // subscribes to the switch change, so the source must not matter.
-    await ctx.switches.setKill(true, 'shortcut');
-    await waitUntil(() => stored(shared, 'a1').state === 'killed');
+    const { w } = await boot(shared);
+    // The real `commands` listener (main.ts) calls switches.setKill(true, 'shortcut');
+    // disarm-all subscribes to the switch change, so the source must not matter.
+    expect(w.onCommand.listeners).toHaveLength(1);
+    for (const l of w.onCommand.listeners) l(KILL_COMMAND);
+    await waitUntil(() => stored(shared, 'a1').state === 'killed' && audits(shared).some((e) => e.kind === 'kill.on'));
     expect(shared.clock.now()).toBe(T0);
     const killOn = audits(shared).filter((e) => e.kind === 'kill.on');
     expect(killOn).toHaveLength(1);
