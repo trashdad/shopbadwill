@@ -52,4 +52,69 @@ text for each dialog, and whether any step failed.
 
 ---
 
-<!-- A-2 (T-59), A-3 (T-72) and the consolidated sections land later; T-73 owns the final file. -->
+## A-2 Daily job (Phase 2)
+
+Purpose: a watch runs overnight in dry-run with the browser open, catches up
+after a closed-browser day, and one user-chosen item is favorited live (then
+undone) — all without the user's account being written to otherwise.
+
+No live writes happen unless you opt in at step 10. Steps 1–9 are read-only
+and dry-run: the extension never favorites anything on your account there.
+
+**Setup**
+
+1. Build and load the extension (Chrome: `pnpm build`, Load unpacked
+   `.output/chrome-mv3`; Firefox: `pnpm build:firefox`, temporary install).
+2. Sign in to shopgoodwill.com in that browser (so the extension can pick up
+   your session for the live step later; it is not used before step 10).
+3. In the options page, create a **watch** rule (a keyword you expect to match
+   a few results), then create a **watch** for a search that matches it
+   ("Use my current tab" or "Paste a search address").
+4. Keep **dry-run for favorites on** (the default) in the daily-run section.
+
+**Checks**
+
+5. Open the health panel (options page) and note the request counts, then
+   leave the browser open with at least one ShopGoodwill tab; the daily run
+   fires at the configured time (default 07:00). You can also press **Run now**
+   in the watches section and watch the progress line advance step by step.
+6. After the run finishes, open the audit log in the options page. You should
+   see: a `job.run.done` entry naming the run; `favorite.add` entries marked
+   **dry-run** for every new match; and **zero** `favorite.add` entries
+   without the dry-run mark. In DevTools, filter requests to
+   `buyerapi.shopgoodwill.com`: there must be **zero** `AddToFavorite` or
+   `Favorite/Save` calls. Consecutive background requests (the health panel's
+   log) must be at least 120 s apart.
+7. Closed-browser catch-up: close the browser for at least one whole day (with
+   the watch due daily), then reopen it. The next run should be marked
+   **catch-up** in the audit log (`job.run.done`, trigger `catch-up`), run the
+   watch once, and move its next run time to the next daily slot.
+8. Repeat the overnight check once more if convenient: the next day's run
+   should re-report the same already-seen items without duplicate favorites
+   (the watch's seen ring de-duplicates).
+9. Local-only sanity: create a second watch with **favorites: track in
+   ShopBadwill only** and run it: its matches appear in the audit as tracked
+   items, with no `favorite.add` entries at all.
+
+10. **Opt-in live favorite.** Pick ONE item the dry-run just matched, and
+    confirm you want this exact step:
+    - Turn **dry-run for favorites OFF** in the options page.
+    - Press **Run now** (or wait for the scheduled run), then immediately turn
+      dry-run back ON.
+    - Check your ShopGoodwill favorites: that one item is there, and nothing
+      else was added by the extension.
+    - In the audit log, find the `favorite.add` entry for that item (no
+      dry-run mark, with an **Undo** action) and click Undo; confirm the item
+      leaves your ShopGoodwill favorites.
+
+**Record**
+
+Paste back: the watch name, the run's trigger (`scheduled` / `catch-up`), the
+number of dry-run `favorite.add` entries, the health-panel spacing you saw,
+whether catch-up worked after the closed-browser day, the one item id you
+favorited live, and that Undo removed it. Never paste tokens, cookies or
+account details.
+
+---
+
+<!-- A-3 (T-72) and the consolidated sections land later; T-73 owns the final file. -->
