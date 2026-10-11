@@ -71,7 +71,8 @@ export const MsgSchema = z.discriminatedUnion('type', [
    * with `undo: { kind: 'disableRule', ref: ruleId }`.
    */
   msg('rules.disable', z.object({ ruleId: z.string().min(1) })),
-  msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema) })),
+  /** R5: at most 40 item ids. The TypeScript payload type stays `ItemId[]`. */
+  msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema).max(40) })),
   msg('quick.hideSeller', z.object({ sellerId: z.number().int(), sellerName: z.string() })),
   /** A non-empty term: an empty one would hide every listing. */
   msg('quick.hideKeyword', z.object({ term: z.string().min(1) })),
@@ -201,10 +202,28 @@ export type MsgBroadcastType = {
   [K in MsgType]: (typeof MSG_SENDER)[K] extends 'background' ? K : never;
 }[MsgType];
 
+/**
+ * T-57 contract change (R1): the value of one `landedCost.get` reply entry.
+ * `pickup: true` marks a pickup-only item: shipping and handling are 0 and no
+ * SGW request was made. Module-private schema: the reply is validated through
+ * `MsgReplySchemas`, and only the type joins the contract surface.
+ */
+const LandedCostQuoteSchema = z.object({
+  shipping: CentsSchema,
+  handling: CentsSchema,
+  pickup: z.boolean(),
+});
+export type LandedCostQuote = z.infer<typeof LandedCostQuoteSchema>;
+
 /** Reply schemas for the §3.12 types that declare a `reply`. */
 export const MsgReplySchemas = Object.freeze({
   'rules.evaluate': z.array(MatchResultSchema),
-  'landedCost.get': z.record(ItemIdSchema, CentsSchema.nullable()),
+  /**
+   * T-57 contract change (R1): each entry is the quote, or null when none is
+   * available (feature off, no ZIP, no quote from SGW). `pickup: true` means
+   * pickup-only, with shipping and handling 0.
+   */
+  'landedCost.get': z.record(ItemIdSchema, LandedCostQuoteSchema.nullable()),
   'settings.get': SettingsSchema,
   'rules.list': z.array(RuleSchema),
   'rules.preview': z.object({
