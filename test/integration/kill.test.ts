@@ -742,7 +742,7 @@ describe('the send gate does not depend on disarm-all', () => {
     expect(stored(shared, 'x1').attempt.idempotencyKey).toBeUndefined();
   });
 
-  it('a kill that lands after `sent` is stored, just before the request: nothing leaves, and the snipe is never called stopped', async () => {
+  it('a kill that lands after `sent` is stored, just before the request: nothing leaves, it settles as "No bid was sent", and is never called stopped', async () => {
     const shared = makeShared({ live: true });
     let storedAtSend: Snipe['state'] | undefined;
     const probe: BackgroundModule = {
@@ -763,16 +763,18 @@ describe('the send gate does not depend on disarm-all', () => {
     if (runner === undefined) throw new Error('the snipe runner did not register');
     await seedFiring(shared);
     await runner.drive('x1');
-    await waitUntil(() => audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND && e.ref === 'x1'));
+    // T-84b: the write gate throws BidNotSentError before any byte leaves, so the
+    // runner settles the snipe through `not-sent` ("No bid was sent").
+    await waitUntil(() => stored(shared, 'x1').state === 'resolved');
 
     expect(storedAtSend).toBe('sent'); // persist before send
     expect(bidRequests(shared)).toEqual([]); // the adapter's own gate refused it
     const s = stored(shared, 'x1');
-    expect(s.state).toBe('sent'); // a bid may be out as far as the reducer knows: never killed
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'network', attempt: { notSent: true } });
     expect(s.history.some((h) => h.to === 'killed')).toBe(false);
-    expect(audits(shared).find((e) => e.kind === KILL_SNIPE_SENT_KIND && e.ref === 'x1')?.details.note).toBe(
-      'kill: snipe x1 already sent; outcome pending',
-    );
+    // If disarm-all saw the snipe while it was still `sent`, its note is honest about it.
+    const note = audits(shared).find((e) => e.kind === KILL_SNIPE_SENT_KIND && e.ref === 'x1')?.details.note;
+    if (note !== undefined) expect(note).toBe('kill: snipe x1 already sent; outcome pending');
     expect(audits(shared).some((e) => e.kind === 'snipe.disarm' && e.ref === 'x1')).toBe(false);
     expect(await badgeText()).toBe('KILL');
   });
