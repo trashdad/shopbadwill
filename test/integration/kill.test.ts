@@ -8,6 +8,10 @@
 // No network: FakeHttp has no scripted routes, so any request fails loudly.
 // Snipe records are seeded directly into `sbw:snipes` (valid per SnipeSchema);
 // arming through `snipe.arm` is T-84's tested path and is not re-tested here.
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeBrowser } from 'wxt/testing/fake-browser';
 
@@ -26,7 +30,7 @@ import {
   KILL_DISARM_WHY,
   KILL_SNIPE_SENT_KIND,
 } from '../../src/background/jobs/kill-disarm';
-import { startBackground, type BackgroundBrowser, type BackgroundHandle } from '../../src/background/main';
+import { KILL_COMMAND, startBackground, type BackgroundBrowser, type BackgroundHandle } from '../../src/background/main';
 import type { MessageResponse, RouterSender } from '../../src/background/router';
 import { section as killSection } from '../../src/entrypoints/popup/sections/kill/index';
 import { killReasons } from '../../src/entrypoints/popup/sections/kill/reasons';
@@ -48,6 +52,7 @@ const DAY = 24 * HOUR;
 const EXT_ID = 'test-extension-id';
 const EXT_ORIGIN = `chrome-extension://${EXT_ID}/`;
 const UI: RouterSender = { id: EXT_ID, url: `${EXT_ORIGIN}popup.html` };
+const CONTENT: RouterSender = { id: EXT_ID, tab: { id: 3 }, url: 'https://shopgoodwill.com/item/1' };
 
 const T0 = Date.UTC(2026, 9, 10, 15, 0, 0);
 /** Auction end, far enough in the future that nothing wakes or reads. */
@@ -209,6 +214,7 @@ type MessageListener = (raw: unknown, sender: RouterSender, sendResponse: (r: un
 class LightWorker {
   readonly onMessage = fakeEvent<MessageListener>();
   readonly onConnect = fakeEvent<(port: RuntimePort) => void>();
+  readonly onCommand = fakeEvent<(command: string) => void>();
   readonly handle: BackgroundHandle;
   readonly ready: Promise<BackgroundContext>;
 
@@ -224,7 +230,7 @@ class LightWorker {
         onStartup: fakeEvent<() => void>(),
         onInstalled: fakeEvent<(d: { reason: string; previousVersion?: string }) => void>(),
       },
-      commands: { onCommand: fakeEvent<(command: string) => void>() },
+      commands: { onCommand: this.onCommand },
       tabs: { query: () => Promise.resolve([]), sendMessage: () => Promise.resolve(undefined) },
       storage: fakeBrowser.storage,
       alarms: fakeBrowser.alarms,
@@ -250,10 +256,15 @@ class LightWorker {
   }
 
   send(type: string, payload?: unknown): Promise<MessageResponse> {
+    return this.sendAs(UI, type, payload);
+  }
+
+  /** `sender` is the browser sender the router classifies (popup page = ui). */
+  sendAs(sender: RouterSender, type: string, payload?: unknown): Promise<MessageResponse> {
     const listener = this.onMessage.listeners[0];
     if (listener === undefined) throw new Error('no onMessage listener');
     return new Promise<MessageResponse>((resolve) => {
-      listener({ v: 1, type, reqId: `req-${type}`, ...(payload === undefined ? {} : { payload }) }, UI, (r) => {
+      listener({ v: 1, type, reqId: `req-${type}`, ...(payload === undefined ? {} : { payload }) }, sender, (r) => {
         resolve(r as MessageResponse);
       });
     });
@@ -394,6 +405,14 @@ describe('kill switch: disarm-all (R1, R2, R6)', () => {
     const disarm = await runner.dispatch('a1', { type: 'disarm', now: shared.clock.now(), by: 'user', why: 'again' });
     expect(disarm.kind).toBe('rejected');
     if (disarm.kind === 'rejected') expect(disarm.rejection.reason).toBe('terminal');
+
+    // An explicit new arm (a new record) is left alone once kill is off.
+    const kept = (shared.areas.local.dump()[STORAGE_KEYS.snipes] ?? {}) as Record<string, Snipe>;
+    await shared.areas.local.set({ [STORAGE_KEYS.snipes]: { ...kept, n1: armedSnipe('n1') } });
+    await flush();
+    expect(stored(shared, 'n1').state).toBe('armed');
+    expect(stored(shared, 'a1').state).toBe('killed');
+    expect(stored(shared, 'a2').state).toBe('killed');
   });
 
   it('a worker that starts while the kill switch is on disarms the armed snipes at startup', async () => {
@@ -411,13 +430,124 @@ describe('kill switch: disarm-all (R1, R2, R6)', () => {
     expect(typeof w.send).toBe('function');
   });
 
-  it('a sent snipe is audited only once per kill episode, even when the switch view changes again', async () => {
+  it('kill turned on while starting, before snipes are stored, disarms them once they load', async () => {
+    const shared = makeShared();
+    const w = new LightWorker(shared);
+    // The shortcut is live before migrate finishes. Snipes are not stored yet.
+    for (const l of w.onCommand.listeners) l(KILL_COMMAND);
+    const ctx = await w.ready;
+    expect(ctx.switches.view().killSwitch).toBe(true);
+    expect(shared.areas.local.dump()[STORAGE_KEYS.snipes]).toBeUndefined();
+    await flush();
+    expect(audits(shared).some((e) => e.kind === 'snipe.disarm')).toBe(false);
+
+    await shared.areas.local.set({
+      [STORAGE_KEYS.snipes]: { a1: armedSnipe('a1'), a2: armedSnipe('a2'), s1: sentSnipe('s1'), d1: draftSnipe('d1') },
+    });
+    await waitUntil(
+      () => stored(shared, 'a1').state === 'killed' && stored(shared, 'a2').state === 'killed' && audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND),
+    );
+    expect(shared.clock.now()).toBe(T0);
+    expect(storedStates(shared)).toEqual({ a1: 'killed', a2: 'killed', s1: 'sent', d1: 'draft' });
+    const sent = audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.details.note).toBe('kill: snipe s1 already sent; outcome pending');
+    expect(stored(shared, 's1').history).toHaveLength(2);
+    expect(stored(shared, 's1').outcome).toBeUndefined();
+    expect(await badgeText()).toBe('KILL');
+  });
+
+  it('shows KILL while kill is on even when the snipe read has not returned, then disarms once it does', async () => {
+    const shared = makeShared({ killSwitch: true, snipes: { a1: armedSnipe('a1'), s1: sentSnipe('s1') } });
+    let resolveGate: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      resolveGate = resolve;
+    });
+    let open = false;
+    const realGet = shared.areas.local.get.bind(shared.areas.local);
+    shared.areas.local.get = async <T>(key: string): Promise<T | undefined> => {
+      if (!open && key === STORAGE_KEYS.snipes) await gate;
+      return realGet<T>(key);
+    };
+    const release = (): void => {
+      open = true;
+      resolveGate();
+    };
+    try {
+      await boot(shared);
+      // Kill is already on, but the snipes have not been read yet.
+      expect(await badgeText()).toBe('KILL');
+      expect(await badgeBackground()).toEqual(RED_RGBA);
+      expect(stored(shared, 'a1').state).toBe('armed');
+      expect(stored(shared, 's1').state).toBe('sent');
+      release();
+      await waitUntil(
+        () => stored(shared, 'a1').state === 'killed' && audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND && e.ref === 's1'),
+      );
+      expect(stored(shared, 's1').state).toBe('sent');
+      expect(stored(shared, 's1').outcome).toBeUndefined();
+      expect(audits(shared).find((e) => e.kind === KILL_SNIPE_SENT_KIND)?.details.note).toBe('kill: snipe s1 already sent; outcome pending');
+      expect(await badgeText()).toBe('KILL');
+    } finally {
+      release();
+    }
+  });
+
+  it('a content-script kill.set is refused and disarms nothing; the popup sender disarms', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1'), s1: sentSnipe('s1') } });
+    const { w } = await boot(shared);
+    const refused = await w.sendAs(CONTENT, 'kill.set', { on: true });
+    expect(refused).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    await flush();
+    expect(storedStates(shared)).toEqual({ a1: 'armed', s1: 'sent' });
+    expect(audits(shared).some((e) => e.kind === 'snipe.disarm' || e.kind === KILL_SNIPE_SENT_KIND)).toBe(false);
+
+    expect(UI.url ?? '').toMatch(/popup\.html$/);
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => stored(shared, 'a1').state === 'killed' && audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND));
+    expect(stored(shared, 's1').state).toBe('sent');
+    expect(stored(shared, 's1').outcome).toBeUndefined();
+  });
+
+  it('retries the sent-refusal audit when the write fails, and still records it once', async () => {
     const shared = makeShared({ snipes: { s1: sentSnipe('s1') } });
-    const { ctx, w } = await boot(shared);
+    const { w } = await boot(shared);
+    const realSet = shared.areas.local.set.bind(shared.areas.local);
+    let failSentWrite = true;
+    shared.areas.local.set = async (entries) => {
+      const refusesSent = Object.values(entries).some(
+        (value) => Array.isArray(value) && value.some((e) => (e as AuditEntry).kind === KILL_SNIPE_SENT_KIND),
+      );
+      if (failSentWrite && refusesSent) {
+        failSentWrite = false;
+        throw new Error('audit write failed');
+      }
+      return realSet(entries);
+    };
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => vi.mocked(console.warn).mock.calls.some((c) => String(c[0]).includes('auditing failed')));
+    expect(audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND)).toHaveLength(0);
+    expect(stored(shared, 's1').state).toBe('sent');
+
+    // A snipe write while kill stays on runs the pass again (a dry-run noteSettings
+    // does not: with kill on, the broadcast view does not change).
+    const s1 = stored(shared, 's1');
+    await shared.areas.local.set({ [STORAGE_KEYS.snipes]: { s1: { ...s1, title: 'still out' } } });
+    await waitUntil(() => audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND));
+    expect(audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND)).toHaveLength(1);
+    expect(audits(shared).find((e) => e.kind === KILL_SNIPE_SENT_KIND)?.details.note).toBe('kill: snipe s1 already sent; outcome pending');
+    expect(stored(shared, 's1').state).toBe('sent');
+    expect(stored(shared, 's1').outcome).toBeUndefined();
+  });
+
+  it('a sent snipe is audited only once per kill episode, even when another pass runs', async () => {
+    const shared = makeShared({ snipes: { s1: sentSnipe('s1') } });
+    const { w } = await boot(shared);
     await w.ok('kill.set', { on: true });
     await waitUntil(() => audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND));
-    // Another switch change while kill stays on (e.g. a dry-run setting) re-runs disarm-all.
-    ctx.switches.noteSettings({ ...settingsWith(true), dryRun: { favorites: false, calendar: true, bidding: true } });
+    // A snipe write while kill stays on re-runs the pass. The refusal is not audited again.
+    const s1 = stored(shared, 's1');
+    await shared.areas.local.set({ [STORAGE_KEYS.snipes]: { s1: { ...s1, title: 'still out' } } });
     await flush();
     expect(audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND)).toHaveLength(1);
     expect(stored(shared, 's1').state).toBe('sent');
@@ -479,11 +609,64 @@ describe('action badge (R3)', () => {
     await flush();
     expect(spy.mock.calls.length).toBe(calls);
     expect(await badgeText()).toBe('4');
+
+    // A snipe write that does not change the armed count recomputes and writes nothing.
+    const afterSwitch = spy.mock.calls.length;
+    const current = (shared.areas.local.dump()[STORAGE_KEYS.snipes] ?? {}) as Record<string, Snipe>;
+    await shared.areas.local.set({ [STORAGE_KEYS.snipes]: { ...current, d1: draftSnipe('d1') } });
+    await flush();
+    expect(await badgeText()).toBe('4');
+    expect(spy.mock.calls.length).toBe(afterSwitch);
   });
 
-  it('registerBadge is exported and writes nothing before the first state is known', () => {
-    // The badge writer must be the single owner of the action badge: registering it
-    // in an empty background leaves the badge empty rather than stale.
+  it('precedence is KILL, then the armed count, then !, then empty', async () => {
+    const shared = makeShared({ snipes: { s1: sentSnipe('s1') } });
+    const { ctx, w } = await boot(shared);
+    expect(await badgeText()).toBe('1');
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+
+    ctx.googleNeedsInteraction.set(true);
+    await flush();
+    // The armed count beats ! (the sent snipe still counts, and kill is off).
+    expect(await badgeText()).toBe('1');
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+
+    await w.ok('kill.set', { on: true });
+    await waitUntil(async () => (await badgeText()) === 'KILL');
+    // KILL beats both the still-live sent snipe and the reconnect flag.
+    expect(stored(shared, 's1').state).toBe('sent');
+    expect(await badgeText()).toBe('KILL');
+    expect(await badgeBackground()).toEqual(RED_RGBA);
+
+    await w.ok('kill.set', { on: false });
+    await waitUntil(async () => (await badgeText()) === '1');
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+
+    await shared.areas.local.set({ [STORAGE_KEYS.snipes]: { d1: draftSnipe('d1') } });
+    await waitUntil(async () => (await badgeText()) === '!');
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+
+    ctx.googleNeedsInteraction.set(false);
+    await waitUntil(async () => (await badgeText()) === '');
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+  });
+
+  it('badge.ts is the only writer of the action badge', () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
+    const files: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) walk(path);
+        else if (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) files.push(path);
+      }
+    };
+    walk(join(root, 'src'));
+    const writers = files
+      .filter((file) => /setBadgeText|setBadgeBackgroundColor/.test(readFileSync(file, 'utf8')))
+      .map((file) => relative(root, file).replaceAll('\\', '/'))
+      .sort();
+    expect(writers).toEqual(['src/background/badge.ts']);
     expect(typeof registerBadge).toBe('function');
     expect(KILL_BADGE_COLOR).toBe('#a1181f');
     expect(BADGE_DEFAULT_COLOR).toBe('#5f5d5b');

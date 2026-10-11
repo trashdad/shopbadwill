@@ -18,7 +18,8 @@
 // claims that snipe was stopped. Finished snipes (`resolved`, `killed`) and
 // drafts are never touched. The refusal audit is deduplicated per kill episode
 // (while the switch stays on, re-triggers — e.g. a storage write by the runner
-// or another switch-view change — do not repeat it).
+// or another switch-view change — do not repeat it). A write that failed is
+// not counted: the next pass tries it again.
 //
 // R4: turning the kill switch OFF does not re-arm anything. Killed snipes stay
 // `killed`; re-arming is only the user's explicit `snipe.arm` of a NEW snipe
@@ -70,11 +71,13 @@ export function register(ctx: BackgroundContext): void {
   const audit = async (
     kind: string,
     entry: { itemId?: number; ref?: string; details: Record<string, string | number | boolean | null> },
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     try {
       await ctx.audit.append({ actor: 'system', kind, ...entry });
+      return true;
     } catch (e) {
       console.warn('kill-disarm: auditing failed', e);
+      return false;
     }
   };
 
@@ -105,8 +108,12 @@ export function register(ctx: BackgroundContext): void {
       if (r.kind === 'rejected' && QUIET_REFUSALS.has(r.rejection.reason)) continue;
       if (r.kind === 'rejected' && r.rejection.reason === 'already-sent') {
         if (sentAudited.has(s.id)) continue;
-        sentAudited.add(s.id);
-        await audit(KILL_SNIPE_SENT_KIND, { itemId: s.itemId, ref: s.id, details: { note: sentRefusalNote(s.id) } });
+        const wrote = await audit(KILL_SNIPE_SENT_KIND, {
+          itemId: s.itemId,
+          ref: s.id,
+          details: { note: sentRefusalNote(s.id) },
+        });
+        if (wrote) sentAudited.add(s.id);
         continue;
       }
       // 'busy' cannot apply to a disarm (it is not an attempt event); a 'missing'

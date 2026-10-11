@@ -114,5 +114,9 @@ export function registerBadge(ctx: BackgroundContext): void {
   ctx.storage.local.onChanged((changes) => {
     if (Object.prototype.hasOwnProperty.call(changes, STORAGE_KEYS.snipes)) readCount();
   });
+  // Kill (and !) must show before the snipe read returns. The count fills in when it does.
+  kill = ctx.switches.view().killSwitch;
+  googleNeedsInteraction = ctx.googleNeedsInteraction.get();
+  recompute();
   readCount();
 }
