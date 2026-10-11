@@ -5,19 +5,25 @@
 // is no background handler for it. One-line third-party privacy note (R4), the
 // Firefox `technicalAndInteraction` note (R9), and v1 supports only ntfy.sh.
 import type { VNode } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
+import { BrowserClock } from '../../../../adapters/browser/clock';
 import { isFirefox } from '../../../../adapters/browser/env';
+import { BrowserHttp } from '../../../../adapters/browser/http';
 import { BrowserPermissions } from '../../../../adapters/browser/permissions';
-import { NTFY_ORIGIN, NTFY_SERVER } from '../../../../adapters/ntfy/ntfy-sink';
-import { generateTopic, maskTopic } from '../../../../adapters/ntfy/topic';
+import { NTFY_ORIGIN, NTFY_SERVER, cancelScheduledMessages } from '../../../../adapters/ntfy/ntfy-sink';
+import { generateTopic, isValidTopic, maskTopic } from '../../../../adapters/ntfy/topic';
 import type { Settings } from '../../../../domain/settings/schema';
+import type { NtfyState } from '../../../../domain/storage/schema';
+import type { Clock } from '../../../../ports/clock';
+import type { Http } from '../../../../ports/http';
 import type { Permissions } from '../../../../ports/permissions';
 import { Card, Field } from '../../../../ui/components/Field';
 import { describeError } from '../../../../ui/components/describeError';
 import { Status } from '../../../../ui/components/Status';
 import { Switch } from '../../../../ui/components/Switch';
 import type { SectionDef, SectionProps } from '../../registry';
+import { createNtfyScheduledStore, type NtfyScheduledStore } from './scheduled-store';
 
 export interface NtfySectionProps extends SectionProps {
   /** Injectable for tests. */
@@ -25,6 +31,18 @@ export interface NtfySectionProps extends SectionProps {
   generate?: () => string;
   firefox?: boolean;
   clipboard?: { writeText(text: string): Promise<void> };
+  /** Stored seqs (`sbw:ntfy`). The click path cancels them before saving. */
+  scheduled?: NtfyScheduledStore;
+  http?: Http;
+  clock?: Clock;
+  /** 0 in tests; production uses the sink's 1 s pace. */
+  minIntervalMs?: number;
+}
+
+const MAY_STILL_ARRIVE = 'Already-scheduled pushes may still arrive.';
+
+function hasScheduled(state: NtfyState): boolean {
+  return Object.values(state.items).some((item) => item.entries.some((entry) => entry.status === 'scheduled'));
 }
 
 type Msg = { message: string; tone: 'ok' | 'error' };
@@ -35,6 +53,9 @@ type NtfyGroup = NonNullable<Settings['ntfy']>;
 export function NtfySection(props: NtfySectionProps): VNode {
   const { client } = props;
   const [api] = useState(() => props.permissions ?? new BrowserPermissions());
+  const [http] = useState(() => props.http ?? new BrowserHttp());
+  const [clock] = useState(() => props.clock ?? new BrowserClock());
+  const [scheduled] = useState(() => props.scheduled ?? createNtfyScheduledStore());
   const generate = props.generate ?? generateTopic;
   const firefox = props.firefox ?? isFirefox();
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -42,6 +63,7 @@ export function NtfySection(props: NtfySectionProps): VNode {
   const [granted, setGranted] = useState<Granted>('unknown');
   const [status, setStatus] = useState<Msg>({ message: '', tone: 'ok' });
   const [busy, setBusy] = useState(false);
+  const retiring = useRef(false);
 
   useEffect(() => {
     client.send('settings.get', undefined).then(
@@ -72,10 +94,10 @@ export function NtfySection(props: NtfySectionProps): VNode {
   const ntfy: NtfyGroup = settings.ntfy ?? { enabled: false, server: NTFY_SERVER, topic: '' };
   const unsupportedServer = ntfy.server !== NTFY_SERVER;
 
-  const save = (next: NtfyGroup, what: string, mask = false): void => {
+  const save = (next: NtfyGroup, what: string, mask = false): Promise<void> => {
     const previous = settings;
     setSettings({ ...settings, ntfy: next });
-    client.send('settings.set', { ntfy: next }).then(
+    return client.send('settings.set', { ntfy: next }).then(
       () => {
         setStatus({ message: `Saved: ${mask ? maskTopic(next.topic) : what}.`, tone: 'ok' });
       },
@@ -84,6 +106,47 @@ export function NtfySection(props: NtfySectionProps): VNode {
         setStatus({ message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' });
       },
     );
+  };
+
+  // Cancel while the old topic and the host permission are still in force.
+  // The sink refuses every request once the setting is saved off (R2), so the
+  // DELETEs have to happen here, before `sbw:ntfy` is cleared and before save.
+  const cancelCurrent = async (current: NtfyGroup): Promise<boolean> => {
+    const state = await scheduled.load();
+    if (!hasScheduled(state)) return true;
+    if (!current.enabled || current.server !== NTFY_SERVER || !isValidTopic(current.topic)) return false;
+    try {
+      if (!(await api.contains({ origins: [NTFY_ORIGIN] }))) return false;
+    } catch {
+      return false;
+    }
+    const result = await cancelScheduledMessages({
+      topic: current.topic,
+      state,
+      http,
+      clock,
+      ...(props.minIntervalMs === undefined ? {} : { minIntervalMs: props.minIntervalMs }),
+    });
+    return result.ok;
+  };
+
+  const applyChange = (current: NtfyGroup, next: NtfyGroup, what: string, mask: boolean, forceSave: boolean): void => {
+    if (retiring.current) return;
+    retiring.current = true;
+    setBusy(true);
+    void (async () => {
+      let cancelOk: boolean;
+      try {
+        cancelOk = await cancelCurrent(current);
+        if (cancelOk) await scheduled.clear();
+      } catch {
+        cancelOk = false;
+      }
+      if (forceSave || cancelOk) await save(next, what, mask);
+      if (!cancelOk) setStatus({ message: MAY_STILL_ARRIVE, tone: 'error' });
+      retiring.current = false;
+      setBusy(false);
+    })();
   };
 
   // The permission prompt needs the click's gesture (I-21): the request is the
@@ -140,8 +203,14 @@ export function NtfySection(props: NtfySectionProps): VNode {
           label="Phone push (ntfy.sh)"
           hint="Sends the auction end reminders (60, 15 and 5 minutes before) to your phone through ntfy.sh."
           checked={ntfy.enabled}
+          disabled={busy}
           onChange={(v) => {
-            save({ ...ntfy, enabled: v }, 'phone push');
+            if (retiring.current) return;
+            if (v) {
+              void save({ ...ntfy, enabled: true }, 'phone push');
+              return;
+            }
+            applyChange(ntfy, { ...ntfy, enabled: false }, 'phone push', false, true);
           }}
         />
         <p class="sbw-hint">Auction titles and end times are sent to ntfy.sh.</p>
@@ -170,8 +239,10 @@ export function NtfySection(props: NtfySectionProps): VNode {
           </Field>
           <button
             type="button"
+            disabled={busy}
             onClick={() => {
-              save({ ...ntfy, topic: generate() }, 'topic', true);
+              if (retiring.current) return;
+              applyChange(ntfy, { ...ntfy, topic: generate() }, 'topic', true, false);
             }}
           >
             Generate topic

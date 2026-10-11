@@ -165,6 +165,16 @@ const NtfyStateSchema = z.object({
 });
 export type NtfyState = z.infer<typeof NtfyStateSchema>;
 
+/**
+ * Missing or invalid `sbw:ntfy` reads as empty. Callers that cannot see the
+ * Repo (the options page) use this so a bad record cannot be treated as a list
+ * of messages to send again.
+ */
+export function parseNtfyState(raw: unknown): NtfyState {
+  const parsed = NtfyStateSchema.safeParse(raw);
+  return parsed.success ? parsed.data : { items: {} };
+}
+
 /** `sbw:auditMeta`: ring bookkeeping. */
 export const AuditMetaSchema = z.object({
   nextSeq: z.number().int().nonnegative(),

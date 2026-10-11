@@ -1,14 +1,20 @@
 // T-69: the ntfy topic (R3). It is a secret: 128 bits of entropy, lowercase
 // base32, prefixed `sbw-`. Tests pin the shape and the masking rule.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { TOPIC_PREFIX, generateTopic, isValidTopic, maskTopic } from '../../../../src/adapters/ntfy/topic';
 
 describe('generateTopic', () => {
-  it('produces a lowercase base32 topic prefixed sbw- with 26 base32 chars (128 bits)', () => {
+  it('draws 128 bits from crypto.getRandomValues and encodes them as sbw- plus 26 base32 chars', () => {
+    const spy = vi.spyOn(crypto, 'getRandomValues');
     const topic = generateTopic();
+    expect(spy).toHaveBeenCalledTimes(1);
+    const bytes = spy.mock.calls[0]?.[0];
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(bytes).toHaveLength(16);
     expect(topic.startsWith(TOPIC_PREFIX)).toBe(true);
     expect(topic).toMatch(/^sbw-[a-z2-7]{26}$/);
+    spy.mockRestore();
   });
 
   it('uses exactly the 128 random bits given (deterministic for tests)', () => {

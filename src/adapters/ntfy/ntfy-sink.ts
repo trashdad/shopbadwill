@@ -173,6 +173,57 @@ class Pacer {
   }
 }
 
+/** Scheduled seqs only, in a stable order: item id, then the longest lead first. */
+function scheduledSeqs(state: NtfyState): string[] {
+  const seqs: string[] = [];
+  const ids = Object.keys(state.items)
+    .map((id) => Number(id))
+    .filter((id) => Number.isInteger(id))
+    .sort((a, b) => a - b);
+  for (const id of ids) {
+    const item = state.items[id];
+    if (item === undefined) continue;
+    const entries = [...item.entries]
+      .filter((entry) => entry.status === 'scheduled')
+      .sort((a, b) => b.leadMin - a.leadMin || a.seq.localeCompare(b.seq));
+    for (const entry of entries) seqs.push(entry.seq);
+  }
+  return seqs;
+}
+
+/**
+ * DELETE every stored scheduled message on the old topic. Deferred entries were
+ * never published. Stops on 429/5xx (the caller does not retry in this click).
+ * Never throws, and never puts the topic into an error.
+ */
+export async function cancelScheduledMessages(opts: {
+  topic: string;
+  state: NtfyState;
+  http: Http;
+  clock: Clock;
+  minIntervalMs?: number;
+}): Promise<{ ok: boolean }> {
+  const seqs = scheduledSeqs(opts.state);
+  if (seqs.length === 0) return { ok: true };
+  if (!isValidTopic(opts.topic)) return { ok: false };
+  const pacer = new Pacer(opts.clock, opts.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS);
+  let ok = true;
+  for (const seq of seqs) {
+    const request = ntfyRequest('cancel', opts.topic, { seq });
+    let response;
+    try {
+      response = await pacer.run(() => opts.http.send(request));
+    } catch {
+      ok = false;
+      continue;
+    }
+    if ((response.status >= 200 && response.status < 300) || response.status === 404 || response.status === 410) continue;
+    ok = false;
+    if (response.status === 429 || response.status >= 500) break;
+  }
+  return { ok };
+}
+
 export class NtfySink {
   readonly name = 'ntfy';
   private readonly pacer: Pacer;
@@ -223,10 +274,19 @@ export class NtfySink {
       let entries: NtfyEntry[] = [];
       if (prev !== undefined && prev.fingerprint !== fingerprint) {
         // R6: the end time (or generation, or reminders) changed: cancel the
-        // stored seqs, then publish new ones. The new publishes reuse the same
-        // deterministic seqs, so ntfy overwrites any message a failed DELETE
-        // left behind instead of firing it twice.
-        entries = await this.cancelEntries(event.itemId, prep.topic, prev.entries);
+        // stored seqs, then publish new ones. If a cancel does not finish
+        // (429/5xx or a failed DELETE), keep the old fingerprint and every seq
+        // not yet cancelled so the next upsert retries. Publishing now would
+        // forget a seq whose generation changed and leave it live on ntfy.
+        const remaining = await this.cancelEntries(event.itemId, prep.topic, prev.entries);
+        if (remaining.some((entry) => entry.status === 'scheduled')) {
+          await this.deps.store.update((s) => ({
+            ...(s.status === undefined ? {} : { status: s.status }),
+            items: { ...s.items, [event.itemId]: { fingerprint: prev.fingerprint, entries: remaining } },
+          }));
+          return;
+        }
+        entries = [];
       } else if (prev !== undefined) {
         entries = prev.entries;
       }
@@ -314,16 +374,21 @@ export class NtfySink {
     });
   }
 
-  /** DELETEs every stored entry (best effort); returns the entries that must stay stored. */
+  /**
+   * DELETEs stored scheduled entries. Returns every entry that is still live:
+   * deferred ones (never published), failed cancels, and anything not attempted
+   * because a 429/5xx stopped this sync.
+   */
   private async cancelEntries(itemId: ItemId, topic: string, entries: readonly NtfyEntry[]): Promise<NtfyEntry[]> {
-    const kept: NtfyEntry[] = [];
+    const cancelled = new Set<string>();
+    let stop = false;
     for (const entry of entries) {
-      if (entry.status === 'deferred') continue; // never published: nothing to cancel
+      if (stop || entry.status === 'deferred') continue;
       const result = await this.cancel(itemId, topic, entry);
-      if (result !== 'ok') kept.push(entry);
-      if (result === 'rate-limited') break;
+      if (result === 'ok') cancelled.add(entry.seq);
+      else if (result === 'rate-limited') stop = true;
     }
-    return kept;
+    return entries.filter((entry) => !cancelled.has(entry.seq));
   }
 
   private async publish(

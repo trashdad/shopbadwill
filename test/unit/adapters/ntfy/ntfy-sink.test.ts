@@ -37,6 +37,8 @@ const T0 = 1_750_000_000_000;
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
+/** R5: a lead this far out is not "more than 10 s" in the future. */
+const MIN_LEAD_EDGE = 10_000;
 const TOPIC = 'sbw-abcdefghijklmnopqrstuvwxyz';
 const TIME_ZONE = 'America/New_York';
 
@@ -335,6 +337,27 @@ describe('scheduling and deferral', () => {
     expect(r.store.state.items['7']?.entries).toEqual([]);
   });
 
+  it('skips a lead exactly 10 s out and schedules one a millisecond further', async () => {
+    const r = rig();
+    // The 60- and 15-minute leads are already past; only the 5-minute lead is near the cut.
+    await r.sink.upsert(desiredEvent(7, 5 * MIN + MIN_LEAD_EDGE));
+    expect(r.requests).toHaveLength(0);
+    await r.sink.upsert(desiredEvent(8, 5 * MIN + MIN_LEAD_EDGE + 1));
+    expect(r.requests.map((x) => x.headers['x-sequence-id'])).toEqual([sequenceId(8, 5, 0)]);
+  });
+
+  it('schedules a lead exactly 3 days out and defers one a millisecond further', async () => {
+    const r = rig();
+    await r.sink.upsert(desiredEvent(7, 3 * DAY + 5 * MIN));
+    expect(r.store.state.items['7']?.entries.find((x) => x.leadMin === 5)?.status).toBe('scheduled');
+    expect(r.requests.some((x) => x.headers['x-sequence-id'] === sequenceId(7, 5, 0))).toBe(true);
+
+    const before = r.requests.length;
+    await r.sink.upsert(desiredEvent(8, 3 * DAY + 5 * MIN + 1));
+    expect(r.store.state.items['8']?.entries.find((x) => x.leadMin === 5)?.status).toBe('deferred');
+    expect(r.requests.slice(before).some((x) => x.headers['x-sequence-id'] === sequenceId(8, 5, 0))).toBe(false);
+  });
+
   it('promotes deferred leads when upsert is called again inside the 3-day window (the daily re-call)', async () => {
     const r = rig();
     const e = desiredEvent(7, 5 * DAY);
@@ -401,6 +424,56 @@ describe('cancel', () => {
     await r.sink.remove(7);
     expect(r.requests.filter((x) => x.kind === 'delete')).toHaveLength(0);
     expect(r.store.state.items['7']?.entries).toHaveLength(3);
+  });
+
+  it('a 429 during remove stops this sync and keeps every seq not yet cancelled', async () => {
+    const r = rig();
+    await r.sink.upsert(desiredEvent(7, 2 * HOUR));
+    installNtfy(r.requests, r.clock, (kind, n) => (kind === 'delete' && n === 1 ? { status: 429 } : { status: 200 }));
+    await r.sink.remove(7);
+    expect(r.requests.filter((x) => x.kind === 'delete')).toHaveLength(1);
+    expect(r.store.state.items['7']?.entries.map((x) => x.seq)).toEqual([
+      sequenceId(7, 60, 0),
+      sequenceId(7, 15, 0),
+      sequenceId(7, 5, 0),
+    ]);
+    r.clock.advance(61_000);
+    await r.sink.remove(7);
+    expect(r.requests.filter((x) => x.kind === 'delete')).toHaveLength(4);
+    expect(r.store.state.items['7']).toBeUndefined();
+  });
+
+  it('a 429 while cancelling an end-time change keeps the old seqs and publishes nothing until the next upsert', async () => {
+    const r = rig();
+    const original = desiredEvent(7, 2 * HOUR);
+    await r.sink.upsert(original);
+    installNtfy(r.requests, r.clock, (kind, n) => (kind === 'delete' && n === 1 ? { status: 429 } : { status: 200 }));
+    const moved = desiredEvent(7, 4 * HOUR, 1);
+    await r.sink.upsert(moved);
+    expect(r.requests.filter((x) => x.kind === 'delete')).toHaveLength(1);
+    expect(r.requests.filter((x) => x.kind === 'post')).toHaveLength(3);
+    expect(r.store.state.items['7']?.fingerprint).toBe(fingerprintOf(original));
+    expect(r.store.state.items['7']?.entries.map((x) => x.seq)).toEqual([
+      sequenceId(7, 60, 0),
+      sequenceId(7, 15, 0),
+      sequenceId(7, 5, 0),
+    ]);
+
+    r.clock.advance(61_000);
+    await r.sink.upsert(moved);
+    expect(r.requests.filter((x) => x.kind === 'delete').map((x) => x.url)).toEqual([
+      `${NTFY_SERVER}/${TOPIC}/${sequenceId(7, 60, 0)}`,
+      `${NTFY_SERVER}/${TOPIC}/${sequenceId(7, 60, 0)}`,
+      `${NTFY_SERVER}/${TOPIC}/${sequenceId(7, 15, 0)}`,
+      `${NTFY_SERVER}/${TOPIC}/${sequenceId(7, 5, 0)}`,
+    ]);
+    expect(r.requests.filter((x) => x.kind === 'post')).toHaveLength(6);
+    expect(r.store.state.items['7']?.fingerprint).toBe(fingerprintOf(moved));
+    expect(r.store.state.items['7']?.entries.map((x) => x.seq)).toEqual([
+      sequenceId(7, 60, 1),
+      sequenceId(7, 15, 1),
+      sequenceId(7, 5, 1),
+    ]);
   });
 });
 
@@ -530,12 +603,17 @@ describe('privacy', () => {
     }
     for (const req of r.requests.filter((x) => x.kind === 'post')) {
       // The title travels in X-Title; the body holds only the lead and the end
-      // time. The only header fetch adds is the content-type.
+      // time. The only header fetch adds is the content-type. The topic is the
+      // URL path, never notification text.
       const keys = Object.keys(req.headers)
         .filter((k) => k.startsWith('x-'))
         .sort();
       expect(keys).toEqual(['x-click', 'x-delay', 'x-sequence-id', 'x-tags', 'x-title']);
       expect(req.body).not.toContain('Pyrex bowl');
+      expect(req.body).not.toContain(TOPIC);
+      expect(req.headers['x-title']).not.toContain(TOPIC);
+      expect(req.headers['x-click']).not.toContain(TOPIC);
+      expect(req.headers['x-click']).toBe('https://shopgoodwill.com/item/7');
     }
   });
 
@@ -655,7 +733,165 @@ describe('registration', () => {
     expect(requests.map((x) => x.kind)).toEqual(['post', 'post', 'post']);
     expect((await repo.find(STORAGE_KEYS.ntfy))?.items['7']?.entries.every((x) => x.status === 'scheduled')).toBe(true);
   });
+
+  it('promotes a due reminder once from startup and from a job run, and does not send when nothing became due', async () => {
+    const h = harness();
+    await h.seedDeferred();
+    h.clock.advance(3 * DAY + 2 * HOUR);
+    h.start();
+    await until(h.clock, () => (h.requests.length === 3 ? true : undefined));
+    expect(h.requests.map((x) => x.kind)).toEqual(['post', 'post', 'post']);
+
+    const n = h.requests.length;
+    h.start();
+    await h.finishJob('run-2');
+    await pump(h.clock, 40);
+    expect(h.requests.length).toBe(n);
+  });
+
+  it('a job run and a startup send nothing while every deferred lead is still outside the window', async () => {
+    const h = harness();
+    await h.seedDeferred();
+    h.start();
+    await h.finishJob('run-early');
+    await pump(h.clock, 40);
+    expect(h.requests).toHaveLength(0);
+    expect((await h.repo.find(STORAGE_KEYS.ntfy))?.items['7']?.entries.every((x) => x.status === 'deferred')).toBe(true);
+  });
+
+  it('promotion stays behind the opt-in gate: disabled, invalid topic, or no permission sends nothing', async () => {
+    for (const tweak of [
+      async (h: Harness) => {
+        const s = await h.repo.get(STORAGE_KEYS.settings);
+        s.ntfy = { enabled: false, server: NTFY_SERVER, topic: TOPIC };
+        await h.repo.set(STORAGE_KEYS.settings, s);
+      },
+      async (h: Harness) => {
+        const s = await h.repo.get(STORAGE_KEYS.settings);
+        s.ntfy = { enabled: true, server: NTFY_SERVER, topic: 'not a topic' };
+        await h.repo.set(STORAGE_KEYS.settings, s);
+      },
+      async (h: Harness) => {
+        const s = await h.repo.get(STORAGE_KEYS.settings);
+        s.ntfy = { enabled: true, server: 'https://evil.example', topic: TOPIC };
+        await h.repo.set(STORAGE_KEYS.settings, s);
+      },
+      (h: Harness): Promise<void> => {
+        h.permissions.revoke({ origins: ['https://ntfy.sh/*'] });
+        return Promise.resolve();
+      },
+    ]) {
+      const h = harness();
+      await h.seedDeferred();
+      await tweak(h);
+      h.clock.advance(3 * DAY + 2 * HOUR);
+      h.start();
+      await h.finishJob(`run-${String(h.requests.length)}`);
+      await pump(h.clock, 40);
+      expect(h.requests, 'a closed gate must not publish').toHaveLength(0);
+    }
+  });
 });
+
+interface Harness {
+  repo: Repo;
+  clock: FakeClock;
+  requests: Captured[];
+  permissions: FakePermissions;
+  start: () => void;
+  finishJob: (id: string) => Promise<void>;
+  seedDeferred: () => Promise<void>;
+}
+
+/** A registered ntfy sink with one tracked auction five days out and deferred seqs stored. */
+function harness(): Harness {
+  const areas = new FakeStorageAreas();
+  const clock = new FakeClock(T0);
+  const repo = new Repo(areas, clock);
+  const requests: Captured[] = [];
+  installNtfy(requests, clock);
+  const permissions = new FakePermissions({ origins: ['https://ntfy.sh/*'] });
+  let start = (): void => {
+    throw new Error('startup hook was not registered');
+  };
+  register({
+    repo,
+    audit: new FakeAuditLog(clock),
+    clock,
+    storage: areas,
+    http: new BrowserHttp({ now: () => clock.now() }),
+    permissions,
+    switches: new FakeSwitches(),
+    lifecycle: {
+      onStartup: (cb: () => void) => {
+        start = cb;
+        return () => undefined;
+      },
+      onInstalled: () => () => undefined,
+    },
+  } as never);
+
+  const seedDeferred = async (): Promise<void> => {
+    const s = structuredClone(await repo.get(STORAGE_KEYS.settings));
+    s.calendar.enabled = true;
+    s.dryRun.calendar = false;
+    s.ntfy = { enabled: true, server: NTFY_SERVER, topic: TOPIC };
+    await repo.set(STORAGE_KEYS.settings, s);
+    const endMs = T0 + 5 * DAY;
+    await repo.update(STORAGE_KEYS.tracked, (cur) => ({
+      ...cur,
+      7: {
+        itemId: 7,
+        title: 'Pyrex bowl',
+        endTime: new Date(endMs).toISOString(),
+        sellerId: 3,
+        reasons: [{ kind: 'manual' }],
+        favoriteState: 'none',
+        calendar: true,
+        addedAt: T0,
+        updatedAt: T0,
+      },
+    }));
+    await repo.set(STORAGE_KEYS.ntfy, {
+      items: {
+        7: {
+          fingerprint: 'seed',
+          entries: [60, 15, 5].map((leadMin) => ({
+            seq: sequenceId(7, leadMin, 0),
+            leadMin,
+            fireAt: endMs - leadMin * MIN,
+            status: 'deferred' as const,
+          })),
+        },
+      },
+    });
+  };
+
+  return {
+    repo,
+    clock,
+    requests,
+    permissions,
+    start: () => {
+      start();
+    },
+    finishJob: async (id: string) => {
+      const run: JobRun = {
+        id,
+        trigger: 'manual',
+        startedAt: clock.now(),
+        finishedAt: clock.now(),
+        status: 'done',
+        steps: [],
+        cursor: 0,
+        results: { newMatches: [], favorited: [], calendarUpserts: [], errors: [] },
+      };
+      const prev = (await repo.find(STORAGE_KEYS.jobRuns)) ?? [];
+      await repo.set(STORAGE_KEYS.jobRuns, [...prev, run]);
+    },
+    seedDeferred,
+  };
+}
 
 function stubCalendarApi(): CalendarApi {
   const never = (): Promise<never> => {
