@@ -39,6 +39,7 @@ const LOCAL_KEYS = [
   'sbw:favoritesCache',
   'sbw:jobRuns',
   'sbw:calendar',
+  'sbw:ntfy',
   'sbw:snipes',
   'sbw:auditMeta',
   'sbw:sgwSession',
@@ -67,6 +68,18 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:favoritesCache': example('FavoritesCache'),
   'sbw:jobRuns': [example('JobRun')],
   'sbw:calendar': example('CalendarState'),
+  'sbw:ntfy': {
+    status: 'disabled',
+    items: {
+      '279250057': {
+        fingerprint: '2026-10-08T02:18:30.000Z|0|60,15,5',
+        entries: [
+          { seq: 'sbw-279250057-15-0', leadMin: 15, fireAt: 1791397110000, status: 'scheduled' },
+          { seq: 'sbw-279250057-60-0', leadMin: 60, fireAt: 1791394410000, status: 'deferred' },
+        ],
+      },
+    },
+  },
   'sbw:snipes': { 'snp-1': example('Snipe') },
   'sbw:auditMeta': example('AuditMeta'),
   'sbw:sgwSession': example('SgwSessionRecord'),
