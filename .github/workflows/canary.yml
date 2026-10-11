@@ -1,0 +1,115 @@
+name: SGW canary
+
+# T-60: nightly, read-only drift check against shopgoodwill.com (SGW).
+# At most 3 anonymous requests per run (a search, an ItemDetail read, one rendered item page),
+# 120 s apart, plus at most 1 retry after a network/5xx failure (never more than 4 per rolling 24 h).
+# Never a search page or /shopgoodwill/* (robots.txt). See scripts/canary.ts for the rules.
+#
+# Scheduled workflows run only from the default branch (main); until dev is merged to main,
+# only workflow_dispatch from a branch that has this file works.
+on:
+  schedule:
+    # Off-peak US time (02:17 PDT / 01:17 PST), not on the hour.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Bypass the 12 h run lock (the 4/day budget and the 120 s spacing still apply)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write # open or update the "SGW drift detected" issue
+  actions: read # find the previous run's lock artifact (read-only)
+
+# Never two canaries at once; never cancel one that is mid-spacing.
+concurrency:
+  group: sgw-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: canary (schemas and selectors)
+    runs-on: ubuntu-latest
+    # 3 requests with two 120 s waits, one possible 120 s retry wait, page load limits.
+    timeout-minutes: 25
+    env:
+      CI: 'true'
+      CANARY_FORCE: ${{ inputs.force && 'true' || 'false' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0 - version comes from package.json "packageManager"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+
+      # The lock file lives in the previous run's `canary-state` artifact (no new action needed).
+      # No artifact (first run, or expired) means no lock.
+      - name: Find previous canary state
+        id: prev
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=canary-state&per_page=1" \
+            --jq '.artifacts[0] | select(.expired == false) | .workflow_run.id // empty' || true)
+          echo "run_id=$id" >> "$GITHUB_OUTPUT"
+      - name: Restore canary state
+        if: steps.prev.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: canary-state
+          path: canary-state
+          run-id: ${{ steps.prev.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Run canary
+        id: canary
+        # Exit 1 means drift (the issue step below handles it); 0 is pass, inconclusive or skipped.
+        continue-on-error: true
+        run: pnpm canary
+
+      # State is saved even when the canary fails or is skipped, so the lock and budget carry over.
+      - name: Save canary state
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: canary-state
+          path: canary-state/state.json
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Open or update the drift issue
+        if: steps.canary.outputs.status == 'drift'
+        run: |
+          {
+            echo "The nightly SGW canary found that SGW no longer matches our schemas or selectors."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Time: $(jq -r .startedAt canary-out/result.json)"
+            echo
+            echo "| check | path | detail |"
+            echo "| --- | --- | --- |"
+            jq -r '.failures[] | "| `\(.check)` | `\(.path)` | \(.message | gsub("[|\r\n]"; " ")) |"' canary-out/result.json
+            echo
+            echo "No response bodies are recorded here. Fix the adapter (src/adapters/sgw/*) and re-capture fixtures (S-1)."
+          } > canary-out/issue.md
+          num=$(gh issue list --state open --search '"SGW drift detected" in:title' --json number,title \
+            --jq '[.[] | select(.title == "SGW drift detected")][0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body-file canary-out/issue.md
+          else
+            gh issue create --title "SGW drift detected" --body-file canary-out/issue.md
+          fi
+
+      - name: Fail the job on drift
+        if: steps.canary.outputs.status == 'drift'
+        run: exit 1
+      - name: Fail the job if the canary crashed
+        if: steps.canary.outcome == 'failure' && steps.canary.outputs.status == ''
+        run: |
+          echo "::error::canary crashed before producing a result"
+          exit 1
