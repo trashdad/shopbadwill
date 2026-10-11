@@ -415,10 +415,14 @@ describe('NtfySection', () => {
     expect(note?.textContent).toMatch(/titles and end times/i);
   });
 
-  it('warns that nothing is sent while calendar events are off (the sink is fed by calendar sync)', async () => {
+  it('warns that no new pushes are scheduled while calendar events are off, and points at the toggle (T-70b)', async () => {
     const off = defaultSettings();
     app({ settings: { ...off, calendar: { ...off.calendar, enabled: false }, ntfy: { enabled: true, server: NTFY_SERVER, topic: TOPIC } } });
-    expect((await screen.findByText(/calendar events are off/i)).textContent).toMatch(/nothing is sent/i);
+    const note = (await screen.findByText(/calendar events are off/i)).textContent;
+    // Pushes ntfy.sh already holds still fire, so the note does not claim nothing is sent.
+    expect(note).toMatch(/no new pushes are scheduled/i);
+    expect(note).not.toMatch(/nothing is sent/i);
+    expect(note).toMatch(/Turn them on in the Google Calendar section\./);
     cleanup();
 
     app({ settings: ntfyOn() });
