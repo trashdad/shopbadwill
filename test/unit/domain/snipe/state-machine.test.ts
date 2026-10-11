@@ -732,6 +732,9 @@ describe('R1: post-read-failed resolves a sent snipe whose outcome read gave up'
     expect(message).toMatch(/Unconfirmed/);
     expect(message).toContain('Check ShopGoodwill');
     expect(message).not.toMatch(NO_BID_CLAIM);
+    // Nothing was read: no claim that the result "comes from re-reading the item".
+    expect(message).toContain('the item could not be read');
+    expect(message).not.toContain('re-reading');
     expect(money(r.effects)).toEqual([]);
     expect(ofKind(r.effects, 'readDetail')).toEqual([]);
     expect(kinds(r.effects)).toEqual(['notify', 'audit', 'holdKeepAwake']);

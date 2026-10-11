@@ -334,17 +334,26 @@ export function classifyOutcome(
     detail = message;
     stampAs = priceKnown ? 'lost' : null;
   } else {
-    // accepted, outbid, or an ambiguous send settled by re-reading the item.
+    // accepted, outbid, or an ambiguous send settled by re-reading the item, or
+    // (T-80b `post-read-failed`) judged with no read at all.
     const v = judgeAccepted(snipe, bidResult, post);
     final = closed;
     finalPrice = price;
     const unknown = bidResult?.kind === 'rejected-unknown' ? bidResult : null;
-    const via =
-      bidResult === null
+    // No ItemDetail: never claim a re-read, or an auction "still open", that nobody saw.
+    const unread = post === null;
+    const via = unread
+      ? bidResult === null
+        ? ' The bid response was lost and the item could not be read.'
+        : unknown
+          ? " ShopGoodwill's reply was not recognised and the item could not be read."
+          : " This comes from ShopGoodwill's reply; the item could not be read afterwards."
+      : bidResult === null
         ? ' The bid response was lost; this comes from re-reading the item.'
         : unknown
           ? " ShopGoodwill's reply was not recognised; this comes from re-reading the item."
           : '';
+    const stillOpen = unread ? '' : 'auction still open; ';
     const rawNote = unknown
       ? ` Unrecognised reply (status ${String(unknown.rawStatus)}, result ${String(unknown.rawResult)}): ${unknown.messageText}`
       : '';
@@ -352,14 +361,14 @@ export function classifyOutcome(
     if (v.outcome === 'won') {
       outcome = 'won';
       heading = 'Won';
-      message = `Won${final ? '' : ' (leading; auction still open)'}${at} (your max ${max}).${via}`;
+      message = `Won${final ? '' : unread ? ' (leading when the bid went in)' : ' (leading; auction still open)'}${at} (your max ${max}).${via}`;
       detail = `Won; ${v.how}.${rawNote}`;
       stampAs = final ? 'won' : null;
     } else if (v.outcome === 'outbid') {
       outcome = 'outbid';
       heading = final ? 'Lost' : 'Outbid';
       if (price !== undefined) marginCents = price > snipe.maxBid ? price - snipe.maxBid : 0;
-      message = `${final ? 'Lost: outbid' : 'Currently outbid'}${at} (${final ? '' : 'auction still open; '}your max ${max})${marginCents ? `, short by ${formatMoney(marginCents)}` : ''}.${via}`;
+      message = `${final ? 'Lost: outbid' : unread ? 'Outbid when the bid went in' : 'Currently outbid'}${at} (${final ? '' : stillOpen}your max ${max})${marginCents ? `, short by ${formatMoney(marginCents)}` : ''}.${via}`;
       detail = `Outbid; ${v.how}.${rawNote}`;
       stampAs = final ? 'lost' : null;
     } else {

@@ -468,3 +468,53 @@ describe('T-80b: not-sent proof and the unconfirmed post-read-failed copy', () =
     expect(r.notify.message).not.toContain('dry-run measure failed');
   });
 });
+
+// T-80b post-read-failed judges a sent snipe with no ItemDetail at all (the
+// runner gave up reading it, about 7 days on). The copy must not claim a re-read
+// that never happened, nor an auction "still open" (Opus final check).
+describe('T-80b: a sent snipe judged with no read at all', () => {
+  const unk = bid('rejected-unknown', { rawStatus: 200, rawResult: 77, messageText: 'weird reply' });
+
+  it.each([
+    ['no reply (lost response)', snipe(), null],
+    ['an ambiguous send', snipe({ attempt: { sentAt: END_MS - 8000, ambiguous: true } }), null],
+    ['an unrecognised reply', snipe(), unk],
+  ] as const)('%s: Unconfirmed, says the item could not be read, never "re-reading"', (_label, s, reply) => {
+    const r = classifyOutcome(s, reply, null);
+    expect(r.outcome).toBe('network');
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).toMatch(/^Unconfirmed: the bid may have been placed/);
+    expect(r.notify.message).toContain('Check ShopGoodwill');
+    expect(r.notify.message).toContain('the item could not be read');
+    expect(r.notify.message).not.toContain('re-reading');
+    expect(r.stamp).toBeNull();
+  });
+
+  it('an accepted, leading reply: not final, no "auction still open", no re-read claimed', () => {
+    const r = classifyOutcome(snipe(), bid('accepted', { isHighBidder: true }), null);
+    expect(r.outcome).toBe('won');
+    expect(r.final).toBe(false);
+    expect(r.stamp).toBeNull();
+    expect(r.notify.message).toContain('leading when the bid went in');
+    expect(r.notify.message).toContain('the item could not be read');
+    expect(r.notify.message).not.toContain('still open');
+    expect(r.notify.message).not.toContain('re-reading');
+  });
+
+  it('an outbid reply: outbid when the bid went in, no "auction still open"', () => {
+    const r = classifyOutcome(snipe(), bid('outbid', { isHighBidder: false }), null);
+    expect(r.outcome).toBe('outbid');
+    expect(r.notify.title).toMatch(/^Outbid:/);
+    expect(r.notify.message).toMatch(/^Outbid when the bid went in \(your max \$20\.00\)\./);
+    expect(r.notify.message).toContain('the item could not be read');
+    expect(r.notify.message).not.toContain('still open');
+    expect(r.notify.message).not.toContain('Currently outbid');
+    expect(r.stamp).toBeNull();
+  });
+
+  it('with a read, the open-auction copy is unchanged', () => {
+    const open = detail({ isClosed: false, serverTime: new Date(END_MS - 2000).toISOString(), isHighBidder: true, currentPrice: 1800 });
+    expect(classifyOutcome(snipe(), bid('accepted'), open).notify.message).toContain('Won (leading; auction still open) at $18.00');
+    expect(classifyOutcome(snipe(), null, detail({ currentPrice: 1500 })).notify.message).toContain('re-reading the item');
+  });
+});
