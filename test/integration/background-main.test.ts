@@ -423,6 +423,36 @@ describe('T-36 brief', () => {
     expect(seen).toHaveLength(2);
   });
 
+  it('settings.set never changes completedDryRuns (T-90): a stale snipe group cannot roll it back, a crafted one cannot raise it', async () => {
+    const seeded = defaultSettings();
+    seeded.snipe.completedDryRuns = 3;
+    const judged: number[] = [];
+    const gate: BackgroundModule = {
+      register: (ctx) => {
+        ctx.interceptors.settingsSet.add((change) => {
+          judged.push(change.next.snipe.completedDryRuns);
+          return undefined;
+        });
+      },
+    };
+    const h = boot({
+      seed: { [STORAGE_KEYS.settings]: seeded },
+      handlerModules: { ...HANDLER_MODULES, './zz-live-gate.ts': gate },
+    });
+    await h.handle.ready;
+    const stored = (): Settings['snipe'] => (h.areas.local.dump()[STORAGE_KEYS.settings] as Settings).snipe;
+
+    // A page loaded before the last dry runs were counted sends its whole snipe group back.
+    await h.ok('settings.set', { snipe: { ...defaultSettings().snipe, defaultLeadMs: 10_500 } });
+    expect(stored().defaultLeadMs).toBe(10_500);
+    expect(stored().completedDryRuns).toBe(3);
+    // A crafted group cannot open the live gate early.
+    await h.ok('settings.set', { snipe: { ...stored(), completedDryRuns: 99 } });
+    expect(stored().completedDryRuns).toBe(3);
+    // The settings.set interceptors (T-102's live gate) judge the real count.
+    expect(judged).toEqual([3, 3]);
+  });
+
   it('page.token reaches SessionAdapter.observe', async () => {
     const h = boot();
     const ctx = await h.handle.ready;
