@@ -34,18 +34,22 @@ import {
   getSnipeRunner,
   KEEP_ALIVE_INTERVAL_MS,
   POST_READ_FAST_ATTEMPTS,
+  POST_READ_SLOW_ATTEMPTS,
   RUNNER_KEY,
   snipeAlarmName,
   snipeSeams,
   type SendStrategy,
 } from '../../src/background/jobs/snipe-runner';
+import { SWITCHES_LOAD_TIMEOUT_MS } from '../../src/background/switches';
 import { startBackground, type BackgroundBrowser } from '../../src/background/main';
 import type { MessageResponse, RouterSender } from '../../src/background/router';
+import { BidNotSentError } from '../../src/adapters/sgw/bid';
 import { normalizeItemDetail } from '../../src/adapters/sgw/normalize';
 import type { AuditEntry } from '../../src/domain/audit/types';
 import { bidAmount } from '../../src/domain/money';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
+import { exposure } from '../../src/domain/snipe/caps';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import { formatPacificNaive } from '../../src/domain/time/pacific';
 import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
@@ -310,6 +314,8 @@ class WorkerStorage implements Storage {
     private readonly crash: {
       after?: CrashPredicate;
       failAfter?: CrashPredicate;
+      /** The matching write is refused: nothing is stored, and its promise rejects. */
+      failBefore?: CrashPredicate;
       /** Fake ms a matching write takes to land (a slow disk); the worker's clock runs it. */
       slow?: (area: 'local' | 'session', entries: Record<string, unknown>) => number;
       later: (fn: () => void, ms: number) => void;
@@ -333,6 +339,10 @@ class WorkerStorage implements Storage {
   }
   private store(entries: Record<string, unknown>): Promise<void> {
     if (this.life.dead) return never();
+    // The write fails and nothing is stored (the worker lives on).
+    if (this.crash.failBefore?.(this.area, entries) === true) {
+      return Promise.reject(new Error('storage.local.set failed; nothing was stored'));
+    }
     const p = this.base.set(entries);
     if (this.crash.after?.(this.area, entries) === true) {
       this.crash.kill();
@@ -404,6 +414,8 @@ interface WorkerOptions {
   slowSet?: (area: 'local' | 'session', entries: Record<string, unknown>) => number;
   /** The matching write is stored, then reported as failed (the worker stays alive). */
   failAfterSet?: CrashPredicate;
+  /** The matching write fails and is NOT stored (the worker stays alive). */
+  failSet?: CrashPredicate;
   jobModules?: Record<string, BackgroundModule>;
 }
 
@@ -434,6 +446,7 @@ class Worker {
       },
       ...(opts.crashAfterSet ? { after: opts.crashAfterSet } : {}),
       ...(opts.failAfterSet ? { failAfter: opts.failAfterSet } : {}),
+      ...(opts.failSet ? { failBefore: opts.failSet } : {}),
       ...(opts.slowSet ? { slow: opts.slowSet } : {}),
       later: (fn: () => void, ms: number) => {
         this.clock.setTimeout(fn, ms);
@@ -1083,22 +1096,43 @@ describe('money safety carries', () => {
     const s = stored(shared);
     expect(shared.sgw.placeBids).toHaveLength(1);
     expect(s.attempt.ambiguous).toBe(true);
+    expect(s.attempt.notSent).not.toBe(true);
     expect(s.state).toBe('resolved');
     expect(s.outcomeDetail ?? '').not.toMatch(NO_BID_CLAIM);
+    // Never a "No bid was sent" notification when PlaceBid may have left.
+    expect(shared.notifier.sent.some((n) => n.notification.title.startsWith('Not bid'))).toBe(false);
+    expect(shared.notifier.sent.some((n) => /No bid was sent/i.test(n.notification.message))).toBe(false);
+    expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(1);
+    expect(kinds(shared)).toContain('bid.ambiguous');
+    expect(kinds(shared)).not.toContain('bid.not-sent');
   });
 
-  it('PlaceBid contract: a provably unsent bid (ShowBidModal failed) is not retried by the default strategy', async () => {
+  it('PlaceBid contract: a provably unsent bid (ShowBidModal failed) resolves as not-sent: one send attempt, zero PlaceBid on the wire', async () => {
     const shared = makeShared();
     const { w } = await boot(shared);
     await arm(w);
     await runTo(shared, FIRE_LOCAL - 10);
-    // Break ShowBidModal: bid.ts sends nothing after a failed modal read.
+    // Break ShowBidModal: bid.ts throws BidNotSentError, so nothing was ever sent.
     shared.http.on(MODAL_URL, { status: 500, latencyMs: LATENCY });
     await runTo(shared, END + 10 * MIN);
     expect(shared.sgw.placeBids).toHaveLength(0);
+    // The default strategy does not retry: one modal read, and no PlaceBid byte.
+    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(1);
+    expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
+    const s = stored(shared);
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.notSent).toBe(true);
+    expect(s.attempt.ambiguous).not.toBe(true);
+    expect(s.outcome).toBe('network');
+    expect(s.outcomeDetail ?? '').toMatch(/provably never went out/);
+    expect(kinds(shared).filter((k) => k === 'bid.sent')).toHaveLength(1);
+    expect(kinds(shared)).not.toContain('bid.ambiguous');
+    expect(kinds(shared)).not.toContain('snipe.post-read');
     const notSent = audits(shared).find((a) => a.kind === 'bid.not-sent');
-    expect(notSent?.details).toMatchObject({ effect: 'placeBid', afterSent: true });
-    expect(stored(shared).state).toBe('resolved');
+    expect(notSent?.details).toMatchObject({ event: 'not-sent', from: 'sent', to: 'resolved' });
+    expect(String(notSent?.details.reason).length).toBeGreaterThan(0);
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Not bid'));
+    expect(notice?.notification.message).toMatch(NO_BID_CLAIM);
   });
 });
 
@@ -1220,7 +1254,7 @@ describe('money path edges (final check)', () => {
     expect(String(audits(shared).find((a) => a.kind === 'snipe.disarm')?.details.why)).toMatch(/health/);
   });
 
-  it('the kill switch between ShowBidModal and PlaceBid: nothing on the wire, and the sent snipe is read, never killed', async () => {
+  it('the kill switch between ShowBidModal and PlaceBid: nothing on the wire, and the proven-unsent bid resolves, never killed', async () => {
     const shared = makeShared();
     const { w } = await boot(shared);
     await arm(w);
@@ -1233,10 +1267,21 @@ describe('money path edges (final check)', () => {
     await runTo(shared, END + 10 * MIN);
     const s = stored(shared);
     expect(shared.sgw.placeBids).toHaveLength(0);
+    // The write gate throws before http.send, so no PlaceBid byte is on the wire.
+    expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
     expect(s.state).toBe('resolved');
-    expect(s.attempt.ambiguous).toBe(true);
+    // The write gate refused before any byte left: bid.ts proved it, so the
+    // snipe resolves through `not-sent` instead of a read.
+    expect(s.attempt.notSent).toBe(true);
+    expect(s.attempt.ambiguous).not.toBe(true);
     expect(s.history.some((h) => h.to === 'killed')).toBe(false);
-    expect(audits(shared).find((a) => a.kind === 'bid.not-sent')?.details).toMatchObject({ effect: 'placeBid', afterSent: true });
+    expect(kinds(shared)).not.toContain('snipe.post-read');
+    const notSent = audits(shared).find((a) => a.kind === 'bid.not-sent');
+    expect(notSent?.details).toMatchObject({ event: 'not-sent', from: 'sent', to: 'resolved' });
+    expect(String(notSent?.details.reason)).toBe('kill switch is on');
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Not bid'));
+    expect(notice?.notification.message).toMatch(/No bid was sent \(kill switch is on\)/);
+    expect(notice?.notification.message).not.toMatch(/may have been placed/i);
   });
 });
 
@@ -1919,9 +1964,12 @@ function checkWorld(world: PropWorld): void {
   expect(s.maxBid).toBe(world.maxBid);
   expect(s.history.filter((h) => h.to === 'sent' && h.from !== 'sent').length).toBeLessThanOrEqual(1);
   if (s.attempt.ambiguous === true) expect(s.attempt.reply).toBeUndefined();
+  if (s.attempt.notSent === true) expect(bids).toHaveLength(0);
   if (bids.length > 0) {
     // A bid that may be live is never killed, nor reported as "no bid".
     expect(['sent', 'resolved']).toContain(s.state);
+    expect(s.attempt.notSent).not.toBe(true);
+    expect(shared.notifier.sent.some((n) => /No bid was sent/i.test(n.notification.message))).toBe(false);
     if (s.state === 'resolved') {
       expect(['killed', 'cap-blocked', 'skipped', 'dry-run']).not.toContain(s.outcome);
       expect(s.outcomeDetail ?? '').not.toMatch(NO_BID_CLAIM);
@@ -2148,5 +2196,457 @@ describe('auto-kill on anomalies (clock, latency, schema drift)', () => {
     await runTo(shared, END + 2 * MIN);
     expect(stored(shared)).toMatchObject({ state: 'resolved', outcome: 'skipped' });
     expect(shared.sgw.placeBids).toHaveLength(0);
+  });
+});
+
+// ── T-84b: give-up settles through post-read-failed (brief item 1) ────────────
+
+describe('T-84b: the 7-day give-up settles a sent snipe (post-read-failed)', () => {
+  it('the give-up leaves a terminal snipe with exposure released and one final notification (the reducer\'s)', async () => {
+    const shared = makeShared();
+    // The worker dies right after `sent` is stored, before any PlaceBid: the
+    // reply is lost, so the restart treats it as ambiguous (never a "no bid" claim).
+    const first = await boot(shared, { crashAfterSet: crashOn('sent') });
+    await arm(first.w);
+    await runTo(shared, FIRE_LOCAL + 100);
+    expect(first.w.life.dead).toBe(true);
+    expect(stored(shared).state).toBe('sent');
+    await boot(shared);
+    await runTo(shared, FIRE_LOCAL + 5 * SEC);
+    expect(stored(shared)).toMatchObject({ state: 'sent', attempt: { ambiguous: true } });
+    shared.sgw.detailDown = net();
+    const readsBefore = shared.sgw.details.length;
+    expect(exposure([stored(shared)]).count).toBe(1); // a sent snipe still counts
+
+    // The fast attempts fail: the early heads-up alert goes out, and the snipe stays sent.
+    await runTo(shared, END + 45 * MIN);
+    expect(stored(shared).state).toBe('sent');
+    expect(shared.notifier.sent.find((n) => n.notification.title.startsWith('Unconfirmed'))?.notification.message).toMatch(/after 3 tries/);
+    const notesBefore = shared.notifier.sent.length;
+
+    // The slow retries fail for 7 days: the runner gives up through the reducer.
+    await runTo(shared, END + 7 * DAY + 2 * HOUR);
+    const s = stored(shared);
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.ambiguous).toBe(true);
+    expect(kinds(shared)).toContain('snipe.post-read-failed');
+    expect(shared.sgw.details.length - readsBefore).toBe(POST_READ_FAST_ATTEMPTS + POST_READ_SLOW_ATTEMPTS);
+    // Terminal: no more exposure, no snipe alarms, the runner entry is gone.
+    expect(exposure([s]).count).toBe(0);
+    expect(await snipeAlarms(shared)).toEqual([]);
+    expect(runnerRecord(shared).entries.s1).toBeUndefined();
+    // One final notification at the give-up, and it is the reducer's effect:
+    // the classification heading, no "after N tries" runner card, no "no bid" claim.
+    const after = shared.notifier.sent.slice(notesBefore);
+    const snipeNotes = after.filter((n) => n.notification.title.includes(stored(shared).title));
+    expect(snipeNotes).toHaveLength(1);
+    expect(snipeNotes[0]?.notification.title).toBe(`Unconfirmed: ${stored(shared).title}`);
+    expect(snipeNotes[0]?.notification.message).toMatch(/Check ShopGoodwill/i);
+    expect(snipeNotes[0]?.notification.message).not.toMatch(/tries/i);
+    expect(snipeNotes[0]?.notification.message).not.toMatch(NO_BID_CLAIM);
+  });
+
+  it('an accepted, leading reply makes both alerts say "Leading", never "Won" or "Not bid"', async () => {
+    const shared = makeShared();
+    const strategy: SendStrategy = {
+      // T-101's seam: the accepted, leading reply (the fake SGW has no catalogue entry for it).
+      send: (_req, deps) =>
+        Promise.resolve({
+          kind: 'result',
+          result: {
+            kind: 'accepted',
+            rawStatus: null,
+            rawResult: null,
+            messageText: 'Bid placed',
+            isHighBidder: true,
+            observedAt: deps.clock.now(),
+          },
+        }),
+    };
+    const { w } = await boot(shared, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setSendStrategy(strategy);
+      }),
+    });
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared)).toMatchObject({ state: 'sent', attempt: { reply: { kind: 'accepted' } } });
+    shared.sgw.detailDown = net();
+
+    // The early heads-up alert after the fast retries: the SAME classification as the reducer's.
+    await runTo(shared, END + 45 * MIN);
+    const early = shared.notifier.sent.find((n) => n.notification.title.startsWith('Leading'));
+    expect(early?.notification.title).toBe(`Leading: ${stored(shared).title}`);
+    expect(early?.notification.message).toMatch(/Leading when the bid went in/);
+    expect(early?.notification.message).toMatch(/after 3 tries/);
+
+    // The final notification at the give-up: the reducer's, from its effects.
+    await runTo(shared, END + 7 * DAY + 2 * HOUR);
+    const s = stored(shared);
+    expect(s.state).toBe('resolved');
+    expect(s.outcome).toBe('won');
+    expect(kinds(shared)).toContain('snipe.post-read-failed');
+    const finals = shared.notifier.sent.filter(
+      (n) => n.notification.title.startsWith('Leading') && !/tries/.test(n.notification.message),
+    );
+    expect(finals).toHaveLength(1);
+    expect(finals[0]?.notification.message).toMatch(/Leading when the bid went in/);
+    for (const n of shared.notifier.sent) {
+      expect(n.notification.title).not.toMatch(/^Won/);
+      expect(n.notification.title).not.toMatch(/^Not bid/);
+    }
+  });
+
+  it('a later successful read before the give-up still settles normally (post-read, never the give-up)', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared).state).toBe('sent');
+    shared.sgw.detailDown = net();
+    await runTo(shared, END + 45 * MIN);
+    expect(stored(shared).state).toBe('sent');
+
+    // Storage heals long before the 7 days: the next slow read settles it.
+    shared.sgw.detailDown = undefined;
+    await runTo(shared, END + 20 * HOUR);
+    expect(stored(shared).state).toBe('resolved');
+    expect(kinds(shared)).toContain('snipe.post-read');
+    expect(kinds(shared)).not.toContain('snipe.post-read-failed');
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+});
+
+// ── T-84b: a provably unsent bid resolves through not-sent (brief item 2) ─────
+
+describe('T-84b: the SendStrategy seam routes not-sent', () => {
+  it('a SendStrategy reporting not-sent resolves the snipe as not-sent (the default never retries)', async () => {
+    const shared = makeShared();
+    const strategy: SendStrategy = {
+      send: () => Promise.resolve({ kind: 'not-sent', error: new Error('the write gate refused before any byte left') }),
+    };
+    const { w } = await boot(shared, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setSendStrategy(strategy);
+      }),
+    });
+    await arm(w);
+    await runTo(shared, END + 2 * MIN);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    const s = stored(shared);
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.notSent).toBe(true);
+    expect(s.outcome).toBe('network');
+    expect(s.outcomeDetail ?? '').toMatch(/provably never went out/);
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Not bid'));
+    expect(notice?.notification.message).toMatch(/No bid was sent/);
+    expect(notice?.notification.message).toMatch(/write gate refused/);
+  });
+
+  it('a SendStrategy that throws BidNotSentError resolves as not-sent, and a generic throw stays ambiguous', async () => {
+    const provable = makeShared();
+    const { w: proved } = await boot(provable, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setSendStrategy({
+          send: () => Promise.reject(new BidNotSentError('paused', 'kill switch is on')),
+        });
+      }),
+    });
+    await arm(proved);
+    await runTo(provable, END + 2 * MIN);
+    expect(provable.sgw.placeBids).toHaveLength(0);
+    expect(provable.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
+    expect(stored(provable)).toMatchObject({ state: 'resolved', outcome: 'network', attempt: { notSent: true } });
+    expect(provable.notifier.sent.find((n) => n.notification.title.startsWith('Not bid'))?.notification.message).toMatch(
+      /No bid was sent \(kill switch is on\)/,
+    );
+
+    const lost = makeShared();
+    const { w } = await boot(lost, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setSendStrategy({
+          send: () => Promise.reject(new Error('socket hang up')),
+        });
+      }),
+    });
+    await arm(w);
+    await runTo(lost, END + 10 * MIN);
+    const s = stored(lost);
+    expect(lost.sgw.placeBids).toHaveLength(0);
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.ambiguous).toBe(true);
+    expect(s.attempt.notSent).not.toBe(true);
+    expect(lost.notifier.sent.some((n) => /No bid was sent/i.test(n.notification.message))).toBe(false);
+    expect(kinds(lost)).toContain('bid.ambiguous');
+    expect(kinds(lost)).not.toContain('bid.not-sent');
+  });
+});
+
+// ── T-84b: verify-read order (brief item 3) ───────────────────────────────────
+
+describe('T-84b: content exits win over the latency anomaly at the verify', () => {
+  it('a slow verify read showing price-over-max aborts on price, with no early proxy', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 2 * MIN);
+    expect(stored(shared).state).toBe('waking');
+    shared.sgw.latency = 2500; // over MAX_RTT_MS
+    shared.sgw.item = { ...shared.sgw.item, price: 2500, minimumBid: 2600 };
+    await runTo(shared, END + 2 * MIN);
+
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    // The price exit, never the latency anomaly: no fallback, no disarm, nothing on the wire.
+    expect(audits(shared).some((a) => a.kind === 'snipe.fallback')).toBe(false);
+    expect(audits(shared).some((a) => a.kind === 'snipe.disarm')).toBe(false);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Not bid'));
+    expect(notice?.notification.message).toMatch(/above your max/);
+  });
+
+  it('a slow verify read of a closed auction aborts as ended, with no early proxy', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 2 * MIN);
+    expect(stored(shared).state).toBe('waking');
+    shared.sgw.latency = 2500;
+    shared.sgw.item.closed = true;
+    await runTo(shared, END + 2 * MIN);
+
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'ended' });
+    expect(audits(shared).some((a) => a.kind === 'snipe.fallback')).toBe(false);
+    expect(audits(shared).some((a) => a.kind === 'snipe.disarm')).toBe(false);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.notifier.sent.some((n) => n.notification.title.startsWith('Ended'))).toBe(true);
+  });
+
+  it('a slow verify read of a later end aborts as extended, with no early proxy', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 2 * MIN);
+    expect(stored(shared).state).toBe('waking');
+    shared.sgw.latency = 2500;
+    shared.sgw.item.endMs = END + 30 * MIN;
+    await runTo(shared, END + 2 * MIN);
+
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'extended' });
+    expect(audits(shared).some((a) => a.kind === 'snipe.fallback')).toBe(false);
+    expect(audits(shared).some((a) => a.kind === 'snipe.disarm')).toBe(false);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+  });
+
+  it('a slow verify read where the user is already high aborts as already-high, with no early proxy', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 2 * MIN);
+    expect(stored(shared).state).toBe('waking');
+    shared.sgw.latency = 2500;
+    shared.sgw.item.high = true;
+    await runTo(shared, END + 2 * MIN);
+
+    expect(stored(shared)).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(audits(shared).some((a) => a.kind === 'snipe.fallback')).toBe(false);
+    expect(audits(shared).some((a) => a.kind === 'snipe.disarm')).toBe(false);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.notifier.sent.find((n) => n.notification.title.startsWith('No bid needed'))?.notification.message).toMatch(
+      /already the high bidder/i,
+    );
+  });
+});
+
+// ── T-84b: dispatch refuses attempt events from outside (brief item 4) ────────
+
+describe('T-84b: dispatch refuses attempt events from outside', () => {
+  it('an outside result or post-read-failed is refused and changes nothing', async () => {
+    const shared = makeShared();
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared).state).toBe('sent');
+    const runner = getSnipeRunner(ctx);
+    if (runner === undefined) throw new Error('no runner');
+    const before = stored(shared);
+    const now = shared.clock.now();
+    const detail = normalizeItemDetail(shared.sgw.raw(), { observedAt: now, authenticated: true });
+    const attempts: SnipeEvent[] = [
+      { type: 'sent', now, key: 'outside' },
+      {
+        type: 'result',
+        now,
+        result: { kind: 'accepted', rawStatus: null, rawResult: null, messageText: 'outside', isHighBidder: true, observedAt: now },
+      },
+      { type: 'ambiguous', now },
+      { type: 'post-read', now, detail },
+      { type: 'post-read-failed', now },
+      { type: 'not-sent', now, reason: 'outside' },
+    ];
+    for (const e of attempts) {
+      const r = await runner.dispatch('s1', e);
+      expect(r.kind).toBe('rejected');
+      if (r.kind === 'rejected') expect(r.rejection.reason).toBe('invalid-event');
+    }
+    expect(stored(shared)).toEqual(before);
+    expect(stored(shared).state).toBe('sent');
+    // disarm is not an attempt event. On a sent snipe the reducer refuses it; the runner does not.
+    const disarm = await runner.dispatch('s1', { type: 'disarm', now, by: 'user', why: 'stop' });
+    expect(disarm.kind).toBe('rejected');
+    if (disarm.kind === 'rejected') expect(disarm.rejection.reason).toBe('already-sent');
+    expect(stored(shared)).toEqual(before);
+    // The runner's own outcome read still settles it.
+    await runTo(shared, END + 2 * MIN);
+    expect(stored(shared).state).toBe('resolved');
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+
+  it('an outside disarm of an armed snipe still stops it, and sends nothing', async () => {
+    const shared = makeShared();
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    expect(stored(shared).state).toBe('armed');
+    const runner = getSnipeRunner(ctx);
+    if (runner === undefined) throw new Error('no runner');
+    const r = await runner.dispatch('s1', { type: 'disarm', now: shared.clock.now(), by: 'user', why: 'the user stopped it' });
+    expect(r.kind).toBe('accepted');
+    await flush();
+    expect(stored(shared).state).toBe('killed');
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.http.requests.filter((req) => req.url.startsWith(PLACE_URL))).toHaveLength(0);
+  });
+});
+
+// ── T-84b: slow storage start copy (brief item 5) ─────────────────────────────
+
+describe('T-84b: a slow storage start fails closed with plain copy', () => {
+  it('the disarm notification says the storage did not start in time and never claims a bid was placed', async () => {
+    const shared = makeShared();
+    const first = await boot(shared);
+    await arm(first.w);
+    await runTo(shared, END - SKEW - 30 * SEC);
+    expect(stored(shared).state).toBe('verified');
+    first.w.kill();
+
+    // The next worker's storage answers only after 6 s: the 5 s switch-snapshot deadline passes first.
+    const realGet = shared.areas.local.get.bind(shared.areas.local);
+    let delayed = true;
+    shared.areas.local.get = async <T>(key: string): Promise<T | undefined> => {
+      if (delayed && key === STORAGE_KEYS.settings) {
+        delayed = false;
+        await new Promise<void>((resolve) => {
+          shared.clock.setTimeout(resolve, 6 * SEC);
+        });
+      }
+      return realGet<T>(key);
+    };
+
+    const pending = boot(shared);
+    // Let migrate and the switch-snapshot load start (and its 5 s deadline timer register) before advancing.
+    await flush(6);
+    shared.clock.advance(SWITCHES_LOAD_TIMEOUT_MS + 2 * SEC);
+    await flush();
+    await pending;
+    await flush(5);
+
+    const s = stored(shared);
+    expect(s.state).toBe('killed');
+    expect(s.outcome).toBe('skipped');
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Snipe skipped'));
+    expect(notice?.notification.message).toMatch(/did not start in time/);
+    expect(notice?.notification.message).toMatch(/skipped for safety/);
+    expect(notice?.notification.message).toMatch(/No bid was placed/);
+    expect(String(audits(shared).find((a) => a.kind === 'snipe.disarm')?.details.why)).toMatch(/did not start in time/);
+    // The honest denial is the only "placed" sentence. A claim that a bid went out fails this.
+    const denialStripped = (notice?.notification.message ?? '').replace(/No bid was placed\./g, '');
+    expect(denialStripped).not.toMatch(/bid was placed|placing your max|you (won|lead)|early proxy bid instead/i);
+  });
+});
+
+describe('T-84b: a dry-run measure give-up has no money effect', () => {
+  it('giving up on the dry-run measure read resolves as dry-run and sends nothing', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w, { dryRun: true });
+    await runTo(shared, FIRE_LOCAL - 10);
+    expect(stored(shared).state).toBe('verified');
+    expect(stored(shared).dryRun).toBe(true);
+    shared.sgw.detailDown = net();
+    await runTo(shared, END + 45 * MIN);
+
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'dry-run' });
+    expect(kinds(shared)).toContain('snipe.post-read-failed');
+    expect(kinds(shared)).not.toContain('bid.sent');
+    expect(kinds(shared)).not.toContain('snipe.fallback');
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
+    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(0);
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Dry run'));
+    expect(notice?.notification.title).toBe(`Dry run: ${s.title}`);
+    expect(notice?.notification.message).toMatch(/would have bid/i);
+    expect(notice?.notification.message).toMatch(/measure failed/i);
+    expect(notice?.notification.message).not.toMatch(/may have been placed|No bid was sent/i);
+    expect(shared.notifier.sent.some((n) => n.notification.title.startsWith('Unconfirmed'))).toBe(false);
+    expect(exposure([s]).count).toBe(0);
+  });
+});
+
+// ── T-84b final check (Opus) ──────────────────────────────────────────────────
+
+describe('T-84b final check: a failed not-sent write', () => {
+  it('a not-sent write that fails (nothing stored) still resolves as not-sent in the same worker: never ambiguous, never resent, never an outbid', async () => {
+    const shared = makeShared();
+    let failing = true;
+    const { w } = await boot(shared, {
+      // The first `not-sent` write fails and nothing is stored: the snipe stays `sent` with no reply.
+      failSet: (area, entries) => {
+        const s = snipesIn(entries)?.s1;
+        if (!failing || area !== 'local' || s?.attempt.notSent !== true) return false;
+        failing = false;
+        return true;
+      },
+    });
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL - 10);
+    // ShowBidModal fails: bid.ts throws BidNotSentError, so PlaceBid never left.
+    shared.http.on(MODAL_URL, { status: 500, latencyMs: LATENCY });
+    await runTo(shared, FIRE_LOCAL + 5 * SEC);
+    expect(failing).toBe(false);
+    expect(w.life.dead).toBe(false);
+    expect(stored(shared).state).toBe('sent');
+    expect(stored(shared).attempt.notSent).not.toBe(true);
+
+    await runTo(shared, END + 10 * MIN);
+    const s = stored(shared);
+    // Nothing was ever resent: one modal read, no PlaceBid byte.
+    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(1);
+    expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
+    expect(s.history.filter((h) => h.to === 'sent' && h.from !== 'sent')).toHaveLength(1);
+    // The worker still knows the bid provably never left: not-sent, never the ambiguous read.
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.notSent).toBe(true);
+    expect(s.attempt.ambiguous).not.toBe(true);
+    expect(s.outcome).toBe('network');
+    expect(kinds(shared)).not.toContain('bid.ambiguous');
+    expect(kinds(shared)).not.toContain('snipe.post-read');
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Not bid'));
+    expect(notice?.notification.message).toMatch(/No bid was sent/);
+    // Honest copy: no claim that a bid went out, was outbid, or may have been placed.
+    for (const n of shared.notifier.sent) {
+      expect(n.notification.title).not.toMatch(/^(Lost|Won|Leading|Outbid|Unconfirmed)\b/);
+      expect(n.notification.message).not.toMatch(/Lost: outbid|Currently outbid|Outbid when|may have been placed|bid response was lost/i);
+    }
   });
 });
