@@ -899,7 +899,8 @@ describe('wiring', () => {
     expect(h.http.requests).toEqual([]);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(Object.values(ctx.scheduler.stats().lanes).map((l) => l.usedToday)).toEqual([0, 0, 0, 0]);
-    expect(await h.alarms.getAll()).toEqual([]);
+    // T-52: reconcile() creates the one `sbw:tick` alarm (no request, R7 still holds).
+    expect(await h.alarms.getAll()).toEqual([expect.objectContaining({ name: 'sbw:tick', periodInMinutes: 2 })]);
     expect(h.notifier.sent).toEqual([]);
   });
 
