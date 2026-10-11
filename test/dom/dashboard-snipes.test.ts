@@ -15,7 +15,6 @@ import { reduce } from '../../src/domain/snipe/state-machine';
 import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
-import { formatDual } from '../../src/domain/time/pacific';
 import type { ItemDetail } from '../../src/domain/types';
 import { PORT_NAMES, type MsgPayload } from '../../src/messaging/protocol';
 import { itemIdFromSearch, SnipesSection } from '../../src/ui/dashboard/sections/snipes';
@@ -319,10 +318,37 @@ describe('dashboard snipes: money guards (tests first)', () => {
     // in both zones. The time node is formatDual's own string.
     expect(region.getByText('Max bid: $20.00')).toBeTruthy();
     expect(region.getByText('Estimated all-in: $30.00 (max $20.00 + shipping $9.00 + handling $1.00)')).toBeTruthy();
-    const bothZones = formatDual(END_MS, TZ);
-    expect(bothZones).toMatch(/PT/);
-    expect(bothZones).toMatch(/ET/);
-    expect(region.getByText(bothZones)).toBeTruthy();
+    // The end with its DATE, in the user's zone and in SGW Pacific (ruling 3).
+    expect(region.getByText('Wed Oct 7, 10:18:30 PM EDT (7:18:30 PM PT)')).toBeTruthy();
+  });
+
+  describe('the confirmation end date (ruling 3)', () => {
+    async function confirmFor(endTime: string, userTz = TZ): Promise<HTMLElement> {
+      const m = new FakeMessaging();
+      m.handle('settings.get', () => settings({ snipe: { ...settings().snipe, caps: generousCaps } }));
+      m.handle('snipe.list', () => []);
+      m.handle('snipe.prepare', ({ itemId }) => ({ detail: detail({ itemId, endTime }), estAllIn: 2349, caps: { ok: true, violations: [] } }));
+      render(h(SnipesSection, { client: m, userTz, openOptions: () => undefined }));
+      await prepare(m);
+      fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '20.00' } });
+      fireEvent.click(screen.getByRole('button', { name: /^review and arm$/i }));
+      return (await screen.findByText(/^review your snipe$/i)).closest('div') as HTMLElement;
+    }
+
+    it('across midnight, each side shows its own date', async () => {
+      // 12:30 AM Thursday in New York is still 9:30 PM Wednesday in Pacific.
+      const region = within(await confirmFor('2026-10-08T04:30:00.000Z'));
+      expect(region.getByText('Thu Oct 8, 12:30:00 AM EDT (Wed Oct 7, 9:30:00 PM PT)')).toBeTruthy();
+    });
+
+    it('at a DST boundary, each zone uses its own offset that night', async () => {
+      // 2026-11-01: New York falls back at 06:00Z, Pacific at 09:00Z. At 06:30Z
+      // New York is on EST (1:30 AM, the second one) while Pacific is still PDT.
+      expect(within(await confirmFor('2026-11-01T06:30:00.000Z')).getByText('Sun Nov 1, 1:30:00 AM EST (Sat Oct 31, 11:30:00 PM PT)')).toBeTruthy();
+      cleanup();
+      // An hour earlier is the first 1:30 AM (EDT) in New York.
+      expect(within(await confirmFor('2026-11-01T05:30:00.000Z')).getByText('Sun Nov 1, 1:30:00 AM EDT (Sat Oct 31, 10:30:00 PM PT)')).toBeTruthy();
+    });
   });
 
   it('parses dollar text into cents and refuses junk', async () => {

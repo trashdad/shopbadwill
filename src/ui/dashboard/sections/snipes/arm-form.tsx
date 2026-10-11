@@ -29,6 +29,7 @@ import { Status } from '../../../components/Status';
 import { Money } from '../../../money';
 import { PacificTime } from '../../../time';
 import { ErrorAlert } from '../../parts';
+import { formatEndDual } from './end-time';
 
 /** R3: the exact label a dry-run snipe carries everywhere it appears. */
 export const DRY_RUN_LABEL = 'DRY RUN — no bid will be placed';
@@ -544,7 +545,7 @@ export function ArmForm(props: ArmFormProps): VNode {
             ) : null}
             <li>Estimated all-in: {allInText}</li>
             <li>
-              Ends <PacificTime ms={endMs} userTz={props.userTz} />
+              Ends <time dateTime={new Date(endMs).toISOString()}>{formatEndDual(endMs, props.userTz)}</time>
             </li>
             <li>Lead: {String(Math.round(planned.leadMs / 1000))} seconds</li>
             <li>
