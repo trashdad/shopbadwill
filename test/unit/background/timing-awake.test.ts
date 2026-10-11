@@ -1,6 +1,6 @@
 // T-90: `timing.awake` returns the persisted sbw:awake heartbeat history.
-// UI only, empty request. A missing or invalid record answers an empty array
-// (the repo's default after quarantine), never a thrown error.
+// UI only, empty request. A missing or invalid record answers an empty array,
+// never a thrown error, and a read never writes (no quarantine move here).
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { register } from '../../../src/background/handlers/timing';
@@ -44,12 +44,30 @@ describe('timing.awake', () => {
     expect(await router.handle(env(), UI)).toEqual({ ok: true, reply: [BEAT, BEAT + 60_000] });
   });
 
-  it('an invalid record is quarantined and answers an empty array', async () => {
+  it('an invalid record answers an empty array and is left in place (a read never writes)', async () => {
     await areas.local.set({ [STORAGE_KEYS.awake]: [-1, 'nope'] });
+    const before = areas.local.dump();
     expect(await router.handle(env(), UI)).toEqual({ ok: true, reply: [] });
-    const quarantined = await areas.local.get<unknown>(`sbw:quarantine:${STORAGE_KEYS.awake}`);
-    expect(quarantined).toMatchObject({ value: [-1, 'nope'] });
-    expect(await areas.local.get(STORAGE_KEYS.awake)).toBeUndefined();
+    // No quarantine move: the heartbeat job, under its own lock, owns that.
+    expect(areas.local.dump()).toEqual(before);
+    expect(await areas.local.get(`sbw:quarantine:${STORAGE_KEYS.awake}`)).toBeUndefined();
+  });
+
+  it('answering never writes storage', async () => {
+    await repo.set(STORAGE_KEYS.awake, [BEAT]);
+    const writes: unknown[] = [];
+    const realSet = areas.local.set.bind(areas.local);
+    const realRemove = areas.local.remove.bind(areas.local);
+    areas.local.set = async (items) => {
+      writes.push(items);
+      await realSet(items);
+    };
+    areas.local.remove = async (keys) => {
+      writes.push(keys);
+      await realRemove(keys);
+    };
+    expect(await router.handle(env(), UI)).toEqual({ ok: true, reply: [BEAT] });
+    expect(writes).toEqual([]);
   });
 
   it('a content script may not send it', async () => {

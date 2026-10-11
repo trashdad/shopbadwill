@@ -571,7 +571,7 @@ Source: controller ruling on T-90 concern 1. Additive. No other protocol change.
 
 The Timing page's awake chart needs the persisted heartbeat history. No existing message carries `sbw:awake`.
 
-`timing.awake` is a UI signal (empty request). The reply is `STORAGE_RECORDS[STORAGE_KEYS.awake].schema`, which is `EpochMs[]`: the stored history, or an empty array when nothing is stored. A content script is refused (`forbidden`), same as every other UI message. The handler reads through `repo.get`, so an invalid record is quarantined and the reply is `[]`.
+`timing.awake` is a UI signal (empty request). The reply is `STORAGE_RECORDS[STORAGE_KEYS.awake].schema`, which is `EpochMs[]`: the stored history, or an empty array when nothing is stored. A content script is refused (`forbidden`), same as every other UI message. The handler is read only (T-90 final check): it reads the raw bytes and validates them with that schema, so an invalid record answers `[]` and is left in place. The heartbeat job quarantines it under its own `sbw:awake` lock on its next beat. A `repo.get` here would quarantine outside that lock, and its remove could delete a history the heartbeat had just written.
 
 **Tests.** `test/contract/types/messages.test.ts`, `test/contract/types/examples/Msg/timing.awake.{valid,invalid}.json`, `test/unit/background/timing-awake.test.ts`, and `test/dom/timing-section.test.ts`.
 
