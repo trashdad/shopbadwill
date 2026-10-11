@@ -800,7 +800,8 @@ describe('dry-run measure give-up: post-read-failed in firing', () => {
     expect(dry.last.outcomeDetail).toContain('dry-run measure failed');
     expect(dry.last.outcomeDetail).toMatch(/unconfirmed/i);
     const notify = ofKind(dry.results[4]?.effects ?? [], 'notify')[0];
-    expect(notify?.title).toMatch(/^Unconfirmed:/);
+    // A dry-run title, never the live "Unconfirmed" one (a real bid may be out).
+    expect(notify?.title).toMatch(/^Dry run:/);
     expect(notify?.message).toContain('dry-run measure failed');
     expect(notify?.message).not.toContain('may have been placed');
     expect(notify?.message ?? '').not.toMatch(NO_BID_CLAIM);

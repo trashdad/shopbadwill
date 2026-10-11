@@ -449,7 +449,9 @@ describe('T-80b: not-sent proof and the unconfirmed post-read-failed copy', () =
     expect(r.outcome).toBe('dry-run');
     expect(r.final).toBe(false);
     expect(r.stamp).toBeNull();
-    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    // Like every dry-run outcome, the title says "Dry run". The "Unconfirmed"
+    // heading is the live one: it means a real bid may be out (Opus final check).
+    expect(r.notify.title).toBe('Dry run: Blue vase');
     expect(r.notify.message).toContain('dry-run measure failed');
     expect(r.notify.message).toMatch(/unconfirmed/i);
     expect(r.notify.message).toContain('Would have bid $20.00');

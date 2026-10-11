@@ -35,9 +35,10 @@
 // - A dry run walks the same states. Its `fire` emits a `measure` read and a
 //   `bid.dry-run` audit entry in place of `placeBid`, and the measure read's
 //   `post-read` resolves it as 'dry-run' (C4). If that read never arrives,
-//   `post-read-failed` in `firing` resolves it as Unconfirmed (the dry-run
-//   measure failed). The same event in `firing` is refused for a live snipe:
-//   nothing has been sent, so there is nothing to give up on.
+//   `post-read-failed` in `firing` resolves it as 'dry-run' with an unconfirmed
+//   result (the dry-run measure failed; the title still says "Dry run"). The
+//   same event in `firing` is refused for a live snipe: nothing has been
+//   sent, so there is nothing to give up on.
 // - Every outcome and its copy come from T-87's `classifyOutcome` (I-18),
 //   pre-bid ends included (its `abort` reasons).
 //

@@ -38,8 +38,10 @@ export interface OutcomeContext {
   abortDetail?: string;
   /**
    * The dry run's measure read was given up (`post-read-failed` in `firing`).
-   * Ignored unless the snipe is a dry run and there is no post-read. It must
-   * not produce the live "bid may have been placed" copy: a dry run never bids.
+   * Ignored unless the snipe is a dry run and there is no post-read. The result
+   * is unconfirmed (`final: false`) under the usual 'Dry run' heading. It must
+   * not produce the live "Unconfirmed" heading or "bid may have been placed"
+   * copy: a dry run never bids.
    */
   dryRunMeasureFailed?: boolean;
 }
@@ -263,8 +265,9 @@ export function classifyOutcome(
       bits.push(`price was ${formatMoney(post.currentPrice)}, next bid ${formatMoney(post.minimumBid)}`);
       bits.push(wouldHaveWon ? 'it would have been leading (a later bid could still beat it)' : 'it would NOT have won');
     } else if (ctx.dryRunMeasureFailed === true) {
-      // The measure read never arrived. Unknown result, and no bid exists.
-      heading = 'Unconfirmed';
+      // The measure read never arrived. Unknown result, and no bid exists. The
+      // heading stays 'Dry run': 'Unconfirmed' is the live heading for a bid
+      // that may be out, and a dry run must never read like one.
       final = false;
       bits.push('the dry-run measure failed, so the result is unconfirmed');
     } else {
