@@ -17,6 +17,7 @@ import type { SgwApi } from '../../ports/sgw-api';
 import type { BackgroundContext } from '../context';
 import { parseUnfavoriteRef } from '../jobs/steps/favorite';
 import type { Handler } from '../router';
+import { createCalendarUndoExecutors } from './calendar';
 
 export type UndoKind = NonNullable<AuditEntry['undo']>['kind'];
 
@@ -133,7 +134,9 @@ export function createAuditHandlers(deps: AuditHandlerDeps): {
 
 /** T-36 self-registration (I-01): main.ts's handler registry calls this once. */
 export function register(ctx: BackgroundContext): void {
-  const handlers = createAuditHandlers({ audit: ctx.audit, executors: createUndoExecutors({ api: ctx.api, repo: ctx.repo }) });
+  // T-67: `deleteEvent` undo (ref format in docs/CONTRACT-DECISIONS.md).
+  const executors = { ...createUndoExecutors({ api: ctx.api, repo: ctx.repo }), ...createCalendarUndoExecutors(ctx) };
+  const handlers = createAuditHandlers({ audit: ctx.audit, executors });
   ctx.router.register('audit.list', handlers['audit.list']);
   ctx.router.register('audit.undo', handlers['audit.undo']);
 }
