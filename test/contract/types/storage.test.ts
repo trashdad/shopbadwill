@@ -37,6 +37,8 @@ const LOCAL_KEYS = [
   'sbw:listingCache',
   'sbw:detailCache',
   'sbw:shippingCache',
+  'sbw:quoteCache',
+  'sbw:quoteSalt',
   'sbw:favoritesCache',
   'sbw:jobRuns',
   'sbw:calendar',
@@ -67,6 +69,10 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:listingCache': { '279250057': example('ListingCacheEntry') },
   'sbw:detailCache': { '279250057': example('DetailCacheEntry') },
   'sbw:shippingCache': { '279250057:14201': example('ShippingCacheEntry') },
+  // T-57 (R2): the ZIP lives only as a hash; the 24 h TTL runs from fetchedAt.
+  'sbw:quoteCache': { '279250057': { shipping: 500, handling: 100, 'zip-hash': 'a'.repeat(64), fetchedAt: 1791400000000 } },
+  // T-57 final check: the per-install key for that hash (32 random bytes, hex).
+  'sbw:quoteSalt': '0f'.repeat(32),
   'sbw:favoritesCache': example('FavoritesCache'),
   'sbw:jobRuns': [example('JobRun')],
   'sbw:calendar': example('CalendarState'),
@@ -193,6 +199,17 @@ describe('storage schema v1', () => {
       version: 1,
       counted: { 'snp-1': 1791400000000 },
     });
+  });
+
+  it('registers the optional quote salt: 64 lowercase hex, nothing else (T-57 final check)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.quoteSalt];
+    expect(STORAGE_KEYS.quoteSalt).toBe('sbw:quoteSalt');
+    expect(spec.area).toBe('local');
+    expect(spec.schema.safeParse('0f'.repeat(32)).success).toBe(true);
+    // Rejected, so a typed repo read quarantines it and a fresh salt is made.
+    for (const bad of ['', '43004', 'AB'.repeat(32), '0f'.repeat(31), '0f'.repeat(33), 42, null]) {
+      expect(spec.schema.safeParse(bad).success, String(bad)).toBe(false);
+    }
   });
 
   it('registers the optional snipe-runner record and rejects one that cannot be replayed (T-84)', () => {

@@ -1184,7 +1184,7 @@ describe('carries: saved watches (watches.save / watches.importSaved)', () => {
 });
 
 describe('carries: step-executor registry (I-07)', () => {
-  it('loads ./*.ts by import.meta.glob: favorite, search, favorites-list, detail (and T-56 notify-digest, T-67 calendar-upsert, T-103 post-end) export {kind, run}', () => {
+  it('loads ./*.ts by import.meta.glob: favorite, search, favorites-list, detail (and T-56 notify-digest, T-67 calendar-upsert, T-103 post-end, T-57 quote) export {kind, run}', () => {
     expect(Object.keys(STEP_MODULES).sort()).toEqual(
       expect.arrayContaining([
         './calendar-upsert.ts',
@@ -1193,12 +1193,22 @@ describe('carries: step-executor registry (I-07)', () => {
         './favorites-list.ts',
         './notify-digest.ts',
         './post-end.ts',
+        './quote.ts',
         './search.ts',
       ]),
     );
     expect(Object.keys(STEP_MODULES)).not.toContain('./index.ts');
     const registry = createStepRegistry();
-    expect([...registry.kinds].sort()).toEqual(['calendarUpsert', 'detail', 'favorite', 'favoritesList', 'notifyDigest', 'postEnd', 'search']);
+    expect([...registry.kinds].sort()).toEqual([
+      'calendarUpsert',
+      'detail',
+      'favorite',
+      'favoritesList',
+      'notifyDigest',
+      'postEnd',
+      'quote',
+      'search',
+    ]);
     expect(registry.failed).toEqual([]);
   });
 

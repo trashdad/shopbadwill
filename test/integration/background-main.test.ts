@@ -342,14 +342,16 @@ describe('T-36 brief', () => {
     }
 
     // A new module in the map is registered with the context, and its handler serves.
-    // (T-85 registered ui.openSnipe for real, so the probe uses the one content-only
-    // type no built-in module registers yet: landedCost.get, with its valid reply.)
+    // (T-57 registered landedCost.get for real, the last content type no built-in
+    // module served, so the probe stands in for that module: the map leaves
+    // ./landed-cost.ts out and the probe registers landedCost.get with a valid reply.)
     const handlerProbe = vi.fn((ctx: BackgroundContext) => {
       ctx.router.register('landedCost.get', () => ({}));
     });
     const jobProbe = vi.fn();
+    const otherHandlers = Object.fromEntries(Object.entries(HANDLER_MODULES).filter(([file]) => file !== './landed-cost.ts'));
     const h = boot({
-      handlerModules: { ...HANDLER_MODULES, './new-feature.ts': { register: handlerProbe } },
+      handlerModules: { ...otherHandlers, './new-feature.ts': { register: handlerProbe } },
       jobModules: { ...JOB_MODULES, './new-job.ts': { register: jobProbe } },
     });
     const ctx = await h.handle.ready;
