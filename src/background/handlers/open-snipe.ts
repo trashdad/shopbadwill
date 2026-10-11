@@ -64,10 +64,12 @@ async function tryOpenPanel(b: DashboardBrowser): Promise<'side-panel' | 'sideba
 export async function openDashboard(b: DashboardBrowser, itemId: ItemId): Promise<DashboardSurface> {
   const panel = await tryOpenPanel(b);
   if (panel !== null) return panel;
-  if (b.tabs === undefined || b.runtime?.getURL === undefined) {
+  const runtime = b.runtime;
+  if (b.tabs === undefined || runtime === undefined) {
     throw new Error('The dashboard could not be opened.');
   }
-  await b.tabs.create({ url: dashboardTabUrl(b.runtime.getURL, itemId, dashboardPage(b)) });
+  // Call getURL on runtime so `this` stays bound.
+  await b.tabs.create({ url: dashboardTabUrl((path) => runtime.getURL(path), itemId, dashboardPage(b)) });
   return 'tab';
 }
 

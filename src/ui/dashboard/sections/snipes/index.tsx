@@ -127,7 +127,7 @@ export function SnipesSection(props: SectionProps): VNode {
   const [settings, reloadSettings] = useLoad(() => client.send('settings.get', undefined), [client]);
   const [snipes, reloadSnipes] = useLoad(() => client.send('snipe.list', undefined), [client]);
   const [ticks, setTicks] = useState<ReadonlyMap<string, SnipeCountdownTick>>(new Map());
-  const [openItem, setOpenItem] = useState<ItemId | null>(() => itemIdFromSearch(globalThis.location?.search ?? ''));
+  const [openItem, setOpenItem] = useState<ItemId | null>(() => itemIdFromSearch(globalThis.location.search));
   const [disarming, setDisarming] = useState<string | null>(null);
   const [disarmError, setDisarmError] = useState('');
 
