@@ -92,6 +92,94 @@ describe('sbw:test:baseUrl', () => {
     ]);
   });
 
+  it('rejects a non-loopback, non-.test origin and keeps the previous patch', async () => {
+    const browserStub = fakeHookBrowser();
+    installHooks({ './base-url.ts': baseUrlHook }, browserStub);
+
+    const first = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
+    first.post({ payload: { sgw: 'http://127.0.0.1:8787' } });
+    expect((await first.nextReply()).ok).toBe(true);
+
+    // A wrong check (any http URL, or a raw-string prefix of "127.0.0.1") accepts these.
+    const rejected = [
+      'https://evil.example',
+      'https://shopgoodwill.com',
+      'https://buyerapi.shopgoodwill.com',
+      'https://www.googleapis.com',
+      'http://10.0.0.1:8787',
+      'http://0.0.0.0',
+      'http://[::]',
+      'http://[::2]:8787',
+      'http://[::ffff:8.8.8.8]/',
+      'http://127.0.0.1.evil.com',
+      'http://127.0.0.1%2eevil.com/',
+      'http://sgw.test.evil.com',
+      'http://localhost.evil.com',
+      'http://nottest',
+    ];
+    for (const raw of rejected) {
+      const port = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
+      port.post({ payload: { sgw: raw } });
+      const reply = await port.nextReply();
+      expect(reply.ok, raw).toBe(false);
+      expect(baseUrlHook.rewriteUrl(API), raw).toBe('http://127.0.0.1:8787/api/Search/ItemListing');
+    }
+  });
+
+  it('accepts only a parsed loopback or .test origin, including spellings that normalize to one', async () => {
+    const browserStub = fakeHookBrowser();
+    installHooks({ './base-url.ts': baseUrlHook }, browserStub);
+    const accepted: Array<[string, string]> = [
+      ['http://127.0.0.1:8787/', 'http://127.0.0.1:8787'],
+      ['http://127.0.0.255:9', 'http://127.0.0.255:9'],
+      ['http://2130706433', 'http://127.0.0.1'], // decimal form of 127.0.0.1
+      ['http://[::1]:8787', 'http://[::1]:8787'],
+      ['http://[::ffff:127.0.0.1]/', 'http://[::ffff:7f00:1]'],
+      ['http://localhost:8788', 'http://localhost:8788'],
+      ['http://foo.localhost/', 'http://foo.localhost'],
+      ['http://sgw.test:8789/', 'http://sgw.test:8789'],
+      ['https://SGW.TEST', 'https://sgw.test'],
+      ['https://a.b.test/path', 'https://a.b.test'],
+    ];
+    for (const [raw, origin] of accepted) {
+      const port = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
+      port.post({ payload: { sgw: raw, google: null } });
+      const reply = await port.nextReply();
+      expect(reply.ok, raw).toBe(true);
+      expect(reply.value, raw).toEqual({ sgw: origin, google: null });
+    }
+  });
+
+  it('a bad origin in the same payload does not apply the good one', async () => {
+    const browserStub = fakeHookBrowser();
+    installHooks({ './base-url.ts': baseUrlHook }, browserStub);
+    const port = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
+    port.post({ payload: { sgw: 'http://127.0.0.1:8787', google: 'https://evil.example' } });
+    expect((await port.nextReply()).ok).toBe(false);
+    expect(baseUrlHook.rewriteUrl(API)).toBe(API);
+    expect(baseUrlHook.rewriteUrl(CAL)).toBe(CAL);
+  });
+
+  it.each([
+    ['a content script', { id: 'test-extension-id', url: 'https://shopgoodwill.com/categories/listing?st=pyrex' }],
+    ['a web page', { url: 'https://shopgoodwill.com/categories/listing?st=pyrex' }],
+  ])('refuses %s and does not rewrite', async (_label, sender) => {
+    const spy = fetchSpy();
+    vi.stubGlobal('fetch', spy);
+    const browserStub = fakeHookBrowser();
+    installHooks({ './base-url.ts': baseUrlHook }, browserStub);
+
+    const port = browserStub.connect(baseUrlHook.BASE_URL_HOOK, sender);
+    port.post({ payload: { sgw: 'http://127.0.0.1:8787', google: 'http://sgw.test:8788' } });
+    const reply = await port.nextReply();
+    expect(reply.ok).toBe(false);
+
+    await globalThis.fetch(API);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(API);
+    expect(baseUrlHook.rewriteUrl(API)).toBe(API);
+  });
+
   it('installing twice never double-wraps fetch', async () => {
     const spy = fetchSpy();
     vi.stubGlobal('fetch', spy);

@@ -1,8 +1,10 @@
 // `sbw:test:baseUrl` (T-39): the test-only override of the two remote origins
 // the background can talk to. E2E runs set them to the fake servers on
 // 127.0.0.1 (buyerapi on 8787, Google on 8788), so no background request can
-// leave the machine. Test builds only; see ./index.ts for how hooks are loaded
-// and called.
+// leave the machine. An override is accepted only when the parsed host is
+// loopback or a `.test` name. Test builds only; see ./index.ts for how hooks
+// are loaded and called. The port gate there refuses content scripts and web
+// pages, so only an extension page (the test harness) can set this.
 //
 // Mechanism: a wrapper around the background's `globalThis.fetch`. The only
 // network caller in the background is BrowserHttp (src/adapters/browser/http.ts),
@@ -45,6 +47,46 @@ const OverridesSchema = z
 
 let patch: BaseUrlPatch = { sgw: null, google: null };
 
+/** Host after URL parsing, with one trailing dot removed (`sgw.test.` is `sgw.test`). */
+function canonicalHost(url: URL): string {
+  const host = url.hostname.toLowerCase();
+  return host.endsWith('.') ? host.slice(0, -1) : host;
+}
+
+/** Dotted IPv4 in 127.0.0.0/8. The URL parser has already normalized decimal, hex and octal forms. */
+function isLoopbackV4(host: string): boolean {
+  const parts = host.split('.');
+  if (parts.length !== 4) return false;
+  const nums = parts.map((part) => (/^\d+$/.test(part) ? Number(part) : Number.NaN));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  return nums[0] === 127;
+}
+
+/**
+ * IPv4-mapped IPv6 as Node's URL parser emits it (`[::ffff:7f00:1]` is 127.0.0.1).
+ * Only the 127.0.0.0/8 range counts; `[::ffff:808:808]` (8.8.8.8) does not.
+ */
+function isMappedLoopback(host: string): boolean {
+  const mapped = /^\[::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/.exec(host);
+  const hi = mapped?.[1];
+  const lo = mapped?.[2];
+  if (hi === undefined || lo === undefined) return false;
+  const high = Number.parseInt(hi, 16);
+  const low = Number.parseInt(lo, 16);
+  if (!Number.isInteger(high) || !Number.isInteger(low) || high > 0xffff || low > 0xffff) return false;
+  return ((high >> 8) & 0xff) === 127;
+}
+
+/** Loopback (127.0.0.0/8, ::1, localhost) or the reserved `.test` TLD. Judged on the parsed host. */
+function isLoopbackOrTest(url: URL): boolean {
+  const host = canonicalHost(url);
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === '[::1]') return true;
+  if (host === 'test' || host.endsWith('.test')) return true;
+  if (isLoopbackV4(host)) return true;
+  return isMappedLoopback(host);
+}
+
 function parseOrigin(key: OverrideKey, raw: string | null): string | null {
   if (raw === null) return null;
   let url: URL;
@@ -55,6 +97,12 @@ function parseOrigin(key: OverrideKey, raw: string | null): string | null {
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error(`${key}: not an http(s) origin: ${JSON.stringify(raw)}`);
+  }
+  // A content script and a web page cannot reach this function (the hook port
+  // refuses them). An extension page still cannot point the background at a
+  // public host: only loopback or a `.test` name.
+  if (!isLoopbackOrTest(url)) {
+    throw new Error(`${key}: origin must be loopback or a .test host: ${JSON.stringify(raw)}`);
   }
   return url.origin;
 }
