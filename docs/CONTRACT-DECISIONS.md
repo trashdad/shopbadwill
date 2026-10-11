@@ -456,3 +456,14 @@ Approved by the controller (T-80b rulings R1–R5) and made in `task/T-80b`.
 **Follow-up for the next PLAN edit.** Add both events to PLAN §3.9's event list, `notSent` to `Snipe.attempt`, and the R4 rule to the caps text; update `contracts.md`.
 
 **Review correction (Grok).** `post-read-failed` is also accepted in `firing` when `snipe.dryRun` is true, and never when it is false. A dry run whose measure read fails forever would otherwise stay in `firing` with no settle path. That settlement is outcome `dry-run`, heading Unconfirmed, copy that the dry-run measure failed — not "the bid may have been placed", and not "No bid was sent". No money effect. A live snipe in `firing` is still refused with `not-sent`. No schema change and no migration.
+
+**Final check correction (Opus).** Three changes, all additive. No schema change and no migration.
+
+1. **The dry-run give-up keeps its title.** A dry run settled by `post-read-failed` in `firing` is titled "Dry run", like every other dry-run outcome. The review correction above had it titled "Unconfirmed". The result is still unconfirmed (`final: false`, copy "the dry-run measure failed, so the result is unconfirmed"). "Unconfirmed" stays the live heading for a bid that may be out. The flag is `OutcomeContext.dryRunMeasureFailed?: boolean` in `src/domain/snipe/outcome.ts`; it is additive and ignored for a live snipe.
+2. **A settlement with no read says so.** When `classifyOutcome` judges a sent snipe with no ItemDetail (`post-read-failed` in `sent`), the copy now says that the item could not be read. Three phrases change:
+   - "this comes from re-reading the item" no longer appears, because nothing was read;
+   - "leading; auction still open" becomes "leading when the bid went in";
+   - "Currently outbid (auction still open; …)" becomes "Outbid when the bid went in".
+
+   Outcomes, `final`, stamps and the with-a-read copy are unchanged.
+3. **No stale proof on a draft.** `reduce(arm)` refuses a draft that carries `attempt.notSent` (`invalid-snipe`), as it already refused `sentAt`, the key and a `reply`. A stale proof would keep the next attempt's Unconfirmed outcome out of `spentToday` (R4).
