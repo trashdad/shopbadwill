@@ -314,6 +314,8 @@ class WorkerStorage implements Storage {
     private readonly crash: {
       after?: CrashPredicate;
       failAfter?: CrashPredicate;
+      /** The matching write is refused: nothing is stored, and its promise rejects. */
+      failBefore?: CrashPredicate;
       /** Fake ms a matching write takes to land (a slow disk); the worker's clock runs it. */
       slow?: (area: 'local' | 'session', entries: Record<string, unknown>) => number;
       later: (fn: () => void, ms: number) => void;
@@ -337,6 +339,10 @@ class WorkerStorage implements Storage {
   }
   private store(entries: Record<string, unknown>): Promise<void> {
     if (this.life.dead) return never();
+    // The write fails and nothing is stored (the worker lives on).
+    if (this.crash.failBefore?.(this.area, entries) === true) {
+      return Promise.reject(new Error('storage.local.set failed; nothing was stored'));
+    }
     const p = this.base.set(entries);
     if (this.crash.after?.(this.area, entries) === true) {
       this.crash.kill();
@@ -408,6 +414,8 @@ interface WorkerOptions {
   slowSet?: (area: 'local' | 'session', entries: Record<string, unknown>) => number;
   /** The matching write is stored, then reported as failed (the worker stays alive). */
   failAfterSet?: CrashPredicate;
+  /** The matching write fails and is NOT stored (the worker stays alive). */
+  failSet?: CrashPredicate;
   jobModules?: Record<string, BackgroundModule>;
 }
 
@@ -438,6 +446,7 @@ class Worker {
       },
       ...(opts.crashAfterSet ? { after: opts.crashAfterSet } : {}),
       ...(opts.failAfterSet ? { failAfter: opts.failAfterSet } : {}),
+      ...(opts.failSet ? { failBefore: opts.failSet } : {}),
       ...(opts.slowSet ? { slow: opts.slowSet } : {}),
       later: (fn: () => void, ms: number) => {
         this.clock.setTimeout(fn, ms);
@@ -2591,5 +2600,53 @@ describe('T-84b: a dry-run measure give-up has no money effect', () => {
     expect(notice?.notification.message).not.toMatch(/may have been placed|No bid was sent/i);
     expect(shared.notifier.sent.some((n) => n.notification.title.startsWith('Unconfirmed'))).toBe(false);
     expect(exposure([s]).count).toBe(0);
+  });
+});
+
+// ── T-84b final check (Opus) ──────────────────────────────────────────────────
+
+describe('T-84b final check: a failed not-sent write', () => {
+  it('a not-sent write that fails (nothing stored) still resolves as not-sent in the same worker: never ambiguous, never resent, never an outbid', async () => {
+    const shared = makeShared();
+    let failing = true;
+    const { w } = await boot(shared, {
+      // The first `not-sent` write fails and nothing is stored: the snipe stays `sent` with no reply.
+      failSet: (area, entries) => {
+        const s = snipesIn(entries)?.s1;
+        if (!failing || area !== 'local' || s?.attempt.notSent !== true) return false;
+        failing = false;
+        return true;
+      },
+    });
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL - 10);
+    // ShowBidModal fails: bid.ts throws BidNotSentError, so PlaceBid never left.
+    shared.http.on(MODAL_URL, { status: 500, latencyMs: LATENCY });
+    await runTo(shared, FIRE_LOCAL + 5 * SEC);
+    expect(failing).toBe(false);
+    expect(w.life.dead).toBe(false);
+    expect(stored(shared).state).toBe('sent');
+    expect(stored(shared).attempt.notSent).not.toBe(true);
+
+    await runTo(shared, END + 10 * MIN);
+    const s = stored(shared);
+    // Nothing was ever resent: one modal read, no PlaceBid byte.
+    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(1);
+    expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
+    expect(s.history.filter((h) => h.to === 'sent' && h.from !== 'sent')).toHaveLength(1);
+    // The worker still knows the bid provably never left: not-sent, never the ambiguous read.
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.notSent).toBe(true);
+    expect(s.attempt.ambiguous).not.toBe(true);
+    expect(s.outcome).toBe('network');
+    expect(kinds(shared)).not.toContain('bid.ambiguous');
+    expect(kinds(shared)).not.toContain('snipe.post-read');
+    const notice = shared.notifier.sent.find((n) => n.notification.title.startsWith('Not bid'));
+    expect(notice?.notification.message).toMatch(/No bid was sent/);
+    // Honest copy: no claim that a bid went out, was outbid, or may have been placed.
+    for (const n of shared.notifier.sent) {
+      expect(n.notification.title).not.toMatch(/^(Lost|Won|Leading|Outbid|Unconfirmed)\b/);
+      expect(n.notification.message).not.toMatch(/Lost: outbid|Currently outbid|Outbid when|may have been placed|bid response was lost/i);
+    }
   });
 });

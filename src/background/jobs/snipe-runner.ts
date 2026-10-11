@@ -437,6 +437,14 @@ export class SnipeRunner {
   /** Snipes with a send in flight in this worker. */
   private readonly inFlight = new Set<string>();
   /**
+   * T-84b: this worker's proof that an attempt (its idempotency key) never left,
+   * kept until its `not-sent` commit lands. If that write fails, the next drive
+   * of the still-`sent` snipe commits `not-sent` again, never `ambiguous`: the
+   * read path would judge an unsent bid as "outbid". Lost on a restart, where
+   * the send's fate is unknown and `ambiguous` is the honest record.
+   */
+  private readonly notSentProof = new Map<string, { key: string; reason: string }>();
+  /**
    * Snipes inside a window read. `flagSchemaFailure` notifies switches during
    * that read; react() must not disarm for it, or the audit says "health check
    * failed" instead of the read's own reason (schema drift). The kill switch
@@ -969,14 +977,14 @@ export class SnipeRunner {
       outcome = bidMayHaveBeenSent(error) ? { kind: 'ambiguous', error } : { kind: 'not-sent', error };
     }
     try {
-      await this.recordOutcome(s, outcome);
+      await this.recordOutcome(s, key, outcome);
     } finally {
       this.inFlight.delete(id);
     }
   }
 
   /** The send's one answer: `result`, `not-sent` (provably nothing left), or `ambiguous` (the outcome read settles it). */
-  private async recordOutcome(s: Snipe, outcome: SendOutcome): Promise<void> {
+  private async recordOutcome(s: Snipe, key: string, outcome: SendOutcome): Promise<void> {
     const id = s.id;
     const at = this.ctx.clock.now();
     if (outcome.kind === 'result' && BidResultSchema.safeParse(outcome.result).success) {
@@ -987,7 +995,11 @@ export class SnipeRunner {
     // with the "No bid was sent" notification and its own bid.not-sent audit;
     // never the ambiguous path (there is nothing to read for).
     if (outcome.kind === 'not-sent') {
-      await this.commit(id, { type: 'not-sent', now: at, reason: errorText(outcome.error) });
+      const reason = errorText(outcome.error);
+      // Kept until the commit lands: a failed write is retried as not-sent (sentStep).
+      this.notSentProof.set(id, { key, reason });
+      await this.commit(id, { type: 'not-sent', now: at, reason });
+      this.notSentProof.delete(id);
       return;
     }
     // Ambiguous, or a reply that is not a BidResult: the outcome read settles it.
@@ -1152,6 +1164,13 @@ export class SnipeRunner {
   private async sentStep(s: Snipe, entry: Entry): Promise<StepResult> {
     if (this.inFlight.has(s.id)) return 'wait';
     if (s.attempt.reply === undefined && s.attempt.ambiguous !== true) {
+      // This worker proved this attempt never left, but the not-sent write failed: record it again.
+      const proof = this.notSentProof.get(s.id);
+      if (proof !== undefined && proof.key === s.attempt.idempotencyKey) {
+        await this.commit(s.id, { type: 'not-sent', now: this.ctx.clock.now(), reason: proof.reason });
+        this.notSentProof.delete(s.id);
+        return 'continue';
+      }
       // `sent` is stored but its reply is not: the worker died mid-send. Ambiguous: read, never resend.
       await this.commit(s.id, { type: 'ambiguous', now: this.ctx.clock.now() });
       return 'continue';
@@ -1260,6 +1279,7 @@ export class SnipeRunner {
     await this.releaseAwake(id);
     this.sessions.delete(id);
     this.closeWhy.delete(id);
+    this.notSentProof.delete(id);
     this.alarmsSet.delete(id);
     for (const kind of SNIPE_ALARM_KINDS) await this.ctx.alarms.clear(snipeAlarmName(id, kind));
     await this.updateRecord((r) => {
@@ -1272,6 +1292,7 @@ export class SnipeRunner {
   private async forget(id: string): Promise<void> {
     this.cache.delete(id);
     this.details.delete(id);
+    this.notSentProof.delete(id);
     this.clearTimer(id);
     await this.closeWindow(id);
     await this.releaseAwake(id);
