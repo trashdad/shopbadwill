@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import type { AuthStatus } from '../../src/domain/calendar/types';
 import { defaultSettings } from '../../src/domain/settings/defaults';
+import type { Settings } from '../../src/domain/settings/schema';
 import { loadSections } from '../../src/entrypoints/options/registry';
 import {
   createGoogleConfigStore,
@@ -219,6 +220,121 @@ describe('google section', () => {
       expect(sent(fake, 'settings.set')).toHaveLength(1);
     });
     expect(sent(fake, 'settings.set')[0]?.payload).toMatchObject({ calendar: { mode: 'dedicated' } });
+  });
+});
+
+describe('calendar enabled toggle and connect prompt (T-70b)', () => {
+  function toggleApp(opts: { auth?: AuthStatus; enabled?: boolean } = {}) {
+    const fake = new FakeMessaging();
+    let auth = opts.auth ?? status({ connected: true, grantedScopes: [SCOPE] });
+    let settings = defaultSettings();
+    settings.calendar.enabled = opts.enabled ?? false;
+    fake.handle('calendar.status', () => auth);
+    fake.handle('calendar.connect', () => {
+      auth = status({ connected: true, grantedScopes: [SCOPE], account: 'me@example.com' });
+      return auth;
+    });
+    fake.handle('calendar.disconnect', () => {
+      auth = status();
+      return undefined;
+    });
+    fake.handle('settings.get', () => settings);
+    fake.handle('settings.set', (p) => {
+      settings = { ...settings, ...(p as Partial<Settings>) };
+      return undefined;
+    });
+    fake.handle('calendar.syncNow', () => undefined);
+    render(
+      h(GoogleSection, {
+        client: fake,
+        store: new MemStore({ clientId: GOOD_ID, secretTail: 'abcd' }),
+        now: () => NOW,
+      }),
+    );
+    return { fake };
+  }
+
+  const toggle = async (): Promise<HTMLInputElement> =>
+    screen.findByRole<HTMLInputElement>('switch', { name: 'Add auction ends to Google Calendar' });
+
+  it('keeps the toggle disabled with "Connect Google first" while Google is not connected', async () => {
+    toggleApp({ auth: status({ connected: false }) });
+    const t = await toggle();
+    expect(t.disabled).toBe(true);
+    expect(t.checked).toBe(false);
+    expect(screen.getByText('Connect Google first')).toBeTruthy();
+  });
+
+  it('turning the toggle on saves calendar.enabled = true and then sends calendar.syncNow', async () => {
+    const { fake } = toggleApp({ enabled: false });
+    const t = await toggle();
+    await waitFor(() => {
+      expect(t.disabled).toBe(false);
+    });
+    fireEvent.click(t);
+    await waitFor(() => {
+      expect(sent(fake, 'calendar.syncNow')).toHaveLength(1);
+    });
+    const setI = fake.sent.findIndex((m) => m.type === 'settings.set');
+    const syncI = fake.sent.findIndex((m) => m.type === 'calendar.syncNow');
+    expect(setI).toBeGreaterThan(-1);
+    expect(setI).toBeLessThan(syncI);
+    expect(fake.sent[setI]?.payload).toMatchObject({ calendar: { enabled: true } });
+    expect(t.checked).toBe(true);
+  });
+
+  it('turning the toggle off sends no delete, no sync, and says existing events stay', async () => {
+    const { fake } = toggleApp({ enabled: true });
+    const t = await toggle();
+    await waitFor(() => {
+      expect(t.disabled).toBe(false);
+    });
+    fireEvent.click(t);
+    await waitFor(() => {
+      expect(sent(fake, 'settings.set')).toHaveLength(1);
+    });
+    expect(sent(fake, 'settings.set')[0]?.payload).toMatchObject({ calendar: { enabled: false } });
+    const types = fake.sent.map((m) => m.type);
+    expect(types).not.toContain('audit.undo');
+    expect(types).not.toContain('calendar.disconnect');
+    expect(types).not.toContain('calendar.syncNow');
+    expect(screen.getByText(/stay on your calendar/)).toBeTruthy();
+  });
+
+  it('offers "Turn on calendar events now?" after connecting while the setting is off, and does nothing until clicked', async () => {
+    const { fake } = toggleApp({ auth: status({ connected: false }), enabled: false });
+    const connect = await screen.findByRole<HTMLButtonElement>('button', { name: 'Connect to Google Calendar' });
+    await waitFor(() => {
+      expect(connect.disabled).toBe(false);
+    });
+    fireEvent.click(connect);
+    const prompt = await screen.findByRole('button', { name: 'Turn on calendar events now?' });
+    // Never on silently: the prompt is a click, not a side effect of connecting.
+    expect(sent(fake, 'settings.set')).toHaveLength(0);
+    expect(sent(fake, 'calendar.syncNow')).toHaveLength(0);
+    fireEvent.click(prompt);
+    await waitFor(() => {
+      expect(sent(fake, 'calendar.syncNow')).toHaveLength(1);
+    });
+    const setI = fake.sent.findIndex((m) => m.type === 'settings.set');
+    const syncI = fake.sent.findIndex((m) => m.type === 'calendar.syncNow');
+    expect(setI).toBeGreaterThan(-1);
+    expect(setI).toBeLessThan(syncI);
+    expect(fake.sent[setI]?.payload).toMatchObject({ calendar: { enabled: true } });
+    expect(screen.queryByRole('button', { name: 'Turn on calendar events now?' })).toBeNull();
+  });
+
+  it('does not offer the prompt when calendar events are already on', async () => {
+    const { fake } = toggleApp({ auth: status({ connected: false }), enabled: true });
+    const connect = await screen.findByRole<HTMLButtonElement>('button', { name: 'Connect to Google Calendar' });
+    await waitFor(() => {
+      expect(connect.disabled).toBe(false);
+    });
+    fireEvent.click(connect);
+    await screen.findByText('Connected to Google Calendar.');
+    expect(screen.queryByRole('button', { name: 'Turn on calendar events now?' })).toBeNull();
+    expect(sent(fake, 'settings.set')).toHaveLength(0);
+    expect(sent(fake, 'calendar.syncNow')).toHaveLength(0);
   });
 });
 

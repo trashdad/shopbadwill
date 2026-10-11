@@ -6,6 +6,7 @@ import type { Settings } from '../../../../domain/settings/schema';
 import { describeError } from '../../../../ui/components/describeError';
 import { Card } from '../../../../ui/components/Field';
 import { Status } from '../../../../ui/components/Status';
+import { Switch } from '../../../../ui/components/Switch';
 import type { SectionDef, SectionProps } from '../../registry';
 import {
   CLIENT_ID_RE,
@@ -53,6 +54,7 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
   const [authUnavailable, setAuthUnavailable] = useState(false);
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [offerEnable, setOfferEnable] = useState(false);
   const [msg, setMsg] = useState<Msg>({ message: '', tone: 'ok' });
   const [settings, setSettings] = useState<Settings | null>(null);
   const [reminders, setReminders] = useState<string[]>(DEFAULT_REMINDERS.map(String));
@@ -113,6 +115,8 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
       const status = await client.send('calendar.connect', undefined);
       setAuth(status);
       setAuthUnavailable(false);
+      // Never turn calendar events on silently: connecting only offers the one-click prompt.
+      if (status.connected && settings?.calendar.enabled === false) setOfferEnable(true);
       setMsg(
         status.connected
           ? { message: 'Connected to Google Calendar.', tone: 'ok' }
@@ -130,6 +134,7 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
 
   const disconnect = async (): Promise<void> => {
     setConfirming(false);
+    setOfferEnable(false);
     setBusy(true);
     try {
       await client.send('calendar.disconnect', undefined);
@@ -171,8 +176,53 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
     saveCalendar({ reminders: parsed }, 'reminders');
   };
 
+  /**
+   * T-70b: the calendar on/off toggle. Turning it off only stops future syncs;
+   * it never deletes events (that is the per-event audit undo). Turning it on
+   * saves `calendar.enabled` first, so the sync it then starts sees it on.
+   */
+  const setCalendarEnabled = (on: boolean, afterSaved?: () => void): void => {
+    if (settings === null) {
+      setModeMsg({ message: 'Could not save calendar events: your settings have not loaded.', tone: 'error' });
+      return;
+    }
+    const next = { ...settings.calendar, enabled: on, mode: 'dedicated' as const };
+    client.send('settings.set', { calendar: next }).then(
+      () => {
+        setSettings({ ...settings, calendar: next });
+        afterSaved?.();
+        if (on) {
+          setModeMsg({ message: 'Calendar events are on. Syncing your auctions now...', tone: 'ok' });
+          client.send('calendar.syncNow', undefined).catch((e: unknown) => {
+            setModeMsg({ message: `Calendar events are on, but the sync could not start. ${describeError(e)}`, tone: 'error' });
+          });
+        } else {
+          setModeMsg({
+            message: 'Calendar sync is off. Existing events stay on your calendar; delete them with the per-event undo.',
+            tone: 'ok',
+          });
+        }
+      },
+      (e: unknown) => {
+        setModeMsg({ message: `Could not save calendar events. ${describeError(e)}`, tone: 'error' });
+      },
+    );
+  };
+
   const expiresAt = auth?.refreshTokenExpiresAt;
   const testingWarning = auth?.connected === true && expiresAt !== undefined && expiresAt <= now() + TESTING_WINDOW_MS;
+
+  const calendarToggleOff = settings === null || auth === null || !auth.connected;
+  const calendarToggleHint =
+    auth === null
+      ? authUnavailable
+        ? 'Could not check Google, so this stays off. Reload the page to try again.'
+        : 'Checking Google...'
+      : !auth.connected
+        ? 'Connect Google first'
+        : settings === null
+          ? 'Could not read your settings, so this stays off. Reload the page to try again.'
+          : 'Adds auction ends to your calendar.';
 
   return (
     <div class="sbw-google">
@@ -256,6 +306,21 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
               <dt>Last error</dt>
               <dd>{auth.lastError === undefined ? 'None' : ERROR_HINTS[auth.lastError]}</dd>
             </dl>
+            {offerEnable && auth.connected ? (
+              <div role="group" aria-label="Turn on calendar events" class="sbw-actions">
+                <p>Calendar events are still off. One click turns them on:</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCalendarEnabled(true, () => {
+                      setOfferEnable(false);
+                    });
+                  }}
+                >
+                  Turn on calendar events now?
+                </button>
+              </div>
+            ) : null}
             {testingWarning ? (
               <p class="sbw-warn" role="note">
                 <strong>Warning:</strong> Your Google app is in Testing mode, so Google signs you out every 7 days. Open Google Cloud console → OAuth consent screen → Publish app.
@@ -321,6 +386,16 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
       <Card>
         <h3>Calendar</h3>
         <Status message={modeMsg.message} tone={modeMsg.tone} />
+        <Switch
+          id="g-calendar-enabled"
+          label="Add auction ends to Google Calendar"
+          hint={calendarToggleHint}
+          checked={settings?.calendar.enabled === true}
+          disabled={calendarToggleOff}
+          onChange={(v) => {
+            setCalendarEnabled(v);
+          }}
+        />
         <fieldset class="sbw-inline-fieldset">
           <legend>Which calendar</legend>
           <label>
