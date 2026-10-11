@@ -13,7 +13,7 @@ import { AuditEntrySchema } from '../audit/types';
 import { CalendarLinkSchema } from '../calendar/types';
 import { RuleSchema } from '../rules/schema';
 import { SettingsSchema } from '../settings/schema';
-import { SnipeIdSchema, SnipeSchema } from '../snipe/types';
+import { EffectSchema, SnipeIdSchema, SnipeSchema } from '../snipe/types';
 import {
   CentsSchema,
   ClockSampleSchema,
@@ -60,6 +60,12 @@ export const STORAGE_KEYS = {
   healthReport: 'sbw:healthReport',
   /** Optional (T-30): probe bookkeeping for SgwHealth; local so it survives a restart. */
   healthProbe: 'sbw:healthProbe',
+  /**
+   * Optional (T-84): the snipe runner's effect outbox and per-snipe bookkeeping.
+   * Written in the same `storage.local.set` as `sbw:snipes`. Absent means nothing
+   * is pending. No migration; `schemaVersion` stays 1.
+   */
+  snipeRunner: 'sbw:snipeRunner',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -221,6 +227,37 @@ export const HealthProbeSchema = z.object({
 });
 export type HealthProbe = z.infer<typeof HealthProbeSchema>;
 
+/**
+ * One snipe's row in `sbw:snipeRunner`. Not exported: an exported `*Schema`
+ * joins the locked example list, and the record schema is the contract.
+ */
+const SnipeRunnerEntrySchema = z.object({
+  /** Effects of accepted events not yet executed, in order. */
+  outbox: z.array(EffectSchema),
+  /** When the T-15 min preflight ran. */
+  preflightAt: EpochMsSchema.optional(),
+  /** The preflight was "not due" (the end moved later): not before this. */
+  preflightNotBefore: EpochMsSchema.optional(),
+  /** An AuthHealth failure before T-15 min (the preflight decides). */
+  atRisk: z.string().optional(),
+  /** Failed outcome (or dry-run measure) reads, and when the last one was tried. */
+  readFailures: z.number().int().nonnegative().optional(),
+  lastReadAt: EpochMsSchema.optional(),
+  /** When the user was told the outcome is unconfirmed. */
+  unconfirmedAt: EpochMsSchema.optional(),
+});
+
+/**
+ * `sbw:snipeRunner` (T-84). Optional. The runner writes this shape and reads it
+ * back with the same schema. A record that fails it is not replayed: no outbox
+ * means no money effect leaves on restart.
+ */
+export const SnipeRunnerRecordSchema = z.object({
+  version: z.literal(1),
+  entries: z.record(SnipeIdSchema, SnipeRunnerEntrySchema),
+});
+export type SnipeRunnerRecord = z.infer<typeof SnipeRunnerRecordSchema>;
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -270,6 +307,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.runtimeHealth]: { area: 'session', schema: HealthReportSchema },
   [STORAGE_KEYS.healthReport]: { area: 'local', schema: HealthReportSchema },
   [STORAGE_KEYS.healthProbe]: { area: 'local', schema: HealthProbeSchema },
+  [STORAGE_KEYS.snipeRunner]: { area: 'local', schema: SnipeRunnerRecordSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

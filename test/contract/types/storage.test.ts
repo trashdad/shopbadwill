@@ -50,6 +50,7 @@ const LOCAL_KEYS = [
   'sbw:awake',
   'sbw:healthReport',
   'sbw:healthProbe',
+  'sbw:snipeRunner',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -85,6 +86,7 @@ const SAMPLE_VALUES: Record<string, unknown> = {
     lastGoodProbeAt: { search: 1791400000000 },
     sticky: [{ endpoint: 'favorites', at: 1791400000000, detail: 'bad rows' }],
   },
+  'sbw:snipeRunner': example('SnipeRunnerRecord'),
 };
 
 describe('storage schema v1', () => {
@@ -157,6 +159,14 @@ describe('storage schema v1', () => {
     const credentials = { ...(example('GoogleCredentials') as object), calendarId: 'example@group.calendar.google.com' };
     expect(GoogleCredentialsSchema.parse(credentials)).not.toHaveProperty('calendarId');
     expect(CalendarStateSchema.parse(example('CalendarState'))).toHaveProperty('calendarId');
+  });
+
+  it('registers the optional snipe-runner record and rejects one that cannot be replayed (T-84)', () => {
+    const schema = STORAGE_RECORDS[STORAGE_KEYS.snipeRunner].schema;
+    expect(STORAGE_RECORDS[STORAGE_KEYS.snipeRunner].area).toBe('local');
+    expect(schema.safeParse({ version: 1, entries: {} }).success).toBe(true);
+    expect(schema.safeParse({ version: 2, entries: {} }).success).toBe(false);
+    expect(schema.safeParse({ version: 1, entries: { s1: { outbox: 'not-an-array' } } }).success).toBe(false);
   });
 
   it('versions the store through sbw:meta.schemaVersion', () => {
