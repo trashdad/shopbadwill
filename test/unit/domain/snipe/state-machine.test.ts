@@ -8,6 +8,7 @@ import fc from 'fast-check';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_CAPS } from '../../../../src/domain/settings/defaults';
+import { exposure, spentToday } from '../../../../src/domain/snipe/caps';
 import { classifyOutcome } from '../../../../src/domain/snipe/outcome';
 import type * as OutcomeModule from '../../../../src/domain/snipe/outcome';
 import { fallbackDecision } from '../../../../src/domain/snipe/preflight';
@@ -375,9 +376,10 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     sent: 'sent (guards: dry-run, already-sent, invalid-event)',
     result: '✗ not-sent',
     ambiguous: '✗ not-sent',
-    // Only a dry run's measure read: a live firing snipe has sent nothing to settle.
+    // Only a dry run's measure read. A live firing snipe has sent nothing, so the
+    // read and a give-up are both refused. The give-up settles the dry run.
     'post-read': 'resolved (guards: not-sent, invalid-event)',
-    'post-read-failed': '✗ not-sent',
+    'post-read-failed': 'resolved (guards: not-sent)',
     'not-sent': '✗ not-sent',
     'preflight-failed': '✗ step-passed',
     'apply-fallback': '✗ step-passed',
@@ -436,8 +438,10 @@ describe('R1: exhaustive transition table (state × event → next or a typed re
   describe.each(STATES)('from %s', (state) => {
     it.each(EVENT_TYPES)('%s behaves as the table says', (type) => {
       const cell = TRANSITIONS[state][type];
-      // A live firing snipe has nothing for a post-read to settle; the dry run's measure read does.
-      const s = deepFreeze(state === 'firing' && type === 'post-read' ? inState(state, { dryRun: true }) : inState(state));
+      // A live firing snipe has nothing for a post-read to settle. The dry run's
+      // measure read does, and so does giving up on that read.
+      const dryMeasure = state === 'firing' && (type === 'post-read' || type === 'post-read-failed');
+      const s = deepFreeze(dryMeasure ? inState(state, { dryRun: true }) : inState(state));
       const before = structuredClone(s);
       const r = reduce(s, CANON[type], CAPS_OK, CTX);
       if ('reject' in cell) {
@@ -759,10 +763,110 @@ describe('R1: post-read-failed resolves a sent snipe whose outcome read gave up'
   });
 
   it('is refused outside sent with a typed reason', () => {
+    // Live snipes. A dry run stuck in firing is the one exception, pinned below.
     for (const state of ['draft', 'armed', 'fallback-applied', 'waking', 'verified', 'firing'] as const) {
       expect(reduce(inState(state), E.postReadFailed(), CAPS_OK, CTX).rejection?.reason).toBe(
         state === 'draft' ? 'not-armed' : 'not-sent',
       );
+    }
+  });
+
+  it('with a reply that proves the outcome, that outcome stands (not a blanket Unconfirmed)', () => {
+    const reply = bid('outbid', { isHighBidder: false });
+    const s = reduce(inState('sent'), E.result(reply), CAPS_OK, CTX).next;
+    expect(s.state).toBe('sent');
+    vi.mocked(classifyOutcome).mockClear();
+    const r = reduce(s, E.postReadFailed(), CAPS_OK, CTX);
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[1]).toEqual(reply);
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[2]).toBeNull();
+    expect(r.next.outcome).toBe('outbid');
+    const message = ofKind(r.effects, 'notify')[0]?.message ?? '';
+    expect(message).not.toMatch(/Unconfirmed/);
+    expect(message).not.toMatch(NO_BID_CLAIM);
+    expect(money(r.effects)).toEqual([]);
+  });
+});
+
+describe('dry-run measure give-up: post-read-failed in firing', () => {
+  const steps = [E.arm(), E.wake(), E.verified(), E.fire(), E.postReadFailed()];
+
+  it('settles a dry run whose measure read never arrives: Unconfirmed, measure failed, no money', () => {
+    const dry = play(snipe({ dryRun: true }), steps);
+    expect(dry.results.map((r) => r.rejection)).toEqual([null, null, null, null, null]);
+    expect(dry.last.state).toBe('resolved');
+    expect(dry.last.outcome).toBe('dry-run');
+    expect(dry.last.dryRun).toBe(true);
+    expect(dry.last.measured?.responseAt).toBeUndefined();
+    expect(dry.last.outcomeDetail).toContain('dry-run measure failed');
+    expect(dry.last.outcomeDetail).toMatch(/unconfirmed/i);
+    const notify = ofKind(dry.results[4]?.effects ?? [], 'notify')[0];
+    expect(notify?.title).toMatch(/^Unconfirmed:/);
+    expect(notify?.message).toContain('dry-run measure failed');
+    expect(notify?.message).not.toContain('may have been placed');
+    expect(notify?.message ?? '').not.toMatch(NO_BID_CLAIM);
+    expect(dry.results.flatMap((r) => money(r.effects))).toEqual([]);
+    expect(ofKind(dry.results[4]?.effects ?? [], 'stampCalendar')).toEqual([]);
+    expect(ofKind(dry.results[4]?.effects ?? [], 'audit')[0]?.entry.kind).toBe('snipe.post-read-failed');
+    expect(spentToday([dry.last], POST_LOCAL, TZ)).toBe(0);
+    expect(exposure([dry.last])).toEqual({ total: 0, shippingUnknown: false, count: 0 });
+    for (const type of EVENT_TYPES) {
+      const after = reduce(dry.last, CANON[type], CAPS_OK, CTX);
+      expect(after.rejection?.reason).toBe('terminal');
+      expect(money(after.effects)).toEqual([]);
+    }
+  });
+
+  it('calls classifyOutcome with no reply, no item, and the dry-run measure-failed flag', () => {
+    const s = inState('firing', { dryRun: true });
+    vi.mocked(classifyOutcome).mockClear();
+    const r = reduce(s, E.postReadFailed(), CAPS_OK, CTX);
+    expect(r.rejection).toBeNull();
+    const [arg, bidArg, postArg, ctx] = vi.mocked(classifyOutcome).mock.calls[0] ?? [];
+    expect(arg?.dryRun).toBe(true);
+    expect(arg?.state).toBe('firing');
+    expect(bidArg).toBeNull();
+    expect(postArg).toBeNull();
+    expect(ctx).toMatchObject({ dryRunMeasureFailed: true });
+    expect(ctx?.abort).toBeUndefined();
+    expect(r.next.history.at(-1)?.why).toContain('dry-run measure');
+    expect(kinds(r.effects)).toEqual(['notify', 'audit', 'holdKeepAwake']);
+  });
+
+  it('is refused for a live firing snipe: same object, no effects, still exposed', () => {
+    const s = deepFreeze(inState('firing'));
+    const before = exposure([s]);
+    const r = reduce(s, E.postReadFailed(), CAPS_OK, CTX);
+    expect(r).toMatchObject({ next: s, effects: [], rejection: { reason: 'not-sent' } });
+    expect(r.next).toBe(s);
+    expect(r.next.state).toBe('firing');
+    expect(exposure([r.next])).toEqual(before);
+    expect(before.count).toBe(1);
+  });
+
+  it('a live fire then a measure give-up does not settle and does not bid again', () => {
+    const live = play(snipe(), steps);
+    expect(live.results[3]?.rejection).toBeNull();
+    expect(ofKind(live.results[3]?.effects ?? [], 'placeBid')).toHaveLength(1);
+    expect(live.results[4]?.rejection?.reason).toBe('not-sent');
+    expect(live.results[4]?.effects).toEqual([]);
+    expect(live.last.state).toBe('firing');
+    expect(live.last).toBe(live.results[3]?.next);
+  });
+
+  it('does not accept not-sent in firing for a dry run, and accepts post-read-failed in no other dry-run state', () => {
+    const firing = deepFreeze(inState('firing', { dryRun: true }));
+    expect(reduce(firing, E.notSent(), CAPS_OK, CTX)).toMatchObject({
+      next: firing,
+      effects: [],
+      rejection: { reason: 'not-sent' },
+    });
+    for (const state of STATES) {
+      if (state === 'firing') continue;
+      const s = inState(state, { dryRun: true });
+      const r = reduce(s, E.postReadFailed(), CAPS_OK, CTX);
+      expect(r.rejection, state).not.toBeNull();
+      expect(r.next).toBe(s);
+      expect(r.effects).toEqual([]);
     }
   });
 });
@@ -1452,7 +1556,10 @@ function guidedBody(s: Snipe, step: PropStep): Body {
     case 'verified':
       return { type: 'fire' };
     case 'firing':
-      return s.dryRun ? { type: 'post-read', detail: detail() } : { type: 'sent', key: 'k1' };
+      if (s.dryRun) {
+        return step.body.type === 'post-read-failed' ? { type: 'post-read-failed' } : { type: 'post-read', detail: detail() };
+      }
+      return { type: 'sent', key: 'k1' };
     case 'fallback-applied':
       return { type: 'sent', key: 'k1' };
     case 'sent':

@@ -443,7 +443,7 @@ Approved by the controller (T-80b rulings R1–R5) and made in `task/T-80b`.
 
 **Changes.**
 
-1. **New event `post-read-failed`** (`{ type: 'post-read-failed', now }`), accepted only in `sent`. It resolves the snipe through `classifyOutcome(snipe, attempt.reply ?? null, null, ctx)` — with no post-read the outcome is "Unconfirmed: the bid may have been placed … check ShopGoodwill", never "Not bid". Terminal, emits the usual notify/audit effects and no money effect.
+1. **New event `post-read-failed`** (`{ type: 'post-read-failed', now }`), accepted in `sent`. It resolves the snipe through `classifyOutcome(snipe, attempt.reply ?? null, null, ctx)` — with no post-read the outcome is "Unconfirmed: the bid may have been placed … check ShopGoodwill", never "Not bid". Terminal, emits the usual notify/audit effects and no money effect. See the review correction below for the dry-run `firing` exception.
 2. **New event `not-sent`** (`{ type: 'not-sent', now, reason }`), accepted only in `sent` and only when no reply and no ambiguity are recorded (else `duplicate`). The runner dispatches it when `bid.ts` throws `BidNotSentError`. It resolves through `classifyOutcome` with abort `network` and copy "No bid was sent (reason). This is not an outbid." — never the judge path. Terminal, no money effect.
 3. **`Snipe.attempt.notSent?: boolean`** (`src/domain/snipe/types.ts`). The `not-sent` handler records the proof on the attempt, so it survives a restart. `classifyOutcome` treats it as overriding the send evidence (the abort path wins over the judge path), and `spentToday` reads it (R4).
 4. **`OutcomeContext.abortDetail?: string`** (`src/domain/snipe/outcome.ts`): the text after "No bid was sent". The abort-`network` copy is now "No bid was sent (…). This is not an outbid."
@@ -454,3 +454,5 @@ Approved by the controller (T-80b rulings R1–R5) and made in `task/T-80b`.
 **Tests.** `test/contract/types/spec-shapes.test.ts` mirrors both events and `notSent`. The reducer table, the fast-check properties and the spend tests are in `test/unit/domain/snipe/`.
 
 **Follow-up for the next PLAN edit.** Add both events to PLAN §3.9's event list, `notSent` to `Snipe.attempt`, and the R4 rule to the caps text; update `contracts.md`.
+
+**Review correction (Grok).** `post-read-failed` is also accepted in `firing` when `snipe.dryRun` is true, and never when it is false. A dry run whose measure read fails forever would otherwise stay in `firing` with no settle path. That settlement is outcome `dry-run`, heading Unconfirmed, copy that the dry-run measure failed — not "the bid may have been placed", and not "No bid was sent". No money effect. A live snipe in `firing` is still refused with `not-sent`. No schema change and no migration.

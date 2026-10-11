@@ -441,4 +441,28 @@ describe('T-80b: not-sent proof and the unconfirmed post-read-failed copy', () =
     expect(r.notify.message).toContain('Unconfirmed');
     expect(r.notify.message).not.toMatch(/^No bid was sent/);
   });
+
+  it('a failed dry-run measure is Unconfirmed, and does not claim a bid may have been placed', () => {
+    const r = classifyOutcome(snipe({ dryRun: true, state: 'firing', attempt: {} }), null, null, {
+      dryRunMeasureFailed: true,
+    });
+    expect(r.outcome).toBe('dry-run');
+    expect(r.final).toBe(false);
+    expect(r.stamp).toBeNull();
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).toContain('dry-run measure failed');
+    expect(r.notify.message).toMatch(/unconfirmed/i);
+    expect(r.notify.message).toContain('Would have bid $20.00');
+    expect(r.notify.message).not.toContain('may have been placed');
+    expect(r.notify.message).not.toMatch(/No bid was sent|Not bid/);
+    expect(r.detail).toContain('dry-run measure failed');
+  });
+
+  it('a dry run with no post and no measure-failed flag still says the item could not be read', () => {
+    const r = classifyOutcome(snipe({ dryRun: true, attempt: {}, measured: undefined }), null, null);
+    expect(r.outcome).toBe('dry-run');
+    expect(r.notify.title).toMatch(/^Dry run:/);
+    expect(r.notify.message).toContain('could not be read');
+    expect(r.notify.message).not.toContain('dry-run measure failed');
+  });
 });

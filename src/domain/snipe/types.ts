@@ -139,9 +139,11 @@ export const SnipeEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('post-read'), now, detail: ItemDetailSchema }),
   /**
    * T-80b: the runner gave up retrying the outcome read (about 7 days) and no
-   * ItemDetail will ever settle this snipe. The reducer resolves it through
-   * `classifyOutcome` with the recorded reply and no post-read: "Unconfirmed …
-   * check ShopGoodwill", never "Not bid".
+   * ItemDetail will ever settle this snipe. In `sent`, the reducer resolves it
+   * through `classifyOutcome` with the recorded reply and no post-read:
+   * "Unconfirmed … check ShopGoodwill", never "Not bid". In `firing` it is
+   * accepted only for a dry run, whose measure read failed: outcome `dry-run`,
+   * Unconfirmed, and never a claim that a bid may have been placed.
    */
   z.object({ type: z.literal('post-read-failed'), now }),
   /**
@@ -175,7 +177,10 @@ export const EffectSchema = z.discriminatedUnion('kind', [
    *   instead (T-80b), which settles the snipe without the ItemDetail;
    * - `measure` (dry run only: the harmless read at fire time, in place of
    *   PlaceBid, that measures real latency) → `post-read` with the detail it
-   *   read; the reducer resolves the snipe with outcome 'dry-run'.
+   *   read; the reducer resolves the snipe with outcome 'dry-run'. When the
+   *   runner gives up on that read, → `post-read-failed` instead, which
+   *   settles the dry run as Unconfirmed (the measure failed). A live snipe
+   *   in `firing` refuses that event.
    */
   z.object({
     kind: z.literal('readDetail'),

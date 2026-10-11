@@ -36,6 +36,12 @@ export interface OutcomeContext {
    * T-80b's `not-sent` passes the BidNotSentError's message here.
    */
   abortDetail?: string;
+  /**
+   * The dry run's measure read was given up (`post-read-failed` in `firing`).
+   * Ignored unless the snipe is a dry run and there is no post-read. It must
+   * not produce the live "bid may have been placed" copy: a dry run never bids.
+   */
+  dryRunMeasureFailed?: boolean;
 }
 
 export interface OutcomeTiming {
@@ -256,6 +262,11 @@ export function classifyOutcome(
       wouldHaveWon = closed ? snipe.maxBid > post.currentPrice : snipe.maxBid >= post.minimumBid;
       bits.push(`price was ${formatMoney(post.currentPrice)}, next bid ${formatMoney(post.minimumBid)}`);
       bits.push(wouldHaveWon ? 'it would have been leading (a later bid could still beat it)' : 'it would NOT have won');
+    } else if (ctx.dryRunMeasureFailed === true) {
+      // The measure read never arrived. Unknown result, and no bid exists.
+      heading = 'Unconfirmed';
+      final = false;
+      bits.push('the dry-run measure failed, so the result is unconfirmed');
     } else {
       bits.push('the item could not be read, so the result is unknown');
     }

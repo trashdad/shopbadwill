@@ -34,7 +34,10 @@
 //   `attempt.notSent`).
 // - A dry run walks the same states. Its `fire` emits a `measure` read and a
 //   `bid.dry-run` audit entry in place of `placeBid`, and the measure read's
-//   `post-read` resolves it as 'dry-run' (C4).
+//   `post-read` resolves it as 'dry-run' (C4). If that read never arrives,
+//   `post-read-failed` in `firing` resolves it as Unconfirmed (the dry-run
+//   measure failed). The same event in `firing` is refused for a live snipe:
+//   nothing has been sent, so there is nothing to give up on.
 // - Every outcome and its copy come from T-87's `classifyOutcome` (I-18),
 //   pre-bid ends included (its `abort` reasons).
 //
@@ -262,9 +265,10 @@ export const TRANSITIONS: TransitionTable = freezeTable({
     sent: guarded(['sent'], ['dry-run', 'already-sent', 'invalid-event']),
     result: reject('not-sent'),
     ambiguous: reject('not-sent'),
-    // Only a dry run's measure read: a live firing snipe has sent nothing to settle.
+    // Only a dry run's measure read. A live firing snipe has sent nothing, so
+    // both the read and a give-up are refused (`not-sent`).
     'post-read': guarded(['resolved'], ['not-sent', 'invalid-event']),
-    'post-read-failed': reject('not-sent'),
+    'post-read-failed': guarded(['resolved'], ['not-sent']),
     'not-sent': reject('not-sent'),
   },
   // R3: after sent, only the reply, the ambiguity, the outcome read, and the
@@ -682,6 +686,18 @@ function onPostRead(s: Snipe, e: Extract<SnipeEvent, { type: 'post-read' }>, ctx
 
 /** T-80b R1: the runner gave up on the outcome read; settle with the reply (or none) and no ItemDetail. */
 function onPostReadFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'post-read-failed' }>, ctx: ReduceContext): Handled {
+  if (s.state === 'firing') {
+    // The dry run's measure read never arrived. A live snipe here has not been
+    // sent: accepting this would settle a bid that may still go out.
+    if (!s.dryRun) return refuse('not-sent');
+    return settled(
+      s,
+      e,
+      'resolved',
+      classifyOutcome(s, null, null, { ...outcomeContext(ctx), dryRunMeasureFailed: true }),
+      'post-read failed: dry-run measure',
+    );
+  }
   if (s.dryRun) return refuse('dry-run');
   // The recorded reply, like the post-read path; an ambiguous send has none, so
   // its send evidence still leads classifyOutcome to "Unconfirmed".
