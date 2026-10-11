@@ -15,6 +15,7 @@ import { AuthStatusSchema } from '../domain/calendar/types';
 import { MatchResultSchema, RuleSchema } from '../domain/rules/schema';
 import { SettingsSchema } from '../domain/settings/schema';
 import { CapsResultSchema, SnipeIdSchema, SnipeSchema, SnipeStateSchema } from '../domain/snipe/types';
+import { STORAGE_KEYS, STORAGE_RECORDS } from '../domain/storage/schema';
 import {
   CentsSchema,
   EpochMsSchema,
@@ -70,7 +71,8 @@ export const MsgSchema = z.discriminatedUnion('type', [
    * with `undo: { kind: 'disableRule', ref: ruleId }`.
    */
   msg('rules.disable', z.object({ ruleId: z.string().min(1) })),
-  msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema) })),
+  /** R5: at most 40 item ids. The TypeScript payload type stays `ItemId[]`. */
+  msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema).max(40) })),
   msg('quick.hideSeller', z.object({ sellerId: z.number().int(), sellerName: z.string() })),
   /** A non-empty term: an empty one would hide every listing. */
   msg('quick.hideKeyword', z.object({ term: z.string().min(1) })),
@@ -117,6 +119,8 @@ export const MsgSchema = z.discriminatedUnion('type', [
   ),
   msg('snipe.disarm', z.object({ id: SnipeIdSchema })),
   signal('snipe.list'),
+  /** Persisted `sbw:awake` heartbeat history (T-90). Empty request; reply is the stored epochs, or []. */
+  signal('timing.awake'),
   msg('kill.set', z.object({ on: z.boolean() })),
   signal('health.get'),
   /** The user checked a sticky schema failure and resumes its feature (T-30b, R2). Refused from content scripts. */
@@ -180,6 +184,7 @@ export const MSG_SENDER = Object.freeze({
   'snipe.arm': 'ui',
   'snipe.disarm': 'ui',
   'snipe.list': 'ui',
+  'timing.awake': 'ui',
   'kill.set': 'ui',
   'health.get': 'ui',
   'health.clearSticky': 'ui',
@@ -197,10 +202,28 @@ export type MsgBroadcastType = {
   [K in MsgType]: (typeof MSG_SENDER)[K] extends 'background' ? K : never;
 }[MsgType];
 
+/**
+ * T-57 contract change (R1): the value of one `landedCost.get` reply entry.
+ * `pickup: true` marks a pickup-only item: shipping and handling are 0 and no
+ * SGW request was made. Module-private schema: the reply is validated through
+ * `MsgReplySchemas`, and only the type joins the contract surface.
+ */
+const LandedCostQuoteSchema = z.object({
+  shipping: CentsSchema,
+  handling: CentsSchema,
+  pickup: z.boolean(),
+});
+export type LandedCostQuote = z.infer<typeof LandedCostQuoteSchema>;
+
 /** Reply schemas for the §3.12 types that declare a `reply`. */
 export const MsgReplySchemas = Object.freeze({
   'rules.evaluate': z.array(MatchResultSchema),
-  'landedCost.get': z.record(ItemIdSchema, CentsSchema.nullable()),
+  /**
+   * T-57 contract change (R1): each entry is the quote, or null when none is
+   * available (feature off, no ZIP, no quote from SGW). `pickup: true` means
+   * pickup-only, with shipping and handling 0.
+   */
+  'landedCost.get': z.record(ItemIdSchema, LandedCostQuoteSchema.nullable()),
   'settings.get': SettingsSchema,
   'rules.list': z.array(RuleSchema),
   'rules.preview': z.object({
@@ -222,6 +245,8 @@ export const MsgReplySchemas = Object.freeze({
   'snipe.prepare': z.object({ detail: ItemDetailSchema, estAllIn: CentsSchema.nullable(), caps: CapsResultSchema }),
   'snipe.arm': SnipeSchema,
   'snipe.list': z.array(SnipeSchema),
+  /** The same schema as `sbw:awake`, so the reply cannot drift from storage. */
+  'timing.awake': STORAGE_RECORDS[STORAGE_KEYS.awake].schema,
   /** `session` is SgwSessionRecord['expiresAt']; `sessionState` and `budget` per I-08. */
   'health.get': z.object({
     sgw: HealthReportSchema.nullable(),

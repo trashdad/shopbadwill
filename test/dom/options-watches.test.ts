@@ -226,7 +226,7 @@ describe('options: Watches', () => {
     cleanup();
     app({ calendarEnabled: false });
     await openForm();
-    await screen.findByText(/turned off in Settings/);
+    await screen.findByText(/Turn them on in the Google Calendar section/);
     expect(screen.getByLabelText<HTMLInputElement>('Add matches to my calendar').disabled).toBe(true);
     cleanup();
     const { store } = app();

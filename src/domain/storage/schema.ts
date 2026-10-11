@@ -41,6 +41,14 @@ export const STORAGE_KEYS = {
   listingCache: 'sbw:listingCache',
   detailCache: 'sbw:detailCache',
   shippingCache: 'sbw:shippingCache',
+  /** Optional (T-57, ruling R2): landed-cost shipping quotes, keyed by item id. */
+  quoteCache: 'sbw:quoteCache',
+  /**
+   * Optional (T-57 final check): the per-install random key for the quote
+   * cache's `zip-hash`, created on first quote. Absent until then; an invalid
+   * one is replaced (the cache then misses). No migration; `schemaVersion` stays 1.
+   */
+  quoteSalt: 'sbw:quoteSalt',
   favoritesCache: 'sbw:favoritesCache',
   jobRuns: 'sbw:jobRuns',
   calendar: 'sbw:calendar',
@@ -68,6 +76,12 @@ export const STORAGE_KEYS = {
    * is pending. No migration; `schemaVersion` stays 1.
    */
   snipeRunner: 'sbw:snipeRunner',
+  /**
+   * Optional (T-90): snipe ids whose completed dry run already incremented
+   * `settings.snipe.completedDryRuns`. Absent means none counted. No migration;
+   * `schemaVersion` stays 1. Invalid data parses to the empty record.
+   */
+  dryRunCounted: 'sbw:dryRunCounted',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -300,6 +314,37 @@ export const SnipeRunnerRecordSchema = z.object({
 });
 export type SnipeRunnerRecord = z.infer<typeof SnipeRunnerRecordSchema>;
 
+/**
+ * `sbw:dryRunCounted` (T-90). Optional. Module-private schema: an exported
+ * `*Schema` would join the locked example list. Idempotency for the live-gate
+ * counter: snipe id → when it was counted. Invalid data parses to empty
+ * (`parseDryRunCounted`); the counter itself refuses to adopt that empty set
+ * when a record is present but invalid, so a corrupt set cannot be counted again.
+ */
+const DryRunCountedRecordSchema = z.object({
+  version: z.literal(1),
+  counted: z.record(SnipeIdSchema, EpochMsSchema),
+});
+export type DryRunCountedRecord = z.infer<typeof DryRunCountedRecordSchema>;
+
+/** Missing is empty. Present-but-invalid is `'invalid'` (the counter refuses it). */
+export function readDryRunCounted(raw: unknown): DryRunCountedRecord | 'invalid' {
+  if (raw === undefined) return { version: 1, counted: {} };
+  const parsed = DryRunCountedRecordSchema.safeParse(raw);
+  return parsed.success ? parsed.data : 'invalid';
+}
+
+/** Missing or invalid `sbw:dryRunCounted` parses to the empty record. */
+export function parseDryRunCounted(raw: unknown): DryRunCountedRecord {
+  const read = readDryRunCounted(raw);
+  return read === 'invalid' ? { version: 1, counted: {} } : read;
+}
+
+/** The record the counter is about to store. Throws when it does not match. */
+export function checkedDryRunCounted(record: DryRunCountedRecord): DryRunCountedRecord {
+  return DryRunCountedRecordSchema.parse(record);
+}
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -323,6 +368,26 @@ export type StorageArea = 'local' | 'session';
 const SgwSessionRejectionSchema = z.object({ ids: z.array(z.string().min(1)).max(8), at: EpochMsSchema });
 export type SgwSessionRejection = z.infer<typeof SgwSessionRejectionSchema>;
 
+/**
+ * T-57 contract change (R2): one `sbw:quoteCache` entry, keyed by item id.
+ * The 24 h TTL runs from `fetchedAt` (readers compute it; no `expiresAt`).
+ * `zip-hash` is the HMAC-SHA-256 hex of the home ZIP under the per-install
+ * `sbw:quoteSalt` key: the ZIP itself is never stored, a plain table of the
+ * 100 000 five-digit ZIPs cannot reverse it, and a ZIP change misses the
+ * cache. Module-private schema, like `SgwSessionRejectionSchema`: exporting it
+ * would join the locked list in test/contract/types/examples.test.ts.
+ */
+const QuoteCacheEntrySchema = z.object({
+  shipping: CentsSchema,
+  handling: CentsSchema,
+  'zip-hash': z.string().min(1),
+  fetchedAt: EpochMsSchema,
+});
+export type QuoteCacheEntry = z.infer<typeof QuoteCacheEntrySchema>;
+
+/** `sbw:quoteSalt` (T-57 final check): 32 random bytes as lowercase hex. Module-private, as above. */
+const QuoteSaltSchema = z.string().regex(/^[0-9a-f]{64}$/);
+
 export const STORAGE_RECORDS = {
   [STORAGE_KEYS.meta]: { area: 'local', schema: StorageMetaSchema },
   [STORAGE_KEYS.settings]: { area: 'local', schema: SettingsSchema },
@@ -332,6 +397,8 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.listingCache]: { area: 'local', schema: z.record(ItemIdSchema, ListingCacheEntrySchema) },
   [STORAGE_KEYS.detailCache]: { area: 'local', schema: z.record(ItemIdSchema, DetailCacheEntrySchema) },
   [STORAGE_KEYS.shippingCache]: { area: 'local', schema: z.record(z.string(), ShippingCacheEntrySchema) },
+  [STORAGE_KEYS.quoteCache]: { area: 'local', schema: z.record(ItemIdSchema, QuoteCacheEntrySchema) },
+  [STORAGE_KEYS.quoteSalt]: { area: 'local', schema: QuoteSaltSchema },
   [STORAGE_KEYS.favoritesCache]: { area: 'local', schema: FavoritesCacheSchema },
   [STORAGE_KEYS.jobRuns]: { area: 'local', schema: z.array(JobRunSchema) },
   [STORAGE_KEYS.calendar]: { area: 'local', schema: CalendarStateSchema },
@@ -351,6 +418,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.healthReport]: { area: 'local', schema: HealthReportSchema },
   [STORAGE_KEYS.healthProbe]: { area: 'local', schema: HealthProbeSchema },
   [STORAGE_KEYS.snipeRunner]: { area: 'local', schema: SnipeRunnerRecordSchema },
+  [STORAGE_KEYS.dryRunCounted]: { area: 'local', schema: DryRunCountedRecordSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

@@ -238,7 +238,7 @@ export function NtfySection(props: NtfySectionProps): VNode {
         ) : null}
         {ntfy.enabled && !settings.calendar.enabled ? (
           <Status
-            message="Calendar events are off, so nothing is sent: phone push follows the auctions calendar sync tracks."
+            message="Calendar events are off, so no new pushes are scheduled: phone push follows the auctions calendar sync tracks. Turn them on in the Google Calendar section."
             tone="error"
           />
         ) : null}

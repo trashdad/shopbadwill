@@ -21,43 +21,44 @@
 //
 // Run: pnpm build && pnpm test:e2e:chromium -- overlay-why
 // (CI runs it on `pnpm build:test`; SBW_CHROME_EXTENSION_DIR picks a build.)
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-import { chromium, expect, test, type BrowserContext, type CDPSession, type Page, type Route, type Worker } from '@playwright/test';
+import { expect, test, type BrowserContext, type Route, type Worker } from '@playwright/test';
 
 import type { Rule } from '../../../src/domain/rules/schema';
 import { defaultSettings } from '../../../src/domain/settings/defaults';
 import type { Settings } from '../../../src/domain/settings/schema';
+import {
+  CORS,
+  HTML,
+  ROOT,
+  SEARCH_API,
+  action,
+  attr,
+  card,
+  clickNode,
+  escapeAndCheck,
+  expectOnScreenOrClosed,
+  extensionDir,
+  find,
+  host,
+  hoverNode,
+  id,
+  launchExtension,
+  openDialogs,
+  openFixturePage,
+  seed,
+  type DomNode,
+  type Opened,
+} from './fixtures';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
-/** SBW_CHROME_EXTENSION_DIR, else the newer of the production build and CI's test build (`pnpm build:test`). */
-function extensionDir(): string {
-  const fromEnv = process.env.SBW_CHROME_EXTENSION_DIR;
-  if (fromEnv !== undefined && fromEnv !== '') return path.resolve(fromEnv);
-  const built = ['.output/chrome-mv3', '.output/chrome-mv3-test']
-    .map((d) => path.join(ROOT, d))
-    .filter((d) => existsSync(path.join(d, 'manifest.json')))
-    .sort((x, y) => statSync(path.join(y, 'manifest.json')).mtimeMs - statSync(path.join(x, 'manifest.json')).mtimeMs);
-  return built[0] ?? path.join(ROOT, '.output/chrome-mv3');
-}
 const EXTENSION = extensionDir();
-const FIX = path.join(ROOT, 'test/fixtures/sgw');
-const HTML = readFileSync(path.join(FIX, 'html/search-grid-logged-out.html'), 'utf8');
 interface SearchJson {
   searchResults: { items: Array<Record<string, unknown>>; itemCount: number };
 }
-const SEARCH_JSON = JSON.parse(readFileSync(path.join(FIX, 'json/search-grid-p1.json'), 'utf8')) as SearchJson;
-const PAGE_URL = 'https://shopgoodwill.com/categories/listing?st=pyrex&p=1';
-const SEARCH_API = 'https://buyerapi.shopgoodwill.com/api/Search/ItemListing';
+const SEARCH_JSON = JSON.parse(readFileSync(path.join(ROOT, 'test/fixtures/sgw/json/search-grid-p1.json'), 'utf8')) as SearchJson;
 const BEARER = 'eyJhbGciOiJIUzI1NiJ9.eyJCdXllcklkIjoiMSJ9.c2lnbmF0dXJl';
-const CORS = {
-  'access-control-allow-origin': 'https://shopgoodwill.com',
-  'access-control-allow-credentials': 'true',
-  'access-control-allow-headers': 'authorization, content-type',
-  'access-control-allow-methods': 'POST, OPTIONS',
-};
 
 // ── rules: one keyword token per card title ──────────────────────────────────
 
@@ -125,61 +126,27 @@ async function fulfil(route: Route): Promise<void> {
   await route.abort();
 }
 
-
 test.beforeAll(async () => {
-  if (!existsSync(path.join(EXTENSION, 'manifest.json'))) {
-    throw new Error(`No Chrome build at ${EXTENSION}. Run \`pnpm build\` first.`);
-  }
-  context = await chromium.launchPersistentContext('', {
-    channel: 'chromium',
-    headless: true,
-    viewport: { width: 1280, height: 800 },
-    args: [
-      `--disable-extensions-except=${EXTENSION}`,
-      `--load-extension=${EXTENSION}`,
-      // Fail closed: no name resolves and any proxied request hits a dead port.
-      '--host-resolver-rules=MAP * ~NOTFOUND',
-      '--proxy-server=http://127.0.0.1:9',
-    ],
-  });
+  ({ context, worker } = await launchExtension(EXTENSION));
   await context.route('**/*', fulfil);
-  worker = context.serviceWorkers()[0] ?? (await context.waitForEvent('serviceworker'));
 });
 
 test.afterAll(async () => {
   await context.close();
 });
 
-interface ChromeLike {
-  chrome: { storage: { local: { set(items: Record<string, unknown>): Promise<void> } } };
-}
-async function seed(items: Record<string, unknown>): Promise<void> {
-  await worker.evaluate(async (v) => {
-    await (globalThis as unknown as ChromeLike).chrome.storage.local.set(v);
-  }, items);
-}
-
-interface Opened {
-  page: Page;
-  cdp: CDPSession;
-  /** Item ids of the result cards, in page order. */
-  ids: number[];
-}
-
 /** Seeds rules and settings, opens the fixture search page and lets the page make its one search call. */
 async function openSearch(rules: Rule[], settings: Settings = defaultSettings()): Promise<Opened> {
   searchCalls = 0;
   blocked = [];
-  await seed({ 'sbw:rules': rules, 'sbw:settings': settings });
+  await seed(worker, { 'sbw:rules': rules, 'sbw:settings': settings });
   const page = await context.newPage();
   if (process.env.SBW_E2E_CONSOLE === '1') {
     page.on('console', (m) => {
       console.log(`[page ${m.type()}] ${m.text()}`);
     });
   }
-  await page.goto(PAGE_URL);
-  await page.waitForSelector('html[data-sbw-nonce]', { state: 'attached' });
-  const ids = await page.$$eval('app-home-product-items a.feat-item_name', (as) => as.map((a) => Number(a.id)));
+  const { cdp, ids } = await openFixturePage(page);
   searchBody = JSON.stringify(searchBodyFor(ids));
   const status = await page.evaluate(
     async ({ url, bearer }) => {
@@ -194,8 +161,6 @@ async function openSearch(rules: Rule[], settings: Settings = defaultSettings())
     { url: SEARCH_API, bearer: BEARER },
   );
   expect(status).toBe(200);
-  const cdp = await context.newCDPSession(page);
-  await cdp.send('DOM.enable');
   return { page, cdp, ids };
 }
 
@@ -207,204 +172,11 @@ async function closePage(o: Opened): Promise<void> {
   await o.page.close();
 }
 
-function id(o: Opened, index: number): string {
-  const v = o.ids[index];
-  if (v === undefined) throw new Error(`no card ${String(index)}`);
-  return String(v);
-}
-const card = (o: Opened, index: number) => o.page.locator(`app-home-product-items:has(a.feat-item_name[id="${id(o, index)}"])`);
-
 // ── CDP: closed shadow roots ────────────────────────────────────────────────
-
-interface DomNode {
-  nodeName: string;
-  backendNodeId: number;
-  attributes?: string[];
-  children?: DomNode[];
-  shadowRoots?: DomNode[];
-}
-function attr(n: DomNode, name: string): string | undefined {
-  const a = n.attributes ?? [];
-  for (let i = 0; i + 1 < a.length; i += 2) if (a[i] === name) return a[i + 1];
-  return undefined;
-}
-function* walk(n: DomNode): Generator<DomNode> {
-  yield n;
-  for (const c of n.children ?? []) yield* walk(c);
-  for (const s of n.shadowRoots ?? []) yield* walk(s);
-}
-async function tree(o: Opened): Promise<DomNode> {
-  const { root } = await o.cdp.send('DOM.getDocument', { depth: -1, pierce: true });
-  return root;
-}
-/** The first node matching `pred` inside the subtree of the first node matching `scope`. */
-async function find(o: Opened, scope: (n: DomNode) => boolean, pred: (n: DomNode) => boolean): Promise<DomNode> {
-  for (const s of walk(await tree(o))) {
-    if (!scope(s)) continue;
-    for (const n of walk(s)) if (n !== s && pred(n)) return n;
-  }
-  throw new Error('node not found');
-}
-const host = (tag: string, name: string, value: string) => (n: DomNode) => n.nodeName === tag && attr(n, name) === value;
-const action = (a: string) => (n: DomNode) => n.nodeName === 'BUTTON' && attr(n, 'data-action') === a;
 
 const stubRow = (o: Opened, i: number) => host('SBW-STUB-ROW', 'data-sbw-stub', id(o, i));
 const toolsHost = (o: Opened, i: number) => host('SBW-TOOLS', 'data-sbw-tools', id(o, i));
 const openDialog = (n: DomNode): boolean => n.nodeName === 'DIALOG' && attr(n, 'open') !== undefined;
-
-async function centre(o: Opened, n: DomNode): Promise<{ x: number; y: number }> {
-  await o.cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: n.backendNodeId });
-  const { model } = await o.cdp.send('DOM.getBoxModel', { backendNodeId: n.backendNodeId });
-  const q = model.border.map((v) => v);
-  const x = ((q[0] ?? 0) + (q[2] ?? 0) + (q[4] ?? 0) + (q[6] ?? 0)) / 4;
-  const y = ((q[1] ?? 0) + (q[3] ?? 0) + (q[5] ?? 0) + (q[7] ?? 0)) / 4;
-  return { x, y };
-}
-async function clickNode(o: Opened, n: DomNode): Promise<void> {
-  const p = await centre(o, n);
-  await o.page.mouse.click(p.x, p.y);
-}
-async function hoverNode(o: Opened, n: DomNode): Promise<void> {
-  const p = await centre(o, n);
-  await o.page.mouse.move(p.x, p.y);
-}
-async function call<T>(o: Opened, backendNodeId: number, fn: string): Promise<T> {
-  const { object } = await o.cdp.send('DOM.resolveNode', { backendNodeId });
-  const objectId = object.objectId;
-  if (objectId === undefined) throw new Error('node not resolvable');
-  try {
-    const { result } = await o.cdp.send('Runtime.callFunctionOn', { objectId, functionDeclaration: fn, returnByValue: true });
-    return result.value as T;
-  } finally {
-    await o.cdp.send('Runtime.releaseObject', { objectId });
-  }
-}
-
-interface DialogState {
-  modal: boolean;
-  visible: boolean;
-  width: number;
-  height: number;
-  /** elementFromPoint at the dialog's centre is the dialog (or its shadow host). */
-  onTop: boolean;
-  heading: string;
-  rules: string[];
-}
-const DIALOG_STATE = `function () {
-  const r = this.getBoundingClientRect();
-  const root = this.getRootNode();
-  const host = root instanceof ShadowRoot ? root.host : null;
-  const hit = r.width > 0 ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : null;
-  const text = (e) => (e ? e.textContent : '').replace(/\\s+/g, ' ').trim();
-  return {
-    modal: this.matches(':modal'),
-    visible: this.checkVisibility(),
-    width: r.width,
-    height: r.height,
-    onTop: hit !== null && (hit === this || hit === host),
-    heading: text(this.querySelector('.pop-h')),
-    rules: Array.from(this.querySelectorAll('.rule'), text),
-  };
-}`;
-
-async function openDialogs(o: Opened): Promise<DialogState[]> {
-  const out: DialogState[] = [];
-  for (const n of walk(await tree(o))) {
-    if (openDialog(n)) out.push(await call<DialogState>(o, n.backendNodeId, DIALOG_STATE));
-  }
-  return out;
-}
-
-/** A real click on a probe at the top-right corner reaches the page (it is not inert). It leaves focus where it is. */
-async function pageTakesClicks(o: Opened): Promise<boolean> {
-  const clicks = (): Promise<number> =>
-    o.page.evaluate(() => {
-      let p = document.getElementById('sbw-e2e-probe');
-      if (p === null) {
-        const el = document.createElement('div');
-        el.id = 'sbw-e2e-probe';
-        el.setAttribute('style', 'position:fixed;top:0;right:0;width:24px;height:24px;z-index:2147483647;background:#f0f');
-        el.dataset.clicks = '0';
-        // A press on a non-focusable element would blur the focused control.
-        el.addEventListener('mousedown', (e) => {
-          e.preventDefault();
-        });
-        el.addEventListener('click', () => {
-          el.dataset.clicks = String(Number(el.dataset.clicks) + 1);
-        });
-        document.documentElement.append(el);
-        p = el;
-      }
-      return Number(p.dataset.clicks);
-    });
-  const before = await clicks();
-  const vp = o.page.viewportSize() ?? { width: 1280, height: 800 };
-  await o.page.mouse.click(vp.width - 12, 12);
-  return (await clicks()) === before + 1;
-}
-
-/** The invariant: every open dialog is on screen; with none open, the page takes clicks. */
-async function expectOnScreenOrClosed(o: Opened, label: string): Promise<DialogState[]> {
-  const dialogs = await openDialogs(o);
-  for (const d of dialogs) {
-    expect(d.modal && d.visible && d.width > 0 && d.height > 0 && d.onTop, `${label}: open dialog not on screen: ${JSON.stringify(d)}`).toBe(true);
-  }
-  if (dialogs.length === 0) expect(await pageTakesClicks(o), `${label}: no dialog, yet the page is inert`).toBe(true);
-  return dialogs;
-}
-
-interface Focus {
-  /** Tag of document.activeElement (our shadow host), or null for the body. */
-  host: string | null;
-  attrs: Record<string, string>;
-  /** data-action of the focused control inside the host's shadow root. */
-  action: string | null;
-  visible: boolean;
-}
-async function focused(o: Opened): Promise<Focus> {
-  const { result } = await o.cdp.send('Runtime.evaluate', {
-    expression: 'document.activeElement === document.body ? null : document.activeElement',
-  });
-  if (result.objectId === undefined) return { host: null, attrs: {}, action: null, visible: false };
-  const { node } = await o.cdp.send('DOM.describeNode', { objectId: result.objectId, depth: 1, pierce: true });
-  await o.cdp.send('Runtime.releaseObject', { objectId: result.objectId });
-  const a: Record<string, string> = {};
-  const list = node.attributes ?? [];
-  for (let i = 0; i + 1 < list.length; i += 2) a[list[i] ?? ''] = list[i + 1] ?? '';
-  const shadow = node.shadowRoots?.[0];
-  if (shadow === undefined) {
-    return { host: node.nodeName.toLowerCase(), attrs: a, action: a['data-action'] ?? null, visible: true };
-  }
-  const inner = await call<{ action: string | null; visible: boolean } | null>(
-    o,
-    shadow.backendNodeId,
-    `function () {
-      let el = this.activeElement;
-      while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
-      return el ? { action: el.getAttribute('data-action'), visible: el.checkVisibility() } : null;
-    }`,
-  );
-  return { host: node.nodeName.toLowerCase(), attrs: a, action: inner?.action ?? null, visible: inner?.visible ?? false };
-}
-
-/** Closes the open dialog with a real Escape and checks the page is usable and focus is on a visible control. */
-async function escapeAndCheck(o: Opened, label: string): Promise<Focus> {
-  if ((await openDialogs(o)).length > 0) await o.page.keyboard.press('Escape');
-  await expect.poll(async () => (await openDialogs(o)).length, { message: `${label}: Escape closes the dialog` }).toBe(0);
-  // A dialog that went away while focused hands focus on after the overlay's pass: poll briefly.
-  let f = await focused(o);
-  await expect
-    .poll(
-      async () => {
-        f = await focused(o);
-        return f.host !== null && f.visible;
-      },
-      { message: `${label}: focus went nowhere`, timeout: 2000 },
-    )
-    .toBe(true);
-  expect(await pageTakesClicks(o), `${label}: page inert after close`).toBe(true);
-  return f;
-}
 
 // ── ways to open Why? ───────────────────────────────────────────────────────
 
@@ -501,7 +273,7 @@ test.describe('Why? dialog: on screen or closed, never an inert page', () => {
     const o = await openSearch(RULES);
     await decorated(o);
     await openStubWhy(o, A);
-    await seed({ 'sbw:settings': { ...defaultSettings(), killSwitch: true } });
+    await seed(worker, { 'sbw:settings': { ...defaultSettings(), killSwitch: true } });
     await expect(card(o, A)).not.toHaveAttribute('data-sbw-hidden', /.*/);
     await expectOnScreenOrClosed(o, 'killed');
     await escapeAndCheck(o, 'killed');
@@ -514,7 +286,7 @@ test.describe('Why? dialog: on screen or closed, never an inert page', () => {
     await openStubWhy(o, A);
     const dim = defaultSettings();
     dim.overlay.hideStyle = 'dim';
-    await seed({ 'sbw:settings': dim });
+    await seed(worker, { 'sbw:settings': dim });
     await expect(card(o, A)).toHaveAttribute('data-sbw-hidden', 'dim');
     await expectOnScreenOrClosed(o, 'dim');
     const f = await escapeAndCheck(o, 'dim');
@@ -529,7 +301,7 @@ test.describe('Why? dialog: on screen or closed, never an inert page', () => {
     await expect(card(o, A)).toHaveAttribute('data-sbw-hidden', 'dim');
     await openStubWhy(o, A);
     await expectOnScreenOrClosed(o, 'dim open');
-    await seed({ 'sbw:rules': [off(HIDE_A), GLOW_B, HIDE_C] });
+    await seed(worker, { 'sbw:rules': [off(HIDE_A), GLOW_B, HIDE_C] });
     await expect(card(o, A)).not.toHaveAttribute('data-sbw-hidden', /.*/);
     await expectOnScreenOrClosed(o, 'rule off');
     const f = await escapeAndCheck(o, 'rule off');
@@ -543,7 +315,7 @@ test.describe('Why? dialog: on screen or closed, never an inert page', () => {
     await openToolsWhyByHover(o, B);
     const [before] = await expectOnScreenOrClosed(o, 'hover open');
     expect(before?.heading).toBe('Why this listing is highlighted');
-    await seed({ 'sbw:rules': [...RULES, HIDE_B] });
+    await seed(worker, { 'sbw:rules': [...RULES, HIDE_B] });
     await expect(card(o, B)).toHaveAttribute('data-sbw-hidden', '1');
     const [after] = await expectOnScreenOrClosed(o, 'collapsed');
     if (after !== undefined) expect(after.heading).toBe('Why this listing is hidden');
@@ -557,7 +329,7 @@ test.describe('Why? dialog: on screen or closed, never an inert page', () => {
     await decorated(o);
     await openToolsWhyByHandle(o, B);
     await expectOnScreenOrClosed(o, 'handle open');
-    await seed({ 'sbw:rules': [HIDE_A, off(GLOW_B), HIDE_C] });
+    await seed(worker, { 'sbw:rules': [HIDE_A, off(GLOW_B), HIDE_C] });
     await expect(card(o, B)).not.toHaveAttribute('data-sbw-highlight', /.*/);
     await expectOnScreenOrClosed(o, 'rule off');
     const f = await escapeAndCheck(o, 'rule off');
@@ -615,7 +387,7 @@ test.describe('Why? dialog: on screen or closed, never an inert page', () => {
     await expect(o.page.locator('shopbadwill-badge [role="status"]')).toHaveText('ShopBadwill paused (kill switch)');
     await o.page.waitForTimeout(500);
     await expect(o.page.locator('[data-sbw-hidden], [data-sbw-highlight], sbw-stub-row')).toHaveCount(0);
-    await seed({ 'sbw:settings': defaultSettings() });
+    await seed(worker, { 'sbw:settings': defaultSettings() });
     await decorated(o); // the same page and rules decorate once it is off
     await closePage(o);
   });
@@ -625,7 +397,7 @@ test.describe('Why? dialog: on screen or closed, never an inert page', () => {
     await decorated(o);
     await revealByStub(o, C);
     await openToolsWhyByHandle(o, C);
-    await seed({ 'sbw:rules': [HIDE_A, GLOW_B, { ...HIDE_C, name: 'Hide C renamed', updatedAt: 2 }] });
+    await seed(worker, { 'sbw:rules': [HIDE_A, GLOW_B, { ...HIDE_C, name: 'Hide C renamed', updatedAt: 2 }] });
     await expect
       .poll(async () => (await openDialogs(o))[0]?.rules ?? [])
       .toEqual(['Hide rule: Hide C renamed']);

@@ -548,3 +548,85 @@ Source: T-69 (controller ruling R7 authorises this additive storage change).
 **Options cancel (review ruling).** Turning phone push off, or generating a new topic, runs from the options click path while the host permission is still granted: DELETE each stored `scheduled` seq on the old topic (paced, `https://ntfy.sh` only), then clear `sbw:ntfy`, then save. Deferred seqs were never sent and are not deleted. If a DELETE fails, phone push is still turned off and the page says already-scheduled pushes may still arrive; the stored seqs are kept. A failed regenerate keeps the old topic. `parseNtfyState` reads a missing or invalid record as empty.
 
 **Follow-up for the next PLAN edit.** Add the `sbw:ntfy` key to PLAN §2.3's storage table.
+
+## T-90 contract change: optional storage key `sbw:dryRunCounted`
+
+Source: controller ruling on T-90 concern 4.
+
+The dry-run counter keeps the snipe ids it has already counted in `sbw:dryRunCounted`, so a replayed completion event does not increment `settings.snipe.completedDryRuns` twice. The key was module-private. It is now a storage record, the same kind of optional bookkeeping as `sbw:snipeRunner` and `sbw:ntfy`.
+
+`STORAGE_KEYS.dryRunCounted = 'sbw:dryRunCounted'` (area `local`). The schema is module-private (an exported `*Schema` would join the locked example list): `{ version: 1, counted: Record<SnipeId, EpochMs> }`. `counted` maps a snipe id to when it was counted.
+
+Optional and additive. A profile with no record has counted nothing. No migration, and `sbw:meta.schemaVersion` stays 1.
+
+Invalid data parses to the empty record `{ version: 1, counted: {} }` through `parseDryRunCounted` (missing or unreadable). A typed `repo.find` quarantines an invalid record and returns undefined, which is that empty record. The counter does not read the key through `find`. It reads the raw bytes and, when a record is present but invalid, refuses the increment and leaves the bytes in place. Adopting the empty parse would drop the idempotency set, and a replay could count again. Over-counting is the direction that opens the live-bidding gate early.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, the sample, invalid parses to empty) and `test/unit/background/dry-run-counter.test.ts` (refuse on a corrupt record; `repo.find` quarantines).
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-90 contract change: `timing.awake`
+
+Source: controller ruling on T-90 concern 1. Additive. No other protocol change.
+
+The Timing page's awake chart needs the persisted heartbeat history. No existing message carries `sbw:awake`.
+
+`timing.awake` is a UI signal (empty request). The reply is `STORAGE_RECORDS[STORAGE_KEYS.awake].schema`, which is `EpochMs[]`: the stored history, or an empty array when nothing is stored. A content script is refused (`forbidden`), same as every other UI message. The handler is read only (T-90 final check): it reads the raw bytes and validates them with that schema, so an invalid record answers `[]` and is left in place. The heartbeat job quarantines it under its own `sbw:awake` lock on its next beat. A `repo.get` here would quarantine outside that lock, and its remove could delete a history the heartbeat had just written.
+
+**Tests.** `test/contract/types/messages.test.ts`, `test/contract/types/examples/Msg/timing.awake.{valid,invalid}.json`, `test/unit/background/timing-awake.test.ts`, and `test/dom/timing-section.test.ts`.
+
+**Follow-up for the next PLAN edit.** Add `timing.awake` to PLAN §3.12 and contracts.md.
+
+## T-90: `settings.set` never changes `snipe.completedDryRuns`
+
+Source: T-90 final check (Opus). A behaviour rule on an existing message, like `killSwitch` (T-36 R3). No schema or protocol change.
+
+`settings.set` replaces whole top-level groups. A page that edits one `snipe` field must send the whole `snipe` group, and that group carries `completedDryRuns`. A copy loaded before the last dry runs were counted would roll the count back. A crafted group could raise it and open the live-bidding gate early. `applySettingsPatch` now keeps `current.snipe.completedDryRuns`, whatever the patch says. The dry-run counter (`src/background/jobs/dry-run-counter.ts`) is the only writer. The kept count is in `next` before the `settings.set` interceptors run, so T-102's live gate judges the real count. The handler and the counter both take the `sbw:settings` lock, so the two cannot interleave.
+
+The Timing page's Apply also reads the settings fresh (`settings.get`) just before it writes, so it does not send back stale caps or other `snipe` fields either.
+
+**Tests.** `test/integration/background-main.test.ts` ("settings.set never changes completedDryRuns") and `test/dom/timing-section.test.ts` ("Apply re-reads the settings first").
+
+**Follow-up for the next PLAN edit.** Note the rule beside `killSwitch` in PLAN §3.12 (`settings.set`) and contracts.md.
+
+## T-57 contract change: landedCost.get reply and `sbw:quoteCache`
+
+Approved by the controller (T-57 rulings R1, R2) and made in `task/T-57`.
+
+### R1: the `landedCost.get` reply value
+
+**Before:** `MsgReplySchemas['landedCost.get']` was `record(ItemId, Cents | null)`, which cannot carry the brief's `pickup` flag.
+
+**Change** (`src/messaging/protocol.ts`): the reply is now `record(ItemId, { shipping: Cents; handling: Cents; pickup: boolean } | null)`.
+
+- The badge computes landed = the card's current price + shipping + handling.
+- Pickup-only items answer `{ shipping: 0, handling: 0, pickup: true }` with no SGW request.
+- The entry schema is module-private (`LandedCostQuoteSchema`); only the type `LandedCostQuote` is exported, so the locked schema surface in `test/contract/types/examples.test.ts` is unchanged.
+- `test/contract/types/messages.test.ts` pins the new reply type and validation examples. No other consumer of the reply existed (the handler and the badge are new in T-57). The request payload's TypeScript type stays `{ itemIds: ItemId[] }`; the runtime zod schema caps `itemIds` at 40 (R5).
+
+### R2: the `sbw:quoteCache` storage key
+
+**Change** (`src/domain/storage/schema.ts`, plus the Repo default in `src/domain/storage/repo.ts`): one new optional key `STORAGE_KEYS.quoteCache = 'sbw:quoteCache'` (area `local`), `record(ItemId, { shipping, handling, zip-hash, fetchedAt })`.
+
+- `zip-hash` is the HMAC-SHA-256 hex of the home ZIP under the per-install salt `sbw:quoteSalt` (below): the ZIP itself is never stored, and a ZIP change misses the cache.
+- The 24 h TTL runs from `fetchedAt` (readers compute it; the record has no `expiresAt`).
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration. An invalid record parses to empty (the Repo default `{}` after quarantine).
+- The entry schema is module-private (`QuoteCacheEntrySchema`), like `SgwSessionRejectionSchema`, so the locked example list is unchanged; `test/contract/types/storage.test.ts` pins the new key, its area and a sample value.
+
+### `sbw:quoteSalt`: the per-install key for `zip-hash` (T-57 final check)
+
+Source: T-57 final check (Opus). The controller's check asked for a salted or keyed hash, kept in local storage, with any new key optional and additive.
+
+A plain SHA-256 of a 5-digit ZIP is reversible: there are only 100 000 ZIPs, so a table of every hash recovers the ZIP from the cache. The hash is now keyed.
+
+**Change** (`src/domain/storage/schema.ts`): one new optional key `STORAGE_KEYS.quoteSalt = 'sbw:quoteSalt'` (area `local`). The value is 32 random bytes as lowercase hex (`/^[0-9a-f]{64}$/`). The schema is module-private, so the locked example list is unchanged.
+
+- `zip-hash` = HMAC-SHA-256(key = the salt, message = the trimmed ZIP), as hex. The handler and the `quote` step share the helper (`zipHashFor` in `src/background/handlers/landed-cost.ts`), so they read each other's entries.
+- The salt is made on the first quote, under the key's Repo lock, so concurrent first uses agree on one salt. No salt is made while the feature is off, the kill switch is on, or the ZIP is invalid.
+- An invalid record is quarantined by the Repo and a fresh salt is made. The old cache entries then miss and expire within 24 h.
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration.
+- **Limit.** The salt and the cache live in the same `storage.local`. The salt defeats a precomputed table and links nothing across installs. It does not stop someone who can read this profile's storage, but they can also read `settings.homeZip` there.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, its area, a sample value, rejected values) and `test/unit/background/landed-cost.test.ts` ("ZIP hash privacy: a per-install salt").
+
+**Follow-up for the next PLAN edit.** Add `sbw:quoteCache` and `sbw:quoteSalt` to PLAN §2.3 and the new reply shape to §3.12 and contracts.md.

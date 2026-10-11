@@ -13,6 +13,7 @@ import {
   REQUEST_SCHEDULER_STATE_VERSION,
   RequestBudgetSchema,
   RequestSchedulerStateSchema,
+  parseDryRunCounted,
   STORAGE_KEYS,
   STORAGE_LIMITS,
   STORAGE_RECORDS,
@@ -36,6 +37,8 @@ const LOCAL_KEYS = [
   'sbw:listingCache',
   'sbw:detailCache',
   'sbw:shippingCache',
+  'sbw:quoteCache',
+  'sbw:quoteSalt',
   'sbw:favoritesCache',
   'sbw:jobRuns',
   'sbw:calendar',
@@ -52,6 +55,7 @@ const LOCAL_KEYS = [
   'sbw:healthReport',
   'sbw:healthProbe',
   'sbw:snipeRunner',
+  'sbw:dryRunCounted',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -65,6 +69,10 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:listingCache': { '279250057': example('ListingCacheEntry') },
   'sbw:detailCache': { '279250057': example('DetailCacheEntry') },
   'sbw:shippingCache': { '279250057:14201': example('ShippingCacheEntry') },
+  // T-57 (R2): the ZIP lives only as a hash; the 24 h TTL runs from fetchedAt.
+  'sbw:quoteCache': { '279250057': { shipping: 500, handling: 100, 'zip-hash': 'a'.repeat(64), fetchedAt: 1791400000000 } },
+  // T-57 final check: the per-install key for that hash (32 random bytes, hex).
+  'sbw:quoteSalt': '0f'.repeat(32),
   'sbw:favoritesCache': example('FavoritesCache'),
   'sbw:jobRuns': [example('JobRun')],
   'sbw:calendar': example('CalendarState'),
@@ -100,6 +108,7 @@ const SAMPLE_VALUES: Record<string, unknown> = {
     sticky: [{ endpoint: 'favorites', at: 1791400000000, detail: 'bad rows' }],
   },
   'sbw:snipeRunner': example('SnipeRunnerRecord'),
+  'sbw:dryRunCounted': { version: 1, counted: { 'snp-1': 1791400000000 } },
 };
 
 describe('storage schema v1', () => {
@@ -172,6 +181,35 @@ describe('storage schema v1', () => {
     const credentials = { ...(example('GoogleCredentials') as object), calendarId: 'example@group.calendar.google.com' };
     expect(GoogleCredentialsSchema.parse(credentials)).not.toHaveProperty('calendarId');
     expect(CalendarStateSchema.parse(example('CalendarState'))).toHaveProperty('calendarId');
+  });
+
+  it('registers the optional dry-run counted record; invalid data parses to empty (T-90)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.dryRunCounted];
+    expect(spec.area).toBe('local');
+    expect(spec.schema.safeParse({ version: 1, counted: {} }).success).toBe(true);
+    expect(spec.schema.safeParse({ version: 1, counted: { 'snp-1': 1791400000000 } }).success).toBe(true);
+    // The strict schema still rejects, so a typed repo read can quarantine.
+    expect(spec.schema.safeParse({ version: 2, counted: {} }).success).toBe(false);
+    expect(spec.schema.safeParse({ version: 1, counted: { 'snp-1': -1 } }).success).toBe(false);
+    // Missing or invalid parses to the empty record. No migration; schemaVersion stays 1.
+    expect(parseDryRunCounted(undefined)).toEqual({ version: 1, counted: {} });
+    expect(parseDryRunCounted({ version: 2, nope: true })).toEqual({ version: 1, counted: {} });
+    expect(parseDryRunCounted({ junk: true })).toEqual({ version: 1, counted: {} });
+    expect(parseDryRunCounted({ version: 1, counted: { 'snp-1': 1791400000000 } })).toEqual({
+      version: 1,
+      counted: { 'snp-1': 1791400000000 },
+    });
+  });
+
+  it('registers the optional quote salt: 64 lowercase hex, nothing else (T-57 final check)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.quoteSalt];
+    expect(STORAGE_KEYS.quoteSalt).toBe('sbw:quoteSalt');
+    expect(spec.area).toBe('local');
+    expect(spec.schema.safeParse('0f'.repeat(32)).success).toBe(true);
+    // Rejected, so a typed repo read quarantines it and a fresh salt is made.
+    for (const bad of ['', '43004', 'AB'.repeat(32), '0f'.repeat(31), '0f'.repeat(33), 42, null]) {
+      expect(spec.schema.safeParse(bad).success, String(bad)).toBe(false);
+    }
   });
 
   it('registers the optional snipe-runner record and rejects one that cannot be replayed (T-84)', () => {
