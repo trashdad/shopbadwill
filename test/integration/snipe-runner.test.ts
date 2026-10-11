@@ -1431,11 +1431,18 @@ describe('live safety', () => {
     await arm(w);
     await runTo(shared, END - SKEW - 30 * SEC);
     expect(stored(shared).state).toBe('verified');
+    const switchedAt = shared.clock.now();
     await w.ok('settings.set', { dryRun: { favorites: false, calendar: false, bidding: true } });
+    await flush();
+    // The live snipe's window check sees the dry run at once (it never asks with ignoreDryRun).
+    const s = stored(shared);
+    expect(transitions(s).at(-1)).toBe('verified>killed');
+    expect((s.history.at(-1)?.at ?? 0) - switchedAt).toBeLessThan(SEC);
     await runTo(shared, END + 2 * MIN);
     expect(shared.sgw.placeBids).toHaveLength(0);
     expect(shared.sgw.modals).toHaveLength(0);
     expect(stored(shared).state).toBe('killed');
+    expect(String(audits(shared).find((a) => a.kind === 'snipe.disarm')?.details.why)).toMatch(/dry run/);
   });
 
   it('a session lost mid-window is an anomaly: killed, fallback reason auth, no bid', async () => {
