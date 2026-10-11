@@ -1,46 +1,58 @@
-// Placeholder overlay (T-01): mounts an empty Shadow DOM badge on every SGW
-// page to prove the content-script + Shadow DOM pipeline. Replaced by the real
-// overlay in T-32.
+// The SGW content overlay (T-32), ISOLATED world. Logic lives in
+// src/content/sgw-overlay.ts. It runs at document_start so the tap nonce is on
+// <html> before the MAIN-world api-tap (T-31) has to buffer for long; the page
+// UI and the card scan wait for the DOM.
 //
-// Built with plain DOM, not Preact: Preact's runtime contains an `innerHTML`
-// assignment (for `dangerouslySetInnerHTML`), which `web-ext lint
-// --warnings-as-errors` rejects (UNSAFE_VAR_ASSIGNMENT).
+// The page-level UI keeps T-01's host, an open-shadow <shopbadwill-badge> with a
+// [role="status"] pill (the Firefox E2E smoke looks for it). In-card UI uses
+// closed shadow roots (src/content/ui/shadow.ts). Preact is bundled into this
+// script; its runtime's one innerHTML statement is the allowlisted entry in
+// scripts/lint-webext.ts and scripts/check-prod-bundle.ts.
+import { browser } from 'wxt/browser';
 import { createShadowRootUi } from 'wxt/utils/content-script-ui/shadow-root';
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
-const BADGE_STYLE: Partial<CSSStyleDeclaration> = {
-  position: 'fixed',
-  right: '12px',
-  bottom: '12px',
-  zIndex: '2147483647',
-  padding: '4px 8px',
-  borderRadius: '4px',
-  background: '#1f2937',
-  color: '#ffffff',
-  font: '12px/1.4 system-ui, sans-serif',
-  pointerEvents: 'none',
-};
+import { createStorageAreas } from '../adapters/browser/storage';
+import { startOverlay } from '../content/sgw-overlay';
+import { PAGE_CSS } from '../content/ui/styles';
+import { createMessagingClient } from '../messaging/client';
 
 export default defineContentScript({
   matches: ['https://shopgoodwill.com/*'],
-  async main(ctx) {
-    const ui = await createShadowRootUi(ctx, {
-      name: 'shopbadwill-badge',
-      position: 'inline',
-      anchor: 'body',
-      append: 'last',
-      onMount(container) {
-        const badge = document.createElement('div');
-        badge.setAttribute('role', 'status');
-        badge.textContent = 'ShopBadwill ready';
-        Object.assign(badge.style, BADGE_STYLE);
-        container.append(badge);
-        return badge;
-      },
-      onRemove(badge) {
-        badge?.remove();
+  runAt: 'document_start',
+  main(ctx) {
+    const overlay = startOverlay({
+      win: window,
+      messaging: createMessagingClient(browser.runtime),
+      storage: createStorageAreas().local,
+      async mountPageUi(hooks) {
+        const ui = await createShadowRootUi(ctx, {
+          name: 'shopbadwill-badge',
+          position: 'inline',
+          anchor: 'body',
+          append: 'last',
+          css: PAGE_CSS,
+          isolateEvents: true,
+          onMount(container) {
+            hooks.onMount(container);
+          },
+          onRemove() {
+            hooks.onRemove();
+          },
+        });
+        ui.mount();
+        return {
+          remove() {
+            ui.remove();
+          },
+        };
       },
     });
-    ui.mount();
+    ctx.addEventListener(window, 'wxt:locationchange', ({ newUrl }) => {
+      overlay.onLocationChange(newUrl.href);
+    });
+    ctx.onInvalidated(() => {
+      overlay.stop();
+    });
   },
 });

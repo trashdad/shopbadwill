@@ -487,3 +487,26 @@ Approved by the controller (T-80b rulings R1–R5) and made in `task/T-80b`.
 
    Outcomes, `final`, stamps and the with-a-read copy are unchanged.
 3. **No stale proof on a draft.** `reduce(arm)` refuses a draft that carries `attempt.notSent` (`invalid-snipe`), as it already refused `sentAt`, the key and a `reply`. A stale proof would keep the next attempt's Unconfirmed outcome out of `spentToday` (R4).
+
+## T-32 contract change: `rules.disable`
+
+Approved by the controller in the T-32 review (fix round 1, ruling on concern 1).
+
+**Change.** A new message, `rules.disable { ruleId: string (min 1) }`, with no reply. It is in the `content` sender group (`MSG_SENDER['rules.disable'] = 'content'`), so content scripts may send it, and, like every content type, extension pages may too. `src/background/handlers/rules.ts` accepts both sender classes; it does not call `requireContent`.
+
+**Why.** The overlay's undo is "local re-show + optional 'disable rule'" (T-32 card). Before this change, a content script had no way to turn a rule off: `rules.save` and `audit.undo` are UI-only.
+
+**Handler rules.**
+- The rule's `enabled` becomes false and `updatedAt` is set to now. Nothing else changes.
+- An audit entry is written: `{ actor: 'user', kind: 'rule.disabled', ref: ruleId, details: { ruleId, name, from: 'content' | 'ui' }, undo: { kind: 'disableRule', ref: ruleId } }`. This is the T-58 format ("disableRule undo ref = rule id"), so the activity log's undo re-enables the rule.
+- `rules.changed` is broadcast.
+- An already disabled rule is a no-op: no audit, no broadcast. An unknown rule id is an error. Content senders get the router's generic "internal error".
+- The overlay sends it only from a trusted click (`event.isTrusted`) in the Why? dialog, which lives in a closed shadow root.
+
+**Tests.**
+- `test/contract/types/messages.test.ts`: the union, the sender group, and the payload type.
+- `test/contract/types/examples/Msg/rules.disable.{valid,invalid}.json`: the example pair.
+- `test/unit/background/rules-disable.test.ts`: the handler, with both senders, the audit undo round trip, the no-op, the unknown rule, and an empty id.
+- `test/dom/overlay.test.ts`: the trusted-click check.
+
+**Follow-up for the next PLAN edit.** Add `rules.disable` to PLAN §3.12 (content → background) and §2.4 rule 3, and to contracts.md.

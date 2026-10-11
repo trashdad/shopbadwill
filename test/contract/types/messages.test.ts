@@ -42,8 +42,9 @@ import type { RequestScheduler } from '../../../src/ports/request-scheduler';
 const MSG_DIR = path.join(import.meta.dirname, 'examples', 'Msg');
 
 // §3.12, grouped by its comments. §2.4 rule 3: content scripts may send only
-// the `content` group (page.*, ui.openSnipe, rules.evaluate, landedCost.get,
-// quick.*).
+// the `content` group (page.*, ui.openSnipe, rules.evaluate, rules.disable,
+// landedCost.get, quick.*). `rules.disable` is the T-32 contract change
+// (docs/CONTRACT-DECISIONS.md); extension pages may send content types too.
 const EXPECTED = {
   content: [
     'page.listings',
@@ -52,6 +53,7 @@ const EXPECTED = {
     'page.domHealth',
     'ui.openSnipe',
     'rules.evaluate',
+    'rules.disable',
     'landedCost.get',
     'quick.hideSeller',
     'quick.hideKeyword',
@@ -244,6 +246,7 @@ type SpecMsg =
     }
   | { type: 'ui.openSnipe'; payload: { itemId: ItemId } }
   | { type: 'rules.evaluate'; payload: { listings: Listing[] } }
+  | { type: 'rules.disable'; payload: { ruleId: string } }
   | { type: 'landedCost.get'; payload: { itemIds: ItemId[] } }
   | { type: 'quick.hideSeller'; payload: { sellerId: number; sellerName: string } }
   | { type: 'quick.hideKeyword'; payload: { term: string } }

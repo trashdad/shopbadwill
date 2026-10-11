@@ -64,6 +64,12 @@ export const MsgSchema = z.discriminatedUnion('type', [
   /** "Snipe…" deep link: opens the dashboard prefilled, never arms (I-08). */
   msg('ui.openSnipe', ItemIdPayload),
   msg('rules.evaluate', z.object({ listings: z.array(ListingSchema) })),
+  /**
+   * Turns a rule off (T-32 contract change, docs/CONTRACT-DECISIONS.md): the
+   * overlay's "Disable rule" on a trusted click, or an extension page. Audited
+   * with `undo: { kind: 'disableRule', ref: ruleId }`.
+   */
+  msg('rules.disable', z.object({ ruleId: z.string().min(1) })),
   msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema) })),
   msg('quick.hideSeller', z.object({ sellerId: z.number().int(), sellerName: z.string() })),
   /** A non-empty term: an empty one would hide every listing. */
@@ -144,6 +150,7 @@ export const MSG_SENDER = Object.freeze({
   'page.domHealth': 'content',
   'ui.openSnipe': 'content',
   'rules.evaluate': 'content',
+  'rules.disable': 'content',
   'landedCost.get': 'content',
   'quick.hideSeller': 'content',
   'quick.hideKeyword': 'content',
