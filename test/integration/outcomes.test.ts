@@ -20,6 +20,7 @@ import {
 } from '../../src/background/context';
 import { syncFor } from '../../src/background/jobs/calendar-sync';
 import {
+  MAX_POST_END_READS,
   OUTCOME_NOTIFY_ALARM_PREFIX,
   decisiveOutcome,
   onOutcomeAlarm,
@@ -780,5 +781,108 @@ describe('post-end outcome detection', () => {
     }
     expect(patches()).toBe(stable);
     expect((await eventOf(r, 39))?.summary).toBe('WON: Pyrex bowl 39');
+  });
+});
+
+// ── Final check (Opus): bounded reads ────────────────────────────────────────
+
+describe('post-end reads stay bounded', () => {
+  const patchCount = (r: Rig): number => r.calendarApi.calls.filter((c) => c.method === 'eventsPatch').length;
+  const recordedFrom = (r: Rig, itemId: number): unknown =>
+    r.audit.entries.find((e) => e.kind === 'outcome.recorded' && e.itemId === itemId)?.details.from;
+
+  it('an auction whose end keeps moving later is read a bounded number of times, then recorded unknown', async () => {
+    expect(MAX_POST_END_READS).toBeLessThanOrEqual(4);
+    const r = await rig();
+    await track(r, 42);
+    await seedEvent(r, 42, 'Pyrex bowl 42');
+    for (let i = 0; i < 10; i++) {
+      const later = new Date(r.clock.now() + 10 * MIN).toISOString();
+      r.api.details.set(42, closedDetail(42, { isClosed: false, endTime: later }));
+      await r.tick();
+      r.clock.advance(12 * MIN);
+    }
+    await r.tick();
+
+    expect(reads(r)).toHaveLength(MAX_POST_END_READS);
+    expect(await outcomes(r)).toMatchObject({ 42: 'unknown' });
+    expect(recordedFrom(r, 42)).toBe('read-cap');
+    expect(r.notifier.sent).toHaveLength(0);
+    expect(patchCount(r)).toBe(0);
+  });
+
+  it('a read that keeps failing backs off between attempts, then gives up as unknown', async () => {
+    const r = await rig();
+    await track(r, 43);
+    await seedEvent(r, 43, 'Pyrex bowl 43');
+    // No detail seeded: FakeSgwApi answers every read with a 404 server error.
+
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+    expect(r.audit.entries.filter((e) => e.kind === 'outcome.read-failed' && e.itemId === 43)).toHaveLength(1);
+
+    // The next tick, 2 minutes later, does not read the failing item again.
+    r.clock.advance(2 * MIN);
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+
+    // Twelve hours of 2-minute ticks: a bounded number of reads, then unknown.
+    for (let i = 0; i < 360; i++) {
+      r.clock.advance(2 * MIN);
+      await r.tick();
+    }
+    expect(reads(r)).toHaveLength(MAX_POST_END_READS);
+    expect(await outcomes(r)).toMatchObject({ 43: 'unknown' });
+    expect(recordedFrom(r, 43)).toBe('read-cap');
+    expect(r.notifier.sent).toHaveLength(0);
+  });
+
+  it('a failing read does not starve the next due item', async () => {
+    const r = await rig();
+    await track(r, 44); // no detail seeded: its read fails
+    await track(r, 45);
+    r.api.details.set(45, closedDetail(45, { isHighBidder: false, currentPrice: 2500 }));
+
+    await r.tick();
+    r.clock.advance(2 * MIN);
+    await r.tick();
+
+    expect(reads(r).map((c) => c.args[0])).toEqual([44, 45]);
+    expect(await outcomes(r)).toMatchObject({ 44: undefined, 45: 'lost' });
+  });
+
+  it('a tick that starts while the previous one is still reading does not read or notify a second time', async () => {
+    const r = await rig();
+    await track(r, 46);
+    await seedEvent(r, 46, 'Pyrex bowl 46');
+    r.api.details.set(46, closedDetail(46, { isHighBidder: true, currentPrice: 1500 }));
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let attempts = 0;
+    const read = r.api.itemDetail.bind(r.api);
+    r.api.itemDetail = (itemId, lane, opts) => {
+      attempts += 1;
+      return gate.then(() => read(itemId, lane, opts));
+    };
+
+    const first = r.tick();
+    await flush();
+    const second = r.tick();
+    await flush();
+    const state = { done: false };
+    const both = Promise.all([first, second]).then(() => {
+      state.done = true;
+    });
+    release();
+    // Keep fake time moving (the calendar limiter waits on it) until both ticks finish.
+    for (let i = 0; i < 50 && !state.done; i++) await settle(r.clock);
+    await both;
+    await r.tick();
+
+    expect(attempts).toBe(1);
+    expect(await outcomes(r)).toMatchObject({ 46: 'won' });
+    expect(r.notifier.sent).toHaveLength(1);
   });
 });

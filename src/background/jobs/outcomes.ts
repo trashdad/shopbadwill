@@ -31,13 +31,24 @@ import { errorText, type BackgroundContext } from '../context';
 import { syncFor } from './calendar-sync';
 import { snipeSeams } from './snipe-runner';
 import postEnd from './steps/post-end';
-import { OUTCOME_NOTIFY_PREFIX, onOutcomeAlarm, notifyOutcome, stampedOutcome, type OutcomeKind } from './steps/post-end';
+import { OUTCOME_NOTIFY_PREFIX, onOutcomeAlarm, notifyOutcome, recordOutcome, stampedOutcome, type OutcomeKind } from './steps/post-end';
 
 /** The outcome notification alarm / id prefix and the alarm handler (wired in register). */
 export { OUTCOME_NOTIFY_PREFIX as OUTCOME_NOTIFY_ALARM_PREFIX, onOutcomeAlarm, stampedOutcome };
 
 /** The one postEnd read happens at least this long after the auction end (R2). */
 export const POST_END_MIN_DELAY_MS = 2 * 60_000;
+
+/**
+ * Reads that settle nothing (the auction was still open, or the read failed)
+ * are capped per item. At the cap the item is recorded `unknown` and never
+ * read again (R2), so an end that keeps moving later, or a read that keeps
+ * failing, costs at most this many reads.
+ */
+export const MAX_POST_END_READS = 4;
+
+/** After a failed read, the next attempt waits this long (the last delay repeats). */
+export const READ_RETRY_DELAYS_MS: readonly number[] = [15 * 60_000, 60 * 60_000, 4 * 60 * 60_000];
 
 const MID_FLIGHT: ReadonlySet<Snipe['state']> = new Set(['firing', 'sent', 'fallback-applied']);
 const PRE_FIRE: ReadonlySet<Snipe['state']> = new Set(['armed', 'waking', 'verified']);
@@ -62,45 +73,78 @@ export function decisiveOutcome(outcome: SnipeOutcome | undefined): OutcomeKind 
 /** What the tick must do for one item, decided from persisted state only (never memory, R3). */
 export type OutcomePlan =
   | { kind: 'record'; itemId: ItemId; outcome: OutcomeKind; via: 'snipe' | 'stamp' }
+  | { kind: 'give-up'; itemId: ItemId; reads: number }
   | { kind: 'read'; itemId: ItemId };
 
 const STILL_OPEN_KIND = 'outcome.still-open';
+const READ_FAILED_KIND = 'outcome.read-failed';
 const AUDIT_PAGE = 200;
 
-/**
- * Ends for which the one post-end read already found the auction still open
- * (`outcome.still-open` with `final: true`). The newest such row per item wins.
- * A later end time is not in the map's match, so that end gets its own read.
- */
-export async function finalOpenEnds(audit: Pick<AuditLog, 'list'>): Promise<ReadonlyMap<ItemId, string>> {
-  const ends = new Map<ItemId, string>();
+/** The persisted record of an item's post-end reads that settled nothing (audit rows, newest first). */
+export interface ReadHistory {
+  /** Reads that found the auction still open, plus reads that failed. */
+  unsettled: number;
+  failures: number;
+  /** When the newest failed read was audited. */
+  lastFailAt?: EpochMs;
+  /** The end the newest `final` still-open row was read at: that end needs no second read. */
+  finalEnd?: string;
+}
+
+/** One paged pass over the `outcome.still-open` and `outcome.read-failed` rows, per item. */
+export async function readHistory(audit: Pick<AuditLog, 'list'>): Promise<ReadonlyMap<ItemId, ReadHistory>> {
+  const out = new Map<ItemId, ReadHistory>();
   let before: number | undefined;
   for (;;) {
-    const page = await audit.list({ limit: AUDIT_PAGE, kinds: [STILL_OPEN_KIND], ...(before === undefined ? {} : { before }) });
+    const page = await audit.list({
+      limit: AUDIT_PAGE,
+      kinds: [STILL_OPEN_KIND, READ_FAILED_KIND],
+      ...(before === undefined ? {} : { before }),
+    });
     for (const e of page) {
-      if (e.itemId === undefined || e.details.final !== true || ends.has(e.itemId)) continue;
-      const endTime = e.details.endTime;
-      if (typeof endTime === 'string') ends.set(e.itemId, endTime);
+      if (e.itemId === undefined) continue;
+      const h = out.get(e.itemId) ?? { unsettled: 0, failures: 0 };
+      h.unsettled += 1;
+      if (e.kind === READ_FAILED_KIND) {
+        h.failures += 1;
+        h.lastFailAt ??= e.at;
+      } else if (e.details.final === true && h.finalEnd === undefined && typeof e.details.endTime === 'string') {
+        h.finalEnd = e.details.endTime;
+      }
+      out.set(e.itemId, h);
     }
     const last = page.at(-1);
-    if (page.length < AUDIT_PAGE || last === undefined) return ends;
+    if (page.length < AUDIT_PAGE || last === undefined) return out;
     before = last.seq;
   }
 }
 
-/** The one read is due, and this end has not already been read while still open. */
-function dueForRead(t: TrackedItem, now: EpochMs, openEnds: ReadonlyMap<ItemId, string>): boolean {
-  const endMs = new Date(t.endTime).getTime();
-  return now >= endMs + POST_END_MIN_DELAY_MS && openEnds.get(t.itemId) !== t.endTime;
+function sameInstant(a: string, b: string): boolean {
+  return new Date(a).getTime() === new Date(b).getTime();
 }
 
-/** The per-item scan. Pure over the persisted records: snipe outcomes, the calendar links' stamp records. */
+/**
+ * The read is due: at least 2 minutes after the end (R2), this end has not
+ * already been read while still open, and a failed read has waited out its
+ * retry delay (never a read per tick, never a loop).
+ */
+function dueForRead(t: TrackedItem, now: EpochMs, h: ReadHistory | undefined): boolean {
+  const endMs = new Date(t.endTime).getTime();
+  if (now < endMs + POST_END_MIN_DELAY_MS) return false;
+  if (h === undefined) return true;
+  if (h.finalEnd !== undefined && sameInstant(h.finalEnd, t.endTime)) return false;
+  if (h.lastFailAt === undefined) return true;
+  const delay = READ_RETRY_DELAYS_MS[Math.min(h.failures, READ_RETRY_DELAYS_MS.length) - 1] ?? 0;
+  return now >= h.lastFailAt + delay;
+}
+
+/** The per-item scan. Pure over the persisted records: snipe outcomes, the calendar links' stamp records, the read history. */
 export function planOutcomeWork(
   tracked: Readonly<Record<number, TrackedItem>>,
   snipes: Readonly<Record<string, Snipe>>,
   links: Readonly<Record<number, CalendarLink>>,
   now: EpochMs,
-  openEnds: ReadonlyMap<ItemId, string> = new Map(),
+  history: ReadonlyMap<ItemId, ReadHistory> = new Map(),
 ): OutcomePlan[] {
   const byItem = new Map<ItemId, Snipe[]>();
   for (const s of Object.values(snipes)) {
@@ -118,10 +162,15 @@ export function planOutcomeWork(
     if (itemSnipes.length === 0 && !t.calendar && (link === undefined || link.status === 'deleted')) continue;
     // A send may be out: the T-84 runner owns the outcome.
     if (itemSnipes.some((s) => MID_FLIGHT.has(s.state))) continue;
+    const h = history.get(t.itemId);
+    const readOrGiveUp = (): void => {
+      if (h !== undefined && h.unsettled >= MAX_POST_END_READS) plans.push({ kind: 'give-up', itemId: t.itemId, reads: h.unsettled });
+      else if (dueForRead(t, now, h)) plans.push({ kind: 'read', itemId: t.itemId });
+    };
     // R4: pre-fire snipes need the read to confirm the auction closed; the step
     // then moves them to their ended terminal state.
     if (itemSnipes.some((s) => PRE_FIRE.has(s.state))) {
-      if (dueForRead(t, now, openEnds)) plans.push({ kind: 'read', itemId: t.itemId });
+      readOrGiveUp();
       continue;
     }
     // R3: the T-84 path already decided (its stamp and notification went out).
@@ -136,7 +185,7 @@ export function planOutcomeWork(
       plans.push({ kind: 'record', itemId: t.itemId, outcome: stamped, via: 'stamp' });
       continue;
     }
-    if (dueForRead(t, now, openEnds)) plans.push({ kind: 'read', itemId: t.itemId });
+    readOrGiveUp();
   }
   return plans;
 }
@@ -158,8 +207,26 @@ async function applyRecord(ctx: BackgroundContext, plan: Extract<OutcomePlan, { 
   }
 }
 
-/** One scheduler tick: record what is already decided, then ONE postEnd step at most (R2). */
+/** Contexts whose outcomes tick is still running (an in-worker overlap guard, not a decision). */
+const RUNNING = new WeakSet<BackgroundContext>();
+
+/**
+ * One scheduler tick: record what is already decided, then ONE postEnd step at
+ * most (R2). The `sbw:tick` alarm does not wait for the previous tick, so a
+ * tick that finds the last one still working (a queued read, a slow stamp)
+ * does nothing: two ticks must never read, or notify, the same item twice.
+ */
 export async function outcomesTick(ctx: BackgroundContext): Promise<void> {
+  if (RUNNING.has(ctx)) return;
+  RUNNING.add(ctx);
+  try {
+    await runOutcomesTick(ctx);
+  } finally {
+    RUNNING.delete(ctx);
+  }
+}
+
+async function runOutcomesTick(ctx: BackgroundContext): Promise<void> {
   const { repo } = ctx;
   const now = ctx.clock.now();
   const [tracked, snipes, calendar] = await Promise.all([
@@ -167,8 +234,12 @@ export async function outcomesTick(ctx: BackgroundContext): Promise<void> {
     repo.get(STORAGE_KEYS.snipes),
     repo.get(STORAGE_KEYS.calendar),
   ]);
-  const plans = planOutcomeWork(tracked, snipes, calendar.links, now, await finalOpenEnds(ctx.audit));
-  for (const plan of plans) if (plan.kind === 'record') await applyRecord(ctx, plan);
+  const plans = planOutcomeWork(tracked, snipes, calendar.links, now, await readHistory(ctx.audit));
+  for (const plan of plans) {
+    if (plan.kind === 'record') await applyRecord(ctx, plan);
+    // R2: the read cap is spent. `unknown` is final: no stamp, no notification, no further read.
+    if (plan.kind === 'give-up') await recordOutcome(repo, ctx.audit, plan.itemId, 'unknown', { from: 'read-cap', reads: plan.reads });
+  }
   const read = plans.find((p): p is Extract<OutcomePlan, { kind: 'read' }> => p.kind === 'read');
   if (read === undefined) return;
   try {

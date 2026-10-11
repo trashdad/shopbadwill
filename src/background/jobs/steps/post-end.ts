@@ -227,20 +227,23 @@ export async function executePostEnd(step: JobStep, deps: PostEndDeps): Promise<
   // Still running. An end that moved into the future is waited out (one read
   // after the new end). An end that is already due is not polled again: the
   // final `outcome.still-open` row is the "read done for this end" mark.
+  // Exactly one row per read: outcomes.ts counts them against MAX_POST_END_READS.
   if (!detail.isClosed) {
     const newEndMs = new Date(detail.endTime).getTime();
-    let endIso = t.endTime;
-    if (newEndMs !== new Date(t.endTime).getTime()) {
-      endIso = detail.endTime;
+    const moved = newEndMs !== new Date(t.endTime).getTime();
+    if (moved) {
       await repo.update(STORAGE_KEYS.tracked, (cur) => {
         const curItem = cur[itemId];
         return curItem === undefined ? cur : { ...cur, [itemId]: { ...curItem, endTime: detail.endTime, updatedAt: repo.now() } };
       });
-      await audit.append({ actor: 'daily-job', kind: 'outcome.still-open', itemId, details: { endTime: detail.endTime } });
     }
-    if (!(newEndMs > repo.now())) {
-      await audit.append({ actor: 'daily-job', kind: 'outcome.still-open', itemId, details: { endTime: endIso, final: true } });
-    }
+    const endTime = moved ? detail.endTime : t.endTime;
+    await audit.append({
+      actor: 'daily-job',
+      kind: 'outcome.still-open',
+      itemId,
+      details: newEndMs > repo.now() ? { endTime } : { endTime, final: true },
+    });
     return { kind: 'postEnd', detail };
   }
 
