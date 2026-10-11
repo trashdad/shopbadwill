@@ -20,8 +20,13 @@ export interface CalendarSink {
 
 /** Thin typed Calendar v3 subset. */
 export interface CalendarApi {
-  calendarsInsert(summary: string, timeZone: string): Promise<{ id: string }>;
+  calendarsInsert(summary: string, timeZone: string, description?: string): Promise<{ id: string }>;
   calendarListGet(calendarId: string): Promise<{ id: string } | null>;
+  /**
+   * Calendars this grant can see. `calendar.app.created` sees only calendars
+   * this app created. An entry with no id is omitted.
+   */
+  calendarListList(): Promise<Array<{ id: string; summary: string; description?: string }>>;
   /** 409 → CalendarApiError('conflict'). */
   eventsInsert(calendarId: string, body: GcalEventBody & { id: string }): Promise<GcalEvent>;
   /** Includes status 'cancelled'. */

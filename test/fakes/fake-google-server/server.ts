@@ -37,6 +37,11 @@ export interface Scenario {
   denyConsent?: boolean;
   /** The next N Calendar API calls (after auth) get 429 rateLimitExceeded with Retry-After: 1. */
   rateLimitNext?: number;
+  /**
+   * calendarList.list returns 403 insufficientPermissions.
+   * Google's published auth table for that method omits `calendar.app.created`.
+   */
+  forbidCalendarList?: boolean;
 }
 
 export interface FakeEvent {
@@ -55,6 +60,8 @@ export interface FakeCalendar {
   id: string;
   summary: string;
   timeZone: string;
+  /** Set by calendars.insert when the body carries one. A private marker lives here. */
+  description?: string;
   /** Created through calendars.insert (what calendar.app.created may touch). */
   appCreated: boolean;
   events: Map<string, FakeEvent>;
@@ -332,9 +339,47 @@ export async function startFakeGoogle(opts: { port?: number; host?: string; scen
       const parsed = RawCalendarInsertBodySchema.safeParse(b);
       if (!parsed.success) { gerr(res, 400, 'required', 'Missing summary.', { status: 'INVALID_ARGUMENT' }); return; }
       const id = `${rand(16)}@group.calendar.google.com`;
-      const cal: FakeCalendar = { id, summary: parsed.data.summary, timeZone: parsed.data.timeZone ?? 'UTC', appCreated: true, events: new Map() };
+      const cal: FakeCalendar = {
+        id,
+        summary: parsed.data.summary,
+        timeZone: parsed.data.timeZone ?? 'UTC',
+        ...(parsed.data.description === undefined ? {} : { description: parsed.data.description }),
+        appCreated: true,
+        events: new Map(),
+      };
       calendars.set(id, cal);
-      send(res, 200, { kind: 'calendar#calendar', etag: newEtag(), id, summary: cal.summary, timeZone: cal.timeZone }); return;
+      const created: Json = { kind: 'calendar#calendar', etag: newEtag(), id, summary: cal.summary, timeZone: cal.timeZone };
+      if (cal.description !== undefined) created['description'] = cal.description;
+      send(res, 200, created); return;
+    }
+
+    // calendarList.list (before calendarList.get: that one has the calendar id segment)
+    if (m === 'GET' && segs.length === 3 && segs[0] === 'users' && segs[1] === 'me' && segs[2] === 'calendarList') {
+      const broad = hasAny(scopes, [S.calendar, S.calendarReadonly, S.calendarList, S.calendarListReadonly]);
+      const narrow = scopes.includes(S.appCreated);
+      if (scenario.forbidCalendarList === true || (!broad && !narrow)) {
+        gerr(res, 403, 'insufficientPermissions', 'Request had insufficient authentication scopes.', { status: 'PERMISSION_DENIED' });
+        return;
+      }
+      const visible = [...calendars.values()].filter((c) => broad || c.appCreated);
+      const max = Math.min(Math.max(Number(url.searchParams.get('maxResults') ?? 250) || 250, 1), 250);
+      const offset = Number(Buffer.from(url.searchParams.get('pageToken') ?? '', 'base64url').toString() || 0) || 0;
+      const slice = visible.slice(offset, offset + max);
+      const items = slice.map((cal) => {
+        const entry: Json = {
+          kind: 'calendar#calendarListEntry',
+          etag: newEtag(),
+          id: cal.id,
+          summary: cal.summary,
+          timeZone: cal.timeZone,
+          accessRole: 'owner',
+        };
+        if (cal.description !== undefined) entry['description'] = cal.description;
+        return entry;
+      });
+      const body: Json = { kind: 'calendar#calendarList', etag: newEtag(), items };
+      if (offset + max < visible.length) body['nextPageToken'] = Buffer.from(String(offset + max)).toString('base64url');
+      send(res, 200, body); return;
     }
 
     // calendarList.get

@@ -7,7 +7,7 @@ import type { CalendarApi } from '../../ports/calendar';
 import { CalendarApiError, GoogleAuthError, HttpNetworkError, HttpTimeoutError, type CalendarApiErrorCode } from '../../ports/errors';
 import type { GoogleAuthProvider } from '../../ports/google-auth';
 import type { Http, HttpRequest, HttpResponse } from '../../ports/http';
-import { RawCalendarSchema, RawEventsListSchema, RawGoogleErrorSchema, normalizeEvent } from './schemas';
+import { RawCalendarListEntrySchema, RawCalendarListSchema, RawCalendarSchema, RawEventsListSchema, RawGoogleErrorSchema, normalizeEvent } from './schemas';
 
 export const CALENDAR_BASE_URL = 'https://www.googleapis.com/calendar/v3';
 
@@ -124,11 +124,39 @@ export class GoogleCalendarApi implements CalendarApi {
    * `ensureCalendar`) must reconcile possible duplicates by listing calendars
    * before creating a new one.
    */
-  async calendarsInsert(summary: string, timeZone: string): Promise<{ id: string }> {
-    const res = await this.request('POST', '/calendars', { body: { summary, timeZone }, noRetry: true });
+  async calendarsInsert(summary: string, timeZone: string, description?: string): Promise<{ id: string }> {
+    const body: { summary: string; timeZone: string; description?: string } = { summary, timeZone };
+    if (description !== undefined) body.description = description;
+    const res = await this.request('POST', '/calendars', { body, noRetry: true });
     const parsed = RawCalendarSchema.safeParse(this.json(res));
     if (!parsed.success) throw new CalendarApiError('schema', 'calendars.insert: response has no id', { status: res.status });
     return { id: parsed.data.id };
+  }
+
+  /**
+   * One page is not enough: a dedicated calendar past the first page must
+   * still be found, or the caller would create a duplicate.
+   */
+  async calendarListList(): Promise<Array<{ id: string; summary: string; description?: string }>> {
+    const out: Array<{ id: string; summary: string; description?: string }> = [];
+    let pageToken: string | undefined;
+    for (let page = 0; page < MAX_LIST_PAGES; page++) {
+      const q = new URLSearchParams({ maxResults: '250' });
+      if (pageToken !== undefined) q.set('pageToken', pageToken);
+      const res = await this.request('GET', `/users/me/calendarList?${q.toString()}`);
+      const parsed = RawCalendarListSchema.safeParse(this.json(res));
+      if (!parsed.success) throw new CalendarApiError('schema', 'calendarList.list: response is not an object', { status: res.status });
+      for (const item of parsed.data.items ?? []) {
+        const entry = RawCalendarListEntrySchema.safeParse(item);
+        if (!entry.success) continue;
+        const row: { id: string; summary: string; description?: string } = { id: entry.data.id, summary: entry.data.summary ?? '' };
+        if (entry.data.description !== undefined) row.description = entry.data.description;
+        out.push(row);
+      }
+      pageToken = parsed.data.nextPageToken;
+      if (pageToken === undefined || pageToken === '') return out;
+    }
+    throw new CalendarApiError('other', `calendarList.list: more than ${String(MAX_LIST_PAGES)} pages`);
   }
 
   async calendarListGet(calendarId: string): Promise<{ id: string } | null> {

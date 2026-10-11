@@ -182,6 +182,24 @@ describe('GoogleCalendarApi requests and responses', () => {
     expect(http.requests[0]).toMatchObject({ method: 'PATCH', body: '{"summary":"new"}' });
   });
 
+  it('calendarListList returns id, summary and description and follows pages', async () => {
+    const { api, http } = setup();
+    http.on(`${BASE}/users/me/calendarList`, (req) =>
+      req.url.includes('pageToken=p2')
+        ? ok({ items: [{ id: 'marked@group.calendar.google.com', summary: 'Renamed', description: 'sbw:dedicated-calendar' }] })
+        : ok({
+            items: [{ id: 'c1', summary: 'ShopGoodwill Auctions' }, { summary: 'no id' }],
+            nextPageToken: 'p2',
+          }),
+    );
+    const out = await api.calendarListList();
+    expect(out).toEqual([
+      { id: 'c1', summary: 'ShopGoodwill Auctions' },
+      { id: 'marked@group.calendar.google.com', summary: 'Renamed', description: 'sbw:dedicated-calendar' },
+    ]);
+    expect(new URL(http.requests[0]?.url ?? '').pathname).toBe('/calendar/v3/users/me/calendarList');
+  });
+
   it('eventsListByPrivateProp encodes the filter and follows pages', async () => {
     const { api, http } = setup();
     http.on(`${BASE}/calendars/c/events`, (req) =>

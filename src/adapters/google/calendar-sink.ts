@@ -12,7 +12,9 @@
 //     and halts the run.
 //   - RESUMABLE. The link is saved after every op. A restart between a write
 //     and its link save finds the event already there (409, or a patch that
-//     matches) and adopts it: no duplicates, no second write.
+//     matches) and adopts it: no duplicates, no second write. Before creating
+//     a calendar, the sink lists and adopts one that already carries our
+//     marker or summary, so a crash after insert does not leave a duplicate.
 //   - DRY RUN. With dryRun.calendar on, an op becomes an audit entry
 //     (`dryRun: true`) and nothing is sent. Disconnected, the caller queues
 //     `pending` links with queuePending and makes no call.
@@ -86,6 +88,12 @@ export interface CalendarStore {
 }
 
 export const CALENDAR_SUMMARY = 'ShopGoodwill Auctions';
+/**
+ * Written into the calendar description. A rename of the summary must not hide
+ * the calendar we created, and a crash after insert must not create a second one.
+ */
+export const CALENDAR_MARKER = 'sbw:dedicated-calendar';
+const CALENDAR_DESCRIPTION = `Auction end times from ShopBadwill. ${CALENDAR_MARKER}`;
 /** The calendarId of a link queued before any calendar exists. Re-homed when the calendar is created. */
 export const PENDING_CALENDAR_ID = 'pending';
 /** At most 1 Google request per second (R4). */
@@ -140,8 +148,9 @@ export class RequestLimiter {
 /** A CalendarApi whose every call goes through one limiter. */
 export function limitCalendarApi(api: CalendarApi, limiter: RequestLimiter): CalendarApi {
   return {
-    calendarsInsert: (s, tz) => limiter.run(() => api.calendarsInsert(s, tz)),
+    calendarsInsert: (s, tz, description) => limiter.run(() => api.calendarsInsert(s, tz, description)),
     calendarListGet: (id) => limiter.run(() => api.calendarListGet(id)),
+    calendarListList: () => limiter.run(() => api.calendarListList()),
     eventsInsert: (c, b) => limiter.run(() => api.eventsInsert(c, b)),
     eventsGet: (c, e) => limiter.run(() => api.eventsGet(c, e)),
     eventsPatch: (c, e, p) => limiter.run(() => api.eventsPatch(c, e, p)),
@@ -590,17 +599,50 @@ export class GoogleCalendarSink implements CalendarSink {
       }));
       await audit.append({ actor: 'calendar', kind: 'calendar.recreated', details: { lost: stored.calendarId } });
     }
+    // A crash after insert leaves the calendar on Google with no saved id.
+    // Listing finds it (by the private marker, or by summary for one created
+    // before the marker existed) so we do not insert a second one.
+    const existing = await this.findDedicated();
+    if (existing !== undefined) {
+      await this.persistCalendar(existing);
+      await audit.append({ actor: 'calendar', kind: 'calendar.adopted', ref: existing, details: { summary: CALENDAR_SUMMARY } });
+      return existing;
+    }
     // calendarsInsert is noRetry (a lost response would duplicate); we persist the id at once.
-    const created = await api.calendarsInsert(CALENDAR_SUMMARY, this.timeZone);
-    await this.deps.store.update((cur) => ({
-      calendarId: created.id,
-      links: Object.fromEntries(
-        Object.entries(cur.links).map(([k, l]) => [k, l.calendarId === PENDING_CALENDAR_ID ? { ...l, calendarId: created.id } : l]),
-      ),
-    }));
-    this.verified = created.id;
+    const created = await api.calendarsInsert(CALENDAR_SUMMARY, this.timeZone, CALENDAR_DESCRIPTION);
+    await this.persistCalendar(created.id);
     await audit.append({ actor: 'calendar', kind: 'calendar.create', ref: created.id, details: { summary: CALENDAR_SUMMARY } });
     return created.id;
+  }
+
+  /**
+   * The id of our dedicated calendar, if a list can see one. Does not create.
+   * `calendar.app.created` is not on Google's published scope list for
+   * calendarList.list (it is allowed for calendarList.get). A 403 there is
+   * "we cannot look", not "the user must reconnect": fall through and insert.
+   */
+  private async findDedicated(): Promise<string | undefined> {
+    let listed: Awaited<ReturnType<CalendarApi['calendarListList']>>;
+    try {
+      listed = await this.deps.api.calendarListList();
+    } catch (e) {
+      if (e instanceof CalendarApiError && e.code === 'insufficient-scope') return undefined;
+      throw e;
+    }
+    const usable = listed.filter((c) => c.id !== '' && c.id !== 'primary');
+    const marked = usable.find((c) => (c.description ?? '').includes(CALENDAR_MARKER));
+    if (marked !== undefined) return marked.id;
+    return usable.find((c) => c.summary === CALENDAR_SUMMARY)?.id;
+  }
+
+  private async persistCalendar(id: string): Promise<void> {
+    await this.deps.store.update((cur) => ({
+      calendarId: id,
+      links: Object.fromEntries(
+        Object.entries(cur.links).map(([k, l]) => [k, l.calendarId === PENDING_CALENDAR_ID ? { ...l, calendarId: id } : l]),
+      ),
+    }));
+    this.verified = id;
   }
 
   // ── ops ───────────────────────────────────────────────────────────────────

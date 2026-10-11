@@ -11,7 +11,7 @@ import { BrowserHttp } from '../../src/adapters/browser/http';
 import { createStorageAreas } from '../../src/adapters/browser/storage';
 import { PkceRefreshProvider, type WebAuthFlow } from '../../src/adapters/google/auth-pkce';
 import { GoogleCalendarApi } from '../../src/adapters/google/calendar-api';
-import { RequestLimiter, SYNC_STATE_KEY, deleteEventRef, parseDeleteEventRef } from '../../src/adapters/google/calendar-sink';
+import { CALENDAR_SUMMARY, RequestLimiter, SYNC_STATE_KEY, deleteEventRef, parseDeleteEventRef } from '../../src/adapters/google/calendar-sink';
 import { createCalendarHandlers, createCalendarUndoExecutors } from '../../src/background/handlers/calendar';
 import type { BackgroundContext } from '../../src/background/context';
 import { CalendarSync, buildDesired, registerReminderSink, type ReminderSink } from '../../src/background/jobs/calendar-sync';
@@ -246,6 +246,93 @@ describe('first sync', () => {
   });
 });
 
+describe('ensureCalendar looks up our calendar before creating one', () => {
+  it('adopts an existing calendar with our summary instead of creating a second one', async () => {
+    const r = await rig();
+    // The insert reached Google and the worker died before the id was saved.
+    const seeded = await r.api.calendarsInsert(CALENDAR_SUMMARY, 'UTC');
+    const itemId = await r.track();
+    await r.sync.syncNow('recover');
+    const created = [...r.fake.state.calendars.values()].filter((c) => c.appCreated);
+    expect(created.map((c) => c.id)).toEqual([seeded.id]);
+    expect((await r.repo.get(STORAGE_KEYS.calendar)).calendarId).toBe(seeded.id);
+    expect([...must(r.fake.state.calendars.get(seeded.id)).events.keys()]).toEqual([eventIdFor(itemId, 0)]);
+    expect(r.fake.state.requests.filter((q) => q.method === 'POST' && q.path.endsWith('/calendars'))).toHaveLength(1);
+  });
+
+  it('adopts the same calendar after a rename when the saved id was lost', async () => {
+    const r = await rig();
+    const itemId = await r.track();
+    await r.sync.syncNow('one');
+    const saved = must((await r.repo.get(STORAGE_KEYS.calendar)).calendarId);
+    const cal = must(r.fake.state.calendars.get(saved));
+    // The marker is what a rename must not hide. The summary alone would miss it.
+    expect(cal.description ?? '').toContain('sbw:dedicated-calendar');
+    cal.summary = 'Renamed by the user';
+    await r.repo.update(STORAGE_KEYS.calendar, (c) => ({ links: c.links }));
+    const posts = r.fake.state.requests.filter((q) => q.method === 'POST' && q.path.endsWith('/calendars')).length;
+    await r.sync.syncNow('two');
+    expect([...r.fake.state.calendars.values()].filter((c) => c.appCreated).map((c) => c.id)).toEqual([saved]);
+    expect((await r.repo.get(STORAGE_KEYS.calendar)).calendarId).toBe(saved);
+    expect(r.fake.state.requests.filter((q) => q.method === 'POST' && q.path.endsWith('/calendars')).length).toBe(posts);
+    expect(must(r.fake.state.calendars.get(saved)).events.has(eventIdFor(itemId, 0))).toBe(true);
+  });
+
+  it('does not adopt a foreign calendar that only shares the summary, or an unrelated app calendar', async () => {
+    const r = await rig();
+    r.fake.seedCalendar('user-cal@example.com', CALENDAR_SUMMARY);
+    r.fake.state.calendars.set('other@group.calendar.google.com', {
+      id: 'other@group.calendar.google.com',
+      summary: 'Other app calendar',
+      timeZone: 'UTC',
+      appCreated: true,
+      events: new Map(),
+    });
+    const itemId = await r.track();
+    await r.sync.syncNow('one');
+    expect(r.fake.state.calendars.get('user-cal@example.com')?.events.size).toBe(0);
+    expect(r.fake.state.calendars.get('other@group.calendar.google.com')?.events.size).toBe(0);
+    const ours = [...r.fake.state.calendars.values()].filter((c) => c.appCreated && c.summary === CALENDAR_SUMMARY);
+    expect(ours).toHaveLength(1);
+    expect(must(ours[0]).events.has(eventIdFor(itemId, 0))).toBe(true);
+  });
+
+  it('after the saved calendar is deleted, reuses a leftover with our summary instead of creating another', async () => {
+    const r = await rig();
+    const itemId = await r.track();
+    await r.sync.syncNow('one');
+    const saved = must((await r.repo.get(STORAGE_KEYS.calendar)).calendarId);
+    const leftoverId = 'leftover123@group.calendar.google.com';
+    r.fake.state.calendars.set(leftoverId, {
+      id: leftoverId,
+      summary: CALENDAR_SUMMARY,
+      timeZone: 'UTC',
+      appCreated: true,
+      events: new Map(),
+    });
+    r.fake.state.calendars.delete(saved);
+    // The live worker already verified the saved id. A new worker is what notices it is gone.
+    // An end-time change is what makes the sync look: a no-op run never opens the calendar.
+    r.restart();
+    await r.setTracked(itemId, { endTime: new Date(Date.now() + 9 * HOUR).toISOString() });
+    await r.sync.syncNow('two');
+    expect([...r.fake.state.calendars.values()].filter((c) => c.appCreated).map((c) => c.id)).toEqual([leftoverId]);
+    expect((await r.repo.get(STORAGE_KEYS.calendar)).calendarId).toBe(leftoverId);
+    expect(must(r.fake.state.calendars.get(leftoverId)).events.has(eventIdFor(itemId, 0))).toBe(true);
+  });
+
+  it('still creates the calendar when listing is forbidden for this scope', async () => {
+    const r = await rig({ scenario: { forbidCalendarList: true } });
+    const itemId = await r.track();
+    const report = await r.sync.syncNow('one');
+    expect(report.status).toBe('synced');
+    expect(r.notifier.sent.filter((n) => n.id === 'sbw:calendar:reconnect')).toHaveLength(0);
+    const ours = [...r.fake.state.calendars.values()].filter((c) => c.appCreated);
+    expect(ours).toHaveLength(1);
+    expect(must(ours[0]).events.has(eventIdFor(itemId, 0))).toBe(true);
+  });
+});
+
 describe('changes', () => {
   it('an end-time change produces exactly one patch', async () => {
     const r = await rig();
@@ -346,8 +433,9 @@ describe('409 on insert', () => {
     let inserts = 0;
     // The worker dies right after the second event reached Google, before its link was saved.
     r.restart((api) => ({
-      calendarsInsert: (s, tz) => api.calendarsInsert(s, tz),
+      calendarsInsert: (s, tz, description) => api.calendarsInsert(s, tz, description),
       calendarListGet: (c) => api.calendarListGet(c),
+      calendarListList: () => api.calendarListList(),
       eventsGet: (c, e) => api.eventsGet(c, e),
       eventsPatch: (c, e, p) => api.eventsPatch(c, e, p),
       eventsDelete: (c, e) => api.eventsDelete(c, e),

@@ -47,6 +47,17 @@ export const RawEventsListSchema = z.looseObject({
 
 export const RawCalendarSchema = z.looseObject({ id: z.string().min(1) });
 
+export const RawCalendarListEntrySchema = z.looseObject({
+  id: z.string().min(1),
+  summary: lenient(z.string()),
+  description: lenient(z.string()),
+});
+
+export const RawCalendarListSchema = z.looseObject({
+  items: lenient(z.array(z.unknown())),
+  nextPageToken: lenient(z.string()),
+});
+
 /** Google's error envelope; every field is optional because proxies and edge errors return other bodies. */
 export const RawGoogleErrorSchema = z.looseObject({
   error: lenient(
