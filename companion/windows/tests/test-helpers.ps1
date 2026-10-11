@@ -77,6 +77,52 @@ function Get-SbwTestText {
   [IO.File]::ReadAllText((Get-SbwTestPath $RelativePath))
 }
 
+# Pester 5 runs top-level file code and Describe/Context bodies during Discovery
+# only, so functions dot-sourced or defined there do not exist when the It
+# blocks run. Pester 3.4 and 5.x both dot-source a Describe's BeforeAll before
+# its tests run. So a portable test file holds only Describe blocks, and their
+# bodies hold only BeforeAll/AfterAll/BeforeEach/AfterEach/Context/Describe/It.
+# Returns "file:line" for every statement that breaks that shape.
+function Get-SbwPesterShapeViolations {
+  param([string]$TestsDir)
+  $bad = @()
+  foreach ($f in @(Get-ChildItem -LiteralPath $TestsDir -Filter '*.Tests.ps1')) {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -gt 0) { $bad += "$($f.Name): parse error"; continue }
+    if ($null -ne $ast.ParamBlock -or $null -ne $ast.BeginBlock -or $null -ne $ast.ProcessBlock) { $bad += "$($f.Name): param/begin/process block" }
+    if ($null -eq $ast.EndBlock) { continue }
+    $bad += @(Get-SbwPesterBlockViolations -FileName $f.Name -Statements $ast.EndBlock.Statements -Allowed @('Describe'))
+  }
+  $bad
+}
+
+function Get-SbwPesterBlockViolations {
+  param([string]$FileName, $Statements, [string[]]$Allowed)
+  $bad = @()
+  foreach ($s in @($Statements)) {
+    $name = $null
+    $cmd = $null
+    if ($s -is [System.Management.Automation.Language.PipelineAst] -and $s.PipelineElements.Count -eq 1 -and
+        $s.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) {
+      $cmd = $s.PipelineElements[0]
+      $name = $cmd.GetCommandName()
+    }
+    if ($null -eq $name -or $Allowed -cnotcontains $name) {
+      $bad += "${FileName}:$($s.Extent.StartLineNumber)"
+      continue
+    }
+    if ($name -ceq 'Describe' -or $name -ceq 'Context') {
+      $body = @($cmd.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.ScriptBlockExpressionAst] }) | Select-Object -Last 1
+      if ($null -eq $body) { $bad += "${FileName}:$($s.Extent.StartLineNumber)"; continue }
+      $bad += @(Get-SbwPesterBlockViolations -FileName $FileName -Statements $body.ScriptBlock.EndBlock.Statements `
+          -Allowed @('BeforeAll', 'AfterAll', 'BeforeEach', 'AfterEach', 'Context', 'Describe', 'It'))
+    }
+  }
+  $bad
+}
+
 # Returns "file:line" for any *.Tests.ps1 use of $PSScriptRoot that is not a
 # file-scope dot-source. Line comments are ignored.
 function Test-SbwTestsUseScriptRootOnlyToDotSource {

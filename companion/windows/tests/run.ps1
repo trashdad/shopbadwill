@@ -34,5 +34,16 @@ if ($result.FailedCount -gt 0) {
   Write-Error "Pester failures: $($result.FailedCount)"
   exit 1
 }
+# Pester 5 counts a file that fails Discovery, or a BeforeAll that throws, as a
+# failed container/block, not as failed tests. Its overall Result catches both.
+if ($module.Version.Major -ge 5 -and $result.Result -ne 'Passed') {
+  Write-Error "Pester result: $($result.Result) (failed blocks: $($result.FailedBlocksCount), failed containers: $($result.FailedContainersCount))"
+  exit 1
+}
+# A run that executed nothing is a broken run, not a green one.
+if ($result.PassedCount -eq 0) {
+  Write-Error 'Pester ran no passing tests.'
+  exit 1
+}
 Write-Host "Pester: $($result.TotalCount) tests passed."
 exit 0
