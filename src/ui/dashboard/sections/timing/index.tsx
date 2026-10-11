@@ -1,13 +1,13 @@
 // T-90: the dashboard "Timing" section (R4, I-06). Text-only: no canvas, no
 // innerHTML; everything is Preact text nodes, a real table, and CSS-width bars.
 //
-// Data (the protocol is frozen, so the section reuses existing messages):
-//   snipe.list  -> the per-snipe measurements the runner persisted
-//                  (offset, RTT, fire error; alarm delay is never persisted, R3);
+// Data:
+//   snipe.list       -> the per-snipe measurements the runner persisted
+//                       (offset, RTT, fire error; alarm delay is never persisted, R3);
 //   settings.get/set -> the soak counters and the default lead. "Apply" writes
-//                  defaultLeadMs only from the button's click (R2, R5).
-//   The awake-history chart has no data path yet: no message carries
-//   `sbw:awake`, so the chart says "not recorded" (see awake.ts; reported gap).
+//                       defaultLeadMs only from the button's click (R2, R5).
+//   timing.awake     -> the persisted sbw:awake heartbeat history. An empty
+//                       array is a real empty chart, not "not recorded".
 import type { VNode } from 'preact';
 import { useState } from 'preact/hooks';
 
@@ -15,11 +15,12 @@ import { describeError } from '../../../components/describeError';
 import type { Settings } from '../../../../domain/settings/schema';
 import { soakSummary, timingMeasurements } from '../../../../domain/snipe/soak';
 import type { Snipe } from '../../../../domain/snipe/types';
+import type { EpochMs } from '../../../../domain/types';
 import { LoadNotice, useLoad } from '../../parts';
 import type { SectionDef, SectionProps } from '../../registry';
-import { AWAKE_DAYS_SHOWN } from './awake';
+import { awakeFraction, awakeRows } from './awake';
 import { buildTimingExport, downloadTimingExport } from './export';
-import { formatLead, formatMs, NOT_RECORDED, snipeLabel } from './format';
+import { formatLead, formatMs, snipeLabel } from './format';
 
 const pct = (rate: number): string => `${String(Math.round(rate * 1000) / 10)}%`;
 
@@ -83,7 +84,7 @@ function Rows(props: { snipes: readonly Snipe[] }): VNode {
             <td>{formatMs(m.fireErrorMs)}</td>
             <td>{formatMs(m.alarmDelayMs)}</td>
             <td>{formatMs(m.latencyMs)}</td>
-            <td>{m.onTime === null ? '—' : m.onTime ? 'on time' : 'late'}</td>
+            <td>{m.onTime === null ? '—' : m.onTime ? 'on time' : 'off time'}</td>
           </tr>
         ))}
       </tbody>
@@ -91,10 +92,36 @@ function Rows(props: { snipes: readonly Snipe[] }): VNode {
   );
 }
 
+function AwakeChart(props: { history: readonly EpochMs[]; timeZone: string; now: number }): VNode {
+  const rows = awakeRows(props.history, props.timeZone, props.now);
+  const hasHeartbeat = rows.some((row) => row.awake > 0);
+  return (
+    <div>
+      {rows.map((row) => (
+        <div key={row.hour}>
+          <div
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={row.observed}
+            aria-valuenow={row.awake}
+            aria-label={`${row.label} awake ${String(row.awake)} of ${String(row.observed)} days`}
+          >
+            <div class="sbw-bar" style={{ width: `${String(Math.round(awakeFraction(row) * 100))}%` }} />
+          </div>
+          <span>{row.label}</span> <span>{row.awake}/{row.observed}</span>
+        </div>
+      ))}
+      {hasHeartbeat ? null : <p class="sbw-muted">No heartbeats recorded yet.</p>}
+    </div>
+  );
+}
+
 export function TimingSection(props: SectionProps): VNode {
   const { client } = props;
   const [snipes, reloadSnipes] = useLoad(() => client.send('snipe.list', undefined), [client]);
   const [settings, reloadSettings] = useLoad(() => client.send('settings.get', undefined), [client]);
+  const [awake, reloadAwake] = useLoad(() => client.send('timing.awake', undefined), [client]);
+  const now = Date.now();
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -166,11 +193,8 @@ export function TimingSection(props: SectionProps): VNode {
       <h3>Per-snipe timing</h3>
       {snipes.kind === 'ok' ? <Rows snipes={snipes.value} /> : null}
       <h3>Awake history</h3>
-      <p class="sbw-muted">
-        Awake history is {NOT_RECORDED} on this page for now: the background records it (the `sbw:awake` heartbeat history,
-        one row per local hour over the last {AWAKE_DAYS_SHOWN} days) but no message exposes it to the dashboard, so the
-        chart has no data to draw. Reported as a gap.
-      </p>
+      <LoadNotice state={awake} what="awake history" />
+      {awake.kind === 'ok' ? <AwakeChart history={awake.value} timeZone={props.userTz} now={now} /> : null}
       <h3>Export</h3>
       <p>
         <button type="button" class="sbw-secondary" disabled={snipes.kind !== 'ok' || settings.kind !== 'ok'} onClick={exportJson}>
@@ -179,7 +203,15 @@ export function TimingSection(props: SectionProps): VNode {
         <span class="sbw-muted">Timing data and snipe ids only — never bid amounts. Downloads a file; no network.</span>
       </p>
       <p>
-        <button type="button" class="sbw-secondary" onClick={reloadSnipes}>
+        <button
+          type="button"
+          class="sbw-secondary"
+          onClick={() => {
+            reloadSnipes();
+            reloadSettings();
+            reloadAwake();
+          }}
+        >
           Refresh
         </button>
       </p>

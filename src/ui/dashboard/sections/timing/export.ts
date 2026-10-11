@@ -48,6 +48,9 @@ export function downloadTimingExport(data: TimingExport, now: Date = new Date())
   const a = document.createElement('a');
   a.href = url;
   a.download = `shopbadwill-timing-${dayStamp(now)}.json`;
+  // The anchor has to be in the document or the browser drops the download.
+  document.body.append(a);
   a.click();
+  a.remove();
   URL.revokeObjectURL(url);
 }

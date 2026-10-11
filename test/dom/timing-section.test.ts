@@ -2,7 +2,10 @@
 // no network. Covers: registry pickup; the per-snipe columns (alarm delay is
 // 'not recorded', R3); the Apply button writes defaultLeadMs only on click
 // (R5); no bid amount ever reaches the page or the export (R4); the export is
-// a Blob download; the awake-chart row math.
+// a Blob download whose anchor is in the document; the awake chart from
+// timing.awake; text only (no innerHTML).
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -54,22 +57,31 @@ const soaks = (): Snipe[] => [
 ];
 
 const blobs: Blob[] = [];
+/** True only when the download anchor is in the document at click time. */
+let anchorConnected: boolean | null = null;
 beforeEach(() => {
   blobs.length = 0;
+  anchorConnected = null;
   vi.spyOn(URL, 'createObjectURL').mockImplementation((b: Blob | MediaSource) => {
     blobs.push(b as Blob);
     return 'blob:sbw-test';
   });
   vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
-  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+    anchorConnected = this.isConnected;
+  });
 });
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
 
-const mount = (m: FakeMessaging) =>
-  render(h(section.Component, { client: m, userTz: 'America/New_York', openOptions: () => undefined }));
+const mount = (m: FakeMessaging, userTz = 'America/New_York') =>
+  render(h(section.Component, { client: m, userTz, openOptions: () => undefined }));
+
+function handleAwake(m: FakeMessaging, history: number[] = []): void {
+  m.handle('timing.awake', () => history);
+}
 
 function settingsClient(current: Settings) {
   const m = new FakeMessaging();
@@ -81,6 +93,7 @@ function settingsClient(current: Settings) {
     return undefined;
   });
   m.handle('snipe.list', () => soaks());
+  handleAwake(m);
   return m;
 }
 
@@ -97,6 +110,7 @@ describe('timing section', () => {
     const s = defaultSettings();
     s.snipe.completedDryRuns = 3;
     m.handle('settings.get', () => s);
+    handleAwake(m);
     mount(m);
 
     expect(await screen.findByText(/Completed dry runs: 3 of 5 required/)).toBeTruthy();
@@ -106,7 +120,8 @@ describe('timing section', () => {
     // The table: fire error and alarm delay columns.
     expect(screen.getAllByText('+100 ms').length).toBeGreaterThan(0);
     expect(screen.getAllByText('not recorded').length).toBeGreaterThan(0); // alarm delay (R3)
-    expect(screen.getByText(/Awake history is not recorded/)).toBeTruthy();
+    expect(screen.getByText('No heartbeats recorded yet.')).toBeTruthy();
+    expect(screen.getAllByRole('progressbar')).toHaveLength(24);
     // The max bid ($50.00 = 5000 cents) never reaches the page.
     expect(document.body.textContent).not.toContain('5000');
   });
@@ -177,14 +192,72 @@ describe('timing section', () => {
     await screen.findByText('Exported.');
     expect(blobs).toHaveLength(1);
     expect(blobs[0]?.type).toBe('application/json');
-    expect(m.sent.some((x) => x.type !== 'settings.get' && x.type !== 'snipe.list' && x.type !== 'settings.set')).toBe(false);
+    const downloaded = await blobs[0]?.text();
+    expect(downloaded).toContain('"snipeId"');
+    expect(downloaded).not.toContain('maxBid');
+    // The anchor has to be in the document or the browser drops the download.
+    expect(anchorConnected).toBe(true);
+    const allowed = new Set(['settings.get', 'snipe.list', 'settings.set', 'timing.awake']);
+    expect(m.sent.every((x) => allowed.has(x.type))).toBe(true);
+    expect(m.sent.some((x) => x.type === 'timing.awake')).toBe(true);
+  });
+
+  it('labels a fire error of exactly 1000 ms as on time and a larger one as off time', async () => {
+    const m = new FakeMessaging();
+    m.handle('snipe.list', () => [completedDry('edge', 1000, 1000), completedDry('early', -1500, 1000)]);
+    m.handle('settings.get', () => defaultSettings());
+    handleAwake(m);
+    mount(m);
+    await screen.findByText(/Fires attempted: 2/);
+    expect(screen.getAllByText('on time')).toHaveLength(1);
+    expect(screen.getAllByText('off time')).toHaveLength(1);
+    expect(screen.queryByText('late')).toBeNull();
+  });
+
+  it('draws the awake chart from timing.awake, including one heartbeat in its local hour', async () => {
+    const beat = Date.UTC(2026, 9, 10, 12, 30, 0); // 2026-10-10 12:30 UTC
+    const now = beat + 3_600_000; // 13:30: hour 12 has ended, so today counts
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const m = new FakeMessaging();
+    m.handle('snipe.list', () => []);
+    m.handle('settings.get', () => defaultSettings());
+    handleAwake(m, [beat]);
+    mount(m, 'UTC');
+    const bar = await screen.findByRole('progressbar', { name: /12:00/ });
+    expect(bar.getAttribute('aria-valuenow')).toBe('1');
+    expect(bar.getAttribute('aria-valuemax')).toBe('14');
+    expect(bar.querySelector<HTMLElement>('.sbw-bar')?.style.width).toBe('7%');
+    expect(screen.getByText('1/14')).toBeTruthy();
+    expect(screen.queryByText('No heartbeats recorded yet.')).toBeNull();
+    expect(screen.getAllByRole('progressbar')).toHaveLength(24);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await vi.waitFor(() => {
+      expect(m.sent.filter((x) => x.type === 'timing.awake')).toHaveLength(2);
+    });
   });
 
   it('a missing background handler reads as unavailable, not as a problem', async () => {
     const m = new FakeMessaging();
     mount(m);
     expect(await screen.findByText(/snipe timing is unavailable/)).toBeTruthy();
+    expect(screen.getByText(/awake history is unavailable/)).toBeTruthy();
+    expect(screen.queryByRole('progressbar')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('timing section source builds the page from text nodes, not innerHTML', () => {
+    const dir = path.join(process.cwd(), 'src/ui/dashboard/sections/timing');
+    const files = readdirSync(dir).filter((name) => /\.(ts|tsx)$/.test(name));
+    expect(files.length).toBeGreaterThan(2);
+    const sink = /\b(innerHTML|outerHTML|insertAdjacentHTML|dangerouslySetInnerHTML)\b/;
+    const offenders = files.filter((name) => {
+      const src = readFileSync(path.join(dir, name), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/.*$/gm, '');
+      return sink.test(src);
+    });
+    expect(offenders).toEqual([]);
   });
 });
 

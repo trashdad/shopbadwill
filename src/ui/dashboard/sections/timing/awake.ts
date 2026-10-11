@@ -1,10 +1,6 @@
 // T-90: the awake-history chart's row computation, text-based (R4). Pure: the
-// rows come from T-83's awakeDaysAt over the heartbeat history (`sbw:awake`).
-//
-// Gap note (R3): the frozen protocol exposes no message that carries the
-// heartbeat history to the dashboard, so the section renders "not recorded"
-// until a contract change wires one up. These rows are what the chart renders
-// the moment that data arrives.
+// rows come from T-83's awakeDaysAt over the heartbeat history (`sbw:awake`),
+// which the Timing page loads with `timing.awake`.
 import { AWAKE_DAYS, awakeDaysAt } from '../../../../domain/snipe/awake-history';
 
 export interface AwakeRow {
