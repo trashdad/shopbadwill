@@ -101,18 +101,28 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
   }
   const sn: Settings['snipe'] = settings.snipe;
 
-  const saveSnipe = (next: Settings['snipe'], what: string): void => {
+  // settings.set replaces the whole `snipe` group, so every save applies only
+  // the edited fields to a fresh read: the copy this page loaded may predate a
+  // change made elsewhere (the dashboard's lead, the dry-run gate, the counter).
+  const saveSnipe = (change: (current: Settings['snipe']) => Settings['snipe'], what: string): void => {
     const previous = settings;
-    setSettings({ ...settings, snipe: next });
-    client.send('settings.set', { snipe: next }).then(
-      () => {
-        setStatus({ message: `Saved: ${what}.`, tone: 'ok' });
-      },
-      (e: unknown) => {
-        setSettings(previous);
-        setStatus({ message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' });
-      },
-    );
+    setSettings({ ...settings, snipe: change(settings.snipe) });
+    client
+      .send('settings.get', undefined)
+      .then((fresh) => {
+        const snipe = change(fresh.snipe);
+        return client.send('settings.set', { snipe }).then(() => ({ ...fresh, snipe }));
+      })
+      .then(
+        (next) => {
+          setSettings(next);
+          setStatus({ message: `Saved: ${what}.`, tone: 'ok' });
+        },
+        (e: unknown) => {
+          setSettings(previous);
+          setStatus({ message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' });
+        },
+      );
   };
 
   // The permission prompt needs the click's gesture (I-21): the request is the
@@ -140,7 +150,7 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
     const seconds = Math.min(MAX_LEAD_SECONDS, Math.max(MIN_LEAD_SECONDS, Number(text)));
     setLeadError(undefined);
     setLeadText(String(seconds));
-    saveSnipe({ ...sn, defaultLeadMs: seconds * 1000 }, `default lead ${String(seconds)} s`);
+    saveSnipe((s) => ({ ...s, defaultLeadMs: seconds * 1000 }), `default lead ${String(seconds)} s`);
   };
 
   const saveCaps = (): void => {
@@ -154,7 +164,7 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
     setCapsError(undefined);
     setCapsText({ perItem: formatCents(perItem), perDay: formatCents(perDay), exposure: formatCents(exposure) });
     saveSnipe(
-      { ...sn, caps: { ...sn.caps, perItemMax: perItem, perDayMax: perDay, openExposureMax: exposure } },
+      (s) => ({ ...s, caps: { ...s.caps, perItemMax: perItem, perDayMax: perDay, openExposureMax: exposure } }),
       'spending caps',
     );
   };
@@ -171,7 +181,7 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
           hint="Arms 24-hour and 1-hour health checks before each armed snipe, then bids in the final seconds."
           checked={sn.enabled}
           onChange={(v) => {
-            saveSnipe({ ...sn, enabled: v }, 'sniping');
+            saveSnipe((s) => ({ ...s, enabled: v }), 'sniping');
           }}
         />
         {sn.enabled && settings.dryRun.bidding ? (
@@ -215,7 +225,7 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
               value={sn.defaultFallback}
               onChange={(e) => {
                 const value = e.currentTarget.value;
-                saveSnipe({ ...sn, defaultFallback: value === 'skip' ? 'skip' : 'early-proxy' }, 'default fallback');
+                saveSnipe((s) => ({ ...s, defaultFallback: value === 'skip' ? 'skip' : 'early-proxy' }), 'default fallback');
               }}
             >
               <option value="early-proxy">Place an early proxy bid</option>
@@ -293,7 +303,7 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
                 value={t.value}
                 checked={sn.tier === t.value}
                 onChange={() => {
-                  saveSnipe({ ...sn, tier: t.value }, `tier ${t.value}`);
+                  saveSnipe((s) => ({ ...s, tier: t.value }), `tier ${t.value}`);
                 }}
               />{' '}
               {t.label}

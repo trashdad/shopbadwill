@@ -213,7 +213,7 @@ describe('SnipeSection', () => {
     expect(saved[0]).not.toHaveProperty('dryRun');
   });
 
-  it('echoes a non-default dry-run count and cannot roll a newer completedDryRuns back (T-90)', async () => {
+  it('sends the current dry-run counts, never a stale copy, and cannot roll completedDryRuns back (T-90)', async () => {
     const loaded = defaultSettings();
     loaded.snipe.completedDryRuns = 2;
     loaded.snipe.requiredDryRuns = 9;
@@ -239,12 +239,67 @@ describe('SnipeSection', () => {
     });
     const group = saved[0]?.['snipe'] as Record<string, unknown>;
     expect(group['enabled']).toBe(true);
-    expect(group['completedDryRuns']).toBe(2);
+    expect(group['completedDryRuns']).toBe(6); // read fresh at save time, not the 2 this page loaded
     expect(group['requiredDryRuns']).toBe(9);
     expect(saved[0]).not.toHaveProperty('dryRun');
     expect(stored.snipe.completedDryRuns).toBe(6);
     expect(stored.snipe.enabled).toBe(true);
     expect(stored.dryRun.bidding).toBe(true);
+  });
+
+  it('builds each save on a fresh read: a change made elsewhere after load is never rolled back', async () => {
+    let stored = defaultSettings();
+    const fake = new FakeMessaging();
+    const saved: Array<Partial<Settings>> = [];
+    fake.handle('settings.get', () => structuredClone(stored));
+    fake.handle('settings.set', (p) => {
+      saved.push(p);
+      if (p.snipe !== undefined) stored = { ...stored, snipe: { ...p.snipe, completedDryRuns: stored.snipe.completedDryRuns } };
+      return undefined;
+    });
+    render(h(SnipeSection, { client: fake, permissions: new FakePermissions(), firefox: false }));
+    await screen.findByRole('radio', { name: /T2 · Wake the computer/ });
+
+    // After this page loaded: the dashboard applied a lead, the dry-run gate
+    // changed, a typo-cap field moved. This page shows none of them.
+    stored = {
+      ...stored,
+      snipe: {
+        ...stored.snipe,
+        defaultLeadMs: 12000,
+        requiredDryRuns: 7,
+        caps: { ...stored.snipe.caps, typoAbsolute: 9999 },
+      },
+    };
+
+    fireEvent.click(screen.getByRole('radio', { name: /T2 · Wake the computer/ }));
+    await waitFor(() => {
+      expect(saved).toHaveLength(1);
+    });
+    expect(saved[0]?.snipe).toMatchObject({ tier: 'T2', defaultLeadMs: 12000, requiredDryRuns: 7 });
+    expect(saved[0]?.snipe?.caps.typoAbsolute).toBe(9999);
+
+    fireEvent.input(screen.getByLabelText('Per item (USD)'), { target: { value: '60' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save caps' }));
+    await waitFor(() => {
+      expect(saved).toHaveLength(2);
+    });
+    expect(saved[1]?.snipe).toMatchObject({ tier: 'T2', defaultLeadMs: 12000, requiredDryRuns: 7 });
+    expect(saved[1]?.snipe?.caps).toMatchObject({ perItemMax: 6000, typoAbsolute: 9999 });
+    expect(saved.every((p) => Object.keys(p).join() === 'snipe')).toBe(true);
+  });
+
+  it('puts the change back and says so when the save fails', async () => {
+    const fake = new FakeMessaging();
+    fake.handle('settings.get', () => defaultSettings());
+    fake.handle('settings.set', () => {
+      throw new Error('storage full');
+    });
+    render(h(SnipeSection, { client: fake, permissions: new FakePermissions(), firefox: false }));
+    const t2 = await screen.findByRole('radio', { name: /T2 · Wake the computer/ });
+    fireEvent.click(t2);
+    await screen.findByText(/Could not save tier T2/);
+    expect(screen.getByRole('radio', { name: /T0 · Extension only/ })).toHaveProperty('checked', true);
   });
 
   it('says plainly that sniping stays in dry-run mode while bidding is in dry-run (R6)', async () => {
