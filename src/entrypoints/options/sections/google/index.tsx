@@ -55,6 +55,8 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [offerEnable, setOfferEnable] = useState(false);
+  /** Latest calendar on/off save. An older reply must not sync or overwrite a newer click. */
+  const calendarWrite = useRef(0);
   const [msg, setMsg] = useState<Msg>({ message: '', tone: 'ok' });
   const [settings, setSettings] = useState<Settings | null>(null);
   const [reminders, setReminders] = useState<string[]>(DEFAULT_REMINDERS.map(String));
@@ -115,8 +117,10 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
       const status = await client.send('calendar.connect', undefined);
       setAuth(status);
       setAuthUnavailable(false);
-      // Never turn calendar events on silently: connecting only offers the one-click prompt.
-      if (status.connected && settings?.calendar.enabled === false) setOfferEnable(true);
+      // Never turn calendar events on silently. The prompt renders only once settings
+      // are known to be off, including when settings.get finishes after this connect.
+      // A failed settings.get leaves settings null, so the prompt stays hidden.
+      if (status.connected) setOfferEnable(true);
       setMsg(
         status.connected
           ? { message: 'Connected to Google Calendar.', tone: 'ok' }
@@ -180,20 +184,28 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
    * T-70b: the calendar on/off toggle. Turning it off only stops future syncs;
    * it never deletes events (that is the per-event audit undo). Turning it on
    * saves `calendar.enabled` first, so the sync it then starts sees it on.
+   *
+   * settings.set replaces the whole calendar group, so the payload is the group
+   * last read with only `enabled` changed. Mode, reminders and icsFallback stay.
+   * The reminders editor is what forces `mode: 'dedicated'` (T-62).
    */
   const setCalendarEnabled = (on: boolean, afterSaved?: () => void): void => {
     if (settings === null) {
       setModeMsg({ message: 'Could not save calendar events: your settings have not loaded.', tone: 'error' });
       return;
     }
-    const next = { ...settings.calendar, enabled: on, mode: 'dedicated' as const };
+    const gen = ++calendarWrite.current;
+    const base = settings;
+    const next = { ...base.calendar, enabled: on };
     client.send('settings.set', { calendar: next }).then(
       () => {
-        setSettings({ ...settings, calendar: next });
+        if (gen !== calendarWrite.current) return;
+        setSettings({ ...base, calendar: next });
         afterSaved?.();
         if (on) {
           setModeMsg({ message: 'Calendar events are on. Syncing your auctions now...', tone: 'ok' });
           client.send('calendar.syncNow', undefined).catch((e: unknown) => {
+            if (gen !== calendarWrite.current) return;
             setModeMsg({ message: `Calendar events are on, but the sync could not start. ${describeError(e)}`, tone: 'error' });
           });
         } else {
@@ -204,6 +216,7 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
         }
       },
       (e: unknown) => {
+        if (gen !== calendarWrite.current) return;
         setModeMsg({ message: `Could not save calendar events. ${describeError(e)}`, tone: 'error' });
       },
     );
@@ -306,7 +319,7 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
               <dt>Last error</dt>
               <dd>{auth.lastError === undefined ? 'None' : ERROR_HINTS[auth.lastError]}</dd>
             </dl>
-            {offerEnable && auth.connected ? (
+            {offerEnable && auth.connected && settings?.calendar.enabled === false ? (
               <div role="group" aria-label="Turn on calendar events" class="sbw-actions">
                 <p>Calendar events are still off. One click turns them on:</p>
                 <button
@@ -393,7 +406,9 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
           checked={settings?.calendar.enabled === true}
           disabled={calendarToggleOff}
           onChange={(v) => {
-            setCalendarEnabled(v);
+            setCalendarEnabled(v, () => {
+              setOfferEnable(false);
+            });
           }}
         />
         <fieldset class="sbw-inline-fieldset">
