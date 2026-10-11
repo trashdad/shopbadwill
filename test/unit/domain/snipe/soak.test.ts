@@ -61,6 +61,19 @@ describe('percentile (nearest-rank, documented in soak.ts)', () => {
     expect(percentile([5, 5, 5, 7, 9], 99)).toBe(9);
   });
 
+  it('small n (1, 2, 3) and ties: rank = ceil(p/100 × n), 1-based', () => {
+    // n = 1: every percentile is the one value.
+    expect([50, 95, 99].map((p) => percentile([7], p))).toEqual([7, 7, 7]);
+    // n = 2: p50 -> rank 1 (the smaller), p95 and p99 -> rank 2 (the larger).
+    expect([50, 95, 99].map((p) => percentile([300, 100], p))).toEqual([100, 300, 300]);
+    // n = 3: p50 -> rank 2, p95 and p99 -> rank 3.
+    expect([50, 95, 99].map((p) => percentile([30, 10, 20], p))).toEqual([20, 30, 30]);
+    // Ties: the value at the rank, whichever copy it is.
+    expect([50, 95, 99].map((p) => percentile([4, 4, 9], p))).toEqual([4, 9, 9]);
+    expect([50, 95, 99].map((p) => percentile([2, 6, 6, 6], p))).toEqual([6, 6, 6]);
+    expect([50, 95, 99].map((p) => percentile([1, 1, 1, 1], p))).toEqual([1, 1, 1]);
+  });
+
   it('returns null for no values and does not mutate its input', () => {
     expect(percentile([], 99)).toBeNull();
     const input = [3, 1, 2];
