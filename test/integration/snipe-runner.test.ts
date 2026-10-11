@@ -1622,6 +1622,31 @@ describe('snipe handlers', () => {
     expect(ok.maxBid).toBe(4000);
   });
 
+  it('snipe.arm refuses one cent over the per-item cap and over the daily cap still remaining', async () => {
+    const withCaps = (caps: Partial<Settings['snipe']['caps']>): Settings => {
+      const s = settingsWith({ live: true });
+      s.snipe.caps = { ...s.snipe.caps, ...caps };
+      return s;
+    };
+
+    // The item's next bid is $11.00. Exactly $15.00 is the cap; $15.01 is not.
+    const perItem = makeShared({ settings: withCaps({ perItemMax: 1500, perDayMax: 100_000, openExposureMax: 200_000 }) });
+    const itemWorker = await boot(perItem);
+    await expect(arm(itemWorker.w, { maxBid: 1501 })).rejects.toThrow(/per-item/);
+    const atItemCap = await arm(itemWorker.w, { maxBid: 1500 });
+    expect(atItemCap.maxBid).toBe(1500);
+
+    // Estimates ride on the draft. $15.00 + $4.00 shipping + $1.00 handling is
+    // the $20.00 day; one extra cent of bid does not fit. maxBid alone is under
+    // the day, so a check that ignores shipping would let it through.
+    const perDay = makeShared({ settings: withCaps({ perItemMax: 50_000, perDayMax: 2000, openExposureMax: 200_000 }) });
+    const dayWorker = await boot(perDay);
+    const estimates = { estShipping: 400, estHandling: 100 };
+    await expect(arm(dayWorker.w, { maxBid: 1501, ...estimates })).rejects.toThrow(/per-day/);
+    const atDayCap = await arm(dayWorker.w, { maxBid: 1500, ...estimates });
+    expect(atDayCap.maxBid).toBe(1500);
+  });
+
   it('snipe.disarm: before the fire it kills; after `sent` the reducer refuses it (a bid may be out)', async () => {
     const shared = makeShared();
     const { w } = await boot(shared);
