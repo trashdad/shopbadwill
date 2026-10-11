@@ -8,6 +8,9 @@
 //    card (original `style` attribute saved in data-sbw-style0) and inserts our
 //    stub before it. clearDecoration restores the attribute exactly and removes
 //    only nodes we created (data-sbw-stub / data-sbw-label).
+//  - hideStyle 'dim' (T-32 fix round 1): the card stays in place and clickable
+//    at opacity 0.3 instead, with the same stub (told `style: 'dim'`, so the UI
+//    draws a compact chip) and the same exact restore.
 //  - Our UI is injected (DecorationUi, implemented in src/content/ui/stub.ts)
 //    because src/adapters may not import src/content.
 import { parseCents } from '../../domain/money';
@@ -19,6 +22,8 @@ export interface StubSpec {
   ruleId: string;
   ruleName: string;
   itemId: number;
+  /** 'collapse': the card is gone, the stub stands in for it. 'dim': the card is faded; the stub can be a small chip. */
+  style: HideStyle;
   /** Called when the user presses "Show" on the stub. */
   onShow: () => void;
 }
@@ -49,8 +54,13 @@ export interface DiscoveryReport {
   drifted: boolean;
 }
 
+/** settings.overlay.hideStyle. */
+export type HideStyle = 'collapse' | 'dim';
+
 export interface DomAdapterOptions {
   ui: DecorationUi;
+  /** How a hide looks, read at every apply (default 'collapse'). A change re-applies. */
+  hideStyle?: () => HideStyle;
   /** Called after every discoverCards with the outcome; `drifted` is the signal to surface in Health. */
   onReport?: (report: DiscoveryReport) => void;
 }
@@ -284,8 +294,10 @@ export function createDomAdapter(opts: DomAdapterOptions): SgwDomAdapter {
       if (current !== null) clearDecoration(card);
       return;
     }
-    const sig = JSON.stringify(d);
     const degraded = (card as AdapterCardHandle).degraded === true;
+    const style: HideStyle = d.kind === 'hide' && !degraded ? (opts.hideStyle?.() ?? 'collapse') : 'collapse';
+    // The style is part of the signature only for dim, so collapse signatures are unchanged.
+    const sig = JSON.stringify(style === 'dim' ? { ...d, style } : d);
     // Degraded roots are partial cards: never hide, show what would have been hidden instead.
     const eff: Decoration =
       d.kind === 'hide' && degraded
@@ -297,11 +309,12 @@ export function createDomAdapter(opts: DomAdapterOptions): SgwDomAdapter {
     root.setAttribute(A_DECO, sig);
     switch (eff.kind) {
       case 'hide': {
-        root.setAttribute(A_HIDDEN, '1');
+        root.setAttribute(A_HIDDEN, style === 'dim' ? 'dim' : '1');
         const stub = ui.createStub(doc, {
           ruleId: eff.ruleId,
           ruleName: eff.ruleName,
           itemId: card.itemId,
+          style,
           onShow: () => {
             root.setAttribute(A_REVEALED, '1');
             restoreStyle(root);
@@ -309,7 +322,7 @@ export function createDomAdapter(opts: DomAdapterOptions): SgwDomAdapter {
         });
         stub.setAttribute(A_STUB, String(card.itemId));
         root.before(stub);
-        setStyle(root, 'display:none !important');
+        setStyle(root, style === 'dim' ? 'opacity:0.3 !important' : 'display:none !important');
         break;
       }
       case 'highlight': {
