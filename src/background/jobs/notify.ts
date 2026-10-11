@@ -19,11 +19,11 @@
 import { browser } from 'wxt/browser';
 
 import { isFirefox } from '../../adapters/browser/env';
-import type { AuditLog } from '../../domain/audit/types';
+import type { AuditEntry, AuditLog } from '../../domain/audit/types';
 import { isLateAdd } from '../../domain/notify/late-add';
 import type { Repo } from '../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
-import { wallParts, zonedWallToInstant } from '../../domain/time/zoned';
+import { wallAsUtc, wallParts, zonedWallToInstant } from '../../domain/time/zoned';
 import type { EpochMs, ItemId, TrackedItem } from '../../domain/types';
 import type { JobRun, Watch } from '../../domain/watches/schema';
 import type { Alarms } from '../../ports/alarms';
@@ -113,7 +113,10 @@ export function quietHoursEnd(
   if (!inside) return null;
   const nextDay = from > to && m >= from ? 1 : 0;
   const wall = Date.UTC(w.year, w.month - 1, w.day + nextDay, Math.floor(to / 60), to % 60);
-  const end = zonedWallToInstant(wall, timeZone).ms;
+  let end = zonedWallToInstant(wall, timeZone).ms;
+  // Repeated hour (fall back): the helper picks the earlier pass. If `now` is in the
+  // second pass, the end we want is the same wall time one hour later.
+  if (end <= now && wallAsUtc(end + 3_600_000, timeZone) === wall) end += 3_600_000;
   return end > now ? end : now + 60_000;
 }
 
@@ -138,13 +141,25 @@ async function permitted(deps: NotifyDeps, why: { run: string; itemId?: ItemId }
   return ok;
 }
 
-async function alreadyAudited(
-  deps: NotifyDeps,
-  kind: string,
-  match: (e: { ref?: string | undefined; itemId?: number | undefined }) => boolean,
-): Promise<boolean> {
-  const rows = await deps.audit.list({ limit: 200, kinds: [kind] });
-  return rows.some(match);
+const AUDIT_PAGE = 200;
+
+/** Every audit row of `kind`, newest first, read page by page (never a fixed tail). */
+async function auditRows(deps: NotifyDeps, kind: string): Promise<AuditEntry[]> {
+  const out: AuditEntry[] = [];
+  let before: number | undefined;
+  for (;;) {
+    const page = await deps.audit.list({ limit: AUDIT_PAGE, kinds: [kind], ...(before === undefined ? {} : { before }) });
+    out.push(...page);
+    const last = page.at(-1);
+    if (page.length < AUDIT_PAGE || last === undefined) return out;
+    before = last.seq;
+  }
+}
+
+async function auditedRefs(deps: NotifyDeps, kind: string): Promise<Set<string>> {
+  const refs = new Set<string>();
+  for (const e of await auditRows(deps, kind)) if (e.ref !== undefined) refs.add(e.ref);
+  return refs;
 }
 
 async function safeNotify(
@@ -176,70 +191,107 @@ export interface DigestText {
 }
 
 /**
- * "3 new matches in Pyrex" (one watch) or "5 new matches in 2 watches". Only
- * matches of watches with `notify` on are counted. Null when there is nothing
- * to say. The body lists up to three titles and, when real failures happened
- * (policy skips excluded), how many.
+ * "3 new matches in Pyrex" (one watch), "5 new matches in 2 watches", or, when
+ * several runs were held back by quiet hours, "5 new matches across 2 runs".
+ * Only matches of watches with `notify` on are counted (an item is counted
+ * once). Null when there is nothing to say. The body lists up to three titles
+ * and, when real failures happened (policy skips excluded), how many.
  */
-export function buildDigest(
-  run: Pick<JobRun, 'results'>,
+export function buildCombinedDigest(
+  runs: readonly Pick<JobRun, 'results'>[],
   tracked: Readonly<Record<number, TrackedItem | undefined>>,
   watches: readonly Pick<Watch, 'id' | 'name' | 'notify'>[],
 ): DigestText | null {
   const byId = new Map(watches.map((w) => [w.id, w] as const));
   const titles: string[] = [];
   const names: string[] = [];
-  for (const itemId of run.results.newMatches) {
-    const item = tracked[itemId];
-    if (item === undefined) continue;
-    const notifying: Array<Pick<Watch, 'name'>> = [];
-    for (const r of item.reasons) {
-      if (r.kind !== 'watch' || r.id === undefined) continue;
-      const w = byId.get(r.id);
-      if (w?.notify === true) notifying.push(w);
+  const seen = new Set<number>();
+  let contributing = 0;
+  let failures = 0;
+  for (const run of runs) {
+    let added = false;
+    for (const itemId of run.results.newMatches) {
+      const item = tracked[itemId];
+      if (item === undefined || seen.has(itemId)) continue;
+      const notifying: Array<Pick<Watch, 'name'>> = [];
+      for (const r of item.reasons) {
+        if (r.kind !== 'watch' || r.id === undefined) continue;
+        const w = byId.get(r.id);
+        if (w?.notify === true) notifying.push(w);
+      }
+      if (notifying.length === 0) continue;
+      seen.add(itemId);
+      added = true;
+      titles.push(truncateTitle(item.title));
+      for (const w of notifying) if (!names.includes(w.name)) names.push(w.name);
     }
-    if (notifying.length === 0) continue;
-    titles.push(truncateTitle(item.title));
-    for (const w of notifying) if (!names.includes(w.name)) names.push(w.name);
+    if (added) contributing += 1;
+    failures += run.results.errors.filter((e) => !isSkipMessage(e.message)).length;
   }
   if (titles.length === 0) return null;
-  const where = names.length === 1 ? truncateTitle(names[0] ?? '', 40) : plural(names.length, 'watch', 'watches');
-  const failures = run.results.errors.filter((e) => !isSkipMessage(e.message)).length;
+  const where =
+    contributing > 1
+      ? `across ${String(contributing)} runs`
+      : `in ${names.length === 1 ? truncateTitle(names[0] ?? '', 40) : plural(names.length, 'watch', 'watches')}`;
   const lines = titles.slice(0, LISTED_TITLES);
   if (titles.length > LISTED_TITLES) lines.push(`and ${String(titles.length - LISTED_TITLES)} more`);
   if (failures > 0) lines.push(`${plural(failures, 'step', 'steps')} had errors`);
   return {
-    title: `${plural(titles.length, 'new match', 'new matches')} in ${where}`,
+    title: `${plural(titles.length, 'new match', 'new matches')} ${where}`,
     message: lines.join('\n'),
     count: titles.length,
   };
 }
 
+export function buildDigest(
+  run: Pick<JobRun, 'results'>,
+  tracked: Readonly<Record<number, TrackedItem | undefined>>,
+  watches: readonly Pick<Watch, 'id' | 'name' | 'notify'>[],
+): DigestText | null {
+  return buildCombinedDigest([run], tracked, watches);
+}
+
+type DigestRun = Pick<JobRun, 'id' | 'results'>;
+
 /**
- * Sends (or defers) the digest of `run`. Idempotent per run: an audit entry
- * `notify.digest` with ref = run id marks it sent. Never throws for a
- * notification problem; those are audited.
+ * Sends (or defers) the digest of `run`, together with any earlier run whose
+ * digest was deferred and not yet sent: ONE notification for them all. "Sent" is
+ * the audit row `notify.digest` (ref = run id), looked up by ref across the whole
+ * audit, so an old run is never re-sent. Deferral writes one `notify.deferred`
+ * row per run, however often it is re-deferred. Never throws for a notification
+ * problem; those are audited.
  */
-export async function deliverDigest(deps: NotifyDeps, run: Pick<JobRun, 'id' | 'results'>): Promise<DigestResult> {
+export async function deliverDigest(deps: NotifyDeps, run: DigestRun): Promise<DigestResult> {
   const { repo } = deps;
   const settings = await repo.get(STORAGE_KEYS.settings);
   if (!settings.notifications.enabled || !settings.notifications.digest) return 'skipped';
-  const [tracked, watches] = await Promise.all([repo.get(STORAGE_KEYS.tracked), repo.get(STORAGE_KEYS.watches)]);
-  const digest = buildDigest(run, tracked, watches);
+  const [tracked, watches, stored, sent, deferred] = await Promise.all([
+    repo.get(STORAGE_KEYS.tracked),
+    repo.get(STORAGE_KEYS.watches),
+    repo.get(STORAGE_KEYS.jobRuns),
+    auditedRefs(deps, 'notify.digest'),
+    auditedRefs(deps, 'notify.deferred'),
+  ]);
+  const runs: DigestRun[] = [];
+  for (const r of stored) if (r.id !== run.id && deferred.has(r.id) && !sent.has(r.id)) runs.push(r);
+  if (!sent.has(run.id)) runs.push(run);
+  if (!runs.some((r) => r.id === run.id)) return 'skipped';
+  const digest = buildCombinedDigest(runs, tracked, watches);
   if (digest === null) return 'skipped';
-  if (await alreadyAudited(deps, 'notify.digest', (e) => e.ref === run.id)) return 'skipped';
   if (!(await permitted(deps, { run: run.id }))) return 'skipped';
 
   const now = repo.now();
   const until = quietHoursEnd(now, settings.notifications.quietHours, settings.locale.timeZone);
   if (until !== null) {
     await deps.alarms.create(DIGEST_ALARM_PREFIX + run.id, { when: until });
-    await deps.audit.append({
-      actor: 'daily-job',
-      kind: 'notify.deferred',
-      ref: run.id,
-      details: { until, matches: digest.count },
-    });
+    if (!deferred.has(run.id)) {
+      await deps.audit.append({
+        actor: 'daily-job',
+        kind: 'notify.deferred',
+        ref: run.id,
+        details: { until, matches: run.results.newMatches.length },
+      });
+    }
     return 'deferred';
   }
   const ok = await safeNotify(
@@ -254,7 +306,14 @@ export async function deliverDigest(deps: NotifyDeps, run: Pick<JobRun, 'id' | '
     { ref: run.id },
   );
   if (!ok) return 'skipped';
-  await deps.audit.append({ actor: 'daily-job', kind: 'notify.digest', ref: run.id, details: { matches: digest.count } });
+  for (const r of runs) {
+    await deps.audit.append({
+      actor: 'daily-job',
+      kind: 'notify.digest',
+      ref: r.id,
+      details: { matches: r.results.newMatches.length, combinedRuns: runs.length },
+    });
+  }
   return 'sent';
 }
 
@@ -275,12 +334,13 @@ export async function sendLateAdds(deps: NotifyDeps, run: Pick<JobRun, 'id' | 'r
   const notifyWatch = new Set(watches.filter((w) => w.notify).map((w) => w.id));
   const now = repo.now();
   const sent: ItemId[] = [];
+  const alerted = new Set((await auditRows(deps, 'notify.late-add')).map((e) => e.itemId));
   for (const itemId of run.results.newMatches) {
     const item = tracked[itemId];
     if (item === undefined) continue;
     if (!item.reasons.some((r) => r.kind === 'watch' && r.id !== undefined && notifyWatch.has(r.id))) continue;
     if (!isLateAdd({ itemId, endTime: item.endTime }, now)) continue;
-    if (await alreadyAudited(deps, 'notify.late-add', (e) => e.itemId === itemId)) continue;
+    if (alerted.has(itemId)) continue;
     if (!(await permitted(deps, { run: run.id, itemId }))) return sent; // same answer for every item
     const minutes = Math.max(1, Math.ceil((new Date(item.endTime).getTime() - now) / 60_000));
     const ok = await safeNotify(

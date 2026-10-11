@@ -148,6 +148,75 @@ describe('quietHoursEnd', () => {
   });
 });
 
+describe('quietHoursEnd: DST and degenerate windows (round 1)', () => {
+  const NY = 'America/New_York';
+  const q = { from: '22:00', to: '07:00' };
+  it('now inside the repeated 01:30 hour on 2026-11-01 (both passes) ends at 07:00 EST', () => {
+    const firstPass = Date.UTC(2026, 10, 1, 5, 30, 0); // 01:30 EDT
+    const secondPass = Date.UTC(2026, 10, 1, 6, 30, 0); // 01:30 EST
+    expect(quietHoursEnd(firstPass, q, NY)).toBe(Date.UTC(2026, 10, 1, 12, 0, 0));
+    expect(quietHoursEnd(secondPass, q, NY)).toBe(Date.UTC(2026, 10, 1, 12, 0, 0));
+  });
+  it('a window ending inside the repeated hour ends in the pass the caller is in', () => {
+    const w = { from: '00:30', to: '01:45' };
+    expect(quietHoursEnd(Date.UTC(2026, 10, 1, 5, 30, 0), w, NY)).toBe(Date.UTC(2026, 10, 1, 5, 45, 0)); // 01:45 EDT
+    expect(quietHoursEnd(Date.UTC(2026, 10, 1, 6, 30, 0), w, NY)).toBe(Date.UTC(2026, 10, 1, 6, 45, 0)); // 01:45 EST
+  });
+  it('a `to` of 02:30 on 2026-03-08 (which does not exist) resolves to 03:30 EDT', () => {
+    const now = Date.UTC(2026, 2, 8, 5, 30, 0); // 00:30 EST
+    expect(quietHoursEnd(now, { from: '22:00', to: '02:30' }, NY)).toBe(Date.UTC(2026, 2, 8, 7, 30, 0));
+  });
+  it('a zero-length window (from === to) is never quiet', () => {
+    for (const t of [NIGHT, DAY, Date.UTC(2026, 9, 11, 4, 0, 0)]) {
+      expect(quietHoursEnd(t, { from: '00:00', to: '00:00' }, NY)).toBeNull();
+      expect(quietHoursEnd(t, { from: '22:00', to: '22:00' }, NY)).toBeNull();
+    }
+  });
+});
+
+describe('sent check and coalescing (round 1)', () => {
+  const Q = { quietHours: { from: '22:00', to: '07:00' } };
+  const runOf = (id: string, ids: number[]): JobRun => ({ ...run(ids), id });
+
+  it('an old run is never re-sent however many audit rows follow', async () => {
+    await seed([item(1, DAY + 10 * H)]);
+    expect(await deliverDigest(deps, runOf('old', [1]))).toBe('sent');
+    for (let i = 0; i < 450; i += 1) {
+      await audit.append({ actor: 'daily-job', kind: 'notify.digest', ref: `other-${String(i)}`, details: {} });
+    }
+    expect(await deliverDigest(deps, runOf('old', [1]))).toBe('skipped');
+    expect(notifier.sent).toHaveLength(1);
+  });
+
+  it('runs deferred in one quiet period go out as ONE combined digest; every run is marked sent', async () => {
+    clock.set(NIGHT);
+    await seed([1, 2, 3, 4, 5].map((i) => item(i, NIGHT + 10 * H)), Q);
+    const r1 = runOf('r1', [1, 2, 3]);
+    const r2 = runOf('r2', [4, 5]);
+    await repo.set(STORAGE_KEYS.jobRuns, [r1, r2]);
+    expect(await deliverDigest(deps, r1)).toBe('deferred');
+    expect(await deliverDigest(deps, r2)).toBe('deferred');
+    expect(audit.kinds.filter((k) => k === 'notify.deferred')).toHaveLength(2);
+
+    clock.set(Date.UTC(2026, 9, 11, 11, 0, 5));
+    expect(await onDigestAlarm(deps, 'r1')).toBe('sent');
+    expect(await onDigestAlarm(deps, 'r2')).toBe('skipped'); // its alarm fires too: nothing left
+    expect(notifier.sent).toHaveLength(1);
+    expect(notifier.sent[0]?.notification.title).toBe('5 new matches across 2 runs');
+    const sentRefs = audit.entries.filter((e) => e.kind === 'notify.digest').map((e) => e.ref);
+    expect(sentRefs.sort()).toEqual(['r1', 'r2']);
+  });
+
+  it('re-deferring a run adds no second notify.deferred row', async () => {
+    clock.set(NIGHT);
+    await seed([item(1, NIGHT + 10 * H)], Q);
+    const r1 = runOf('r1', [1]);
+    expect(await deliverDigest(deps, r1)).toBe('deferred');
+    expect(await deliverDigest(deps, r1)).toBe('deferred');
+    expect(audit.kinds.filter((k) => k === 'notify.deferred')).toHaveLength(1);
+  });
+});
+
 describe('text', () => {
   it('strips markup and truncates', () => {
     expect(plainText('<b>Pyrex</b>\n  bowl\u0007')).toBe('Pyrex bowl');
