@@ -23,15 +23,18 @@
 //   drift         SGW answered with valid JSON (or a rendered page) that no longer matches, or a
 //                 non-transient HTTP error such as 404/400. Exit code 1; the workflow opens or
 //                 updates the issue only when the set of failing checks changed.
-//   inconclusive  network errors, timeouts, 5xx, 403/429, a challenge page, 401/408, or a 200 whose
-//                 body is HTML or not JSON (a maintenance page). THRESHOLD: a network error or 5xx
+//   inconclusive  network errors, timeouts, 5xx, 403/429, a challenge page, 401/408, a 200 whose
+//                 body is HTML or not JSON (a maintenance page), or a 200 carrying SGW's own error
+//                 marker (null categoryListModel, `status: false`). THRESHOLD: a network error or 5xx
 //                 is retried once after 120 s (one retry per run, which keeps the run at 4 requests);
 //                 401/408 and a non-JSON/HTML 200 are inconclusive immediately, with no retry.
 //                 Logged as a warning, exit code 0, and NO drift issue. A pure network failure is never drift.
-//   skipped       the lock refused the run. Exit code 0.
+//   skipped       the lock refused the run, or the state file exists but is unreadable (fail
+//                 closed: treated as locked, rewritten as a lock that starts now). Exit code 0, ::warning::.
 //
-// Results and failures name the check and the path (`itemDetail: bidHistory.bidComplete: ...`),
-// never a response body.
+// Results and failures name the check, the path and the reason (`itemDetail: bidHistory.bidComplete: ...`),
+// never a response body or a value from it. Log lines are single lines with URLs redacted
+// (an item URL would name the item id, and the logs of a public repo are public).
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -39,6 +42,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SgwApiError } from '../src/ports/errors';
 import { SGW_API_BASE, SGW_ENDPOINTS, SGW_ORIGIN, SGW_SEARCH_BODY_DEFAULTS, SGW_SELECTORS } from '../src/adapters/sgw/config';
 import { normalizeItemDetail, normalizeSearch } from '../src/adapters/sgw/normalize';
+import { formatPath } from '../src/adapters/sgw/schemas';
 import { CAPTURE_MIN_SPACING_MS, checkCaptureUrl } from './capture-fixtures';
 
 // ── Constants (brief / rulings R1 to R3) ────────────────────────────────────
@@ -145,22 +149,50 @@ export function emptyState(): CanaryState {
   return { runs: [], requests: [], lastRequestEndedAt: 0 };
 }
 
-export function loadState(file: string, now: number): CanaryState {
+/** Runner clocks are NTP-synced; a state timestamp further ahead than this is not trusted. */
+export const CANARY_STATE_MAX_FUTURE_MS = 10 * 60 * 1000;
+
+export type StateRead = { ok: true; state: CanaryState } | { ok: false; reason: string };
+
+/**
+ * Reads the lock. Only a MISSING file is a first run (empty state). A file that exists but is
+ * unreadable, mis-shaped, or dated in the future is `ok: false`, and the caller must treat it as
+ * locked (fail closed), never as "no previous run".
+ */
+export function loadState(file: string, now: number): StateRead {
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true, state: emptyState() };
+    return { ok: false, reason: 'cannot read' };
+  }
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(file, 'utf8'));
+    raw = JSON.parse(text);
   } catch {
-    return emptyState();
+    return { ok: false, reason: 'not JSON' };
   }
-  const o = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
-  const nums = (v: unknown): number[] => (Array.isArray(v) ? v.filter((x): x is number => typeof x === 'number' && Number.isFinite(x)) : []);
-  const ended = typeof o['lastRequestEndedAt'] === 'number' && Number.isFinite(o['lastRequestEndedAt']) ? o['lastRequestEndedAt'] : 0;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ok: false, reason: 'not an object' };
+  const o = raw as Record<string, unknown>;
+  const isTime = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x) && x >= 0;
+  const runs = o['runs'];
+  const requests = o['requests'];
+  const ended = o['lastRequestEndedAt'];
+  if (!Array.isArray(runs) || !runs.every(isTime)) return { ok: false, reason: 'bad runs' };
+  if (!Array.isArray(requests) || !requests.every(isTime)) return { ok: false, reason: 'bad requests' };
+  if (!isTime(ended)) return { ok: false, reason: 'bad lastRequestEndedAt' };
+  const latest = Math.max(ended, ...runs, ...requests);
+  if (latest > now + CANARY_STATE_MAX_FUTURE_MS) return { ok: false, reason: 'timestamp in the future' };
   // Prune history so the file stays small. The lock reads `runs` (12 h) and spacing reads
   // `lastRequestEndedAt`, which is not pruned. The per-run request cap does not use this history.
   return {
-    runs: nums(o['runs']).filter((t) => now - t < CANARY_DAY_MS),
-    requests: nums(o['requests']).filter((t) => now - t < CANARY_DAY_MS),
-    lastRequestEndedAt: ended,
+    ok: true,
+    state: {
+      runs: runs.filter((t) => now - t < CANARY_DAY_MS),
+      requests: requests.filter((t) => now - t < CANARY_DAY_MS),
+      lastRequestEndedAt: ended,
+    },
   };
 }
 
@@ -185,17 +217,77 @@ class Drift extends Error {
   }
 }
 
+/** Any absolute URL becomes `<url>`: Playwright and guard errors name `/item/<id>`, and logs are public. */
+export function redactUrls(text: string): string {
+  return text.replace(/\b(?:https?|wss?):\/\/[^\s"'<>)]+/gi, '<url>');
+}
+
+/** One line, no control characters (so it cannot start a workflow command), no URLs. */
+export function safeLogLine(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return redactUrls(text).replace(/[\u0000-\u001F\u007F]+/g, ' ');
+}
+
 function describeError(e: unknown): string {
-  if (e instanceof Error) return `${e.name}: ${e.message}`.slice(0, 200);
+  if (e instanceof Error) return safeLogLine(`${e.name}: ${e.message}`).slice(0, 200);
   return 'unknown error';
 }
 
-function firstSchemaFailure(check: string, e: SgwApiError): CanaryFailure {
-  // parseSgw messages are `<label>: <path>: <reason>[; ...]`, built from field paths and zod reasons only.
-  const msg = e.message.slice(0, 300);
-  const parts = msg.split(': ');
-  const pathPart = parts.length >= 3 ? (parts[1] ?? '(root)') : '(root)';
-  return { check, path: pathPart, message: msg };
+function zodIssuesOf(cause: unknown): { path: PropertyKey[]; message: string }[] | null {
+  if (typeof cause !== 'object' || cause === null) return null;
+  const issues = (cause as { issues?: unknown }).issues;
+  if (!Array.isArray(issues)) return null;
+  const out: { path: PropertyKey[]; message: string }[] = [];
+  for (const i of issues) {
+    if (typeof i !== 'object' || i === null) return null;
+    const { path: p, message } = i as { path?: unknown; message?: unknown };
+    if (!Array.isArray(p) || typeof message !== 'string') return null;
+    out.push({ path: p as PropertyKey[], message });
+  }
+  return out;
+}
+
+function joinPath(base: string, sub: string): string {
+  if (base === '') return sub;
+  if (sub === '(root)') return base;
+  return sub.startsWith('[') ? `${base}${sub}` : `${base}.${sub}`;
+}
+
+/**
+ * A drift failure from an `SgwApiError('schema')`: the field path and the reason, never a value.
+ * parseSgw errors carry the ZodError (zod 4 reasons name types and schema rules only). The other
+ * schema errors come from normalize.ts value checks, `<label>: <reason>: <raw value>`, so the
+ * raw value (a time, a price) is dropped.
+ */
+function schemaFailure(check: string, e: SgwApiError): CanaryFailure {
+  const sep = e.message.indexOf(': ');
+  const label = sep >= 0 ? e.message.slice(0, sep) : check;
+  const under = label === check ? '' : label.startsWith(`${check}.`) ? label.slice(check.length + 1) : label;
+  const issues = zodIssuesOf(e.cause);
+  if (issues !== null && issues.length > 0) {
+    const shown = issues.slice(0, 3).map((i) => `${joinPath(under, formatPath(i.path))}: ${i.message}`);
+    const more = issues.length > 3 ? ` (+${String(issues.length - 3)} more)` : '';
+    const first = issues[0];
+    return {
+      check,
+      path: joinPath(under, formatPath(first?.path ?? [])),
+      message: `${check}: ${shown.join('; ')}${more}`.slice(0, 300),
+    };
+  }
+  const reason = sep >= 0 ? (e.message.slice(sep + 2).split(': ')[0] ?? 'invalid') : 'invalid';
+  const where = under === '' ? '(root)' : under;
+  return { check, path: where, message: `${check}: ${where}: ${reason}`.slice(0, 300) };
+}
+
+/**
+ * A normalizer error on a 200 reply: `schema` is drift. SGW's own error markers (`server`, such as
+ * a null categoryListModel or `status: false`, and `auth`) are inconclusive, and only the kind is
+ * kept because their message can quote SGW text. Anything else is a bug and is rethrown as is.
+ */
+function driftOrInconclusive(check: string, e: unknown): unknown {
+  if (!(e instanceof SgwApiError)) return e;
+  if (e.kind === 'schema') return new Drift(schemaFailure(check, e));
+  return new InconclusiveNow(`${check}: SGW reported an error in a 200 reply (${e.kind})`);
 }
 
 // ── The run ─────────────────────────────────────────────────────────────────
@@ -209,7 +301,23 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
     failures: [],
     inconclusive: [],
   };
-  const state = loadState(opts.stateFile, startedMs);
+  // Every log line is one line with no URL: GitHub Actions logs of a public repo are public, and a
+  // line that starts with `::` would be read as a workflow command.
+  const log = (line: string): void => {
+    opts.log(safeLogLine(line));
+  };
+
+  const loaded = loadState(opts.stateFile, startedMs);
+  if (!loaded.ok) {
+    // Fail closed: a lock we cannot read is "locked now", never "no previous run", and `force`
+    // does not override it. Rewrite it as a lock that starts now so the job heals in 12 h.
+    saveState(opts.stateFile, { runs: [startedMs], requests: [], lastRequestEndedAt: startedMs });
+    result.status = 'skipped';
+    result.reason = `state file unreadable (${loaded.reason}); treated as locked for 12 h, no requests made`;
+    log(result.reason);
+    return result;
+  }
+  const state = loaded.state;
 
   // Lock: one run per 12 h. `force` bypasses only this check. Open at exactly 12 h (`<`, not `<=`).
   const lastRun = state.runs.length > 0 ? Math.max(...state.runs) : 0;
@@ -217,7 +325,7 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
     const hrs = ((startedMs - lastRun) / 3_600_000).toFixed(1);
     result.status = 'skipped';
     result.reason = `locked: last run ${hrs} h ago (minimum 12 h); set force to override`;
-    opts.log(result.reason);
+    log(result.reason);
     return result;
   }
 
@@ -234,7 +342,7 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
       }
       const wait = state.lastRequestEndedAt + CANARY_MIN_SPACING_MS - opts.now();
       if (wait > 0) {
-        opts.log(`waiting ${String(Math.ceil(wait / 1000))} s before ${label}`);
+        log(`waiting ${String(Math.ceil(wait / 1000))} s before ${label}`);
         await opts.sleep(wait);
       }
       const sentAt = opts.now();
@@ -247,7 +355,7 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
       } catch (e) {
         if (e instanceof Transient && retriesUsed < CANARY_MAX_RETRIES && result.requestsMade < CANARY_MAX_REQUESTS_PER_RUN) {
           retriesUsed += 1;
-          opts.log(`${label}: ${e.message}; retrying once after the 120 s spacing`);
+          log(`${label}: ${e.message}; retrying once after the 120 s spacing`);
           continue;
         }
         throw e;
@@ -287,9 +395,9 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
 
   let itemId: number | null = null;
   const inconclusive = (check: string, e: unknown): void => {
-    const message = e instanceof Error ? e.message.slice(0, 300) : 'unknown error';
+    const message = e instanceof Error ? safeLogLine(e.message).slice(0, 300) : 'unknown error';
     result.inconclusive.push({ check, path: '(network)', message });
-    opts.log(`inconclusive: ${message}`);
+    log(`inconclusive: ${message}`);
   };
 
   try {
@@ -316,8 +424,7 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
           itemId = first.itemId;
         }
       } catch (e) {
-        if (e instanceof SgwApiError) result.failures.push(firstSchemaFailure('search', e));
-        else throw e;
+        throw driftOrInconclusive('search', e);
       }
     } catch (e) {
       if (e instanceof Drift) result.failures.push(e.failure);
@@ -335,8 +442,7 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
         try {
           normalizeItemDetail(raw, { observedAt: opts.now(), authenticated: false });
         } catch (e) {
-          if (e instanceof SgwApiError) result.failures.push(firstSchemaFailure('itemDetail', e));
-          else throw e;
+          throw driftOrInconclusive('itemDetail', e);
         }
       } catch (e) {
         if (e instanceof Drift) result.failures.push(e.failure);
@@ -440,7 +546,8 @@ export async function renderItemPageWithPlaywright(url: string, userAgentSuffix:
 export function honestUserAgent(): string {
   const repo = process.env['GITHUB_REPOSITORY'];
   const where = repo !== undefined && repo !== '' ? `https://github.com/${repo}` : 'https://github.com/';
-  return `ShopBadwill-canary/1 (+${where}; nightly read-only schema check, 3 requests/day)`;
+  // ASCII only: a header value must be a ByteString, so a character such as U+2264 would make fetch throw.
+  return `ShopBadwill-canary/1 (+${where}; nightly read-only schema check, max ${String(CANARY_MAX_REQUESTS_PER_RUN)} requests/run, max 2 runs/day)`;
 }
 
 /** Strip C0 controls, DEL and newlines, and break `@mentions` with a zero-width space. */
@@ -520,13 +627,81 @@ export function buildDriftIssueBody(result: CanaryResult, runUrl: string): strin
   ].join('\n');
 }
 
-export function workflowAnnotations(result: Pick<CanaryResult, 'failures' | 'inconclusive'>): string[] {
+/** Workflow-command data: sanitized (no CR/LF), then `%` escaped so `%0A` in a message stays literal. */
+function commandData(text: string): string {
+  return sanitizeCanaryMessage(text).replaceAll('%', '%25');
+}
+
+export function workflowAnnotations(
+  result: Pick<CanaryResult, 'failures' | 'inconclusive'> & Partial<Pick<CanaryResult, 'status' | 'reason'>>,
+): string[] {
   const lines: string[] = [];
+  if (result.status === 'skipped' && result.reason !== undefined) {
+    lines.push(`::warning::${commandData(`SGW canary skipped: ${result.reason}`)}`);
+  }
   for (const f of result.failures) {
-    lines.push(`::error::${sanitizeCanaryMessage(`SGW drift: ${f.check} ${f.path}: ${f.message}`)}`);
+    lines.push(`::error::${commandData(`SGW drift: ${f.check} ${f.path}: ${f.message}`)}`);
   }
   for (const f of result.inconclusive) {
-    lines.push(`::warning::${sanitizeCanaryMessage(`SGW canary inconclusive: ${f.check}: ${f.message}`)}`);
+    lines.push(`::warning::${commandData(`SGW canary inconclusive: ${f.check}: ${f.message}`)}`);
+  }
+  return lines;
+}
+
+// ── The lock artifact (workflow step "Find previous canary state") ─────────
+
+export const CANARY_STATE_ARTIFACT = 'canary-state';
+
+/**
+ * The run id of the newest unexpired `canary-state` artifact in a `GET .../actions/artifacts`
+ * reply, or '' when there is none (a first run; an expired one is older than the 12 h lock and
+ * cannot be downloaded). Anything unexpected throws, so the step fails and the canary does not
+ * run without its lock.
+ */
+export function selectStateRunId(raw: unknown): string {
+  if (typeof raw !== 'object' || raw === null) throw new Error('canary: artifact list is not an object');
+  const list = (raw as { artifacts?: unknown }).artifacts;
+  if (!Array.isArray(list)) throw new Error('canary: artifact list has no artifacts array');
+  let best: { id: number; created: number } | null = null;
+  for (const item of list) {
+    if (typeof item !== 'object' || item === null) throw new Error('canary: artifact entry is not an object');
+    const a = item as { name?: unknown; expired?: unknown; created_at?: unknown; workflow_run?: unknown };
+    if (a.name !== CANARY_STATE_ARTIFACT) continue;
+    if (a.expired === true) continue;
+    if (a.expired !== false) throw new Error('canary: artifact has no expired flag');
+    const run = (typeof a.workflow_run === 'object' && a.workflow_run !== null ? a.workflow_run : {}) as {
+      id?: unknown;
+      repository_id?: unknown;
+      head_repository_id?: unknown;
+    };
+    // A fork PR's own workflow could upload an artifact with this name; only this repo's runs hold the lock.
+    if (typeof run.repository_id === 'number' && typeof run.head_repository_id === 'number' && run.head_repository_id !== run.repository_id) continue;
+    const id = run.id;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) throw new Error('canary: live canary-state artifact has no valid run id');
+    const created = typeof a.created_at === 'string' ? Date.parse(a.created_at) : Number.NaN;
+    if (!Number.isFinite(created)) throw new Error('canary: live canary-state artifact has no valid created_at');
+    if (best === null || created > best.created || (created === best.created && id > best.id)) best = { id, created };
+  }
+  return best === null ? '' : String(best.id);
+}
+
+export function findPreviousStateRunId(repo: string, gh: (args: readonly string[]) => string): string {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error('canary: GITHUB_REPOSITORY is not owner/name');
+  const text = gh(['api', `repos/${repo}/actions/artifacts?name=${CANARY_STATE_ARTIFACT}&per_page=100`]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('canary: artifact list is not JSON');
+  }
+  return selectStateRunId(parsed);
+}
+
+/** What a crash prints: one redacted message line, then the stack frames (file paths only). */
+export function crashLines(e: unknown): string[] {
+  const lines = [`canary: crashed: ${describeError(e)}`];
+  if (e instanceof Error && typeof e.stack === 'string') {
+    for (const l of e.stack.split(/\r?\n/)) if (/^\s+at /.test(l)) lines.push(redactUrls(l));
   }
   return lines;
 }
@@ -654,6 +829,15 @@ async function main(): Promise<void> {
     syncIssueFromDisk(arg('--result') ?? DEFAULT_RESULT_FILE);
     return;
   }
+  if (args.includes('--find-state')) {
+    // Workflow step "Find previous canary state". Any error exits non-zero and fails the step.
+    const out = process.env['GITHUB_OUTPUT'];
+    if (out === undefined || out === '') throw new Error('canary: --find-state needs GITHUB_OUTPUT');
+    const id = findPreviousStateRunId(process.env['GITHUB_REPOSITORY'] ?? '', (a) => execFileSync('gh', [...a], { encoding: 'utf8' }));
+    appendFileSync(out, `run_id=${id}\n`);
+    console.log(`canary: previous state ${id === '' ? 'none (first run)' : `from run ${id}`}`);
+    return;
+  }
   const force = args.includes('--force') || process.env['CANARY_FORCE'] === 'true';
   const stateFile = arg('--state') ?? DEFAULT_STATE_FILE;
   const resultFile = arg('--result') ?? DEFAULT_RESULT_FILE;
@@ -678,7 +862,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e: unknown) => {
-    console.error(e);
+    for (const line of crashLines(e)) console.error(line);
     process.exit(2);
   });
 }

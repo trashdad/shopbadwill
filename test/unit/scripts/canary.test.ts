@@ -9,12 +9,15 @@ import {
   CANARY_DAY_MS,
   CANARY_MIN_SPACING_MS,
   CANARY_RUN_INTERVAL_MS,
+  crashLines,
   decideDriftIssueAction,
   failingCheckFingerprint,
+  findPreviousStateRunId,
   honestUserAgent,
   ITEM_PAGE_CHECK_KEYS,
   runCanary,
   sanitizeCanaryMessage,
+  selectStateRunId,
   shouldOpenDriftIssue,
   syncDriftIssue,
   workflowAnnotations,
@@ -389,11 +392,14 @@ describe('canary against the fake SGW server', () => {
 
   it('sends the exact User-Agent and never sets Origin, Cookie, or Authorization', async () => {
     const prev = process.env['GITHUB_REPOSITORY'];
-    const ua = 'ShopBadwill-canary/1 (+https://github.com/example/shopbadwill; nightly read-only schema check, 3 requests/day)';
-    const fallback = 'ShopBadwill-canary/1 (+https://github.com/; nightly read-only schema check, 3 requests/day)';
+    // Honest about the real caps: 4 requests per run (with the retry) and the 12 h lock (2 runs a day).
+    const ua = 'ShopBadwill-canary/1 (+https://github.com/example/shopbadwill; nightly read-only schema check, max 4 requests/run, max 2 runs/day)';
+    const fallback = 'ShopBadwill-canary/1 (+https://github.com/; nightly read-only schema check, max 4 requests/run, max 2 runs/day)';
     try {
       process.env['GITHUB_REPOSITORY'] = 'example/shopbadwill';
       expect(honestUserAgent()).toBe(ua);
+      // A header value must be a ByteString: a non-ASCII character such as U+2264 makes fetch throw.
+      expect(honestUserAgent()).toMatch(/^[\x20-\x7E]+$/);
       delete process.env['GITHUB_REPOSITORY'];
       expect(honestUserAgent()).toBe(fallback);
     } finally {
@@ -468,15 +474,31 @@ describe('canary URL guard', () => {
   });
 });
 
+/**
+ * Every step of the job, named or not. An unnamed step (`- uses: ...`, `- run: ...`) is keyed by
+ * its first line, so a token added to `pnpm install` cannot hide from the GH_TOKEN test.
+ */
 function workflowSteps(yml: string): { name: string; body: string }[] {
   const steps: { name: string; body: string }[] = [];
   let current: { name: string; body: string } | null = null;
+  let inSteps = false;
   for (const line of yml.split(/\r?\n/)) {
-    const found = /^ {6}- name: (.*)$/.exec(line);
-    if (found) {
+    if (/^ {4}steps:\s*$/.test(line)) {
+      inSteps = true;
+      continue;
+    }
+    if (!inSteps) continue;
+    const start = /^ {6}- (.*)$/.exec(line);
+    if (start) {
       if (current) steps.push(current);
-      current = { name: found[1] ?? '', body: '' };
-    } else if (current) {
+      const first = start[1] ?? '';
+      const named = /^name: (.*)$/.exec(first);
+      current = { name: named ? (named[1] ?? '') : first, body: `${line}\n` };
+      continue;
+    }
+    if (current) {
+      const named = /^ {8}name: (.*)$/.exec(line);
+      if (named) current.name = named[1] ?? current.name;
       current.body += `${line}\n`;
     }
   }
@@ -484,15 +506,28 @@ function workflowSteps(yml: string): { name: string; body: string }[] {
   return steps;
 }
 
+/** The shell text of a step's `run:` (block or inline), or null when it has none. */
+function runText(body: string): string | null {
+  const lines = body.split('\n');
+  const i = lines.findIndex((l) => /^ {6}(- | {2})run:/.test(l));
+  if (i < 0) return null;
+  const out = [(lines[i] ?? '').replace(/^.*?run:\s*/, '')];
+  for (const l of lines.slice(i + 1)) {
+    if (/^ {8}\S/.test(l) || /^ {6}- /.test(l)) break;
+    out.push(l);
+  }
+  return out.join('\n');
+}
+
 describe('canary workflow and gitignore', () => {
   const yml = readFileSync(new URL('../../../.github/workflows/canary.yml', import.meta.url), 'utf8');
   const steps = workflowSteps(yml);
 
-  it('lets gh api errors fail the step, and skips the canary when a restore does not yield state.json', () => {
+  it('finds the lock through the tested --find-state helper, and skips the canary when a restore does not yield state.json', () => {
     const find = steps.find((s) => s.name === 'Find previous canary state');
-    expect(find?.body).toContain('gh api');
-    // The job-level `inputs.force && 'true' || 'false'` expression is not this bug.
-    expect(find?.body).not.toMatch(/\|\|\s*true\b/);
+    // The artifact choice lives in selectStateRunId (unit-tested below); any gh or parse error fails the step.
+    expect(runText(find?.body ?? '')?.trim()).toBe('pnpm exec tsx scripts/canary.ts --find-state');
+    expect(find?.body).not.toContain('continue-on-error');
     expect(yml).toMatch(/\[ ! -f canary-state\/state\.json \]/);
     const run = steps.find((s) => s.name === 'Run canary');
     expect(run?.body).toContain("steps.gate.outputs.skip == 'false'");
@@ -501,8 +536,26 @@ describe('canary workflow and gitignore', () => {
   it('sets GH_TOKEN only on the steps that call gh', () => {
     const beforeSteps = yml.split('\n    steps:')[0] ?? '';
     expect(beforeSteps).not.toContain('GH_TOKEN');
+    // Unnamed steps (checkout, pnpm install, playwright install) are in the list too.
+    expect(steps.some((s) => s.name.startsWith('run: pnpm install'))).toBe(true);
     const tokenSteps = steps.filter((s) => s.body.includes('GH_TOKEN')).map((s) => s.name);
     expect(tokenSteps.sort()).toEqual(['Find previous canary state', 'Open or update the drift issue']);
+  });
+
+  it('does not leave the token in .git/config for later steps (checkout persist-credentials: false)', () => {
+    const checkout = steps.find((s) => s.name.startsWith('uses: actions/checkout@'));
+    expect(checkout?.body).toMatch(/^ {10}persist-credentials: false$/m);
+  });
+
+  it('never interpolates ${{ }} into a run: script (values reach the shell through env only)', () => {
+    const runs = steps.map((s) => ({ name: s.name, text: runText(s.body) })).filter((s) => s.text !== null);
+    expect(runs.length).toBeGreaterThanOrEqual(5);
+    for (const s of runs) expect(s.text, s.name).not.toContain('${{');
+  });
+
+  it('fails the job on any canary crash, even one after status was written, unless it is drift', () => {
+    const crash = steps.find((s) => s.name === 'Fail the job if the canary crashed');
+    expect(crash?.body).toContain("if: steps.canary.outcome == 'failure' && steps.canary.outputs.status != 'drift'");
   });
 
   it('gates the drift issue step on status drift and syncs through the canary script', () => {
@@ -661,5 +714,197 @@ describe('canary message sanitizing and drift issue', () => {
         throw new Error('gh must not be called');
       },
     })).toBe('not-drift');
+  });
+});
+
+describe('Opus check+fix: fail closed, no SGW values in output', () => {
+  it.each([
+    ['garbage', 'not json {'],
+    ['an empty file', ''],
+    ['a wrong shape', '{}'],
+    ['a non-number entry', JSON.stringify({ runs: ['x'], requests: [], lastRequestEndedAt: 0 })],
+    ['a far-future run', JSON.stringify({ runs: [T0 + 30 * CANARY_DAY_MS], requests: [], lastRequestEndedAt: 0 })],
+    ['a far-future spacing mark', JSON.stringify({ runs: [], requests: [], lastRequestEndedAt: T0 + 30 * CANARY_DAY_MS })],
+  ])('treats a state file with %s as locked: no requests, and the lock reopens 12 h later', async (_label, text) => {
+    const file = path.join(dir, 'state.json');
+    writeFileSync(file, text);
+    const r = await runCanary(opts());
+    expect(r.status).toBe('skipped');
+    expect(r.reason).toMatch(/state file unreadable/);
+    expect(r.requestsMade).toBe(0);
+    expect(sent).toEqual([]);
+    expect(await serverLog()).toEqual([]);
+    // Rewritten as a lock that started now, so it heals: the next run 12 h later proceeds.
+    const reset = JSON.parse(readFileSync(file, 'utf8')) as { runs: number[] };
+    expect(reset.runs).toEqual([T0]);
+    clock = T0 + CANARY_RUN_INTERVAL_MS;
+    const next = await runCanary(opts());
+    expect(next.status).toBe('pass');
+    expect(next.requestsMade).toBe(3);
+  });
+
+  it('force does not run on an unreadable lock', async () => {
+    writeFileSync(path.join(dir, 'state.json'), 'not json {');
+    const r = await runCanary(opts({ force: true }));
+    expect(r.status).toBe('skipped');
+    expect(r.requestsMade).toBe(0);
+    expect(sent).toEqual([]);
+  });
+
+  it('a missing state file is still a first run', async () => {
+    const r = await runCanary(opts());
+    expect(r.status).toBe('pass');
+    expect(r.requestsMade).toBe(3);
+  });
+
+  it('drops the raw SGW value from a normalizer failure but keeps the path', async () => {
+    const r = await runCanary(
+      opts({
+        fetchFn: mutating('ItemDetail', (j) => {
+          j['endTime'] = '9999-99-99T99:98:97';
+        }),
+      }),
+    );
+    expect(r.status).toBe('drift');
+    const f = r.failures.find((x) => x.check === 'itemDetail');
+    expect(f?.path).toBe('endTime');
+    expect(f?.message).toMatch(/not a Pacific time/);
+    expect(JSON.stringify(r)).not.toContain('9999-99-99');
+    expect(JSON.stringify(r)).not.toContain('99:98:97');
+    expect(buildDriftIssueBody(r, 'https://example.test/1')).not.toContain('9999-99-99');
+  });
+
+  it('keeps the row prefix on a search row failure', async () => {
+    const r = await runCanary(
+      opts({
+        fetchFn: mutating('Search/ItemListing', (j) => {
+          const sr = j['searchResults'] as { items: Record<string, unknown>[] };
+          const row = sr.items[0];
+          if (row) row['itemId'] = 'not-a-number';
+        }),
+      }),
+    );
+    expect(r.status).toBe('drift');
+    expect(r.failures[0]).toMatchObject({ check: 'search', path: 'searchResults.items[0].itemId' });
+    expect(r.failures[0]?.message).toContain('searchResults.items[0].itemId: Invalid input');
+    expect(JSON.stringify(r)).not.toContain('not-a-number');
+  });
+
+  it('an SGW server-error marker on a 200 (null categoryListModel) is inconclusive, not drift', async () => {
+    const r = await runCanary(
+      opts({
+        fetchFn: mutating('Search/ItemListing', (j) => {
+          j['categoryListModel'] = null;
+        }),
+      }),
+    );
+    expect(r.status).toBe('inconclusive');
+    expect(r.failures).toEqual([]);
+    expect(r.requestsMade).toBe(1);
+  });
+
+  it('keeps the item URL (and so the item id) out of results and logs when the page render fails', async () => {
+    const lines: string[] = [];
+    const r = await runCanary(
+      opts({
+        log: (l) => {
+          lines.push(l);
+        },
+        render: () => {
+          throw new Error('page.goto: net::ERR_CONNECTION_RESET at https://shopgoodwill.com/item/987654321\nCall log:\n  - navigating to "https://shopgoodwill.com/item/987654321"');
+        },
+      }),
+    );
+    expect(r.status).toBe('inconclusive');
+    const all = JSON.stringify(r) + lines.join('\n') + workflowAnnotations(r).join('\n');
+    expect(all).not.toContain('987654321');
+    expect(all).toContain('ERR_CONNECTION_RESET');
+    for (const l of lines) expect(l).not.toMatch(/[\r\n]/);
+  });
+
+  it('escapes % in workflow commands and warns on a skipped run', () => {
+    expect(workflowAnnotations({
+      failures: [{ check: 'search', path: 'p', message: '100%0A::error::x' }],
+      inconclusive: [],
+    })).toEqual(['::error::SGW drift: search p: 100%250A::error::x']);
+    expect(workflowAnnotations({
+      status: 'skipped',
+      reason: 'state file unreadable (not JSON); locked for 12 h',
+      failures: [],
+      inconclusive: [],
+    })).toEqual(['::warning::SGW canary skipped: state file unreadable (not JSON); locked for 12 h']);
+  });
+});
+
+describe('Opus check+fix: choosing the lock artifact', () => {
+  const art = (id: number, created: string, expired = false, name = 'canary-state'): Record<string, unknown> => ({
+    name,
+    expired,
+    created_at: created,
+    workflow_run: { id, repository_id: 1, head_repository_id: 1 },
+  });
+
+  it('a successful empty list is a first run', () => {
+    expect(selectStateRunId({ total_count: 0, artifacts: [] })).toBe('');
+  });
+
+  it('only expired artifacts are a first run (older than the lock, cannot be downloaded)', () => {
+    expect(selectStateRunId({ artifacts: [art(5, '2026-10-01T09:00:00Z', true)] })).toBe('');
+  });
+
+  it('picks the newest unexpired artifact, whatever the list order', () => {
+    expect(selectStateRunId({
+      artifacts: [
+        art(10, '2026-10-08T09:20:00Z'),
+        art(12, '2026-10-09T09:20:00Z'),
+        art(99, '2026-10-10T09:20:00Z', true),
+        art(11, '2026-10-08T21:20:00Z'),
+        art(77, '2026-10-10T10:00:00Z', false, 'something-else'),
+      ],
+    })).toBe('12');
+  });
+
+  it('ignores a canary-state artifact from a fork PR run (it could carry a forged lock)', () => {
+    const fork = { ...art(50, '2026-10-10T09:00:00Z'), workflow_run: { id: 50, repository_id: 1, head_repository_id: 999 } };
+    expect(selectStateRunId({ artifacts: [fork, art(12, '2026-10-09T09:20:00Z')] })).toBe('12');
+    expect(selectStateRunId({ artifacts: [fork] })).toBe('');
+  });
+
+  it.each([
+    ['no artifacts array', { message: 'Bad credentials' }],
+    ['not an object', null],
+    ['a live artifact without a run id', { artifacts: [{ name: 'canary-state', expired: false, created_at: '2026-10-09T09:20:00Z', workflow_run: null }] }],
+    ['a non-integer run id', { artifacts: [{ name: 'canary-state', expired: false, created_at: '2026-10-09T09:20:00Z', workflow_run: { id: '1; rm -rf /' } }] }],
+    ['a missing expired flag', { artifacts: [{ name: 'canary-state', created_at: '2026-10-09T09:20:00Z', workflow_run: { id: 3 } }] }],
+    ['an unreadable created_at', { artifacts: [{ name: 'canary-state', expired: false, created_at: 'yesterday', workflow_run: { id: 4 } }] }],
+  ])('fails closed on %s', (_label, raw) => {
+    expect(() => selectStateRunId(raw)).toThrow(/canary/);
+  });
+
+  it('asks gh for the canary-state artifacts and lets a gh failure fail the step', () => {
+    const calls: string[][] = [];
+    const id = findPreviousStateRunId('acme/shopbadwill', (args) => {
+      calls.push([...args]);
+      return JSON.stringify({ artifacts: [art(42, '2026-10-09T09:20:00Z')] });
+    });
+    expect(id).toBe('42');
+    expect(calls).toEqual([['api', 'repos/acme/shopbadwill/actions/artifacts?name=canary-state&per_page=100']]);
+    const ghDown = (): string => {
+      throw new Error('gh: HTTP 502');
+    };
+    expect(() => findPreviousStateRunId('acme/shopbadwill', ghDown)).toThrow(/502/);
+    expect(() => findPreviousStateRunId('acme/shopbadwill', () => '<html>')).toThrow(/canary/);
+    expect(() => findPreviousStateRunId('acme/x y', () => '{"artifacts":[]}')).toThrow(/canary/);
+  });
+});
+
+describe('Opus check+fix: crash output', () => {
+  it('prints one redacted message line plus stack frames, never a URL or a raw newline from the message', () => {
+    const e = new Error('canary guard refused GET https://shopgoodwill.com/item/555666777: nope\n::error::injected');
+    const lines = crashLines(e);
+    expect(lines[0]).toMatch(/^canary: crashed: Error: canary guard refused GET <url>/);
+    expect(lines.join('\n')).not.toContain('555666777');
+    expect(lines.some((l) => l.startsWith('::'))).toBe(false);
+    for (const l of lines.slice(1)) expect(l).toMatch(/^\s+at /);
   });
 });

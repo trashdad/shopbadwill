@@ -40,6 +40,9 @@ jobs:
       CANARY_FORCE: ${{ inputs.force && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Do not write the token into .git/config, where pnpm install scripts and later steps could read it.
+          persist-credentials: false
       - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0 - version comes from package.json "packageManager"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -48,31 +51,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
 
-      # The lock file lives in the previous run's `canary-state` artifact.
-      # A failed API call fails this step (the canary does not run). Only a successful
-      # response with no unexpired artifact is a first run. An expired artifact cannot
-      # be downloaded and is older than the 12 h lock, so it is not a lock.
+      # The lock file lives in the previous run's `canary-state` artifact. `--find-state` lists the
+      # artifacts with gh and writes run_id (the newest unexpired one; empty only when the list
+      # succeeded and has none) to GITHUB_OUTPUT. The choice is selectStateRunId, unit-tested.
+      # Any gh error or unexpected reply exits non-zero, so the canary does not run without a lock.
+      # An expired artifact cannot be downloaded and is older than the 12 h lock, so it is not a lock.
       - name: Find previous canary state
         id: prev
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if ! id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=canary-state&per_page=20" --jq '
-            if (.artifacts | type) != "array" then
-              error("canary: artifacts field missing")
-            else
-              (([.artifacts[] | select(.expired == false)] | first | .workflow_run.id) // "")
-            end
-          '); then
-            echo "::error::canary: failed to list canary-state artifacts; refusing to run without a lock"
-            exit 1
-          fi
-          if [ -n "$id" ] && ! printf '%s' "$id" | grep -Eq '^[0-9]+$'; then
-            echo "::error::canary: artifact query returned a non-numeric run id"
-            exit 1
-          fi
-          printf 'run_id=%s\n' "$id" >> "$GITHUB_OUTPUT"
+        run: pnpm exec tsx scripts/canary.ts --find-state
       - name: Restore canary state
         if: steps.prev.outputs.run_id != ''
         continue-on-error: true
@@ -129,8 +117,9 @@ jobs:
       - name: Fail the job on drift
         if: steps.canary.outputs.status == 'drift'
         run: exit 1
+      # Drift exits 1 and is handled above; any other failure is a crash, even one after status= was written.
       - name: Fail the job if the canary crashed
-        if: steps.canary.outcome == 'failure' && steps.canary.outputs.status == ''
+        if: steps.canary.outcome == 'failure' && steps.canary.outputs.status != 'drift'
         run: |
-          echo "::error::canary crashed before producing a result"
+          echo "::error::canary crashed (failed without a drift result); see the Run canary step log"
           exit 1
