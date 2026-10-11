@@ -1404,6 +1404,69 @@ describe('T-30b: feature-scoped sticky blocking and the audited resume', () => {
     for (const f of WRITE_FEATURES) expect((await ctx.switches.writesAllowed(f)).ok, f).toBe(false);
   });
 
+  const stickyReport = (checks: HealthReport['checks'], at: number): HealthReport => ({ ok: false, checkedAt: at, configVersion: 'test', checks });
+  const STICKY_DETAIL = 'sticky schema failure: placeBid: drifted';
+  const probeWith = (endpoints: string[]) => ({
+    probedAt: T0,
+    lastGoodProbeAt: {},
+    sticky: endpoints.map((endpoint) => ({ endpoint, at: T0, detail: 'drifted' })),
+  });
+  const allBlocked = async (ctx: Awaited<BackgroundHandle['ready']>, label: string): Promise<void> => {
+    for (const f of WRITE_FEATURES) expect((await ctx.switches.writesAllowed(f)).ok, `${label}: ${f}`).toBe(false);
+  };
+
+  it('a sticky-only report with an EMPTY sticky list fails closed for every feature', async () => {
+    const h = boot({
+      seed: {
+        [STORAGE_KEYS.healthReport]: stickyReport([{ name: 'detail-schema', ok: false, detail: STICKY_DETAIL }], T0),
+        [STORAGE_KEYS.healthProbe]: probeWith([]),
+      },
+    });
+    await allBlocked(await h.handle.ready, 'empty list');
+  });
+
+  it('a corrupt healthProbe change fails closed for every feature (the old list is not kept)', async () => {
+    const h = boot({
+      seed: {
+        [STORAGE_KEYS.healthReport]: stickyReport([{ name: 'detail-schema', ok: false, detail: STICKY_DETAIL }], T0),
+        [STORAGE_KEYS.healthProbe]: probeWith(['placeBid']),
+      },
+    });
+    const ctx = await h.handle.ready;
+    expect((await ctx.switches.writesAllowed('favorites')).ok).toBe(true);
+    await h.areas.local.set({ [STORAGE_KEYS.healthProbe]: { sticky: 'garbage' } });
+    await allBlocked(ctx, 'corrupt probe');
+  });
+
+  it('a placeBid sticky failure plus a shipping-quote problem blocks every feature', async () => {
+    const h = boot({
+      seed: {
+        [STORAGE_KEYS.healthReport]: stickyReport(
+          [{ name: 'detail-schema', ok: false, detail: `${STICKY_DETAIL}; shipping-quote: cached reply no longer parses` }],
+          T0,
+        ),
+        [STORAGE_KEYS.healthProbe]: probeWith(['placeBid']),
+      },
+    });
+    await allBlocked(await h.handle.ready, 'shipping');
+  });
+
+  it('a placeBid sticky failure plus clock skew blocks every feature', async () => {
+    const h = boot({
+      seed: {
+        [STORAGE_KEYS.healthReport]: stickyReport(
+          [
+            { name: 'detail-schema', ok: false, detail: STICKY_DETAIL },
+            { name: 'clock', ok: false, detail: 'skew: offset 400000 ms exceeds 5 min' },
+          ],
+          T0,
+        ),
+        [STORAGE_KEYS.healthProbe]: probeWith(['placeBid']),
+      },
+    });
+    await allBlocked(await h.handle.ready, 'clock');
+  });
+
   it('health.clearSticky removes only that entry, audits health.resume and re-evaluates at once', async () => {
     const h = boot();
     const ctx = await h.handle.ready;

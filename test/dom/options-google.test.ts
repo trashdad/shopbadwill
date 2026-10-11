@@ -430,6 +430,26 @@ describe('health section', () => {
       expect(screen.getByText(/items missing/)).toBeTruthy();
     });
 
+    it('moves focus to the Refresh button after a successful resume', async () => {
+      let current = sticky();
+      const fake = new FakeMessaging();
+      fake.handle('health.get', () => report({ sticky: current }));
+      fake.handle('settings.get', () => defaultSettings());
+      fake.handle('health.clearSticky', () => {
+        current = [];
+        return undefined;
+      });
+      render(h(HealthSection, { client: fake }));
+      fireEvent.click(await screen.findByRole('button', { name: "I've checked; resume bidding" }));
+      fireEvent.click(screen.getByRole('button', { name: 'Yes, resume bidding' }));
+      await waitFor(() => {
+        expect(screen.queryByText(/unexpected reply shape/)).toBeNull();
+      });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Refresh health' }));
+      });
+    });
+
     it('shows a failed resume in an alert and keeps the failure listed', async () => {
       const fake = new FakeMessaging();
       fake.handle('health.get', () => report({ sticky: sticky() }));

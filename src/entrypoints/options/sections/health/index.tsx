@@ -159,6 +159,7 @@ export function HealthSection(props: SectionProps): VNode {
   const [health, setHealth] = useState<Load<Health>>({ kind: 'loading' });
   const [settings, setSettings] = useState<Load<Settings>>({ kind: 'loading' });
 
+  const refreshRef = useRef<HTMLButtonElement>(null);
   const load = (): void => {
     setHealth({ kind: 'loading' });
     client.send('health.get', undefined).then(
@@ -186,6 +187,8 @@ export function HealthSection(props: SectionProps): VNode {
   const resume = async (endpoint: string): Promise<void> => {
     await client.send('health.clearSticky', { endpoint });
     load();
+    // The resume button is gone after the reload: keep focus on a control that stays.
+    refreshRef.current?.focus();
   };
 
   const tz = settings.kind === 'ok' ? settings.value.locale.timeZone : Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -194,7 +197,7 @@ export function HealthSection(props: SectionProps): VNode {
   return (
     <div class="sbw-health">
       <div class="sbw-actions">
-        <button type="button" class="sbw-secondary" onClick={load}>
+        <button type="button" class="sbw-secondary" ref={refreshRef} onClick={load}>
           Refresh health
         </button>
       </div>
