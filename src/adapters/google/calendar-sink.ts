@@ -762,6 +762,11 @@ export class GoogleCalendarSink implements CalendarSink {
       );
     }
     if (!this.own(ev, op.itemId, op.event.generation)) return this.refuse(calendarId, op, 'patch');
+    // A sync that loaded the item before its outcome was recorded must not wipe
+    // a stamp that already landed. The link hash stays until a later sync sees
+    // the outcome and settles (a GET, no second write, no ping-pong).
+    const live = ev.extendedProperties.private.sbwState;
+    if (live !== 'open' && op.event.privateProps.sbwState === 'open') return 'noop';
     const body = toGcalBody(op.event);
     let wrote = false;
     if (!alreadyMatches(ev, body)) {

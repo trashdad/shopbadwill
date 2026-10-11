@@ -9,9 +9,10 @@
 //                   R7: it obeys writesAllowed('calendar') and is not gated by
 //                   the SGW session), recorded on the TrackedItem, notified once;
 //   ended-early     the auction closed while a snipe was still pre-fire: each
-//                   such snipe is moved to its ended terminal state with the
-//                   EXISTING `preflight-failed {reason:'ended'}` reducer event
-//                   (R4, no domain edit); its effects stamp and notify;
+//                   such snipe is moved to its ended terminal state with an
+//                   EXISTING reducer event (R4, no domain edit): `preflight-failed
+//                   {reason:'ended'}` from `armed`, `verify-failed {reason:'ended'}`
+//                   from `waking` or `verified`. Its effects stamp and notify.
 //   still running   the end moved: the tracked end time is refreshed, no
 //                   outcome, and the scan waits for the new end;
 //   mid-flight      a snipe with a possible send out (`firing`, `sent`,
@@ -25,10 +26,10 @@
 // and never notifies twice (the `notify.outcome` marker row is written before
 // the send, R6).
 import type { AuditLog } from '../../../domain/audit/types';
-import type { Snipe } from '../../../domain/snipe/types';
+import type { Snipe, SnipeEvent } from '../../../domain/snipe/types';
 import type { Repo } from '../../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../../domain/storage/schema';
-import type { Cents, ItemId, Lane, TrackedItem } from '../../../domain/types';
+import type { Cents, EpochMs, ItemId, Lane, TrackedItem } from '../../../domain/types';
 import type { JobStep, StepOutcome } from '../../../domain/watches/schema';
 import { SgwApiError } from '../../../ports/errors';
 import type { Notification } from '../../../ports/notifier';
@@ -194,6 +195,17 @@ export interface PostEndDeps {
 const MID_FLIGHT: ReadonlySet<Snipe['state']> = new Set(['firing', 'sent', 'fallback-applied']);
 const PRE_FIRE: ReadonlySet<Snipe['state']> = new Set(['armed', 'waking', 'verified']);
 
+/**
+ * The existing reducer event that ends a pre-fire snipe because the auction
+ * closed (R4). `preflight-failed` is accepted only from `armed`; `waking` and
+ * `verified` reject it (`step-passed`). `verify-failed` is what ends those.
+ */
+function endedEvent(s: Snipe, now: EpochMs): SnipeEvent | undefined {
+  if (s.state === 'armed') return { type: 'preflight-failed', now, reason: 'ended' };
+  if (s.state === 'waking' || s.state === 'verified') return { type: 'verify-failed', now, reason: 'ended' };
+  return undefined;
+}
+
 export async function executePostEnd(step: JobStep, deps: PostEndDeps): Promise<StepOutcome> {
   if (step.kind !== 'postEnd') {
     return { kind: 'error', message: `step skipped: postEnd executor got a '${step.kind}' step`, retryable: false };
@@ -212,14 +224,22 @@ export async function executePostEnd(step: JobStep, deps: PostEndDeps): Promise<
   const t = tracked[itemId];
   if (t === undefined || decidedOutcome(t)) return { kind: 'postEnd', detail };
 
-  // Still running: the end moved. Refresh it and wait for the new end (no outcome).
+  // Still running. An end that moved into the future is waited out (one read
+  // after the new end). An end that is already due is not polled again: the
+  // final `outcome.still-open` row is the "read done for this end" mark.
   if (!detail.isClosed) {
-    if (new Date(detail.endTime).getTime() !== new Date(t.endTime).getTime()) {
+    const newEndMs = new Date(detail.endTime).getTime();
+    let endIso = t.endTime;
+    if (newEndMs !== new Date(t.endTime).getTime()) {
+      endIso = detail.endTime;
       await repo.update(STORAGE_KEYS.tracked, (cur) => {
         const curItem = cur[itemId];
         return curItem === undefined ? cur : { ...cur, [itemId]: { ...curItem, endTime: detail.endTime, updatedAt: repo.now() } };
       });
       await audit.append({ actor: 'daily-job', kind: 'outcome.still-open', itemId, details: { endTime: detail.endTime } });
+    }
+    if (!(newEndMs > repo.now())) {
+      await audit.append({ actor: 'daily-job', kind: 'outcome.still-open', itemId, details: { endTime: endIso, final: true } });
     }
     return { kind: 'postEnd', detail };
   }
@@ -233,13 +253,15 @@ export async function executePostEnd(step: JobStep, deps: PostEndDeps): Promise<
   const preFire = snipes.filter((s) => PRE_FIRE.has(s.state));
   if (preFire.length > 0) {
     // R4: the auction closed before the snipe could fire. Move each pre-fire snipe
-    // to its ended terminal state with the EXISTING preflight-failed event (the
-    // reducer resolves it `ended`, whose effects stamp ENDED EARLY and notify).
+    // with the existing event for its state (the reducer resolves it `ended`,
+    // whose effects stamp ENDED EARLY and notify).
     const runner = getSnipeRunner(ctx);
     const now = repo.now();
     let moved = 0;
     for (const s of preFire) {
-      const r = await runner?.dispatch(s.id, { type: 'preflight-failed', now, reason: 'ended' });
+      const event = endedEvent(s, now);
+      if (event === undefined) continue;
+      const r = await runner?.dispatch(s.id, event);
       if (r !== undefined && r.kind === 'accepted') moved += 1;
     }
     if (runner === undefined) {

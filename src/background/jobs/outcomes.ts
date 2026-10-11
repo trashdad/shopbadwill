@@ -21,6 +21,7 @@
 // CalendarSink, which obeys writesAllowed('calendar') and is not gated by the
 // SGW session (R7). Spent-today stays T-82's accumulation: nothing here adds
 // spending (R5).
+import type { AuditLog } from '../../domain/audit/types';
 import type { CalendarLink } from '../../domain/calendar/types';
 import type { Snipe, SnipeOutcome } from '../../domain/snipe/types';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
@@ -63,12 +64,43 @@ export type OutcomePlan =
   | { kind: 'record'; itemId: ItemId; outcome: OutcomeKind; via: 'snipe' | 'stamp' }
   | { kind: 'read'; itemId: ItemId };
 
+const STILL_OPEN_KIND = 'outcome.still-open';
+const AUDIT_PAGE = 200;
+
+/**
+ * Ends for which the one post-end read already found the auction still open
+ * (`outcome.still-open` with `final: true`). The newest such row per item wins.
+ * A later end time is not in the map's match, so that end gets its own read.
+ */
+export async function finalOpenEnds(audit: Pick<AuditLog, 'list'>): Promise<ReadonlyMap<ItemId, string>> {
+  const ends = new Map<ItemId, string>();
+  let before: number | undefined;
+  for (;;) {
+    const page = await audit.list({ limit: AUDIT_PAGE, kinds: [STILL_OPEN_KIND], ...(before === undefined ? {} : { before }) });
+    for (const e of page) {
+      if (e.itemId === undefined || e.details.final !== true || ends.has(e.itemId)) continue;
+      const endTime = e.details.endTime;
+      if (typeof endTime === 'string') ends.set(e.itemId, endTime);
+    }
+    const last = page.at(-1);
+    if (page.length < AUDIT_PAGE || last === undefined) return ends;
+    before = last.seq;
+  }
+}
+
+/** The one read is due, and this end has not already been read while still open. */
+function dueForRead(t: TrackedItem, now: EpochMs, openEnds: ReadonlyMap<ItemId, string>): boolean {
+  const endMs = new Date(t.endTime).getTime();
+  return now >= endMs + POST_END_MIN_DELAY_MS && openEnds.get(t.itemId) !== t.endTime;
+}
+
 /** The per-item scan. Pure over the persisted records: snipe outcomes, the calendar links' stamp records. */
 export function planOutcomeWork(
   tracked: Readonly<Record<number, TrackedItem>>,
   snipes: Readonly<Record<string, Snipe>>,
   links: Readonly<Record<number, CalendarLink>>,
   now: EpochMs,
+  openEnds: ReadonlyMap<ItemId, string> = new Map(),
 ): OutcomePlan[] {
   const byItem = new Map<ItemId, Snipe[]>();
   for (const s of Object.values(snipes)) {
@@ -89,8 +121,7 @@ export function planOutcomeWork(
     // R4: pre-fire snipes need the read to confirm the auction closed; the step
     // then moves them to their ended terminal state.
     if (itemSnipes.some((s) => PRE_FIRE.has(s.state))) {
-      const endMs = new Date(t.endTime).getTime();
-      if (now >= endMs + POST_END_MIN_DELAY_MS) plans.push({ kind: 'read', itemId: t.itemId });
+      if (dueForRead(t, now, openEnds)) plans.push({ kind: 'read', itemId: t.itemId });
       continue;
     }
     // R3: the T-84 path already decided (its stamp and notification went out).
@@ -105,8 +136,7 @@ export function planOutcomeWork(
       plans.push({ kind: 'record', itemId: t.itemId, outcome: stamped, via: 'stamp' });
       continue;
     }
-    const endMs = new Date(t.endTime).getTime();
-    if (now >= endMs + POST_END_MIN_DELAY_MS) plans.push({ kind: 'read', itemId: t.itemId });
+    if (dueForRead(t, now, openEnds)) plans.push({ kind: 'read', itemId: t.itemId });
   }
   return plans;
 }
@@ -137,7 +167,7 @@ export async function outcomesTick(ctx: BackgroundContext): Promise<void> {
     repo.get(STORAGE_KEYS.snipes),
     repo.get(STORAGE_KEYS.calendar),
   ]);
-  const plans = planOutcomeWork(tracked, snipes, calendar.links, now);
+  const plans = planOutcomeWork(tracked, snipes, calendar.links, now, await finalOpenEnds(ctx.audit));
   for (const plan of plans) if (plan.kind === 'record') await applyRecord(ctx, plan);
   const read = plans.find((p): p is Extract<OutcomePlan, { kind: 'read' }> => p.kind === 'read');
   if (read === undefined) return;

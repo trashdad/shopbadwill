@@ -18,6 +18,7 @@ import {
   createTickHub,
   type BackgroundContext,
 } from '../../src/background/context';
+import { syncFor } from '../../src/background/jobs/calendar-sync';
 import {
   OUTCOME_NOTIFY_ALARM_PREFIX,
   decisiveOutcome,
@@ -27,11 +28,12 @@ import {
 } from '../../src/background/jobs/outcomes';
 import { register as registerSnipeRunner } from '../../src/background/jobs/snipe-runner';
 import { eventIdFor } from '../../src/domain/calendar/event-id';
+import { spentToday } from '../../src/domain/snipe/caps';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import { Repo } from '../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import type { Snipe } from '../../src/domain/snipe/types';
-import type { ItemDetail, TrackedItem } from '../../src/domain/types';
+import type { ItemDetail, SgwSessionState, TrackedItem } from '../../src/domain/types';
 import { FakeAlarms } from '../fakes/ports/fake-alarms';
 import { FakeAuditLog } from '../fakes/ports/fake-audit-log';
 import { FakeCalendarApi } from '../fakes/ports/fake-calendar-api';
@@ -97,6 +99,10 @@ interface Rig {
   switches: TestSwitches;
   api: FakeSgwApi;
   calendarApi: FakeCalendarApi;
+  /** Mutable: the sink reads it on every sync. Calendar stamps must ignore it. */
+  sessionState: { value: SgwSessionState };
+  /** Mutable: calendar sync writes only while this says connected. */
+  google: { connected: boolean; needsInteraction: boolean };
   tick(): Promise<void>;
 }
 
@@ -121,6 +127,8 @@ async function rig(opts: { now?: number; quiet?: { from: string; to: string } } 
   const ticks = createTickHub(() => undefined);
   const gate = new EventGate(() => undefined);
   const ports = createPortRegistry(new Channel(gate));
+  const sessionState: Rig['sessionState'] = { value: 'ok' };
+  const google: Rig['google'] = { connected: false, needsInteraction: false };
   const ctx = {
     clock,
     storage: areas,
@@ -136,9 +144,9 @@ async function rig(opts: { now?: number; quiet?: { from: string; to: string } } 
     switches,
     ticks,
     ports,
-    session: { state: () => Promise.resolve('ok' as const), current: () => Promise.resolve(null) },
+    session: { state: () => Promise.resolve(sessionState.value), current: () => Promise.resolve(null) },
     sgwClock: { offset: () => null, serverNow: () => null },
-    google: { status: () => Promise.resolve({ connected: false }) },
+    google: { status: () => Promise.resolve({ connected: google.connected, needsInteraction: google.needsInteraction }) },
     googleNeedsInteraction: { set: () => undefined },
     lifecycle: { onStartup: () => () => undefined, onInstalled: () => () => undefined },
     router: { register: () => undefined },
@@ -166,6 +174,8 @@ async function rig(opts: { now?: number; quiet?: { from: string; to: string } } 
     switches,
     api,
     calendarApi,
+    sessionState,
+    google,
     async tick() {
       const p = ticks.tick();
       await settle(clock);
@@ -319,6 +329,8 @@ describe('post-end outcome detection', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.id).toBe('sbw:notify:outcome:11');
     expect(sent[0]?.notification.title).toBe('WON: Pyrex bowl 11');
+    expect(sent[0]?.notification.message).toContain('You won this auction');
+    expect(sent[0]?.notification.id?.startsWith('sbw:notify:digest:')).toBe(false);
     expect(sent[0]?.notification.openUrlOnClick).toBe('https://shopgoodwill.com/item/11');
     expect(r.audit.kinds).toContain('outcome.recorded');
     expect(r.audit.kinds).toContain('notify.outcome');
@@ -364,6 +376,8 @@ describe('post-end outcome detection', () => {
 
     const snipes = await r.repo.get(STORAGE_KEYS.snipes);
     expect(snipes[snipeId]).toMatchObject({ state: 'resolved', outcome: 'ended' });
+    // T-82 is the only spent-today accumulation. `ended` is not a spend.
+    expect(spentToday(Object.values(snipes), r.clock.now())).toBe(0);
 
     expect(reads(r)).toHaveLength(1);
     // The snipe path notifies ("Ended early: ..."); postEnd must not add a second one.
@@ -602,5 +616,169 @@ describe('post-end outcome detection', () => {
     // R6: never sent twice, whatever fires again.
     await onOutcomeAlarm(r.ctx, 28);
     expect(r.notifier.sent).toHaveLength(1);
+  });
+
+  it('a waking or verified snipe that ended early moves through verify-failed, once', async () => {
+    for (const state of ['waking', 'verified'] as const) {
+      const itemId = state === 'waking' ? 31 : 32;
+      const r = await rig();
+      await track(r, itemId, { reasons: [{ kind: 'snipe' }] });
+      await seedEvent(r, itemId, `Pyrex bowl ${String(itemId)}`);
+      const snipeId = await seedSnipe(r, { itemId, state });
+      r.api.details.set(itemId, closedDetail(itemId, { isHighBidder: null }));
+
+      await r.tick();
+      expect(await r.repo.get(STORAGE_KEYS.snipes)).toMatchObject({
+        [snipeId]: { state: 'resolved', outcome: 'ended' },
+      });
+      expect((await eventOf(r, itemId))?.summary).toBe(`ENDED EARLY: Pyrex bowl ${String(itemId)}`);
+      expect(reads(r)).toHaveLength(1);
+      expect(r.notifier.sent).toHaveLength(1);
+
+      await r.tick();
+      expect(reads(r)).toHaveLength(1);
+      expect(r.notifier.sent).toHaveLength(1);
+    }
+  });
+
+  it('an auction that is still open at a due end is read once, and again only after the end moves', async () => {
+    const r = await rig();
+    const end = new Date(r.clock.now() - 5 * MIN).toISOString();
+    await track(r, 33, { endTime: end });
+    await seedEvent(r, 33, 'Pyrex bowl 33');
+    r.api.details.set(33, closedDetail(33, { isClosed: false, endTime: end, isHighBidder: false }));
+
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+    expect(await outcomes(r)).toMatchObject({ 33: undefined });
+    expect(r.notifier.sent).toHaveLength(0);
+    expect(r.calendarApi.calls.filter((c) => c.method === 'eventsPatch')).toHaveLength(0);
+
+    r.clock.advance(30 * MIN);
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+
+    const later = new Date(r.clock.now() + 10 * MIN).toISOString();
+    await r.repo.update(STORAGE_KEYS.tracked, (cur) => {
+      const t = cur[33];
+      return t === undefined ? cur : { ...cur, 33: { ...t, endTime: later } };
+    });
+    r.api.details.set(33, closedDetail(33, { isClosed: true, endTime: later, isHighBidder: false, currentPrice: 2500 }));
+    r.clock.advance(10 * MIN + 2 * MIN);
+    await r.tick();
+    expect(reads(r)).toHaveLength(2);
+    expect(await outcomes(r)).toMatchObject({ 33: 'lost' });
+    expect((await eventOf(r, 33))?.summary).toBe('LOST: Pyrex bowl 33');
+  });
+
+  it('a scheduler pause retries on a later tick and does not read in a loop', async () => {
+    const r = await rig();
+    await track(r, 34);
+    await seedEvent(r, 34, 'Pyrex bowl 34');
+    r.api.details.set(34, closedDetail(34, { isHighBidder: false }));
+    r.api.failNext('itemDetail', 'paused');
+
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+    expect(await outcomes(r)).toMatchObject({ 34: undefined });
+    expect(r.audit.kinds).not.toContain('outcome.read-failed');
+
+    await r.tick();
+    expect(reads(r)).toHaveLength(2);
+    expect(await outcomes(r)).toMatchObject({ 34: 'lost' });
+  });
+
+  it('a snipe with no calendar event is still read; a tracked item with neither is not', async () => {
+    const r = await rig();
+    await track(r, 35, { calendar: false });
+    await track(r, 36, { calendar: false });
+    await seedSnipe(r, { itemId: 35, state: 'resolved', outcome: 'killed', maxBid: 5000 });
+    r.api.details.set(35, closedDetail(35, { isHighBidder: null, currentPrice: 800 }));
+    r.api.details.set(36, closedDetail(36, { isHighBidder: false }));
+
+    await r.tick();
+    expect(reads(r).map((c) => c.args[0])).toEqual([35]);
+    expect(reads(r)[0]?.args[1]).toBe('background');
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+  });
+
+  it('stamps only our own event: a foreign event under the link is left untouched', async () => {
+    const r = await rig();
+    await track(r, 37);
+    await seedEvent(r, 37, 'Not ours');
+    const eventId = eventIdFor(37, 0);
+    const foreign = await r.calendarApi.eventsGet(CALENDAR_ID, eventId);
+    if (foreign === null) throw new Error('seeded event missing');
+    await r.calendarApi.eventsPatch(CALENDAR_ID, eventId, {
+      extendedProperties: { private: { ...foreign.extendedProperties.private, sbwItemId: '999999' } },
+    });
+    r.calendarApi.calls.length = 0;
+    r.api.details.set(37, closedDetail(37, { isHighBidder: true, currentPrice: 1500 }));
+
+    await r.tick();
+    expect(r.calendarApi.calls.filter((c) => c.method === 'eventsPatch')).toHaveLength(0);
+    expect((await eventOf(r, 37))?.summary).toBe('Not ours');
+    expect(await outcomes(r)).toMatchObject({ 37: 'won' });
+    expect(r.notifier.sent).toHaveLength(1);
+  });
+
+  it('a calendar stamp is not gated by the SGW session', async () => {
+    const r = await rig();
+    r.sessionState.value = 'logged-out';
+    await track(r, 38);
+    await seedEvent(r, 38, 'Pyrex bowl 38');
+    r.api.details.set(38, closedDetail(38, { isHighBidder: true, currentPrice: 1500 }));
+
+    await r.tick();
+    expect((await eventOf(r, 38))?.summary).toBe('WON: Pyrex bowl 38');
+    expect((await eventOf(r, 38))?.description).toContain('Final price: $15.00');
+    expect(await outcomes(r)).toMatchObject({ 38: 'won' });
+  });
+
+  it('a sync that samples the item before the outcome is saved does not un-stamp, and later syncs do not ping-pong', async () => {
+    const r = await rig();
+    r.google.connected = true;
+    await track(r, 39);
+    await seedEvent(r, 39, 'Pyrex bowl 39');
+    const patches = (): number => r.calendarApi.calls.filter((c) => c.method === 'eventsPatch').length;
+
+    const stamped = syncFor(r.ctx).sink.stamp(39, 'won', 1299);
+    await settle(r.clock);
+    await stamped;
+    const afterStamp = patches();
+    expect(afterStamp).toBeGreaterThan(0);
+    expect((await eventOf(r, 39))?.summary).toBe('WON: Pyrex bowl 39');
+    expect((await eventOf(r, 39))?.description).toContain('Final price: $12.99');
+    expect((await eventOf(r, 39))?.reminders.overrides).toEqual([]);
+
+    // The outcome is not recorded yet: this is the race window.
+    const raced = syncFor(r.ctx).syncNow('before-record');
+    await settle(r.clock);
+    await raced;
+    expect((await eventOf(r, 39))?.summary).toBe('WON: Pyrex bowl 39');
+    expect((await eventOf(r, 39))?.description).toContain('Final price: $12.99');
+    expect((await eventOf(r, 39))?.reminders.overrides).toEqual([]);
+    expect(patches()).toBe(afterStamp);
+
+    await r.repo.update(STORAGE_KEYS.tracked, (cur) => {
+      const t = cur[39];
+      return t === undefined ? cur : { ...cur, 39: { ...t, outcome: 'won' } };
+    });
+    const settled = syncFor(r.ctx).syncNow('after-record');
+    await settle(r.clock);
+    await settled;
+    expect((await eventOf(r, 39))?.summary).toBe('WON: Pyrex bowl 39');
+    expect((await eventOf(r, 39))?.description).toContain('Final price: $12.99');
+    expect((await eventOf(r, 39))?.reminders.overrides).toEqual([]);
+    const stable = patches();
+
+    for (let i = 0; i < 3; i++) {
+      const again = syncFor(r.ctx).syncNow('again');
+      await settle(r.clock);
+      await again;
+    }
+    expect(patches()).toBe(stable);
+    expect((await eventOf(r, 39))?.summary).toBe('WON: Pyrex bowl 39');
   });
 });
