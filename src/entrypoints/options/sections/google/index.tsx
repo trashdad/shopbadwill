@@ -209,8 +209,10 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
             setModeMsg({ message: `Calendar events are on, but the sync could not start. ${describeError(e)}`, tone: 'error' });
           });
         } else {
+          // Turning off sends no DELETE, ntfy's included, so pushes ntfy.sh already holds still fire.
           setModeMsg({
-            message: 'Calendar sync is off. Existing events stay on your calendar; delete them with the per-event undo.',
+            message:
+              'Calendar sync is off. Existing events stay on your calendar; delete them with Undo in Activity. Phone pushes already scheduled still arrive unless you turn off Phone push.',
             tone: 'ok',
           });
         }

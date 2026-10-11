@@ -306,6 +306,21 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
     expect(screen.getByText(/stay on your calendar/)).toBeTruthy();
   });
 
+  it('turning the toggle off says where to delete events, and that scheduled phone pushes still arrive', async () => {
+    const { fake } = toggleApp({ enabled: true });
+    const t = await toggle();
+    await waitFor(() => {
+      expect(t.disabled).toBe(false);
+    });
+    fireEvent.click(t);
+    const note = await screen.findByText(/stay on your calendar/);
+    // The off path sends no DELETE (ntfy's included), so pushes ntfy.sh already holds still fire.
+    expect(note.textContent).toMatch(/Undo in Activity/);
+    expect(note.textContent).toMatch(/phone pushes already scheduled still arrive unless you turn off Phone push/i);
+    expect(sent(fake, 'settings.set')).toHaveLength(1);
+    expect(fake.sent.map((m) => m.type)).toEqual(expect.not.arrayContaining(['audit.undo', 'calendar.syncNow', 'calendar.disconnect']));
+  });
+
   it('offers "Turn on calendar events now?" after connecting while the setting is off, and does nothing until clicked', async () => {
     const { fake } = toggleApp({ auth: status({ connected: false }), enabled: false });
     const connect = await screen.findByRole<HTMLButtonElement>('button', { name: 'Connect to Google Calendar' });
@@ -439,7 +454,9 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
     expect(types).not.toContain('calendar.disconnect');
     expect(types).not.toContain('calendar.syncNow');
     expect(types).not.toContain('calendar.ics');
-    const note = screen.getByText('Calendar sync is off. Existing events stay on your calendar; delete them with the per-event undo.');
+    const note = screen.getByText(
+      'Calendar sync is off. Existing events stay on your calendar; delete them with Undo in Activity. Phone pushes already scheduled still arrive unless you turn off Phone push.',
+    );
     expect(note.children.length).toBe(0);
   });
 
