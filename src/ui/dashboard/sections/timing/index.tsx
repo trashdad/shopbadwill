@@ -133,8 +133,11 @@ export function TimingSection(props: SectionProps): VNode {
     if (recommendation === null || settings.kind !== 'ok' || busy) return;
     setBusy(true);
     setNote(null);
+    // settings.set replaces the whole `snipe` group, so read it fresh: the copy
+    // this page loaded may predate a counted dry run or a cap change.
     void client
-      .send('settings.set', { snipe: { ...settings.value.snipe, defaultLeadMs: recommendation } })
+      .send('settings.get', undefined)
+      .then((fresh) => client.send('settings.set', { snipe: { ...fresh.snipe, defaultLeadMs: recommendation } }))
       .then(() => {
         setNote(`Applied: the default lead is now ${formatLead(recommendation)}.`);
         setBusy(false);

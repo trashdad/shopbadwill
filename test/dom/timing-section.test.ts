@@ -141,6 +141,36 @@ describe('timing section', () => {
     expect(writes[0]?.payload).toEqual({ snipe: { ...expected, defaultLeadMs: 10_500 } });
   });
 
+  it('Apply re-reads the settings first, so it never writes back a stale counter or stale caps', async () => {
+    let current = defaultSettings();
+    current.snipe.completedDryRuns = 3;
+    const m = new FakeMessaging();
+    m.handle('settings.get', () => current);
+    m.handle('settings.set', (patch: Partial<Settings>) => {
+      current = { ...current, ...patch };
+      return undefined;
+    });
+    m.handle('snipe.list', () => soaks());
+    handleAwake(m);
+    mount(m);
+    expect(await screen.findByText(/Completed dry runs: 3 of 5 required/)).toBeTruthy();
+
+    // While the page is open: the background counts a dry run, and the options page lowers a cap.
+    current = {
+      ...current,
+      snipe: { ...current.snipe, completedDryRuns: 4, caps: { ...current.snipe.caps, perItemMax: 2500 } },
+    };
+    const fresh = current.snipe;
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply 10.5 s lead' }));
+    await screen.findByText(/Applied: the default lead is now 10.5 s/);
+    const writes = m.sent.filter((x) => x.type === 'settings.set');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.payload).toEqual({ snipe: { ...fresh, defaultLeadMs: 10_500 } });
+    expect(current.snipe.completedDryRuns).toBe(4);
+    expect(current.snipe.caps.perItemMax).toBe(2500);
+  });
+
   it('no recommendation or one equal to the current default leaves the button off (no write possible)', async () => {
     // Recommendation equals the current default.
     const s = defaultSettings();
