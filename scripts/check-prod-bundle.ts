@@ -1,6 +1,6 @@
 // `pnpm check:prod-bundle`: greps the PRODUCTION outputs (.output/chrome-mv3,
 // .output/firefox-mv3) for tokens that must never ship, and fails on any hit:
-//   127.0.0.1  localhost  SBW_TEST  __scenario  sbw:test  innerHTML  eval(  new Function
+//   127.0.0.1  localhost  SBW_TEST  __scenario  sbw:test  sbw.test  sgw.test  innerHTML  eval(  new Function
 // `eval(` means the global eval however it is reached (bare, window/globalThis/
 // self, ["eval"], (0, eval)); a method that happens to be named eval, such as
 // re2js's Prefilter.eval, is not flagged (T-36 ruling).
@@ -34,6 +34,10 @@ export const FORBIDDEN = [
   { name: 'SBW_TEST', pattern: /SBW_TEST/g },
   { name: '__scenario', pattern: /__scenario/g },
   { name: 'sbw:test', pattern: /sbw:test/g },
+  // The test hooks' own markers (src/test-hooks/base-url.ts: Symbol.for('sbw.testHooks.baseUrl.fetch')).
+  // The fetch wrapper can be bundled without its `sbw:test:` endpoint string.
+  { name: 'sbw.test', pattern: /sbw\.test/g },
+  { name: 'sgw.test', pattern: /sgw\.test/g },
   { name: 'innerHTML', pattern: /innerHTML/g },
   // A call to the global eval. Not a member call on another object (`x.eval(`)
   // and not a method definition (`eval(a,b){`): re2js, bundled into the
