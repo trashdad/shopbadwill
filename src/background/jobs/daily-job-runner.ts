@@ -33,8 +33,9 @@
 //   (their TrackedItems already written), every onNewMatches(cb) subscriber
 //   gets the run and the new item ids, so T-56's late-add alert (sendLateAdds,
 //   which applies isLateAdd, the only late-add rule) fires at once instead of
-//   with the end-of-run digest. No subscriber: nothing happens. A subscriber
-//   runs outside the run lock; its failure is logged, never thrown.
+//   with the end-of-run digest. register(ctx) subscribes sendLateAdds; a
+//   runner built without register has no subscriber. A subscriber runs
+//   outside the run lock; its failure is logged, never thrown.
 // - Favorites: at most one favorite step per item per run (a later one is a
 //   policy skip). desired() (T-53) adds a favorite step for every tracked item
 //   it says 'add' to (failed or not yet favorited, sgw-late window open) to
@@ -56,6 +57,7 @@ import { PORT_NAMES } from '../../messaging/protocol';
 import { SgwApiError, type SgwApiErrorKind } from '../../ports/errors';
 import { errorText, type BackgroundContext, type RuntimePort } from '../context';
 import { FAVORITE_SKIP_PREFIX } from './steps/favorite';
+import { sendLateAdds } from './notify';
 import { createStepRegistry, STEP_SKIP_PREFIX, type StepDeps, type StepRegistry } from './steps/index';
 
 /** The host permissions every run needs (wxt.config.ts host_permissions). */
@@ -735,9 +737,17 @@ export function runnerFor(ctx: BackgroundContext): DailyJobRunner {
   return runner;
 }
 
-/** T-36 self-registration (I-01): serves the `sbw:job-progress` port. The tick comes from scheduler.ts. */
+/**
+ * T-36 self-registration (I-01): serves the `sbw:job-progress` port and sends
+ * T-56's late-add alerts as soon as a step matches (sendLateAdds keeps only
+ * items ending in under 60 min, once each). The tick comes from scheduler.ts.
+ */
 export function register(ctx: BackgroundContext): void {
   const runner = runnerFor(ctx);
+  const notify = { repo: ctx.repo, audit: ctx.audit, notifier: ctx.notifier, permissions: ctx.permissions, alarms: ctx.alarms };
+  runner.onNewMatches(async (run, itemIds) => {
+    await sendLateAdds(notify, { id: run.id, results: { ...run.results, newMatches: itemIds } });
+  });
   ctx.ports.serve(PORT_NAMES.jobProgress, (port) => {
     runner.serveProgress(port);
   });

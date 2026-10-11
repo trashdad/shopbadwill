@@ -266,6 +266,8 @@ interface BootOptions {
   site?: Partial<Site>;
   /** Host permissions granted (default: both SGW origins). */
   granted?: boolean;
+  /** API permissions granted (e.g. the optional 'notifications'). */
+  permissions?: string[];
   /** Skip seeding storage (a restart over existing storage). */
   restart?: boolean;
   sent?: Sent[];
@@ -328,7 +330,10 @@ function boot(opts: BootOptions = {}) {
   });
   const alarms = new FakeAlarms(clock);
   const notifier = new FakeNotifier();
-  const permissions = new FakePermissions(opts.granted === false ? {} : { origins: [...SGW_HOST_ORIGINS] });
+  const permissions = new FakePermissions({
+    origins: opts.granted === false ? [] : [...SGW_HOST_ORIGINS],
+    permissions: opts.permissions ?? [],
+  });
   const fb = makeBrowser();
   const log = vi.fn();
   const handle: BackgroundHandle = startBackground({
@@ -850,7 +855,11 @@ describe('carries: favorites (writes through T-53)', () => {
       search: () => ok(searchReply([{ ...row(7, 5), endTime: endsSoon }], 1)),
       detail: (itemId) => ok({ ...(detailReply(itemId) as object), endTime: endsSoon }),
     };
-    const h = await ready({ watches: [watch('w1', { nextRunAt: T0 - MIN, ruleIds: [RULE_CHEAP.id], notify: true })], site });
+    const h = await ready({
+      watches: [watch('w1', { nextRunAt: T0 - MIN, ruleIds: [RULE_CHEAP.id], notify: true })],
+      site,
+      permissions: ['notifications'],
+    });
     const calls: Array<{ status: string; cursor: number; itemIds: number[]; tracked: boolean }> = [];
     runnerFor(h.ctx).onNewMatches((run, itemIds) => {
       calls.push({ status: run.status, cursor: run.cursor, itemIds, tracked: h.tracked()['7'] !== undefined });
@@ -861,9 +870,14 @@ describe('carries: favorites (writes through T-53)', () => {
     expect(h.sent.at(-1)).toMatchObject({ endpoint: 'detail', itemId: 7 });
     expect(calls).toEqual([{ status: 'running', cursor: 3, itemIds: [7], tracked: true }]);
     expect(h.lastRun()?.status).toBe('running'); // the favorite step (and run end) still to come
+    // register(ctx) wires T-56's sendLateAdds: the alert is out now, not with the digest.
+    expect(h.notifier.sent.map((n) => n.id)).toEqual(['sbw:notify:late:7']);
+    expect(h.audit()).toContainEqual(expect.objectContaining({ kind: 'notify.late-add', itemId: 7 }));
     await h.advance(3 * TICK);
     expect(h.lastRun()?.status).toBe('done');
     expect(calls).toHaveLength(1);
+    // The digest step (T-56) does not alert the same item twice.
+    expect(h.notifier.sent.filter((n) => n.id === 'sbw:notify:late:7')).toHaveLength(1);
     // A failing subscriber is logged, never breaks the run.
     runnerFor(h.ctx).onNewMatches(() => {
       throw new Error('boom');
@@ -963,11 +977,13 @@ describe('carries: saved watches (watches.save / watches.importSaved)', () => {
 });
 
 describe('carries: step-executor registry (I-07)', () => {
-  it('loads ./*.ts by import.meta.glob: favorite, search, favorites-list and detail export {kind, run}', () => {
-    expect(Object.keys(STEP_MODULES).sort()).toEqual(expect.arrayContaining(['./detail.ts', './favorite.ts', './favorites-list.ts', './search.ts']));
+  it('loads ./*.ts by import.meta.glob: favorite, search, favorites-list, detail (and T-56 notify-digest) export {kind, run}', () => {
+    expect(Object.keys(STEP_MODULES).sort()).toEqual(
+      expect.arrayContaining(['./detail.ts', './favorite.ts', './favorites-list.ts', './notify-digest.ts', './search.ts']),
+    );
     expect(Object.keys(STEP_MODULES)).not.toContain('./index.ts');
     const registry = createStepRegistry();
-    expect([...registry.kinds].sort()).toEqual(['detail', 'favorite', 'favoritesList', 'search']);
+    expect([...registry.kinds].sort()).toEqual(['detail', 'favorite', 'favoritesList', 'notifyDigest', 'search']);
     expect(registry.failed).toEqual([]);
   });
 
