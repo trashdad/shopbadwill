@@ -413,6 +413,28 @@ The port type (`src/ports/global-switches.ts`) is unchanged. `src/background/swi
 
 **Follow-up for the next PLAN edit.** Add the exemption to the fail-closed rule in PLAN §3.3 and contracts.md.
 
+## T-30b: feature-scoped sticky blocking, `health.clearSticky`, and `health.get.sticky`
+
+Source: controller rulings R1 to R3 on T-30b (follow-up to T-30, T-36 and T-70).
+
+**Problem.** A sticky per-endpoint schema failure (`sbw:healthProbe.sticky`) failed the whole HealthReport, so GlobalSwitches blocked writes for every feature. A sticky failure on a write endpoint could never clear, because the writes that would prove recovery were blocked.
+
+**R1. Feature-scoped blocking.** `stickyFeatures(endpoint)` in `src/background/switches.ts`: `addFavorite`, `removeFavorite`, `saveFavoriteNote`, `favorites` affect `favorites`; `placeBid`, `showBidModal` affect `bidding`; `search`, `itemDetail` and any other endpoint affect all features. `writesAllowed(feature)` blocks on a failing report in one of two ways:
+- If every failing check is a sticky-only check (its detail starts with `sticky schema failure` and carries no `shipping-quote:` part), only the features the sticky entries map to are blocked. The entries come from `sbw:healthProbe.sticky`, which Switches loads at startup and follows through `storage.onChanged`. An empty or unreadable list fails closed (all features).
+- Any other failing check (stale, a failed probe, clock, session in `full` mode, shipping quote, or card drift if it ever fails) blocks every feature, as before.
+
+A schema failure flagged by the API but not yet stored (`flagSchemaFailure`) is scoped the same way. The calendar exemption from the SGW session (T-36 ruling) is unchanged. The `HealthReport` schema is frozen and untouched; the per-feature information is derived in `switches.ts`.
+
+**R2. `health.clearSticky { endpoint: string }`.** A new protocol message, sender `ui` only (a content sender is refused by the router). The handler removes that endpoint's sticky entry (through T-30's `recordSchemaSuccess`, which recomposes and stores the report), audits `health.resume` (`actor: 'user'`, `details: { endpoint, action: 'user resumed after checking' }`), and re-evaluates GlobalSwitches at once (`noteHealthProbe`, `noteHealthReport`). An endpoint that is not sticky is a no-op with no audit entry. It never clears stale, clock or session failures; those clear only through probes or real state. `health.recovered` is still audited by T-30 when the report turns ok.
+
+**`health.get` reply gains optional `sticky`.** `sticky?: Array<{ endpoint, at, detail, features }>` (`features` are the write features the entry blocks). The options health panel needs each entry's time and detail, and the frozen HealthReport carries neither. Optional, so older fixtures stay valid; no migration, no storage change. `test/contract/types/messages.test.ts` and `examples/Msg/health.clearSticky.*.json` are updated.
+
+**R3. UI.** The options Health section lists each sticky failure (endpoint, time, detail, blocked features) with an "I've checked; resume <feature>" button. It opens an inline `alertdialog` first; only "Yes, resume ..." sends `health.clearSticky`. Errors use `role="alert"`; every control is a native button (Escape cancels, focus starts on Cancel).
+
+**Tests.** `test/integration/background-main.test.ts` (T-30b block), `test/dom/options-google.test.ts` (sticky failures).
+
+**Follow-up for the next PLAN edit.** Add `health.clearSticky` to PLAN §3.12 and the `sticky` field to the `health.get` reply; add the feature scoping to §3.3.
+
 ## T-32 contract change: `rules.disable`
 
 Approved by the controller in the T-32 review (fix round 1, ruling on concern 1).

@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "endpoint must be a non-empty string",
+  "path": [
+    "payload",
+    "endpoint"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-38",
+    "type": "health.clearSticky",
+    "payload": {
+      "endpoint": ""
+    }
+  }
+}
