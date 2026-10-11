@@ -9,7 +9,8 @@ import { defaultSettings } from '../../src/domain/settings/defaults';
 import { WatchSchema, type Watch } from '../../src/domain/watches/schema';
 import { loadSections } from '../../src/entrypoints/options/registry';
 import { section, WatchesSection } from '../../src/entrypoints/options/sections/watches';
-import { MATCH_ALL_RULE_ID } from '../../src/entrypoints/options/sections/watches/draft';
+import { RulesSection } from '../../src/entrypoints/options/sections/rules';
+import { MATCH_ALL_RULE_ID, pickSearchTab } from '../../src/entrypoints/options/sections/watches/draft';
 import { MessagingError } from '../../src/messaging/errors';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
 
@@ -43,16 +44,24 @@ interface Opts {
   connected?: boolean;
   calendarEnabled?: boolean;
   noWatchHandlers?: boolean;
+  failStatus?: boolean;
+  watches?: Watch[];
 }
 
 function app(opts: Opts = {}) {
   const fake = new FakeMessaging();
-  const store: Watch[] = [];
+  const store: Watch[] = [...(opts.watches ?? [])];
   const rules = [...(opts.rules ?? [])];
   const settings = defaultSettings();
   settings.calendar.enabled = opts.calendarEnabled ?? true;
-  fake.handle('settings.get', () => settings);
-  fake.handle('calendar.status', () => auth(opts.connected ?? true));
+  fake.handle('settings.get', () => {
+    if (opts.failStatus === true) throw new Error('boom');
+    return settings;
+  });
+  fake.handle('calendar.status', () => {
+    if (opts.failStatus === true) throw new Error('boom');
+    return auth(opts.connected ?? true);
+  });
   fake.handle('rules.list', () => rules);
   fake.handle('rules.save', (r) => {
     rules.push(r);
@@ -313,4 +322,148 @@ describe('options: Watches', () => {
     click('Save watch');
     expect((await screen.findByText(/disk full/)).closest('[role="alert"]')).not.toBeNull();
   });
+
+  it('picks the most recently used SGW search tab', () => {
+    const tabs = [
+      { url: 'https://shopgoodwill.com/item/1', lastAccessed: 99 },
+      { url: 'https://shopgoodwill.com/categories/listing?st=a', lastAccessed: 10 },
+      { url: 'https://www.shopgoodwill.com/categories/listing?st=b', lastAccessed: 50 },
+      { url: undefined, lastAccessed: 70 },
+    ];
+    expect(pickSearchTab(tabs)).toBe('https://www.shopgoodwill.com/categories/listing?st=b');
+    expect(pickSearchTab([{ url: 'https://shopgoodwill.com/item/1', lastAccessed: 1 }])).toBeUndefined();
+    expect(pickSearchTab([])).toBeUndefined();
+  });
+
+  it('opens the paste field when no SGW search tab is open', async () => {
+    app({ tab: undefined });
+    click('Use my current tab');
+    await screen.findByText(/No ShopGoodwill search tab is open\./);
+    expect(screen.getByLabelText('ShopGoodwill search address')).toBeTruthy();
+  });
+
+  it('prunes deleted rule ids when editing a watch and says so', async () => {
+    const w: Watch = {
+      id: 'w9', name: 'old', enabled: true, query: { searchText: 'x', categoryIds: [], sellerIds: [], page: 1 },
+      ruleIds: ['a', 'gone'], maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
+    };
+    const { store } = app({ rules: [rule('a')], watches: [w] });
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit old' }));
+    await screen.findByText(/1 rule that no longer exists was removed/);
+    click('Save watch');
+    await waitFor(() => {
+      expect(store[0]?.ruleIds).toEqual(['a']);
+    });
+  });
+
+  it('says the calendar status could not be checked instead of guessing', async () => {
+    app({ failStatus: true });
+    await openForm();
+    await screen.findByText(/Could not check your calendar status/);
+    expect(screen.getByLabelText<HTMLInputElement>('Add matches to my calendar').disabled).toBe(true);
+  });
+
+  it('explains sgw-late', async () => {
+    app();
+    await openForm();
+    expect(screen.getByText(/favorited only in the last hours before they end/)).toBeTruthy();
+  });
+
+  it('creates and saves a watch with the keyboard only', async () => {
+    // jsdom has no Tab key: walk the natural tab order (native controls, no positive tabindex)
+    // and activate with element.click(), which is what Enter and Space do on native controls.
+    const { store } = app({ rules: [rule('a')] });
+    const tabbables = (): HTMLElement[] =>
+      Array.from(document.querySelectorAll<HTMLElement>('button, input, select, a[href]')).filter(
+        (e) => !(e as HTMLButtonElement).disabled,
+      );
+    expect(document.querySelector('[tabindex]:not([tabindex="0"]):not([tabindex="-1"])')).toBeNull();
+    const useTab = await screen.findByRole('button', { name: 'Use my current tab' });
+    expect(tabbables()).toContain(useTab);
+    useTab.focus();
+    useTab.click();
+    await screen.findByRole('heading', { name: 'New watch' });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByLabelText('Name'));
+    });
+    const order = tabbables();
+    const ruleBox = screen.getByLabelText('Rule a');
+    const save = screen.getByRole('button', { name: 'Save watch' });
+    expect(order.indexOf(ruleBox)).toBeGreaterThan(order.indexOf(screen.getByLabelText('Name')));
+    expect(order.indexOf(save)).toBeGreaterThan(order.indexOf(ruleBox));
+    ruleBox.focus();
+    ruleBox.click();
+    await waitFor(() => {
+      expect((ruleBox as HTMLInputElement).checked).toBe(true);
+    });
+    save.focus();
+    save.click();
+    await waitFor(() => {
+      expect(store[0]?.ruleIds).toEqual(['a']);
+    });
+  });
+});
+
+describe('rules section: deleting a rule that watches use', () => {
+  const w = (id: string, ruleIds: string[]): Watch => ({
+    id, name: id, enabled: true, query: { searchText: id, categoryIds: [], sellerIds: [], page: 1 },
+    ruleIds, maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
+  });
+
+  it('names the watch count, deletes, and removes the id from those watches', async () => {
+    const fake = new FakeMessaging();
+    const watches = [w('a', ['r1', 'r2']), w('b', ['r1']), w('c', ['r2'])];
+    const deleted: string[] = [];
+    fake.handle('rules.list', () => [rule('r1', { name: 'Pyrex' })]);
+    fake.handle('rules.delete', ({ id }) => {
+      deleted.push(id);
+      return undefined;
+    });
+    fake.handle('watches.list', () => watches);
+    fake.handle('watches.save', (x) => {
+      const i = watches.findIndex((y) => y.id === x.id);
+      watches[i] = x;
+      return undefined;
+    });
+    render(h(RulesSection, { client: fake }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete Pyrex' }));
+    await screen.findByText(/Used by 2 watches; they will stop matching\./);
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete Pyrex' }));
+    await waitFor(() => {
+      expect(deleted).toEqual(['r1']);
+      expect(watches.map((x) => x.ruleIds)).toEqual([['r2'], [], ['r2']]);
+    });
+});
+
+describe('rules section: deleting a rule that watches use', () => {
+  const w = (id: string, ruleIds: string[]): Watch => ({
+    id, name: id, enabled: true, query: { searchText: id, categoryIds: [], sellerIds: [], page: 1 },
+    ruleIds, maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
+  });
+
+  it('names the watch count, deletes, and removes the id from those watches', async () => {
+    const fake = new FakeMessaging();
+    const watches = [w('a', ['r1', 'r2']), w('b', ['r1']), w('c', ['r2'])];
+    const deleted: string[] = [];
+    fake.handle('rules.list', () => [rule('r1', { name: 'Pyrex' })]);
+    fake.handle('rules.delete', ({ id }) => {
+      deleted.push(id);
+      return undefined;
+    });
+    fake.handle('watches.list', () => watches);
+    fake.handle('watches.save', (x) => {
+      const i = watches.findIndex((y) => y.id === x.id);
+      watches[i] = x;
+      return undefined;
+    });
+    render(h(RulesSection, { client: fake }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete Pyrex' }));
+    await screen.findByText(/Used by 2 watches; they will stop matching\./);
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete Pyrex' }));
+    await waitFor(() => {
+      expect(deleted).toEqual(['r1']);
+      expect(watches.map((x) => x.ruleIds)).toEqual([['r2'], [], ['r2']]);
+    });
+  });
+});
 });

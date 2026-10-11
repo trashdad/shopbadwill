@@ -20,12 +20,13 @@ import {
   draftFromWatch,
   matchEverythingRule,
   newDraft,
+  pickSearchTab,
   queryFromUrl,
   type WatchDraft,
 } from './draft';
 
 export interface WatchesSectionProps extends SectionProps {
-  /** Injectable for tests. Resolves the URL of the active tab, or undefined when unreadable. */
+  /** Injectable for tests. Resolves the URL of the SGW search tab to use, or undefined when there is none. */
   getActiveTabUrl?: () => Promise<string | undefined>;
   now?: () => number;
   newId?: () => string;
@@ -34,10 +35,11 @@ export interface WatchesSectionProps extends SectionProps {
 
 type Msg = { message: string; tone: 'ok' | 'error' };
 
+/** The most recently used ShopGoodwill search tab in any window; the options page itself is never one. */
 async function activeTabUrl(): Promise<string | undefined> {
   try {
-    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-    return tabs[0]?.url;
+    const tabs = await browser.tabs.query({ url: ['https://shopgoodwill.com/*', 'https://www.shopgoodwill.com/*'] });
+    return pickSearchTab(tabs);
   } catch {
     return undefined;
   }
@@ -87,6 +89,9 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   const [rules, setRules] = useState<Rule[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [auth, setAuth] = useState<AuthStatus | null>(null);
+  const [statusFailed, setStatusFailed] = useState(false);
+  const [prunedNote, setPrunedNote] = useState('');
+  const [rulesLoaded, setRulesLoaded] = useState(false);
   const [status, setStatus] = useState<Msg>({ message: '', tone: 'ok' });
   const [pasteUrl, setPasteUrl] = useState('');
   const [showPaste, setShowPaste] = useState(false);
@@ -110,20 +115,39 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   }, [client]);
 
   const loadRules = useCallback(() => {
-    client.send('rules.list', undefined).then(setRules, () => {
-      /* the rule list stays empty; the no-rules warning still shows */
-    });
+    client.send('rules.list', undefined).then(
+      (list) => {
+        setRules(list);
+        setRulesLoaded(true);
+      },
+      () => {
+        /* the rule list stays empty; the no-rules warning still shows */
+      },
+    );
   }, [client]);
 
   useEffect(() => {
     loadWatches();
     loadRules();
-    client.send('settings.get', undefined).then(setSettings, () => undefined);
-    client.send('calendar.status', undefined).then(setAuth, () => undefined);
+    const failed = (): void => {
+      setStatusFailed(true);
+    };
+    client.send('settings.get', undefined).then(setSettings, failed);
+    client.send('calendar.status', undefined).then(setAuth, failed);
     return client.onBroadcast('rules.changed', loadRules);
   }, [client, loadWatches, loadRules]);
 
   const openDraft = (d: WatchDraft, base?: Watch): void => {
+    const known = d.ruleIds.filter((id) => rules.some((r) => r.id === id));
+    const gone = d.ruleIds.length - known.length;
+    if (rulesLoaded && gone > 0) {
+      d = { ...d, ruleIds: known };
+      setPrunedNote(
+        `${String(gone)} rule${gone === 1 ? '' : 's'} that no longer exist${gone === 1 ? 's' : ''} ${gone === 1 ? 'was' : 'were'} removed from this watch. Save to keep the change.`,
+      );
+    } else {
+      setPrunedNote('');
+    }
     setDraft(d);
     setEditingBase(base);
     setErrors({});
@@ -133,7 +157,7 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   const fromUrl = (url: string | undefined): void => {
     if (url === undefined) {
       setShowPaste(true);
-      setSourceError('Could not read the address of your current tab. Paste the search address below instead.');
+      setSourceError('No ShopGoodwill search tab is open. Paste the search address below instead.');
       return;
     }
     const r = queryFromUrl(url);
@@ -158,7 +182,9 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   const calendarOn = settings?.calendar.enabled === true;
   const calendarConnected = auth?.connected === true;
   const calendarDisabled = !calendarOn || !calendarConnected;
-  const calendarHint = !calendarConnected
+  const calendarHint = statusFailed
+    ? 'Could not check your calendar status, so this stays off. Reload the page to try again.'
+    : !calendarConnected
     ? 'Connect Google Calendar in the Google Calendar section to turn this on.'
     : !calendarOn
       ? 'Calendar events are turned off in Settings. Turn them on to use this.'
@@ -327,6 +353,11 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
           {errors['query'] === undefined ? null : (
             <p class="sbw-error" role="alert">
               <strong>Error:</strong> {errors['query']}
+            </p>
+          )}
+          {prunedNote === '' ? null : (
+            <p class="sbw-hint" role="status">
+              {prunedNote}
             </p>
           )}
           <Field id="watch-name" label="Name" error={errors['name']}>

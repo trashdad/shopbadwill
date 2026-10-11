@@ -151,3 +151,14 @@ export function buildWatch(draft: WatchDraft, nextRunAt: number, base?: Watch): 
   if (!parsed.success) return { ok: false, errors: { form: 'That watch is not valid. Check the fields and try again.' } };
   return { ok: true, watch: parsed.data };
 }
+
+/** The URL of the most recently used SGW search tab, or undefined when none is open. */
+export function pickSearchTab(tabs: ReadonlyArray<{ url?: string | undefined; lastAccessed?: number | undefined }>): string | undefined {
+  let best: { url: string; at: number } | undefined;
+  for (const t of tabs) {
+    if (t.url === undefined || !isSgwSearchUrl(t.url)) continue;
+    const at = t.lastAccessed ?? 0;
+    if (best === undefined || at > best.at) best = { url: t.url, at };
+  }
+  return best?.url;
+}

@@ -2,6 +2,7 @@ import type { VNode } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 
 import type { Rule } from '../../../../domain/rules/schema';
+import type { Watch } from '../../../../domain/watches/schema';
 import { describeError } from '../../../../ui/components/describeError';
 import { Status } from '../../../../ui/components/Status';
 import type { SectionDef, SectionProps } from '../../registry';
@@ -24,6 +25,8 @@ export function RulesSection(props: RulesSectionProps): VNode {
   const [rules, setRules] = useState<Rule[] | null>(null);
   const [editing, setEditing] = useState<Editing>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // Watches that reference the rule being confirmed for deletion (empty when unknown).
+  const [usedBy, setUsedBy] = useState<Watch[]>([]);
   const [status, setStatus] = useState<{ message: string; tone: 'ok' | 'error' }>({ message: '', tone: 'ok' });
 
   const reload = useCallback(() => {
@@ -62,11 +65,41 @@ export function RulesSection(props: RulesSectionProps): VNode {
     );
   };
 
+  const askDelete = (rule: Rule): void => {
+    setConfirmDelete(rule.id);
+    setUsedBy([]);
+    // If the watches cannot be listed (no handler yet), the plain confirm is shown.
+    client.send('watches.list', undefined).then(
+      (list) => {
+        setUsedBy(list.filter((w) => w.ruleIds.includes(rule.id)));
+      },
+      () => undefined,
+    );
+  };
+
   const remove = (rule: Rule): void => {
     setConfirmDelete(null);
+    const users = usedBy.filter((w) => w.ruleIds.includes(rule.id));
+    setUsedBy([]);
     client.send('rules.delete', { id: rule.id }).then(
-      () => {
+      async () => {
         setRules((list) => (list ?? []).filter((r) => r.id !== rule.id));
+        // Remove the id from every watch that used it, so none keeps a dangling reference.
+        const failed: string[] = [];
+        for (const w of users) {
+          try {
+            await client.send('watches.save', { ...w, ruleIds: w.ruleIds.filter((id) => id !== rule.id) });
+          } catch {
+            failed.push(w.name);
+          }
+        }
+        if (failed.length > 0) {
+          setStatus({
+            message: `Deleted "${rule.name}", but could not update these watches: ${failed.join(', ')}. Open them to remove the missing rule.`,
+            tone: 'error',
+          });
+          return;
+        }
         setStatus({ message: `Deleted "${rule.name}".`, tone: 'ok' });
       },
       (e: unknown) => {
@@ -151,6 +184,11 @@ export function RulesSection(props: RulesSectionProps): VNode {
                 </button>
                 {confirmDelete === rule.id ? (
                   <>
+                    {usedBy.length === 0 ? null : (
+                      <p class="sbw-hint" role="alert">
+                        Used by {usedBy.length} watch{usedBy.length === 1 ? '' : 'es'}; they will stop matching.
+                      </p>
+                    )}
                     <button
                       type="button"
                       class="sbw-danger"
@@ -177,7 +215,7 @@ export function RulesSection(props: RulesSectionProps): VNode {
                     class="sbw-secondary"
                     aria-label={`Delete ${rule.name}`}
                     onClick={() => {
-                      setConfirmDelete(rule.id);
+                      askDelete(rule);
                     }}
                   >
                     Delete
