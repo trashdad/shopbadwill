@@ -40,21 +40,15 @@ these verdicts are provisional.
 | Windows Update active hours | Cover your usual auction ends | An update restart ends T1 silently. |
 | Lid close action | "Do nothing" on AC if you rely on T1 with the lid shut | `power.requestKeepAwake` does not stop lid-close sleep. |
 
-Apply (elevated PowerShell, changes the active plan):
+The companion never changes the power plan. To put the active plan on the S-8 recommendation (elevated PowerShell) — Sleep after = Never and Allow wake timers = Enable, on AC only:
 
 ```powershell
-powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1      # allow wake timers on AC
-powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0  # never sleep on AC
+powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1      # Allow wake timers = Enable on AC
+powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0  # Sleep after = Never on AC
 powercfg /setactive SCHEME_CURRENT
 ```
 
-Revert to the stock plan values:
-
-```powershell
-powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
-powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0
-powercfg /setactive SCHEME_CURRENT
-```
+On the reference machine those two AC values are already set, so the commands change nothing until someone has chosen a different timeout or wake-timer policy. Nothing here saves the previous values, so there is no one-command undo. Leave wake timers Disabled on battery (`RTCWAKE` 0 on DC); an unplugged laptop will not wake.
 
 Firefox note: Firefox has no `background` permission and no keep-awake API, so
 on Firefox T1 means "PC awake, Firefox open"; T2 (this companion) is the only

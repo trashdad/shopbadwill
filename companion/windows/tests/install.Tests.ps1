@@ -313,6 +313,23 @@ Describe 'registry scope' {
   }
 }
 
+Describe 'COMPANION.md power guidance (R5)' {
+  It 'matches the S-8 provisional verdicts and does not label the apply commands as a revert' {
+    $doc = Get-SbwCompanionDoc
+    Assert-Match $doc 'Sleep after \(AC\)'
+    Assert-Match $doc '\*\*Never\*\*'
+    Assert-Match $doc 'Allow wake timers \(AC\)'
+    Assert-Match $doc '\*\*Enable\*\*'
+    Assert-Match $doc 'Disabled on battery'
+    Assert-Match $doc 'provisional'
+    Assert-Match $doc 'Never paste'
+    Assert-Match $doc 'companion\\windows\\install\.ps1'
+    Assert-Match $doc 'companion\\windows\\uninstall\.ps1'
+    Assert-NotMatch $doc 'Revert to the stock plan values'
+    Assert-NotMatch (Get-SbwUninstallSource) 'powercfg'
+  }
+}
+
 Describe 'Pester runner' {
   It 'uses -Path on Pester 5 and -Script on earlier Pester' {
     $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run.ps1'))

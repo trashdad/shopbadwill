@@ -159,10 +159,7 @@ function Invoke-SbwUninstall {
 
   if (-not $WhatIfPreference) {
     Write-Host ''
-    Write-Host 'Done. If you changed power settings (docs/COMPANION.md), restore them yourself:'
-    Write-Host '  powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1'
-    Write-Host '  powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0'
-    Write-Host '  powercfg /setactive SCHEME_CURRENT'
+    Write-Host 'Done. Power settings were not changed. If you edited the plan yourself, see docs/COMPANION.md.'
     Write-Host 'Fully restart the browsers to drop the stale native-host connection.'
   }
 }
