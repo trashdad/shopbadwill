@@ -31,7 +31,14 @@
 // - A `sent` snipe always gets an exit: the outcome read after the end, a
 //   recovery alarm, bounded retries (POST_READ_FAST_ATTEMPTS over 30 min), then
 //   an "Unconfirmed: check the item" alert (T-87's copy for a bid with no
-//   reply, never "Not bid") and slow retries until a read settles it.
+//   reply, never "Not bid") and slow retries until a read settles it. When the
+//   slow retries give up (about 7 days), the runner dispatches `post-read-failed`
+//   (T-80b): the reducer resolves the snipe through the SAME `classifyOutcome`
+//   the early alert used, and its notification is the only one at the give-up.
+// - A provably unsent bid (bid.ts `BidNotSentError`, T-80b) dispatches `not-sent`
+//   after `sent`, never `ambiguous`: the reducer resolves it as "No bid was sent".
+//   Any other rejection stays `ambiguous`. The SendStrategy seam carries the
+//   decision (the default means no retry; T-101 adds one inside its strategy).
 // - fallbackDecision (T-83) runs inside the reducer on `disarm(anomaly)`, on
 //   the snipe as it is before the kill (C3). The kill switch disarms with
 //   `by: 'kill'` and asks for no fallback. A dry-run snipe passes
@@ -119,6 +126,12 @@ export const MIN_TIME_LEFT_TO_SEND_MS = 1500;
 export const SESSION_ARM_MARGIN_MS = 15 * MIN;
 /** `sbw:snipe-countdown` tick (§3.12). */
 export const COUNTDOWN_INTERVAL_MS = 1000;
+/**
+ * T-84b: the disarm copy when the switch snapshot never loaded (the extension's
+ * storage was too slow at startup). It fails closed, and the notification must
+ * say plainly why, and never imply a bid was placed.
+ */
+const STORAGE_START_WHY = "the extension's storage did not start in time, so the snipe was skipped for safety";
 
 export function snipeAlarmName(id: string, kind: SnipeAlarmKind): string {
   return `${SNIPE_ALARM_PREFIX}${id}:${kind}`;
@@ -353,12 +366,22 @@ interface WindowSession {
 export type CommitResult =
   | { kind: 'accepted'; prev: Snipe; next: Snipe; effects: Effect[] }
   | { kind: 'rejected'; snipe: Snipe; rejection: Rejection }
-  /** An outside event that belongs to a send in flight (its reply settles the attempt). */
-  | { kind: 'busy'; detail: string }
   | { kind: 'missing' };
 
-/** The events of a send attempt: only the runner, which owns the send, feeds them while it is in flight. */
-const ATTEMPT_EVENTS: ReadonlySet<SnipeEvent['type']> = new Set(['sent', 'result', 'ambiguous', 'post-read']);
+/**
+ * The events of a send attempt: only the runner, which owns the send, feeds
+ * them (its internal commits). `dispatch` refuses them from outside, always:
+ * a made-up `result` could suppress a bid, and a made-up `post-read` could
+ * settle one while its PlaceBid is in flight (T-84b, brief item 4).
+ */
+const ATTEMPT_EVENTS: ReadonlySet<SnipeEvent['type']> = new Set([
+  'sent',
+  'result',
+  'ambiguous',
+  'post-read',
+  'post-read-failed',
+  'not-sent',
+]);
 
 interface CommitOptions {
   /** Outbox effects this event completes; removed in the same write (even when the event is refused). */
@@ -367,7 +390,7 @@ interface CommitOptions {
   detail?: ItemDetail;
   /** The history.length the caller reduced from (compare-and-set). */
   expectVersion?: number;
-  /** From outside the runner's own send path (dispatch): refused while a send is in flight. */
+  /** From outside the runner's own send path (`dispatch`): attempt events are always refused. */
   external?: boolean;
 }
 
@@ -618,7 +641,6 @@ export class SnipeRunner {
     const r = await this.commit(id, { type: 'disarm', now: this.ctx.clock.now(), by, why });
     if (r.kind === 'missing') throw new Error('No such snipe.');
     if (r.kind === 'rejected') throw new Error(r.rejection.detail);
-    if (r.kind === 'busy') throw new Error(r.detail);
     void this.drive(id);
     return r.next;
   }
@@ -626,7 +648,9 @@ export class SnipeRunner {
   /**
    * Feeds one event to the reducer for `id` (CAS against `expectVersion` when
    * given) and runs its effects. The way in for other modules (T-86's
-   * disarm-all, tests); the runner itself uses the same path.
+   * disarm-all, tests); the runner itself uses the same path. Attempt events
+   * (`sent`, `result`, `ambiguous`, `post-read`, `post-read-failed`, `not-sent`)
+   * are refused here: only the runner's own send path feeds them.
    */
   async dispatch(id: string, event: SnipeEvent, expectVersion?: number): Promise<CommitResult> {
     const r = await this.commit(id, event, { external: true, ...(expectVersion === undefined ? {} : { expectVersion }) });
@@ -644,8 +668,18 @@ export class SnipeRunner {
       const rec = await this.readRunner();
       const s = all[id];
       if (s === undefined) return { kind: 'missing' };
-      if (opts.external === true && this.inFlight.has(id) && ATTEMPT_EVENTS.has(e.type)) {
-        return { kind: 'busy', detail: 'A bid is being sent for this snipe; its reply settles it.' };
+      // T-84b: outside attempt events are refused outright, never reduced. A
+      // made-up reply or read must not settle (or suppress) a send the runner owns.
+      if (opts.external === true && ATTEMPT_EVENTS.has(e.type)) {
+        return {
+          kind: 'rejected',
+          snipe: s,
+          rejection: {
+            reason: 'invalid-event',
+            detail:
+              'Attempt events (sent, result, ambiguous, post-read, post-read-failed, not-sent) are fed only by the runner; an outside dispatch is refused.',
+          },
+        };
       }
       // CAS: a caller that reduced an older version loses; its event is re-reduced on the fresh snipe.
       if (opts.expectVersion !== undefined && s.history.length !== opts.expectVersion) this.stats.casLost += 1;
@@ -871,7 +905,7 @@ export class SnipeRunner {
   /**
    * A money effect: gates (nothing sent if one fails), then `sent {key}`
    * committed through the reducer together with the effect's removal, then
-   * the send, then its `result` or `ambiguous`.
+   * the send, then its `result`, `not-sent` or `ambiguous` (T-84b).
    */
   private async money(s: Snipe, eff: MoneyEffect): Promise<void> {
     const id = s.id;
@@ -935,33 +969,28 @@ export class SnipeRunner {
       outcome = bidMayHaveBeenSent(error) ? { kind: 'ambiguous', error } : { kind: 'not-sent', error };
     }
     try {
-      await this.recordOutcome(s, eff, outcome);
+      await this.recordOutcome(s, outcome);
     } finally {
       this.inFlight.delete(id);
     }
   }
 
-  /** The send's one answer: `result`, or `ambiguous` (the outcome read settles it). */
-  private async recordOutcome(s: Snipe, eff: MoneyEffect, outcome: SendOutcome): Promise<void> {
+  /** The send's one answer: `result`, `not-sent` (provably nothing left), or `ambiguous` (the outcome read settles it). */
+  private async recordOutcome(s: Snipe, outcome: SendOutcome): Promise<void> {
     const id = s.id;
     const at = this.ctx.clock.now();
     if (outcome.kind === 'result' && BidResultSchema.safeParse(outcome.result).success) {
       await this.commit(id, { type: 'result', now: at, result: outcome.result });
       return;
     }
+    // T-80b: bid.ts proved nothing went out. The reducer resolves the snipe
+    // with the "No bid was sent" notification and its own bid.not-sent audit;
+    // never the ambiguous path (there is nothing to read for).
     if (outcome.kind === 'not-sent') {
-      await this.safely('audit', () =>
-        this.ctx.audit.append({
-          actor: 'snipe',
-          kind: 'bid.not-sent',
-          itemId: s.itemId,
-          ref: id,
-          details: { effect: eff.kind, why: errorText(outcome.error), afterSent: true },
-          dryRun: false,
-        }),
-      );
+      await this.commit(id, { type: 'not-sent', now: at, reason: errorText(outcome.error) });
+      return;
     }
-    // Ambiguous, provably not sent, or a reply that is not a BidResult: the outcome read settles it.
+    // Ambiguous, or a reply that is not a BidResult: the outcome read settles it.
     await this.commit(id, { type: 'ambiguous', now: at });
   }
 
@@ -1036,18 +1065,28 @@ export class SnipeRunner {
       }
     }
     const now = this.ctx.clock.now();
-    // Latency: SGW is too slow right now for a bid to land on time (an older fast sample would hide it).
-    if (detail !== undefined && rttMs > MAX_RTT_MS) {
-      const why = `latency: SGW took ${String(Math.round(rttMs))} ms to answer the 60-second check (over ${String(MAX_RTT_MS)} ms)`;
-      await this.commit(s.id, { type: 'disarm', now, by: 'anomaly', why }, { consume, detail });
-      return;
-    }
     if (detail === undefined) {
       await this.commit(s.id, { type: 'verify-failed', now, reason: failure === 'auth' ? 'auth' : 'network' }, { consume });
       return;
     }
     const sessionUsable = usableSession(await this.ctx.session.state());
-    await this.commit(s.id, this.verifyEvent(s, detail, now, sessionUsable), { consume, detail, expectVersion: s.history.length });
+    const ev = this.verifyEvent(s, detail, now, sessionUsable);
+    // T-84b: when the verify read returned a body, the content exits (ended,
+    // extended, already-high, price-over-max, auth, clock) take precedence over
+    // the latency anomaly. The latency anomaly (with its fallback) applies only
+    // when the content says "proceed" — an event the reducer will not abort
+    // from — or when there is no body (handled above).
+    const endMs = isoMs(detail.endTime);
+    const over = detail.isClosed || isoMs(detail.serverTime) >= endMs;
+    const later = endMs > isoMs(s.endTime);
+    const proceed = ev.type === 'verified' && !over && !later;
+    // Latency: SGW is too slow right now for a bid to land on time (an older fast sample would hide it).
+    if (proceed && rttMs > MAX_RTT_MS) {
+      const why = `latency: SGW took ${String(Math.round(rttMs))} ms to answer the 60-second check (over ${String(MAX_RTT_MS)} ms)`;
+      await this.commit(s.id, { type: 'disarm', now, by: 'anomaly', why }, { consume, detail });
+      return;
+    }
+    await this.commit(s.id, ev, { consume, detail, expectVersion: s.history.length });
   }
 
   /** Maps the verify read to `verified` / `verify-failed`; the reducer judges ended, extended, clock and caps. */
@@ -1124,18 +1163,22 @@ export class SnipeRunner {
    * The outcome read (`post-read`), or a dry run's measure read, with its
    * bounded retries. Success feeds `post-read` to the reducer. A sent snipe
    * whose fast attempts all fail is reported Unconfirmed (check the item),
-   * then retried slowly; a dry run whose measure read keeps failing is closed.
+   * then retried slowly; when those slow retries are spent (about 7 days),
+   * the runner gives up with `post-read-failed` (T-80b): the reducer settles
+   * the snipe with the recorded reply and no ItemDetail, and its notification
+   * is the only one (no parallel runner card). A dry run whose measure read
+   * keeps failing is settled the same way (unconfirmed dry run).
    */
   private async outcomeRead(s: Snipe, entry: Entry, eff: DriveEffect): Promise<StepResult> {
     const failures = entry.readFailures ?? 0;
     const due = this.readDue(s, entry);
     if (due === null) {
       await this.closeWindow(s.id);
-      if (s.state === 'firing') {
-        await this.commit(s.id, { type: 'disarm', now: this.ctx.clock.now(), by: 'anomaly', why: 'the dry-run measure read kept failing' });
-        return 'continue';
-      }
-      return 'wait';
+      // The bounded retries are spent: settle through the reducer. `post-read-failed`
+      // resolves a sent snipe (exposure released) or a dry run's failed measure
+      // read; a live snipe in `firing` never reaches this (it has no measure read).
+      await this.commit(s.id, { type: 'post-read-failed', now: this.ctx.clock.now() }, { consume: [eff] });
+      return 'continue';
     }
     const now = this.ctx.clock.now();
     if (now < due) {
@@ -1176,7 +1219,12 @@ export class SnipeRunner {
     return null;
   }
 
-  /** Tell the user once: T-87's copy for a bid with no readable outcome (never "Not bid"), and "check the item". */
+  /**
+   * Tell the user once: the SAME `classifyOutcome` the reducer will use at the
+   * give-up (T-84b), so this heads-up and the final notification never disagree
+   * (e.g. both say "Leading" for an accepted, leading reply). T-87's copy for
+   * a bid with no readable outcome (never "Not bid"), and "check the item".
+   */
   private async unconfirmed(s: Snipe, attempts: number): Promise<void> {
     const settings = await this.settings();
     const reply = s.attempt.ambiguous === true ? null : (s.attempt.reply ?? null);
@@ -1186,7 +1234,7 @@ export class SnipeRunner {
     await this.safely('notify', () =>
       this.ctx.notifier.notify({
         id: `sbw:snipe:${s.id}:unconfirmed`,
-        title: `Unconfirmed: ${s.title}`,
+        title: c.notify.title,
         message: `${c.notify.message} The result could not be read after ${String(attempts)} tries: check the item on ShopGoodwill.`,
         priority: 2,
         openUrlOnClick: `${ITEM_URL}${String(s.itemId)}`,
@@ -1374,6 +1422,10 @@ export class SnipeRunner {
     if (v.ok) return null;
     const why = v.why ?? 'bidding is blocked';
     if (why === WHY.kill) return { by: 'kill', why: 'the kill switch is on' };
+    // T-84b: a snapshot that never loaded (storage too slow at startup) fails
+    // closed with copy that says so plainly; the fallback's skip notification
+    // then ends with "No bid was placed", never a claim that one was.
+    if (why === WHY.starting) return { by: 'anomaly', why: STORAGE_START_WHY };
     return { by: 'anomaly', why: `bidding is blocked: ${why}` };
   }
 
