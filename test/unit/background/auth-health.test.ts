@@ -6,6 +6,7 @@
 // through the audit log, quiet hours respected only while the end stays more
 // than 1 h away after the window.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { browser } from 'wxt/browser';
 
 import type { BackgroundContext } from '../../../src/background/context';
 import {
@@ -55,12 +56,14 @@ class FakeSession implements Pick<SgwSession, 'state' | 'current'> {
     buyerId: '1',
   };
   throwOnState = false;
+  throwOnCurrent = false;
 
   state(): Promise<SgwSessionState> {
     return this.throwOnState ? Promise.reject(new Error('storage down')) : Promise.resolve(this.stateValue);
   }
 
   current(): Promise<{ bearer: string; expiresAt: EpochMs; buyerId: string } | null> {
+    if (this.throwOnCurrent) return Promise.reject(new Error('storage down'));
     return Promise.resolve(this.token === null ? null : { ...this.token });
   }
 }
@@ -207,6 +210,21 @@ describe('T-91 auth-health: ok:false only when the snipe would certainly fail (R
     expect(await make().check(snipe(), '24h')).toMatchObject({ ok: false, reason: 'logged-out' });
   });
 
+  it('a token that cannot be read is a warning, not "no login saved" (no false alarm)', async () => {
+    session.stateValue = 'ok';
+    session.throwOnCurrent = true;
+    expect(await make().check(snipe(), '24h')).toEqual({ ok: true });
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(1);
+    });
+    expect(notifier.sent[0]?.notification.message).toContain('could not be checked');
+
+    // A certain failure needs no token read: logged out stays ok:false.
+    notifier.sent.length = 0;
+    session.stateValue = 'logged-out';
+    expect(await make().check(snipe({ id: 's-out-unread' }), '24h')).toMatchObject({ ok: false, reason: 'logged-out' });
+  });
+
   it('an ok:false result sends no warning notification from this module (the runner alerts)', async () => {
     session.stateValue = 'logged-out';
     session.token = null;
@@ -330,6 +348,8 @@ describe('T-91 auth-health: everything else is ok:true plus a warning (R2)', () 
       expect(notifier.sent).toHaveLength(1);
     });
     expect(notifier.sent[0]?.notification.message).toContain('could not be checked');
+    // R4: every warning states its fix action.
+    expect(notifier.sent[0]?.notification.message).toContain(SIGN_IN);
   });
 
   it('one notification per snipe per check, deduped across restarts through the audit log (R4)', async () => {
@@ -442,6 +462,110 @@ describe('T-91 auth-health: quiet hours (R4)', () => {
     });
     expect(notifier.sent[0]?.notification).toMatchObject({ id: 'sbw:snipe:s1:at-risk' });
     expect(notifier.sent[0]?.notification.message).toContain(SIGN_IN);
+  });
+
+  it('a deferred re-check of a disarmed (killed) or resolved snipe sends nothing', async () => {
+    clock.set(NIGHT);
+    const endMs = NIGHT + DAY;
+    settings.notifications.quietHours = { from: '22:00', to: '07:00' };
+    session.stateValue = 'expiring';
+    session.token = { bearer: 'test-bearer', expiresAt: endMs + 2 * HOUR, buyerId: '1' };
+    const killed = snipe({ id: 's-killed', endTime: new Date(endMs).toISOString() });
+    const resolved = snipe({ id: 's-resolved', endTime: new Date(endMs).toISOString() });
+    await repo.set(STORAGE_KEYS.snipes, { [killed.id]: killed, [resolved.id]: resolved });
+    const impl = make();
+    await impl.check(killed, '24h');
+    await impl.check(resolved, '24h');
+    expect((await alarms.getAll()).filter((a) => a.name.startsWith(AUTH_WARN_ALARM_PREFIX))).toHaveLength(2);
+
+    // Overnight the user disarms one snipe and the other resolves; the session also dies.
+    await repo.set(STORAGE_KEYS.snipes, {
+      [killed.id]: { ...killed, state: 'killed' },
+      [resolved.id]: { ...resolved, state: 'resolved' },
+    });
+    session.stateValue = 'logged-out';
+    session.token = null;
+    alarms.advance(Date.UTC(2026, 9, 16, 11, 0, 0) - NIGHT);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(notifier.sent).toHaveLength(0);
+  });
+
+  it('authWarnDeferUntil across DST: the quiet end is the real instant and the 1 h rule is elapsed time', () => {
+    const quiet = { from: '22:00', to: '07:00' };
+    const NY = 'America/New_York';
+    // Fall back (2026-11-01): 01:30 EDT, first pass of the repeated hour. Quiet ends 07:00 EST = 12:00Z.
+    const fallNow = Date.UTC(2026, 10, 1, 5, 30, 0);
+    const fallEnd = Date.UTC(2026, 10, 1, 12, 0, 0);
+    expect(authWarnDeferUntil(fallNow, fallEnd + HOUR + 1, quiet, NY)).toBe(fallEnd);
+    expect(authWarnDeferUntil(fallNow, fallEnd + HOUR, quiet, NY)).toBeNull();
+    // Second pass of the repeated hour (01:30 EST): the same quiet end.
+    expect(authWarnDeferUntil(Date.UTC(2026, 10, 1, 6, 30, 0), fallEnd + DAY, quiet, NY)).toBe(fallEnd);
+    // Spring forward (2026-03-08): 00:30 EST. Quiet ends 07:00 EDT = 11:00Z.
+    const springNow = Date.UTC(2026, 2, 8, 5, 30, 0);
+    const springEnd = Date.UTC(2026, 2, 8, 11, 0, 0);
+    expect(authWarnDeferUntil(springNow, springEnd + HOUR + 1, quiet, NY)).toBe(springEnd);
+    expect(authWarnDeferUntil(springNow, springEnd + HOUR, quiet, NY)).toBeNull();
+  });
+});
+
+describe('T-91 auth-health: notification actions', () => {
+  it('a body click opens nothing more (the notifier itself opens openUrlOnClick); the button opens the settings once', async () => {
+    const opened: string[] = [];
+    session.stateValue = 'expiring';
+    session.token = { bearer: 'test-bearer', expiresAt: END + 2 * HOUR, buyerId: '1' };
+    const impl = createAuthHealth({
+      ...deps(),
+      openOptions: () => {
+        opened.push('options');
+      },
+    });
+    await impl.check(snipe(), '24h');
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(1);
+    });
+    const id = notifier.sent[0]?.id ?? '';
+    expect(notifier.sent[0]?.notification.openUrlOnClick).toBe('https://example.invalid/options.html#section-snipe');
+
+    notifier.click(id);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(opened).toEqual([]); // one tab, from the notifier, not two
+
+    notifier.triggerAction(id, 'options');
+    await vi.waitFor(() => {
+      expect(opened).toEqual(['options']);
+    });
+  });
+
+  it('register(): the "Open snipe settings" button opens the snipe section, the same page a click opens', async () => {
+    const created = async (): Promise<string[]> => (await browser.tabs.query({})).map((t) => String(t.url));
+    const before = (await created()).length;
+    session.stateValue = 'expiring';
+    session.token = { bearer: 'test-bearer', expiresAt: END + 2 * HOUR, buyerId: '1' };
+    const ctx = {
+      clock,
+      session,
+      google,
+      health: { last: () => Promise.resolve(healthLast) },
+      keepAwake: { available: true },
+      permissions,
+      switches: { settings: () => settings },
+      audit,
+      notifier,
+      alarms,
+      repo,
+    } as unknown as BackgroundContext;
+    await register(ctx).check(snipe(), '24h');
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(1);
+    });
+    const n = notifier.sent[0];
+    notifier.triggerAction(n?.id ?? '', 'options');
+    await vi.waitFor(async () => {
+      expect(await created()).toHaveLength(before + 1);
+    });
+    const url = (await created()).at(-1);
+    expect(url).toBe(n?.notification.openUrlOnClick);
+    expect(url).toMatch(/\/options\.html#section-snipe$/);
   });
 });
 

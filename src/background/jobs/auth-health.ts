@@ -173,7 +173,7 @@ export function assessAuthHealth(
   if (failure !== null) return { result: failure, warnings: [] };
 
   if (snap.sessionState === null) {
-    warnings.push('Your ShopGoodwill login could not be checked. The 15-minute check will try again.');
+    warnings.push(`Your ShopGoodwill login could not be checked; the 15-minute check will try again. To be safe: ${SIGN_IN}.`);
   } else if (snap.sessionState === 'expiring' && snap.tokenExpiresAt !== null) {
     warnings.push(
       `Your ShopGoodwill login expires ${formatDual(snap.tokenExpiresAt, snap.timeZone)} — after this auction, so this snipe is safe. ${SIGN_IN} for the next one.`,
@@ -228,7 +228,7 @@ export interface AuthHealthDeps {
   audit: Pick<AuditLog, 'append' | 'list'>;
   notifier: Notifier;
   alarms: Pick<Alarms, 'create' | 'onAlarm'>;
-  /** The snipe settings page (options), opened on a notification click. */
+  /** The snipe settings page (options): the notification's click URL; `openOptions` opens it from the button. */
   optionsUrl(): string;
   openOptions(): void | Promise<void>;
   /** The stored snipe, for the deferred re-check. */
@@ -270,18 +270,22 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
 
   const gather = async (): Promise<AuthHealthSnapshot & { now: EpochMs; quiet: Settings['notifications']['quietHours'] }> => {
     const settings = deps.settings();
-    const [sessionState, token, record, google, healthReport, powerGranted] = await Promise.all([
+    const [state, tokenRead, record, google, healthReport, powerGranted] = await Promise.all([
       safe(() => deps.session.state(), null),
-      safe(() => deps.session.current(), null),
+      // `{ token }` when read (token may be null: no login); null when the read failed.
+      safe(async () => ({ token: await deps.session.current() }), null),
       safe(() => deps.sessionRecord(), null),
       safe(() => deps.google.status(), null),
       safe(() => deps.health.last(), null),
       safe(() => deps.permissions.contains({ permissions: ['power'] }), false),
     ]);
+    // R2: a usable state whose token could not be read is unknown (a warning),
+    // never "no login saved" (a failure). Logged-out/expired need no token.
+    const sessionState = tokenRead === null && (state === 'ok' || state === 'expiring') ? null : state;
     return {
       now: deps.clock.now(),
-      sessionState: sessionState,
-      tokenExpiresAt: token?.expiresAt ?? null,
+      sessionState,
+      tokenExpiresAt: tokenRead?.token?.expiresAt ?? null,
       sessionRecordExpiresAt: record?.expiresAt ?? null,
       google,
       calendarEnabled: settings.calendar.enabled,
@@ -382,13 +386,13 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
     });
   });
 
+  // A body click needs nothing here: the notifier opens `openUrlOnClick` itself,
+  // then reports 'click'. Opening again would give the user a second tab.
   deps.notifier.onAction((id, actionId) => {
-    if (!id.includes(':auth-warn-')) return;
-    if (actionId === 'options' || actionId === 'click') {
-      void Promise.resolve()
-        .then(() => deps.openOptions())
-        .catch(() => undefined);
-    }
+    if (!id.includes(':auth-warn-') || actionId !== 'options') return;
+    void Promise.resolve()
+      .then(() => deps.openOptions())
+      .catch(() => undefined);
   });
 
   return { check };
@@ -398,6 +402,7 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
 
 /** Registers the real implementation on T-84's seam. Returns it for tests and diagnostics. */
 export function register(ctx: BackgroundContext): AuthHealth {
+  const optionsUrl = (): string => browser.runtime.getURL('/options.html#section-snipe');
   const impl = createAuthHealth({
     clock: ctx.clock,
     session: ctx.session,
@@ -413,9 +418,13 @@ export function register(ctx: BackgroundContext): AuthHealth {
     audit: ctx.audit,
     notifier: ctx.notifier,
     alarms: ctx.alarms,
-    optionsUrl: () => browser.runtime.getURL('/options.html#section-snipe'),
+    optionsUrl,
+    // The same page a body click opens (the snipe section), not the options top.
     openOptions: () =>
-      browser.runtime.openOptionsPage().catch(() => undefined),
+      browser.tabs.create({ url: optionsUrl() }).then(
+        () => undefined,
+        () => undefined,
+      ),
     getSnipe: async (id) => (await ctx.repo.get(STORAGE_KEYS.snipes))[id],
   });
   snipeSeams(ctx).setAuthHealth(impl);
