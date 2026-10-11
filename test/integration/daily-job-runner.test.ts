@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeBrowser } from 'wxt/testing/fake-browser';
 
+import { REQUEST_TIMEOUT_MS } from '../../src/adapters/sgw/api-adapter';
 import { localDay } from '../../src/adapters/sgw/request-scheduler';
 import type { BackgroundContext, RuntimePort } from '../../src/background/context';
 import { HANDLER_MODULES } from '../../src/background/handlers/index';
@@ -41,6 +42,7 @@ import type { AuditEntry } from '../../src/domain/audit/types';
 import { DEFAULT_LANES, type SgwSessionRecord, type TrackedItem } from '../../src/domain/types';
 import type { JobRun, Watch } from '../../src/domain/watches/schema';
 import { PORT_NAMES } from '../../src/messaging/protocol';
+import { HttpNetworkError } from '../../src/ports/errors';
 import type { HttpRequest } from '../../src/ports/http';
 import { loadFixture } from '../contract/sgw/fixtures';
 import { FakeAlarms } from '../fakes/ports/fake-alarms';
@@ -702,6 +704,7 @@ describe('R3: one run at a time', () => {
     expect(h.ctx.scheduler.stats().lanes.background.usedToday).toBe(0);
     expect(h.ctx.scheduler.stats().lanes.interactive.usedToday).toBeGreaterThan(0);
   });
+
 });
 
 // ── R4: carries ─────────────────────────────────────────────────────────────
@@ -801,11 +804,15 @@ describe('carries: DailyJob wiring', () => {
     expect(h.lastRun()?.results.errors).toEqual([]);
   });
 
-  it('a queued request refused because the lane entered backoff is not a failed retry', async () => {
+  it.each([
+    [500, 'server'],
+    [429, 'rate-limited'],
+    [403, 'blocked'],
+  ])('a queued request refused because the lane entered backoff (%i → %s) is not run and burns no retry', async (status) => {
     const h = await ready({
       watches: [watch('w1', { nextRunAt: T0 - MIN })],
       site: {
-        search: (text) => (text === 'blocker' ? { status: 500, bodyText: 'oops', latencyMs: 5 * SEC } : ok(searchReply(rows(1, 1), 1))),
+        search: (text) => (text === 'blocker' ? { status, bodyText: 'oops', latencyMs: 5 * SEC } : ok(searchReply(rows(1, 1), 1))),
       },
     });
     expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 0 });
@@ -829,6 +836,27 @@ describe('carries: DailyJob wiring', () => {
     expect(h.sgw('search').map((s) => s.searchText)).toEqual(['blocker']);
     expect(h.lastRun()).toMatchObject({ status: 'running', cursor: 0 });
     expect(h.lastRun()?.results.errors).toEqual([]);
+  });
+
+  it.each<[string, HttpStep, number]>([
+    ['a network error', { error: new HttpNetworkError('connection reset') }, 0],
+    ['a timeout', { hang: true }, REQUEST_TIMEOUT_MS],
+    ['a 200 that SGW marks as a server error', ok({ ...(searchReply([]) as object), categoryListModel: null }), 0],
+  ])('a request that left and failed with %s uses a retry, even when it spent the lane budget (no HTTP status ≠ not sent)', async (_why, failure, wait) => {
+    const budget = DEFAULT_LANES.background.dailyBudget;
+    const h = await ready({
+      watches: [watch('w1', { nextRunAt: T0 - MIN })],
+      site: { search: () => failure },
+      seed: { [STORAGE_KEYS.requestBudget]: { day: localDay(T0), used: { background: budget - 1 } } },
+    });
+    const step = runnerFor(h.ctx).tick();
+    await h.advance(wait + SEC);
+    // The request left: the lane is now spent (blocked), but this step did run.
+    expect(h.sgw('search')).toHaveLength(1);
+    expect(h.ctx.scheduler.stats().lanes.background.usedToday).toBe(budget);
+    expect(await step).toBe('stepped');
+    expect(h.lastRun()).toMatchObject({ status: 'paused', cursor: 0 });
+    expect(h.lastRun()?.results.errors).toEqual([expect.objectContaining({ step: 0, message: expect.stringMatching(/^search: /) as unknown })]);
   });
 
   it('a retryable failure pauses the run; resume(run) retries once the lane backoff ends; three failures skip the step', async () => {

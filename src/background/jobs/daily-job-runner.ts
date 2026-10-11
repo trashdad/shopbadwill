@@ -19,9 +19,10 @@
 //   notification + audit) and the RequestScheduler state. A pause, a backoff
 //   on the lane or a spent budget executes nothing and uses no retry (T-51
 //   carry); once it ends, a run T-51 paused is resume()d. An executor that
-//   throws SgwApiError `paused`/`budget`, or a retryable error with no HTTP
-//   status while the lane is now blocked (a queued request refused locally
-//   once the lane entered backoff), sent nothing: the step stays.
+//   throws SgwApiError `paused`/`budget`, or the scheduler's local backoff
+//   refusal of a queued request (refusedBeforeSend), sent nothing: the step
+//   stays. A request that may have left (a network error, a timeout, a 200
+//   SGW marks as failed) is an attempt even with no HTTP status.
 // - Planning happens only under reconcile() or runNow() and sends nothing
 //   (R2): the first SGW request comes from a tick or the runNow drain.
 // - Side effects of a step (on commit): newly matched items become
@@ -48,6 +49,7 @@
 //   gets a small favorites-only run (planFavoriteSweep).
 import { SGW_SEARCH_BODY_DEFAULTS } from '../../adapters/sgw/config';
 import { invalidSearchParams } from '../../adapters/sgw/query-url';
+import type { BackoffKind } from '../../adapters/sgw/request-scheduler';
 import { desired } from '../../domain/favorites/reconcile';
 import { createDailyJob, resume, seenUpdates } from '../../domain/jobs/daily-job';
 import { evaluateBatch } from '../../domain/rules/matcher';
@@ -86,13 +88,26 @@ const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 /** Failures worth retrying (T-51 pauses the run; MAX_STEP_ATTEMPTS bounds it). */
 const RETRYABLE: ReadonlySet<SgwApiErrorKind> = new Set<SgwApiErrorKind>(['rate-limited', 'server', 'network', 'timeout']);
+/** The kinds RequestScheduler refuses a request with when its lane is backing off (every BackoffKind). */
+const BACKOFF_REFUSAL: Readonly<Record<BackoffKind, true>> = { 'rate-limited': true, server: true, blocked: true };
+
+/**
+ * Whether the RequestScheduler refused this request locally, before sending it,
+ * because its lane entered backoff while it was queued: a backoff kind with a
+ * retryAfterMs and no HTTP status. A request that may have left never looks
+ * like this: SGW's own 403/429/5xx carry a status, and a network error, a
+ * timeout or a 200 that SGW marks as failed (kind `server`) has no retryAfterMs.
+ */
+function refusedBeforeSend(e: SgwApiError): boolean {
+  return e.status === undefined && e.retryAfterMs !== undefined && Object.hasOwn(BACKOFF_REFUSAL, e.kind);
+}
 
 /**
  * - 'stepped': one step was executed and committed;
  * - 'idle': no active run;
  * - 'busy': a step or a runNow drain is in progress (tick only);
  * - 'paused': the RequestScheduler is paused, or the lane is backing off or out of budget;
- * - 'not-run': the executor was refused before sending (SgwApiError paused/budget, or a local backoff refusal);
+ * - 'not-run': the executor was refused before sending (SgwApiError paused/budget, or the scheduler's local backoff refusal);
  * - 'no-permission': the host permission is missing (the run failed);
  * - 'conflict': another runner advanced the run first (compare-and-set lost).
  */
@@ -479,9 +494,9 @@ export class DailyJobRunner {
     } catch (e) {
       if (e instanceof SgwApiError) {
         if (e.kind === 'paused' || e.kind === 'budget') return 'not-run';
-        // Queued, then refused locally: the lane entered backoff and nothing was sent
-        // (no HTTP status). A real 429/5xx carries a status and still counts as a retry.
-        if (e.status === undefined && RETRYABLE.has(e.kind) && this.laneBlocked(lane)) return 'not-run';
+        // Queued, then refused locally because the lane entered backoff: nothing was
+        // sent. Anything that may have left (with or without an HTTP status) is an attempt.
+        if (refusedBeforeSend(e) && this.laneBlocked(lane)) return 'not-run';
         return { kind: 'error', message: e.message, retryable: RETRYABLE.has(e.kind) };
       }
       this.log(`daily job: the ${step.kind} executor threw`, e);
