@@ -764,6 +764,7 @@ describe('registration', () => {
         onStartup: (): (() => void) => () => undefined,
         onInstalled: (): (() => void) => () => undefined,
       },
+      ticks: { onTick: (): (() => void) => () => undefined },
     };
     register(ctx as never);
 
@@ -863,12 +864,142 @@ describe('registration', () => {
       const h = harness();
       await h.seedDeferred();
       await tweak(h);
+      await idle();
       h.clock.advance(3 * DAY + 2 * HOUR);
       h.start();
       await h.finishJob(`run-${String(h.requests.length)}`);
+      await h.tick();
       await pump(h.clock, 40);
       expect(h.requests, 'a closed gate must not publish').toHaveLength(0);
     }
+  });
+});
+
+// ── Reconcile: what calendar sync will not re-offer ──────────────────────────
+//
+// feedSinks records an item's hash once upsert resolves, and the sink never
+// rejects (R8). So calendar sync offers an unchanged item only once. Anything
+// the sink could not finish then (the gate was closed, a 429, a rotated topic)
+// is picked up by the job module: after a job run, at startup, when the ntfy
+// settings change, and on a tick once the missing host permission is granted.
+
+describe('reconcile (the job module)', () => {
+  const NEW_TOPIC = 'sbw-zyxwvutsrqponmlkjihgfedcba';
+  const seqs = (itemId: number, gen = 0): string[] => [60, 15, 5].map((m) => sequenceId(itemId, m, gen));
+
+  it('publishes items calendar sync offered while phone push was off, once it is turned on', async () => {
+    const h = harness();
+    await h.setNtfy({ enabled: false, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync(); // the sink is fed while off: no request, and calendar sync records the hash
+    expect(h.requests).toHaveLength(0);
+
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await until(h.clock, () => (h.requests.length >= 3 ? true : undefined));
+    await h.sync();
+    await pump(h.clock, 20);
+    expect(h.requests.map((x) => x.headers['x-sequence-id'])).toEqual(seqs(7));
+  });
+
+  it('publishes on the next tick once the missing host permission is granted; ticks are quiet otherwise', async () => {
+    const h = harness();
+    h.permissions.revoke({ origins: ['https://ntfy.sh/*'] });
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync();
+    expect((await h.repo.find(STORAGE_KEYS.ntfy))?.status).toBe('needs-permission');
+    await h.tick();
+    await pump(h.clock, 20);
+    expect(h.requests).toHaveLength(0);
+
+    await h.permissions.request({ origins: ['https://ntfy.sh/*'] }); // the options page's "Allow ntfy.sh"
+    await h.tick();
+    await until(h.clock, () => (h.requests.length >= 3 ? true : undefined));
+    await h.tick();
+    await pump(h.clock, 20);
+    expect(h.requests.map((x) => x.headers['x-sequence-id'])).toEqual(seqs(7));
+    expect((await h.repo.find(STORAGE_KEYS.ntfy))?.status).toBeUndefined();
+  });
+
+  it('finishes an end-time change a 429 cut short at the next job run (calendar sync will not re-offer it)', async () => {
+    const h = harness();
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync();
+    await until(h.clock, () => (h.requests.length >= 3 ? true : undefined));
+
+    installNtfy(h.requests, h.clock, (kind, n) => (kind === 'delete' && n === 1 ? { status: 429 } : { status: 200 }));
+    await h.track(7, T0 + 4 * HOUR); // SGW moved the end time
+    await h.sync();
+    expect(h.requests.map((x) => x.kind)).toEqual(['post', 'post', 'post', 'delete']);
+
+    h.clock.advance(61_000);
+    await h.sync(); // unchanged hash: calendar sync offers nothing
+    await h.tick(); // and a tick does not retry it either
+    await pump(h.clock, 20);
+    expect(h.requests).toHaveLength(4);
+
+    await h.finishJob('run-1');
+    await until(h.clock, () => (h.requests.length >= 10 ? true : undefined));
+    expect(h.requests.slice(4).map((x) => x.kind)).toEqual(['delete', 'delete', 'delete', 'post', 'post', 'post']);
+    const endMs = T0 + 4 * HOUR;
+    expect(h.requests.slice(7).map((x) => x.headers['x-delay'])).toEqual(
+      [60, 15, 5].map((m) => String(Math.floor((endMs - m * MIN) / 1000))),
+    );
+    const item = (await h.repo.find(STORAGE_KEYS.ntfy))?.items['7'];
+    expect(item?.entries.map((x) => x.fireAt)).toEqual([60, 15, 5].map((m) => endMs - m * MIN));
+  });
+
+  it('republishes every open item on the new topic after a topic rotation', async () => {
+    const h = harness();
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync();
+    await until(h.clock, () => (h.requests.length >= 3 ? true : undefined));
+
+    // The options page cancelled on the old topic, cleared sbw:ntfy, then saved the new topic.
+    await h.repo.set(STORAGE_KEYS.ntfy, { items: {} });
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: NEW_TOPIC });
+    await until(h.clock, () => (h.requests.length >= 6 ? true : undefined));
+    expect(h.requests.slice(3).map((x) => x.url)).toEqual([1, 2, 3].map(() => `${NTFY_SERVER}/${NEW_TOPIC}`));
+    expect(h.requests.slice(3).map((x) => x.headers['x-sequence-id'])).toEqual(seqs(7));
+  });
+
+  it('cancels a stored item that left the calendar while the gate was closed, once the gate reopens', async () => {
+    const h = harness();
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync();
+    await until(h.clock, () => (h.requests.length >= 3 ? true : undefined));
+
+    h.permissions.revoke({ origins: ['https://ntfy.sh/*'] });
+    await h.untrack(7);
+    await h.sync(); // remove(7) is refused (no permission) and calendar sync forgets the hash
+    expect(h.requests).toHaveLength(3);
+    expect((await h.repo.find(STORAGE_KEYS.ntfy))?.items['7']?.entries).toHaveLength(3);
+
+    await h.permissions.request({ origins: ['https://ntfy.sh/*'] });
+    await h.tick();
+    await until(h.clock, () => (h.requests.length >= 6 ? true : undefined));
+    expect(h.requests.slice(3).map((x) => x.url)).toEqual(seqs(7).map((s) => `${NTFY_SERVER}/${TOPIC}/${s}`));
+    expect((await h.repo.find(STORAGE_KEYS.ntfy))?.items['7']).toBeUndefined();
+  });
+
+  it('never retries from a tick: a publish that keeps failing is tried again only at the next job run', async () => {
+    const h = harness();
+    installNtfy(h.requests, h.clock, () => ({ status: 400 }));
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await idle();
+    await h.sync();
+    await pump(h.clock, 20);
+    const n = h.requests.length;
+    expect(n).toBeGreaterThan(0);
+    for (let i = 0; i < 5; i++) {
+      await h.tick();
+      await pump(h.clock, 5);
+    }
+    expect(h.requests).toHaveLength(n);
   });
 });
 
@@ -878,29 +1009,55 @@ interface Harness {
   requests: Captured[];
   permissions: FakePermissions;
   start: () => void;
+  /** One scheduler tick (ctx.ticks). */
+  tick: () => Promise<void>;
   finishJob: (id: string) => Promise<void>;
   seedDeferred: () => Promise<void>;
+  /** Writes the ntfy settings group (calendar sync on, not dry run), as settings.set would. */
+  setNtfy: (ntfy: { enabled: boolean; server: string; topic: string }) => Promise<void>;
+  track: (itemId: number, endMs: number) => Promise<void>;
+  untrack: (itemId: number) => Promise<void>;
+  /** One calendar sync pass (Google disconnected): it feeds the registered sink. */
+  sync: () => Promise<void>;
 }
 
-/** A registered ntfy sink with one tracked auction five days out and deferred seqs stored. */
+/** Lets fire-and-forget work that needs no timer run to completion, without moving the clock. */
+async function idle(rounds = 5): Promise<void> {
+  for (let i = 0; i < rounds; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+/** Awaits `p` while driving the FakeClock (the registered sink paces at the production 1 s). */
+async function drive<T>(clock: FakeClock, p: Promise<T>): Promise<T> {
+  let done = false;
+  const out = p.finally(() => {
+    done = true;
+  });
+  await until(clock, () => (done ? true : undefined));
+  return out;
+}
+
+/** A registered ntfy sink (register(ctx) from ntfy-reminders.ts) over a real Repo. */
 function harness(): Harness {
   const areas = new FakeStorageAreas();
   const clock = new FakeClock(T0);
   const repo = new Repo(areas, clock);
+  const audit = new FakeAuditLog(clock);
+  const switches = new FakeSwitches();
   const requests: Captured[] = [];
   installNtfy(requests, clock);
   const permissions = new FakePermissions({ origins: ['https://ntfy.sh/*'] });
   let start = (): void => {
     throw new Error('startup hook was not registered');
   };
+  const tickCallbacks: Array<() => void | Promise<void>> = [];
   register({
     repo,
-    audit: new FakeAuditLog(clock),
+    audit,
     clock,
     storage: areas,
     http: new BrowserHttp({ now: () => clock.now() }),
     permissions,
-    switches: new FakeSwitches(),
+    switches,
     lifecycle: {
       onStartup: (cb: () => void) => {
         start = cb;
@@ -908,29 +1065,69 @@ function harness(): Harness {
       },
       onInstalled: () => () => undefined,
     },
+    ticks: {
+      onTick: (cb: () => void | Promise<void>) => {
+        tickCallbacks.push(cb);
+        return () => undefined;
+      },
+    },
   } as never);
 
-  const seedDeferred = async (): Promise<void> => {
+  let calendarSync: CalendarSync | undefined;
+  const sync = async (): Promise<void> => {
+    calendarSync ??= new CalendarSync({
+      repo,
+      audit,
+      clock,
+      storage: areas.local,
+      api: stubCalendarApi(),
+      switches,
+      google: {
+        status: () =>
+          Promise.resolve({ connected: false, provider: 'none', grantedScopes: [], needsInteraction: false, configured: false }),
+      },
+      notifier: { notify: () => Promise.resolve('') },
+      permissions,
+      badge: { set: () => undefined },
+      minIntervalMs: 0,
+    });
+    await drive(clock, calendarSync.syncNow('test'));
+  };
+
+  const setNtfy = async (ntfy: { enabled: boolean; server: string; topic: string }): Promise<void> => {
     const s = structuredClone(await repo.get(STORAGE_KEYS.settings));
     s.calendar.enabled = true;
     s.dryRun.calendar = false;
-    s.ntfy = { enabled: true, server: NTFY_SERVER, topic: TOPIC };
+    s.ntfy = ntfy;
     await repo.set(STORAGE_KEYS.settings, s);
-    const endMs = T0 + 5 * DAY;
+  };
+
+  const track = async (itemId: number, endMs: number): Promise<void> => {
     await repo.update(STORAGE_KEYS.tracked, (cur) => ({
       ...cur,
-      7: {
-        itemId: 7,
+      [itemId]: {
+        itemId,
         title: 'Pyrex bowl',
         endTime: new Date(endMs).toISOString(),
         sellerId: 3,
-        reasons: [{ kind: 'manual' }],
-        favoriteState: 'none',
+        reasons: [{ kind: 'manual' as const }],
+        favoriteState: 'none' as const,
         calendar: true,
         addedAt: T0,
-        updatedAt: T0,
+        updatedAt: clock.now(),
       },
     }));
+  };
+
+  const untrack = async (itemId: number): Promise<void> => {
+    await repo.update(STORAGE_KEYS.tracked, (cur) =>
+      Object.fromEntries(Object.entries(cur).filter(([key]) => key !== String(itemId))),
+    );
+  };
+
+  const seedDeferred = async (): Promise<void> => {
+    const endMs = T0 + 5 * DAY;
+    await track(7, endMs);
     await repo.set(STORAGE_KEYS.ntfy, {
       items: {
         7: {
@@ -944,6 +1141,9 @@ function harness(): Harness {
         },
       },
     });
+    // Settings last: the change runs the registered hook over the seeded state.
+    await setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await idle();
   };
 
   return {
@@ -954,6 +1154,13 @@ function harness(): Harness {
     start: () => {
       start();
     },
+    tick: async () => {
+      for (const cb of tickCallbacks) await cb();
+    },
+    setNtfy,
+    track,
+    untrack,
+    sync,
     finishJob: async (id: string) => {
       const run: JobRun = {
         id,

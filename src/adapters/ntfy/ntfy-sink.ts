@@ -318,6 +318,39 @@ export class NtfySink {
     return this.withItem(itemId, () => this.removeNow(itemId));
   }
 
+  /**
+   * One pass that brings ntfy in line with the open events: an upsert for each
+   * (a no-op, with no request and no write, when nothing is owed) and a remove
+   * for every stored item no longer open. Calendar sync offers an unchanged
+   * event only once, so this is what publishes items offered while the gate
+   * was closed, finishes a sync a 429 cut short, republishes after a topic
+   * rotation, and cancels items that left while the gate was closed.
+   * `loadOpen` is only called once the gate (R2) is open. Never throws.
+   */
+  async reconcile(loadOpen: () => Promise<readonly DesiredEvent[]>): Promise<void> {
+    try {
+      const prep = await this.prepare();
+      if (prep.status !== 'ok') {
+        await this.recordStatus(prep.status);
+        return;
+      }
+      const open = await loadOpen();
+      const openIds = new Set<ItemId>(open.map((e) => e.itemId));
+      for (const e of open) await this.upsert(e);
+      const stored = Object.keys((await this.deps.store.load()).items).map(Number);
+      for (const id of stored) {
+        if (Number.isInteger(id) && !openIds.has(id)) await this.remove(id);
+      }
+      // The gate was open for this pass: drop a stale status, so a tick stops looking.
+      if ((await this.prepare()).status === 'ok' && (await this.deps.store.load()).status !== undefined) {
+        await this.deps.store.update((s) => ({ items: s.items }));
+        await this.audit({ kind: 'ntfy.status', details: { status: 'ok' } });
+      }
+    } catch (e) {
+      await this.audit({ kind: 'ntfy.failed', details: { error: this.errorLabel(e) } });
+    }
+  }
+
   private async upsertNow(event: DesiredEvent): Promise<void> {
     try {
       const prep = await this.prepare();
@@ -376,7 +409,11 @@ export class NtfySink {
         }
       }
 
-      await this.deps.store.update((s) => ({ items: { ...s.items, [event.itemId]: { fingerprint, entries: [...byLead.values()] } } }));
+      const next = [...byLead.values()];
+      const unchanged =
+        prev !== undefined && prev.fingerprint === fingerprint && JSON.stringify(prev.entries) === JSON.stringify(next);
+      if (unchanged && state.status === undefined) return; // nothing owed: no write either
+      await this.deps.store.update((s) => ({ items: { ...s.items, [event.itemId]: { fingerprint, entries: next } } }));
       if (state.status !== undefined) await this.audit({ kind: 'ntfy.status', details: { status: 'ok' } });
     } catch (e) {
       // R8: a failure never throws into calendar sync; audit without the topic.
