@@ -5,11 +5,21 @@ import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   assertAllowed,
+  buildDriftIssueBody,
+  CANARY_DAY_MS,
   CANARY_MIN_SPACING_MS,
   CANARY_RUN_INTERVAL_MS,
+  decideDriftIssueAction,
+  failingCheckFingerprint,
+  honestUserAgent,
   ITEM_PAGE_CHECK_KEYS,
   runCanary,
+  sanitizeCanaryMessage,
+  shouldOpenDriftIssue,
+  syncDriftIssue,
+  workflowAnnotations,
   type CanaryOptions,
+  type CanaryResult,
   type PageCheckResult,
 } from '../../../scripts/canary';
 import { checkCaptureUrl } from '../../../scripts/capture-fixtures';
@@ -80,10 +90,10 @@ beforeAll(async () => {
 afterAll(async () => {
   await sgw.close();
 });
-beforeEach(() => {
+beforeEach(async () => {
   dir = mkdtempSync(path.join(tmpdir(), 'canary-'));
   clock = T0;
-  void fetch(`${sgw.url}/__log`, { method: 'DELETE' });
+  await fetch(`${sgw.url}/__log`, { method: 'DELETE' });
   sleeps = [];
   sent = [];
   pages = [];
@@ -180,7 +190,7 @@ describe('canary against the fake SGW server', () => {
     expect(r.failures[0]).toMatchObject({ check: 'itemPage', path: 'SGW_SELECTORS.item.title' });
   });
 
-  it('refuses to run twice within 12 h, even with a restart, and runs again after 12 h', async () => {
+  it('refuses to run twice within 12 h, even with a restart, and runs again at exactly 12 h', async () => {
     const o = opts();
     expect((await runCanary(o)).status).toBe('pass');
     const before = sent.length;
@@ -188,24 +198,64 @@ describe('canary against the fake SGW server', () => {
     const again = await runCanary(o);
     expect(again.status).toBe('skipped');
     expect(again.reason).toMatch(/locked/);
+    expect(again.requestsMade).toBe(0);
     expect(sent.length).toBe(before);
 
-    clock = T0 + CANARY_RUN_INTERVAL_MS + 1000;
+    // The lock is `< 12 h`, so it is open at exactly 12 h. The previous run's
+    // requests must not refuse this one.
+    clock = T0 + CANARY_RUN_INTERVAL_MS;
     const next = await runCanary(o);
-    // 12 h later the lock is open, but the 24 h budget (3 used + 3 needed > 4) still refuses.
-    expect(next.status).toBe('skipped');
-    expect(next.reason).toMatch(/daily budget/);
-
-    clock = T0 + 24 * 60 * 60 * 1000 + 10 * 60 * 1000;
-    expect((await runCanary(o)).status).toBe('pass');
+    expect(next.status).toBe('pass');
+    expect(next.requestsMade).toBe(3);
   });
 
-  it('force bypasses the 12 h lock but not the daily budget', async () => {
+  it('opens the lock at exactly 12 h even when the previous run already made 4 requests', async () => {
+    writeFileSync(
+      path.join(dir, 'state.json'),
+      JSON.stringify({
+        runs: [T0],
+        requests: [T0, T0 + 1, T0 + 2, T0 + 3],
+        lastRequestEndedAt: T0,
+      }),
+    );
+    clock = T0 + CANARY_RUN_INTERVAL_MS - 1;
+    const locked = await runCanary(opts());
+    expect(locked.status).toBe('skipped');
+    expect(locked.reason).toMatch(/locked/);
+    expect(locked.requestsMade).toBe(0);
+
+    clock = T0 + CANARY_RUN_INTERVAL_MS;
+    const opened = await runCanary(opts());
+    expect(opened.status).toBe('pass');
+    expect(opened.requestsMade).toBe(3);
+  });
+
+  it('allows a run that starts 24 h ± a few minutes after the previous one', async () => {
+    const early = T0 + CANARY_DAY_MS - 3 * 60 * 1000;
+    const late = T0 + CANARY_DAY_MS + 4 * 60 * 1000;
+
+    expect((await runCanary(opts())).status).toBe('pass');
+    clock = early;
+    const under = await runCanary(opts());
+    expect(under.status).toBe('pass');
+    expect(under.requestsMade).toBe(3);
+
+    // Fresh state so the late case is measured from its own previous run.
+    rmSync(path.join(dir, 'state.json'));
+    clock = T0;
+    expect((await runCanary(opts())).status).toBe('pass');
+    clock = late;
+    const over = await runCanary(opts());
+    expect(over.status).toBe('pass');
+    expect(over.requestsMade).toBe(3);
+  });
+
+  it('force bypasses the 12 h lock and still makes the run', async () => {
     await runCanary(opts());
     clock += 60 * 60 * 1000;
     const forced = await runCanary(opts({ force: true }));
-    expect(forced.status).toBe('skipped');
-    expect(forced.reason).toMatch(/daily budget/);
+    expect(forced.status).toBe('pass');
+    expect(forced.requestsMade).toBe(3);
   });
 
   it('force with a clean budget still waits out the spacing from the previous request', async () => {
@@ -264,7 +314,118 @@ describe('canary against the fake SGW server', () => {
     expect(r.status).toBe('inconclusive');
     expect(r.failures).toEqual([]);
   });
+
+  it('a 5xx on ItemDetail is inconclusive after one retry and does not fetch the page', async () => {
+    await scenario({ errors: { 'ItemDetail/GetItemDetailModelByItemId': { status: 502 } } });
+    const r = await runCanary(opts());
+    await scenario({ reset: true, serverNowMs: Date.UTC(2026, 9, 6, 12) });
+    expect(r.status).toBe('inconclusive');
+    expect(r.failures).toEqual([]);
+    expect(r.requestsMade).toBe(3);
+    expect(pages).toHaveLength(0);
+    expect(sleeps).toHaveLength(2);
+    for (const s of sleeps) expect(s).toBeGreaterThanOrEqual(CANARY_MIN_SPACING_MS);
+  });
+
+  it('treats an HTML 200 as inconclusive, not drift', async () => {
+    const r = await runCanary(opts({ fetchFn: htmlish(200, '<!DOCTYPE html><html><body>Down for maintenance</body></html>', 'text/html; charset=utf-8') }));
+    expect(r.status).toBe('inconclusive');
+    expect(r.failures).toEqual([]);
+    expect(r.requestsMade).toBe(1);
+    expect(pages).toHaveLength(0);
+  });
+
+  it('treats a non-JSON 200 as inconclusive, not drift', async () => {
+    const r = await runCanary(opts({ fetchFn: htmlish(200, 'be right back', 'text/plain') }));
+    expect(r.status).toBe('inconclusive');
+    expect(r.failures).toEqual([]);
+    expect(r.requestsMade).toBe(1);
+  });
+
+  it('treats 401 and 408 as inconclusive and does not retry them', async () => {
+    for (const status of [401, 408]) {
+      rmSync(path.join(dir, 'state.json'), { force: true });
+      clock = T0;
+      sleeps.length = 0;
+      sent.length = 0;
+      await scenario({ errors: { 'Search/ItemListing': { status } } });
+      const r = await runCanary(opts());
+      await scenario({ reset: true, serverNowMs: Date.UTC(2026, 9, 6, 12) });
+      expect(r.status, String(status)).toBe('inconclusive');
+      expect(r.failures, String(status)).toEqual([]);
+      expect(r.requestsMade, String(status)).toBe(1);
+      expect(sleeps, String(status)).toEqual([]);
+    }
+  });
+
+  it('treats an item-page 401 as inconclusive, not drift', async () => {
+    const r = await runCanary(opts({ render: () => ({ status: 401, challenged: false, matched: {} }) }));
+    expect(r.status).toBe('inconclusive');
+    expect(r.failures).toEqual([]);
+  });
+
+  it('keeps a schema mismatch on valid JSON as drift', async () => {
+    const r = await runCanary(
+      opts({
+        fetchFn: mutating('ItemDetail', (j) => {
+          j['titleX'] = j['title'];
+          delete j['title'];
+        }),
+      }),
+    );
+    expect(r.status).toBe('drift');
+    expect(r.failures.some((f) => f.check === 'itemDetail')).toBe(true);
+    expect(r.inconclusive).toEqual([]);
+  });
+
+  it('still treats HTTP 400 as drift', async () => {
+    await scenario({ errors: { 'Search/ItemListing': { status: 400 } } });
+    const r = await runCanary(opts());
+    await scenario({ reset: true, serverNowMs: Date.UTC(2026, 9, 6, 12) });
+    expect(r.status).toBe('drift');
+    expect(r.failures[0]?.path).toBe('http.status');
+    expect(r.requestsMade).toBe(1);
+  });
+
+  it('sends the exact User-Agent and never sets Origin, Cookie, or Authorization', async () => {
+    const prev = process.env['GITHUB_REPOSITORY'];
+    const ua = 'ShopBadwill-canary/1 (+https://github.com/example/shopbadwill; nightly read-only schema check, 3 requests/day)';
+    const fallback = 'ShopBadwill-canary/1 (+https://github.com/; nightly read-only schema check, 3 requests/day)';
+    try {
+      process.env['GITHUB_REPOSITORY'] = 'example/shopbadwill';
+      expect(honestUserAgent()).toBe(ua);
+      delete process.env['GITHUB_REPOSITORY'];
+      expect(honestUserAgent()).toBe(fallback);
+    } finally {
+      if (prev === undefined) delete process.env['GITHUB_REPOSITORY'];
+      else process.env['GITHUB_REPOSITORY'] = prev;
+    }
+
+    const r = await runCanary(opts({ userAgent: ua }));
+    expect(r.status).toBe('pass');
+    const api = sent.filter((s) => s.headers['user-agent'] !== undefined);
+    expect(api.length).toBeGreaterThanOrEqual(2);
+    for (const s of sent) {
+      expect(s.headers['origin']).toBeUndefined();
+      expect(s.headers['cookie']).toBeUndefined();
+      expect(s.headers['authorization']).toBeUndefined();
+    }
+    for (const s of api) expect(s.headers['user-agent']).toBe(ua);
+  });
 });
+
+/** Fetch stub that records the call and answers with a fixed body (maintenance pages). */
+function htmlish(status: number, body: string, contentType: string): CanaryOptions['fetchFn'] {
+  return (input, init) => {
+    const headers: Record<string, string> = {};
+    new Headers(init?.headers).forEach((v, k) => {
+      headers[k] = v;
+    });
+    sent.push({ realish: urlOf(input), method: init?.method ?? 'GET', at: clock, headers });
+    clock += 500;
+    return Promise.resolve(new Response(body, { status, headers: { 'content-type': contentType } }));
+  };
+}
 
 describe('canary URL guard', () => {
   it('refuses search pages, account pages, writes and foreign hosts', () => {
@@ -304,5 +465,201 @@ describe('canary URL guard', () => {
       expect(checkCaptureUrl(url, method).ok, line).toBe(true);
       expect(url).not.toMatch(/categories\/listing|\/shopgoodwill\//);
     }
+  });
+});
+
+function workflowSteps(yml: string): { name: string; body: string }[] {
+  const steps: { name: string; body: string }[] = [];
+  let current: { name: string; body: string } | null = null;
+  for (const line of yml.split(/\r?\n/)) {
+    const found = /^ {6}- name: (.*)$/.exec(line);
+    if (found) {
+      if (current) steps.push(current);
+      current = { name: found[1] ?? '', body: '' };
+    } else if (current) {
+      current.body += `${line}\n`;
+    }
+  }
+  if (current) steps.push(current);
+  return steps;
+}
+
+describe('canary workflow and gitignore', () => {
+  const yml = readFileSync(new URL('../../../.github/workflows/canary.yml', import.meta.url), 'utf8');
+  const steps = workflowSteps(yml);
+
+  it('lets gh api errors fail the step, and skips the canary when a restore does not yield state.json', () => {
+    const find = steps.find((s) => s.name === 'Find previous canary state');
+    expect(find?.body).toContain('gh api');
+    // The job-level `inputs.force && 'true' || 'false'` expression is not this bug.
+    expect(find?.body).not.toMatch(/\|\|\s*true\b/);
+    expect(yml).toMatch(/\[ ! -f canary-state\/state\.json \]/);
+    const run = steps.find((s) => s.name === 'Run canary');
+    expect(run?.body).toContain("steps.gate.outputs.skip == 'false'");
+  });
+
+  it('sets GH_TOKEN only on the steps that call gh', () => {
+    const beforeSteps = yml.split('\n    steps:')[0] ?? '';
+    expect(beforeSteps).not.toContain('GH_TOKEN');
+    const tokenSteps = steps.filter((s) => s.body.includes('GH_TOKEN')).map((s) => s.name);
+    expect(tokenSteps.sort()).toEqual(['Find previous canary state', 'Open or update the drift issue']);
+  });
+
+  it('gates the drift issue step on status drift and syncs through the canary script', () => {
+    const issue = steps.find((s) => s.name === 'Open or update the drift issue');
+    expect(issue?.body).toContain("steps.canary.outputs.status == 'drift'");
+    expect(issue?.body).toContain('--sync-issue');
+    const fail = steps.find((s) => s.name === 'Fail the job on drift');
+    expect(fail?.body).toContain("steps.canary.outputs.status == 'drift'");
+  });
+
+  it('ignores canary-state and canary-out', () => {
+    const text = readFileSync(new URL('../../../.gitignore', import.meta.url), 'utf8');
+    expect(text).toMatch(/^canary-state\/$/m);
+    expect(text).toMatch(/^canary-out\/$/m);
+  });
+});
+
+function driftResult(checks: string[]): CanaryResult {
+  return {
+    status: 'drift',
+    startedAt: '2026-10-10T09:17:00.000Z',
+    requestsMade: checks.length,
+    failures: checks.map((check) => ({ check, path: `${check}.field\n`, message: `broke @${check}\r\nnext` })),
+    inconclusive: [],
+  };
+}
+
+describe('canary message sanitizing and drift issue', () => {
+  it('strips control characters and newlines and neuters mentions', () => {
+    const raw = 'hello\nthere\r\n@shopbadwill\u0000\u0007\u007F done';
+    const clean = sanitizeCanaryMessage(raw);
+    expect(clean).toBe('hellothere@\u200Bshopbadwill done');
+    for (const ch of clean) {
+      const code = ch.codePointAt(0) ?? 0;
+      expect(code).toBeGreaterThan(31);
+      expect(code).not.toBe(127);
+    }
+  });
+
+  it('sanitizes workflow annotations so a message cannot break the command or mention someone', () => {
+    const lines = workflowAnnotations({
+      failures: [{ check: 'search', path: 'a\nb', message: 'ping @maintainer\nmore' }],
+      inconclusive: [{ check: 'itemDetail', path: '(network)', message: 'HTTP 503\r@ops' }],
+    });
+    expect(lines).toEqual([
+      '::error::SGW drift: search ab: ping @\u200Bmaintainermore',
+      '::warning::SGW canary inconclusive: itemDetail: HTTP 503@\u200Bops',
+    ]);
+    for (const line of lines) expect(line).not.toMatch(/[\r\n]/);
+  });
+
+  it('opens an issue only for drift', () => {
+    expect(shouldOpenDriftIssue('drift')).toBe(true);
+    expect(shouldOpenDriftIssue('pass')).toBe(false);
+    expect(shouldOpenDriftIssue('inconclusive')).toBe(false);
+    expect(shouldOpenDriftIssue('skipped')).toBe(false);
+  });
+
+  it('fingerprints the set of failing checks, ignoring order and repeats', () => {
+    expect(failingCheckFingerprint([
+      { check: 'itemPage' },
+      { check: 'search' },
+      { check: 'search' },
+    ])).toBe('itemPage,search');
+  });
+
+  it('puts a sanitized body and a fingerprint comment in the issue', () => {
+    const body = buildDriftIssueBody(driftResult(['itemDetail', 'search']), 'https://github.com/acme/shopbadwill/actions/runs/9');
+    expect(body).toContain('<!-- canary-fingerprint:itemDetail,search -->');
+    expect(body).toContain('@\u200BitemDetail');
+    expect(body).toContain('@\u200Bsearch');
+    expect(body).not.toContain('@itemDetail');
+    expect(body).not.toContain('@search');
+    const row = body.split('\n').find((line) => line.includes('itemDetail'));
+    expect(row).toBe('| `itemDetail` | `itemDetail.field` | broke @\u200BitemDetailnext |');
+  });
+
+  it('does not comment when the set of failing checks is unchanged since the last comment', () => {
+    const current = driftResult(['search']);
+    const older = buildDriftIssueBody(driftResult(['itemPage']), 'https://example.test/1');
+    const latest = buildDriftIssueBody(current, 'https://example.test/2');
+    expect(decideDriftIssueAction({
+      status: 'drift',
+      failures: current.failures,
+      existing: { body: older, comments: [{ body: 'thanks' }, { body: latest }] },
+    })).toBe('silent');
+  });
+
+  it('comments when the set of failing checks changes, and creates when there is no issue', () => {
+    const current = driftResult(['itemDetail', 'search']);
+    const previous = buildDriftIssueBody(driftResult(['search']), 'https://example.test/1');
+    expect(decideDriftIssueAction({
+      status: 'drift',
+      failures: current.failures,
+      existing: { body: previous, comments: [] },
+    })).toBe('comment');
+    expect(decideDriftIssueAction({
+      status: 'drift',
+      failures: current.failures,
+      existing: null,
+    })).toBe('create');
+    expect(decideDriftIssueAction({
+      status: 'inconclusive',
+      failures: [],
+      existing: null,
+    })).toBe('silent');
+  });
+
+  it('creates, comments, or stays quiet through the gh wrapper', () => {
+    const bodyFile = path.join(dir, 'issue.md');
+    const calls: string[][] = [];
+    const gh = (args: readonly string[]): string => {
+      calls.push([...args]);
+      const cmd = args[1];
+      if (cmd === 'list') return '[]';
+      return '';
+    };
+    expect(syncDriftIssue({
+      result: driftResult(['search']),
+      runUrl: 'https://github.com/acme/shopbadwill/actions/runs/9',
+      bodyFile,
+      gh,
+    })).toBe('created');
+    expect(calls.some((c) => c[1] === 'create')).toBe(true);
+    expect(readFileSync(bodyFile, 'utf8')).toContain('<!-- canary-fingerprint:search -->');
+    expect(readFileSync(bodyFile, 'utf8')).toContain('@\u200Bsearch');
+
+    calls.length = 0;
+    const same = driftResult(['search']);
+    const sameBody = buildDriftIssueBody(same, 'https://github.com/acme/shopbadwill/actions/runs/9');
+    const quiet = (args: readonly string[]): string => {
+      calls.push([...args]);
+      if (args[1] === 'list') return JSON.stringify([{ number: 7, title: 'SGW drift detected' }]);
+      if (args[1] === 'view') return JSON.stringify({ body: sameBody, comments: [] });
+      return '';
+    };
+    expect(syncDriftIssue({ result: same, runUrl: 'https://github.com/acme/shopbadwill/actions/runs/10', bodyFile, gh: quiet })).toBe('unchanged');
+    expect(calls.some((c) => c[1] === 'comment')).toBe(false);
+
+    calls.length = 0;
+    const changed = driftResult(['itemDetail']);
+    const talk = (args: readonly string[]): string => {
+      calls.push([...args]);
+      if (args[1] === 'list') return JSON.stringify([{ number: 7, title: 'SGW drift detected' }, { number: 8, title: 'other' }]);
+      if (args[1] === 'view') return JSON.stringify({ body: sameBody, comments: [{ body: 'note' }] });
+      return '';
+    };
+    expect(syncDriftIssue({ result: changed, runUrl: 'https://github.com/acme/shopbadwill/actions/runs/11', bodyFile, gh: talk })).toBe('commented');
+    expect(calls.some((c) => c[1] === 'comment' && c[2] === '7')).toBe(true);
+
+    expect(syncDriftIssue({
+      result: { ...same, status: 'inconclusive' },
+      runUrl: 'https://example.test',
+      bodyFile,
+      gh: () => {
+        throw new Error('gh must not be called');
+      },
+    })).toBe('not-drift');
   });
 });

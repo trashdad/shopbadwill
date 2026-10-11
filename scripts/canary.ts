@@ -12,22 +12,27 @@
 //     request to the start of the next, including across runs via the state file;
 //   - never a search page (/categories/listing?st=) or /shopgoodwill/*: every URL goes through the
 //     deny-by-default guard from capture-fixtures.ts (checkCaptureUrl) BEFORE it is sent;
-//   - at most one run per 12 h (the lock) and at most 4 requests per rolling 24 h (the budget).
-//     `force` bypasses the lock only; the budget and the spacing still apply;
+//   - at most one run per 12 h (the lock). That is the daily cap (at most two runs a day).
+//     Each run makes at most 4 requests: the 3 checks plus one retry. There is no rolling
+//     24 h budget, so a nightly run is not skipped because yesterday's requests are still
+//     inside a 24 h window. `force` bypasses the lock only; the per-run cap and the spacing still apply;
 //   - 403/429 or a challenge page stops the run at once (no retry): inconclusive.
 //
 // Outcomes:
 //   pass          every check matched.
-//   drift         SGW answered, but a schema or selector no longer matches (or a non-transient
-//                 HTTP error such as 404/400). Exit code 1; the workflow opens/updates the issue.
-//   inconclusive  only network errors, timeouts, 5xx, 403/429 or a challenge. THRESHOLD: a request
+//   drift         SGW answered with valid JSON (or a rendered page) that no longer matches, or a
+//                 non-transient HTTP error such as 404/400. Exit code 1; the workflow opens or
+//                 updates the issue only when the set of failing checks changed.
+//   inconclusive  network errors, timeouts, 5xx, 403/429, a challenge page, 401/408, or a 200 whose
+//                 body is HTML or not JSON (a maintenance page). THRESHOLD: a network error or 5xx
 //                 is retried once after 120 s (one retry per run, which keeps the run at 4 requests);
-//                 if it still fails it is "inconclusive": logged as a warning, exit code 0, and NO
-//                 drift issue. A pure network failure is never drift.
-//   skipped       the lock or the daily budget refused the run. Exit code 0.
+//                 401/408 and a non-JSON/HTML 200 are inconclusive immediately, with no retry.
+//                 Logged as a warning, exit code 0, and NO drift issue. A pure network failure is never drift.
+//   skipped       the lock refused the run. Exit code 0.
 //
 // Results and failures name the check and the path (`itemDetail: bidHistory.bidComplete: ...`),
 // never a response body.
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -42,9 +47,10 @@ export const CANARY_QUERY = 'pyrex';
 export const CANARY_MIN_SPACING_MS = CAPTURE_MIN_SPACING_MS; // 120 s
 export const CANARY_RUN_INTERVAL_MS = 12 * 60 * 60 * 1000; // lock: one run per 12 h
 export const CANARY_DAY_MS = 24 * 60 * 60 * 1000;
-export const CANARY_MAX_REQUESTS_PER_DAY = 4;
 export const CANARY_REQUESTS_PER_RUN = 3;
 export const CANARY_MAX_RETRIES = 1;
+/** Checks plus the single retry. Counted per run, not across a rolling day. */
+export const CANARY_MAX_REQUESTS_PER_RUN = CANARY_REQUESTS_PER_RUN + CANARY_MAX_RETRIES;
 export const CANARY_API_TIMEOUT_MS = 30_000;
 export const CANARY_ISSUE_TITLE = 'SGW drift detected';
 
@@ -149,7 +155,8 @@ export function loadState(file: string, now: number): CanaryState {
   const o = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
   const nums = (v: unknown): number[] => (Array.isArray(v) ? v.filter((x): x is number => typeof x === 'number' && Number.isFinite(x)) : []);
   const ended = typeof o['lastRequestEndedAt'] === 'number' && Number.isFinite(o['lastRequestEndedAt']) ? o['lastRequestEndedAt'] : 0;
-  // Keep a little more than the 24 h window; anything in the future is clock noise and is kept (conservative).
+  // Prune history so the file stays small. The lock reads `runs` (12 h) and spacing reads
+  // `lastRequestEndedAt`, which is not pruned. The per-run request cap does not use this history.
   return {
     runs: nums(o['runs']).filter((t) => now - t < CANARY_DAY_MS),
     requests: nums(o['requests']).filter((t) => now - t < CANARY_DAY_MS),
@@ -168,6 +175,8 @@ export function saveState(file: string, s: CanaryState): void {
 
 class Blocked extends Error {}
 class Transient extends Error {}
+/** Inconclusive immediately: no retry, and not drift. */
+class InconclusiveNow extends Error {}
 class Drift extends Error {
   constructor(
     readonly failure: CanaryFailure,
@@ -202,19 +211,12 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
   };
   const state = loadState(opts.stateFile, startedMs);
 
-  // Lock: one run per 12 h. `force` bypasses only this check.
+  // Lock: one run per 12 h. `force` bypasses only this check. Open at exactly 12 h (`<`, not `<=`).
   const lastRun = state.runs.length > 0 ? Math.max(...state.runs) : 0;
   if (!opts.force && lastRun > 0 && startedMs - lastRun < CANARY_RUN_INTERVAL_MS) {
     const hrs = ((startedMs - lastRun) / 3_600_000).toFixed(1);
     result.status = 'skipped';
     result.reason = `locked: last run ${hrs} h ago (minimum 12 h); set force to override`;
-    opts.log(result.reason);
-    return result;
-  }
-  // Budget: at most 4 requests per rolling 24 h; force does not bypass it.
-  if (state.requests.length + CANARY_REQUESTS_PER_RUN > CANARY_MAX_REQUESTS_PER_DAY) {
-    result.status = 'skipped';
-    result.reason = `daily budget: ${String(state.requests.length)} requests in the last 24 h, a run needs ${String(CANARY_REQUESTS_PER_RUN)} (cap ${String(CANARY_MAX_REQUESTS_PER_DAY)})`;
     opts.log(result.reason);
     return result;
   }
@@ -227,7 +229,9 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
   async function spaced<T>(label: string, realUrl: string, method: string, send: (url: string) => Promise<T>): Promise<T> {
     for (;;) {
       assertAllowed(realUrl, method);
-      if (state.requests.length >= CANARY_MAX_REQUESTS_PER_DAY) throw new Blocked(`${label}: daily request budget exhausted`);
+      if (result.requestsMade >= CANARY_MAX_REQUESTS_PER_RUN) {
+        throw new Blocked(`${label}: per-run request cap of ${String(CANARY_MAX_REQUESTS_PER_RUN)} exhausted`);
+      }
       const wait = state.lastRequestEndedAt + CANARY_MIN_SPACING_MS - opts.now();
       if (wait > 0) {
         opts.log(`waiting ${String(Math.ceil(wait / 1000))} s before ${label}`);
@@ -241,7 +245,7 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
       try {
         return await send(actualUrl(realUrl, opts));
       } catch (e) {
-        if (e instanceof Transient && retriesUsed < CANARY_MAX_RETRIES && state.requests.length < CANARY_MAX_REQUESTS_PER_DAY) {
+        if (e instanceof Transient && retriesUsed < CANARY_MAX_RETRIES && result.requestsMade < CANARY_MAX_REQUESTS_PER_RUN) {
           retriesUsed += 1;
           opts.log(`${label}: ${e.message}; retrying once after the 120 s spacing`);
           continue;
@@ -264,15 +268,20 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
       throw new Transient(`${check}: network error (${describeError(e)})`);
     }
     if (res.status === 403 || res.status === 429) throw new Blocked(`${check}: HTTP ${String(res.status)} (blocked or rate limited)`);
+    if (res.status === 401 || res.status === 408) throw new InconclusiveNow(`${check}: HTTP ${String(res.status)} (inconclusive)`);
     if (res.status >= 500) throw new Transient(`${check}: HTTP ${String(res.status)}`);
     if (res.status !== 200) {
       throw new Drift({ check, path: 'http.status', message: `${check}: unexpected HTTP ${String(res.status)}` });
     }
+    const contentType = res.headers.get('content-type') ?? '';
+    if (/text\/html/i.test(contentType)) {
+      // A maintenance or challenge page, not a schema. Do not parse it as JSON.
+      throw new InconclusiveNow(`${check}: HTTP 200 HTML (maintenance or challenge page)`);
+    }
     try {
       return (await res.json()) as unknown;
     } catch {
-      // A 200 that is not JSON is not a network blip: SGW answered with something else.
-      throw new Drift({ check, path: '(body)', message: `${check}: HTTP 200 but the body is not JSON` });
+      throw new InconclusiveNow(`${check}: HTTP 200 but the body is not JSON`);
     }
   }
 
@@ -345,6 +354,7 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
             throw new Transient(`itemPage: ${describeError(e)}`);
           }
           if (r.challenged || r.status === 403 || r.status === 429) throw new Blocked(`itemPage: HTTP ${String(r.status)} or challenge page`);
+          if (r.status === 401 || r.status === 408) throw new InconclusiveNow(`itemPage: HTTP ${String(r.status)} (inconclusive)`);
           if (r.status >= 500) throw new Transient(`itemPage: HTTP ${String(r.status)}`);
           return r;
         });
@@ -362,12 +372,12 @@ export async function runCanary(opts: CanaryOptions): Promise<CanaryResult> {
           }
         }
       } catch (e) {
-        if (e instanceof Transient || e instanceof Blocked) inconclusive('itemPage', e);
+        if (e instanceof Transient || e instanceof Blocked || e instanceof InconclusiveNow) inconclusive('itemPage', e);
         else throw e;
       }
     }
   } catch (e) {
-    if (e instanceof Transient || e instanceof Blocked) inconclusive('search/itemDetail', e);
+    if (e instanceof Transient || e instanceof Blocked || e instanceof InconclusiveNow) inconclusive('search/itemDetail', e);
     else throw e;
   }
 
@@ -433,6 +443,158 @@ export function honestUserAgent(): string {
   return `ShopBadwill-canary/1 (+${where}; nightly read-only schema check, 3 requests/day)`;
 }
 
+/** Strip C0 controls, DEL and newlines, and break `@mentions` with a zero-width space. */
+export function sanitizeCanaryMessage(text: string): string {
+  let out = '';
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code <= 31 || code === 127) continue;
+    out += code === 64 ? '@\u200B' : ch;
+  }
+  return out;
+}
+
+export function shouldOpenDriftIssue(status: CanaryStatus): boolean {
+  return status === 'drift';
+}
+
+/** Sorted unique check names. The same set on the next night does not get a new comment. */
+export function failingCheckFingerprint(failures: readonly { check: string }[]): string {
+  const checks = new Set<string>();
+  for (const f of failures) {
+    const clean = f.check.replace(/[^a-zA-Z0-9_-]/g, '');
+    if (clean !== '') checks.add(clean);
+  }
+  return [...checks].sort().join(',');
+}
+
+export function readDriftFingerprint(text: string): string | null {
+  // A fresh regex each call: a shared /g pattern keeps lastIndex and skips later reads.
+  const mark = /<!-- canary-fingerprint:([a-zA-Z0-9_-]*(?:,[a-zA-Z0-9_-]+)*) -->/g;
+  let last: string | null = null;
+  for (const match of text.matchAll(mark)) last = match[1] ?? null;
+  return last;
+}
+
+export function latestDriftFingerprint(issue: { body: string; comments: readonly { body: string }[] }): string | null {
+  for (let i = issue.comments.length - 1; i >= 0; i--) {
+    const comment = issue.comments[i];
+    if (comment === undefined) continue;
+    const fp = readDriftFingerprint(comment.body);
+    if (fp !== null) return fp;
+  }
+  return readDriftFingerprint(issue.body);
+}
+
+export function decideDriftIssueAction(input: {
+  status: CanaryStatus;
+  failures: readonly { check: string }[];
+  existing: { body: string; comments: readonly { body: string }[] } | null;
+}): 'create' | 'comment' | 'silent' {
+  if (!shouldOpenDriftIssue(input.status)) return 'silent';
+  if (input.existing === null) return 'create';
+  const next = failingCheckFingerprint(input.failures);
+  return latestDriftFingerprint(input.existing) === next ? 'silent' : 'comment';
+}
+
+function issueCell(text: string): string {
+  return sanitizeCanaryMessage(text).replaceAll('|', ' ');
+}
+
+export function buildDriftIssueBody(result: CanaryResult, runUrl: string): string {
+  const fp = failingCheckFingerprint(result.failures);
+  const rows = result.failures.map((f) => `| \`${issueCell(f.check)}\` | \`${issueCell(f.path)}\` | ${issueCell(f.message)} |`);
+  return [
+    'The nightly SGW canary found that SGW no longer matches our schemas or selectors.',
+    '',
+    `Run: ${sanitizeCanaryMessage(runUrl)}`,
+    `Time: ${sanitizeCanaryMessage(result.startedAt)}`,
+    '',
+    '| check | path | detail |',
+    '| --- | --- | --- |',
+    ...rows,
+    '',
+    'No response bodies are recorded here. Fix the adapter (src/adapters/sgw/*) and re-capture fixtures (S-1).',
+    '',
+    `<!-- canary-fingerprint:${fp} -->`,
+  ].join('\n');
+}
+
+export function workflowAnnotations(result: Pick<CanaryResult, 'failures' | 'inconclusive'>): string[] {
+  const lines: string[] = [];
+  for (const f of result.failures) {
+    lines.push(`::error::${sanitizeCanaryMessage(`SGW drift: ${f.check} ${f.path}: ${f.message}`)}`);
+  }
+  for (const f of result.inconclusive) {
+    lines.push(`::warning::${sanitizeCanaryMessage(`SGW canary inconclusive: ${f.check}: ${f.message}`)}`);
+  }
+  return lines;
+}
+
+interface ListedIssue {
+  number: number;
+  title: string;
+}
+
+function parseIssueList(raw: string): ListedIssue[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) throw new Error('canary: gh issue list was not an array');
+  const out: ListedIssue[] = [];
+  for (const item of parsed) {
+    if (typeof item !== 'object' || item === null) continue;
+    const o = item as Record<string, unknown>;
+    if (typeof o['number'] !== 'number' || typeof o['title'] !== 'string') continue;
+    out.push({ number: o['number'], title: o['title'] });
+  }
+  return out;
+}
+
+function parseIssueView(raw: string): { body: string; comments: { body: string }[] } {
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== 'object' || parsed === null) throw new Error('canary: gh issue view was not an object');
+  const o = parsed as Record<string, unknown>;
+  const body = typeof o['body'] === 'string' ? o['body'] : '';
+  const comments: { body: string }[] = [];
+  if (Array.isArray(o['comments'])) {
+    for (const c of o['comments']) {
+      if (typeof c !== 'object' || c === null) continue;
+      const bodyText = (c as Record<string, unknown>)['body'];
+      comments.push({ body: typeof bodyText === 'string' ? bodyText : '' });
+    }
+  }
+  return { body, comments };
+}
+
+export function syncDriftIssue(opts: {
+  result: CanaryResult;
+  runUrl: string;
+  bodyFile: string;
+  gh: (args: readonly string[]) => string;
+}): 'created' | 'commented' | 'unchanged' | 'not-drift' {
+  if (!shouldOpenDriftIssue(opts.result.status)) return 'not-drift';
+  const listed = parseIssueList(opts.gh([
+    'issue', 'list', '--state', 'open',
+    '--search', '"SGW drift detected" in:title',
+    '--json', 'number,title',
+  ]));
+  const found = listed.find((issue) => issue.title === CANARY_ISSUE_TITLE);
+  const writeBody = (): void => {
+    mkdirSync(path.dirname(opts.bodyFile), { recursive: true });
+    writeFileSync(opts.bodyFile, buildDriftIssueBody(opts.result, opts.runUrl));
+  };
+  if (found === undefined) {
+    writeBody();
+    opts.gh(['issue', 'create', '--title', CANARY_ISSUE_TITLE, '--body-file', opts.bodyFile]);
+    return 'created';
+  }
+  const existing = parseIssueView(opts.gh(['issue', 'view', String(found.number), '--json', 'body,comments']));
+  const action = decideDriftIssueAction({ status: opts.result.status, failures: opts.result.failures, existing });
+  if (action !== 'comment') return 'unchanged';
+  writeBody();
+  opts.gh(['issue', 'comment', String(found.number), '--body-file', opts.bodyFile]);
+  return 'commented';
+}
+
 function writeOutputs(result: CanaryResult, resultFile: string): void {
   mkdirSync(path.dirname(resultFile), { recursive: true });
   writeFileSync(resultFile, JSON.stringify(result, null, 2));
@@ -441,11 +603,45 @@ function writeOutputs(result: CanaryResult, resultFile: string): void {
   const summary = process.env['GITHUB_STEP_SUMMARY'];
   if (summary !== undefined && summary !== '' && existsSync(path.dirname(summary))) {
     const lines = [`### SGW canary: ${result.status}`, `Requests made: ${String(result.requestsMade)}`];
-    if (result.reason !== undefined) lines.push(result.reason);
-    for (const f of result.failures) lines.push(`- DRIFT \`${f.check}\` \`${f.path}\`: ${f.message}`);
-    for (const f of result.inconclusive) lines.push(`- inconclusive \`${f.check}\`: ${f.message}`);
+    if (result.reason !== undefined) lines.push(sanitizeCanaryMessage(result.reason));
+    for (const f of result.failures) {
+      lines.push(`- DRIFT \`${sanitizeCanaryMessage(f.check)}\` \`${sanitizeCanaryMessage(f.path)}\`: ${sanitizeCanaryMessage(f.message)}`);
+    }
+    for (const f of result.inconclusive) {
+      lines.push(`- inconclusive \`${sanitizeCanaryMessage(f.check)}\`: ${sanitizeCanaryMessage(f.message)}`);
+    }
     appendFileSync(summary, lines.join('\n') + '\n');
   }
+}
+
+function workflowRunUrl(): string {
+  const server = process.env['GITHUB_SERVER_URL'] ?? 'https://github.com';
+  const repo = process.env['GITHUB_REPOSITORY'] ?? '';
+  const id = process.env['GITHUB_RUN_ID'] ?? '';
+  return `${server}/${repo}/actions/runs/${id}`;
+}
+
+function isCanaryResult(v: unknown): v is CanaryResult {
+  if (typeof v !== 'object' || v === null) return false;
+  const o = v as Record<string, unknown>;
+  const status = o['status'];
+  return (status === 'pass' || status === 'drift' || status === 'inconclusive' || status === 'skipped')
+    && typeof o['startedAt'] === 'string'
+    && typeof o['requestsMade'] === 'number'
+    && Array.isArray(o['failures'])
+    && Array.isArray(o['inconclusive']);
+}
+
+function syncIssueFromDisk(resultFile: string): void {
+  const parsed: unknown = JSON.parse(readFileSync(resultFile, 'utf8'));
+  if (!isCanaryResult(parsed)) throw new Error(`canary: ${resultFile} is not a canary result`);
+  const outcome = syncDriftIssue({
+    result: parsed,
+    runUrl: workflowRunUrl(),
+    bodyFile: path.join(path.dirname(resultFile), 'issue.md'),
+    gh: (args) => execFileSync('gh', [...args], { encoding: 'utf8' }),
+  });
+  console.log(`canary: drift issue ${outcome}`);
 }
 
 async function main(): Promise<void> {
@@ -454,6 +650,10 @@ async function main(): Promise<void> {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
   };
+  if (args.includes('--sync-issue')) {
+    syncIssueFromDisk(arg('--result') ?? DEFAULT_RESULT_FILE);
+    return;
+  }
   const force = args.includes('--force') || process.env['CANARY_FORCE'] === 'true';
   const stateFile = arg('--state') ?? DEFAULT_STATE_FILE;
   const resultFile = arg('--result') ?? DEFAULT_RESULT_FILE;
@@ -472,8 +672,7 @@ async function main(): Promise<void> {
   });
   writeOutputs(result, resultFile);
   console.log(`canary: ${result.status}${result.reason ? ` (${result.reason})` : ''}; ${String(result.requestsMade)} request(s)`);
-  for (const f of result.failures) console.log(`::error::SGW drift: ${f.check} ${f.path}: ${f.message}`);
-  for (const f of result.inconclusive) console.log(`::warning::SGW canary inconclusive: ${f.check}: ${f.message}`);
+  for (const line of workflowAnnotations(result)) console.log(line);
   process.exit(result.status === 'drift' ? 1 : 0);
 }
 
