@@ -14,7 +14,9 @@
 //  - Only search pages are decorated (never item pages, whose related cards
 //    use the same component). A card is decorated only from the background's
 //    rules.evaluate answer over the page's own API data: a card without that
-//    data is never hidden (unknown never holds).
+//    data is never hidden (unknown never holds). Only `hide` and `highlight`
+//    decorate: `watch` rules drive the daily job, never the page (a shared
+//    match-everything watch rule would otherwise paint every card).
 //  - Never break the page: every decoration goes through the DomAdapter (fully
 //    reversible), every failure is swallowed, and stop() restores the page.
 //    Our nodes are text-only Preact trees inside shadow roots.
@@ -336,9 +338,10 @@ export function startOverlay(deps: OverlayDeps): Overlay {
       settingsUnreadable = false;
       rawKill = false;
     } else {
-      // Keep the last good settings; with none, pause.
+      // Keep the last good settings (and any broadcast kill override); with none, pause.
       rawKill = read.killSwitch;
       settingsUnreadable = !settingsGood;
+      return;
     }
     killOverride = null;
   }
@@ -360,11 +363,12 @@ export function startOverlay(deps: OverlayDeps): Overlay {
 
   // ── results ──────────────────────────────────────────────────────────────
 
-  /** The result for the listing as it is now (possibly from an older generation), or null. */
-  function shownResult(id: ItemId): MatchResult | null {
+  /** The result for the listing as it is now, possibly from an older generation (`stale`), or null. */
+  function shownResult(id: ItemId): { result: MatchResult; stale: boolean } | null {
     const entry = results.get(id);
     const listing = listings.get(id);
-    return entry !== undefined && listing !== undefined && entry.observedAt === listing.observedAt ? entry.result : null;
+    if (entry === undefined || listing === undefined || entry.observedAt !== listing.observedAt) return null;
+    return { result: entry.result, stale: entry.gen !== generation };
   }
 
   function needsEval(id: ItemId): boolean {
@@ -419,21 +423,30 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     retryTimer = undefined;
   }
 
-  function decorationFor(result: MatchResult | null): Decoration {
-    const decision = result?.decision ?? 'none';
-    if (result === null || decision === 'none') return NONE;
-    const m = result.matched.find((x) => x.action === decision) ?? result.matched[0];
+  /**
+   * The page decoration for a shown result. Only hide and highlight decorate
+   * (watch never does). A stale result (the rules changed since) counts only
+   * the rules still present and enabled here, so a rule just disabled or
+   * deleted stops hiding even if the re-evaluation fails; precedence stays
+   * hide over highlight.
+   */
+  function decorationFor(shown: { result: MatchResult; stale: boolean } | null): Decoration {
+    if (shown === null) return NONE;
+    const { result, stale } = shown;
+    const counts = (ruleId: string): boolean => !stale || rules.get(ruleId)?.enabled === true;
+    let decision: 'hide' | 'highlight' | null = null;
+    if (stale) {
+      if (result.matched.some((x) => x.action === 'hide' && counts(x.ruleId))) decision = 'hide';
+      else if (result.matched.some((x) => x.action === 'highlight' && counts(x.ruleId))) decision = 'highlight';
+    } else if (result.decision === 'hide' || result.decision === 'highlight') {
+      decision = result.decision;
+    }
+    if (decision === null) return NONE;
+    const m = result.matched.find((x) => x.action === decision && counts(x.ruleId));
     if (m === undefined) return NONE;
     const name = ruleName(m.ruleId);
-    const tone = rules.get(m.ruleId)?.tone;
-    switch (decision) {
-      case 'hide':
-        return { kind: 'hide', ruleId: m.ruleId, ruleName: name };
-      case 'highlight':
-        return { kind: 'highlight', label: name, ruleId: m.ruleId, tone: tone ?? 'green' };
-      case 'watch':
-        return { kind: 'highlight', label: `Watch: ${name}`, ruleId: m.ruleId, tone: tone ?? 'blue' };
-    }
+    if (decision === 'hide') return { kind: 'hide', ruleId: m.ruleId, ruleName: name };
+    return { kind: 'highlight', label: name, ruleId: m.ruleId, tone: rules.get(m.ruleId)?.tone ?? 'green' };
   }
 
   // ── decorations ──────────────────────────────────────────────────────────
@@ -495,8 +508,10 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   function applyAll(): void {
     const t = now();
     for (const card of cards) {
-      const result = shownResult(card.itemId);
-      const deco = decorationFor(result);
+      const shown = shownResult(card.itemId);
+      const deco = decorationFor(shown);
+      // Why? explains decorated cards only (never a watch-only or dropped match).
+      const result = deco.kind === 'hide' || deco.kind === 'highlight' ? (shown?.result ?? null) : null;
       const prev = decorated.get(card.root);
       if (prev !== undefined && prev.card.itemId !== card.itemId) {
         // The site reused this card for another item.

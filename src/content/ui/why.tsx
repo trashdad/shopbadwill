@@ -4,11 +4,16 @@
 // it). Every string (the listing title from the page, rule names, details) is
 // rendered as text.
 //
-// A native modal <dialog> (fix round 1): top layer, the page behind it inert,
-// Escape handled by the browser ('cancel' -> 'close'). Focus moves in when it
-// opens, Tab and Shift+Tab wrap inside it, and Escape, Close or a click on the
-// backdrop close it and return focus to the Why? button.
-import type { VNode } from 'preact';
+// A native modal <dialog>: top layer, the page behind it inert, Escape handled
+// by the browser ('cancel' -> 'close'). Focus moves in when it opens, Tab and
+// Shift+Tab wrap inside it, and Escape, Close or a click on the backdrop close
+// it and return focus to the Why? button.
+//
+// The button and the dialog are separate components (fix round 2): the card
+// tools render the dialog OUTSIDE their hover/focus panel, so the dialog never
+// depends on that panel being visible (a hidden ancestor would leave an inert,
+// invisible modal). `Why` is the two together, for hosts without such a panel.
+import type { Ref, VNode } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 
 import type { MatchResult } from '../../domain/rules/schema';
@@ -44,15 +49,30 @@ function activeIn(el: Element | null): Element | null {
   return root instanceof ShadowRoot || root instanceof Document ? root.activeElement : null;
 }
 
-export function Why({ result, ruleName, title, client }: WhyProps): VNode {
-  const [open, setOpen] = useState(false);
+export function WhyButton(props: { open: boolean; onToggle: () => void; buttonRef: Ref<HTMLButtonElement> }): VNode {
+  return (
+    <button
+      ref={props.buttonRef}
+      type="button"
+      data-action="why"
+      aria-haspopup="dialog"
+      aria-expanded={props.open}
+      onClick={props.onToggle}
+    >
+      Why?
+    </button>
+  );
+}
+
+/** The modal dialog: mounting it opens it. `onDone` runs once, after it closed (however that happened). */
+export function WhyDialog({ result, ruleName, title, client, onDone }: WhyProps & { onDone: () => void }): VNode {
   const [status, setStatus] = useState('');
-  const button = useRef<HTMLButtonElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
+  const finished = useRef(false);
 
   useLayoutEffect(() => {
     const d = dialog.current;
-    if (!open || d === null) return;
+    if (d === null) return;
     if (!d.open) {
       try {
         d.showModal();
@@ -61,13 +81,12 @@ export function Why({ result, ruleName, title, client }: WhyProps): VNode {
       }
     }
     focusables(d)[0]?.focus();
-  }, [open]);
+  }, []);
 
-  /** Runs once the dialog is closed, however that happened. */
   const finish = (): void => {
-    setOpen(false);
-    setStatus('');
-    button.current?.focus();
+    if (finished.current) return;
+    finished.current = true;
+    onDone();
   };
   const close = (): void => {
     const d = dialog.current;
@@ -116,76 +135,86 @@ export function Why({ result, ruleName, title, client }: WhyProps): VNode {
 
   const unknown = result.unknownConditions;
   return (
+    <dialog
+      ref={dialog}
+      class="pop"
+      role="dialog"
+      aria-labelledby="sbw-why-h"
+      onKeyDown={onKeyDown}
+      onClose={finish}
+      onClick={(e) => {
+        if (e.target === dialog.current) close(); // the backdrop
+      }}
+    >
+      <div class="pop-body">
+        <p id="sbw-why-h" class="pop-h">
+          {HEADING[result.decision]}
+        </p>
+        {title === null ? null : <p class="pop-title">{title}</p>}
+        {result.matched.map((m) => (
+          <div key={m.ruleId}>
+            <p class="rule">
+              {ACTION[m.action]} rule: {ruleName(m.ruleId)}
+            </p>
+            <ul>
+              {m.reasons.map((r, i) => (
+                <li key={i} data-reason={String(r.conditionIndex)}>
+                  {r.detail}
+                </li>
+              ))}
+            </ul>
+            {client === null ? null : (
+              <button
+                type="button"
+                data-action="disable-rule"
+                data-rule-id={m.ruleId}
+                onClick={(e) => {
+                  disable(e, m.ruleId);
+                }}
+              >
+                Disable rule
+              </button>
+            )}
+          </div>
+        ))}
+        {unknown > 0 ? (
+          <p class="note">
+            {unknown === 1 ? '1 condition' : `${String(unknown)} conditions`} could not be checked (the page did not show that
+            data). An unknown condition never hides a listing.
+          </p>
+        ) : null}
+        <p class="status" role="status" data-why-status="">
+          {status}
+        </p>
+        <button type="button" data-action="close-why" onClick={close}>
+          Close
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+/** Why? button and dialog together (the stub row, which has no hover panel). */
+export function Why(props: WhyProps): VNode {
+  const [open, setOpen] = useState(false);
+  const button = useRef<HTMLButtonElement>(null);
+  return (
     <span class="why">
-      <button
-        ref={button}
-        type="button"
-        data-action="why"
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        onClick={() => {
+      <WhyButton
+        open={open}
+        buttonRef={button}
+        onToggle={() => {
           setOpen(!open);
         }}
-      >
-        Why?
-      </button>
+      />
       {open ? (
-        <dialog
-          ref={dialog}
-          class="pop"
-          role="dialog"
-          aria-labelledby="sbw-why-h"
-          onKeyDown={onKeyDown}
-          onClose={finish}
-          onClick={(e) => {
-            if (e.target === dialog.current) close(); // the backdrop
+        <WhyDialog
+          {...props}
+          onDone={() => {
+            setOpen(false);
+            button.current?.focus();
           }}
-        >
-          <div class="pop-body">
-            <p id="sbw-why-h" class="pop-h">
-              {HEADING[result.decision]}
-            </p>
-            {title === null ? null : <p class="pop-title">{title}</p>}
-            {result.matched.map((m) => (
-              <div key={m.ruleId}>
-                <p class="rule">
-                  {ACTION[m.action]} rule: {ruleName(m.ruleId)}
-                </p>
-                <ul>
-                  {m.reasons.map((r, i) => (
-                    <li key={i} data-reason={String(r.conditionIndex)}>
-                      {r.detail}
-                    </li>
-                  ))}
-                </ul>
-                {client === null ? null : (
-                  <button
-                    type="button"
-                    data-action="disable-rule"
-                    data-rule-id={m.ruleId}
-                    onClick={(e) => {
-                      disable(e, m.ruleId);
-                    }}
-                  >
-                    Disable rule
-                  </button>
-                )}
-              </div>
-            ))}
-            {unknown > 0 ? (
-              <p class="note">
-                {unknown === 1 ? '1 condition' : `${String(unknown)} conditions`} could not be checked (the page did not show
-                that data). An unknown condition never hides a listing.
-              </p>
-            ) : null}
-            <p class="status" role="status" data-why-status="">
-              {status}
-            </p>
-            <button type="button" data-action="close-why" onClick={close}>
-              Close
-            </button>
-          </div>
-        </dialog>
+        />
       ) : null}
     </span>
   );

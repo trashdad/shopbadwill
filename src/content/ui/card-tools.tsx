@@ -5,8 +5,11 @@
 // TOOLS_CSS), so fixed-height cards keep their "Quick Bid" line. Only a small
 // handle shows; the panel opens on hover, on keyboard focus, or when the
 // handle is pressed.
+//
+// Fix round 2: the Why? dialog is rendered outside that panel, and the panel is
+// forced open while the dialog is open (so focus can return to Why? on close).
 import { Component, type ComponentChildren, type VNode } from 'preact';
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 import type { MatchResult } from '../../domain/rules/schema';
 import type { Settings } from '../../domain/settings/schema';
@@ -14,11 +17,12 @@ import type { ItemId, Listing } from '../../domain/types';
 import type { MessagingClient } from '../../ports/messaging';
 import type { CardBadge, CardBadgeProps } from './badge-registry';
 import { QuickActions } from './quick-actions';
-import { Why } from './why';
+import { WhyButton, WhyDialog } from './why';
 
 export interface CardToolsProps {
   itemId: ItemId;
   listing: Listing | null;
+  /** The match to explain with Why? (a hide or highlight), or null for no Why?. */
   result: MatchResult | null;
   ruleName: (ruleId: string) => string;
   settings: Settings;
@@ -47,6 +51,13 @@ class BadgeBoundary extends Component<{ id: string; children?: ComponentChildren
 
 export function CardTools(p: CardToolsProps): VNode {
   const [open, setOpen] = useState(false);
+  const [whyOpen, setWhyOpen] = useState(false);
+  const whyButton = useRef<HTMLButtonElement>(null);
+  const why = p.result;
+  const whyShown = whyOpen && why !== null;
+  useEffect(() => {
+    if (why === null && whyOpen) setWhyOpen(false); // the match went away (e.g. its rule was turned off)
+  }, [why, whyOpen]);
   const badgeProps: CardBadgeProps = {
     itemId: p.itemId,
     listing: p.listing,
@@ -56,7 +67,7 @@ export function CardTools(p: CardToolsProps): VNode {
     now: p.now,
   };
   return (
-    <div class={open ? 'tools open' : 'tools'}>
+    <div class={open || whyShown ? 'tools open' : 'tools'}>
       <button
         type="button"
         class="handle"
@@ -76,11 +87,29 @@ export function CardTools(p: CardToolsProps): VNode {
             <b.Component {...badgeProps} />
           </BadgeBoundary>
         ))}
-        {p.result !== null && p.result.decision !== 'none' ? (
-          <Why result={p.result} ruleName={p.ruleName} title={p.listing?.title ?? null} client={p.client} />
-        ) : null}
+        {why === null ? null : (
+          <WhyButton
+            open={whyShown}
+            buttonRef={whyButton}
+            onToggle={() => {
+              setWhyOpen(!whyOpen);
+            }}
+          />
+        )}
         <QuickActions itemId={p.itemId} listing={p.listing} quickFavorite={p.settings.overlay.quickFavorite} client={p.client} />
       </div>
+      {whyShown ? (
+        <WhyDialog
+          result={why}
+          ruleName={p.ruleName}
+          title={p.listing?.title ?? null}
+          client={p.client}
+          onDone={() => {
+            setWhyOpen(false);
+            whyButton.current?.focus();
+          }}
+        />
+      ) : null}
     </div>
   );
 }

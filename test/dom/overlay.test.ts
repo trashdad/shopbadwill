@@ -214,6 +214,8 @@ interface SetupOpts {
   retryMs?: number;
   /** Raw `sbw:settings` record (overrides `settings`), e.g. an invalid one. */
   rawSettings?: unknown;
+  /** Every storage read rejects (e.g. the extension context is going away). */
+  storageGetThrows?: boolean;
   /** Runs on the loaded fixture before the overlay starts. */
   prepare?: () => void;
 }
@@ -250,7 +252,10 @@ async function setup(opts: SetupOpts = {}) {
   const overlay = startOverlay({
     win: window,
     messaging: m,
-    storage,
+    storage:
+      opts.storageGetThrows === true
+        ? { get: () => Promise.reject(new Error('storage unavailable')), onChanged: (cb) => storage.onChanged(cb) }
+        : storage,
     getUrl: () => loc.href,
     now: () => NOW,
     debounceMs: opts.debounceMs ?? 10,
@@ -270,6 +275,19 @@ async function setup(opts: SetupOpts = {}) {
     loc,
     decide(id: number, r: Rule, details?: string[]): void {
       decisions.set(id, hit(id, r, details));
+    },
+    /** A result matching several rules; `decision` per the engine's precedence. */
+    decideAll(id: number, decision: MatchResult['decision'], matchedRules: Rule[]): void {
+      decisions.set(id, {
+        itemId: id,
+        decision,
+        matched: matchedRules.map((r) => ({
+          ruleId: r.id,
+          action: r.action,
+          reasons: [{ ruleId: r.id, conditionIndex: 0, field: 'title', detail: DETAIL }],
+        })),
+        unknownConditions: 0,
+      });
     },
     /** Tap-relays a search reply for every card on the page and waits for the decorations. */
     async feed(patch?: (row: Record<string, unknown>, i: number) => void): Promise<void> {
@@ -1186,5 +1204,119 @@ describe('fix round 1: settings fail closed, memory, layout, dim', () => {
     expect(count('[data-sbw-stub]')).toBe(1);
     // Straight from collapsed to dimmed: the card is never shown plainly in between.
     expect(states.filter((st) => !/display:\s*none|opacity/.test(st))).toEqual([]);
+  });
+});
+
+describe('fix round 2', () => {
+  it('N1: the tools-panel Why? dialog lives outside the hover-only panel, which stays forced open while it is open', async () => {
+    const s = await setup();
+    const id = s.ids[2] ?? 0;
+    s.decide(id, HL);
+    await s.feed();
+    const root = toolsRoot(id);
+    const tools = (): Element | null => root.querySelector('.tools');
+    expect(tools()?.classList.contains('open')).toBe(false);
+    click(button(root, 'why'), true);
+    await tick();
+    const dialog = root.querySelector('dialog');
+    expect(dialog?.open).toBe(true);
+    // Its visibility never depends on the hover/focus panel...
+    expect(dialog?.closest('.panel')).toBeNull();
+    // ...and the panel (with the Why? button focus returns to) is forced visible meanwhile.
+    expect(tools()?.classList.contains('open')).toBe(true);
+    expect(button(root, 'why').getAttribute('aria-expanded')).toBe('true');
+    // Clicking plain text inside the dialog keeps it open.
+    const heading = dialog?.querySelector('.pop-h');
+    if (heading == null) throw new Error('no heading');
+    click(heading, true);
+    await tick();
+    expect(root.querySelector('dialog')?.open).toBe(true);
+    // Closing releases the panel and returns focus to Why?.
+    click(button(root, 'close-why'), true);
+    await tick();
+    expect(root.querySelector('dialog')).toBeNull();
+    expect(tools()?.classList.contains('open')).toBe(false);
+    expect(root.activeElement).toBe(button(root, 'why'));
+    expect(button(root, 'why').getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('watch-only matches are never decorated (a match-everything watch rule paints nothing); highlight still does', async () => {
+    const everything = rule('sbw-match-everything', 'Match everything', 'watch');
+    const s = await setup({ rules: [everything, HIDE, HL] });
+    for (const id of s.ids) s.decide(id, everything);
+    const hl = s.ids[3] ?? 0;
+    const hidden = s.ids[4] ?? 0;
+    s.decideAll(hl, 'highlight', [HL, everything]);
+    s.decideAll(hidden, 'hide', [HIDE, everything]);
+    await s.feed();
+    expect(count('[data-sbw-label]')).toBe(1);
+    expect(cardRoot(hl).querySelector('[data-sbw-label]')).not.toBeNull();
+    expect(count('[data-sbw-stub]')).toBe(1);
+    expect(isHidden(hidden)).toBe(true);
+    expect(barText()).toBe('1 hidden · Show');
+    // No Why? either on a watch-only card.
+    expect(toolsRoot(s.ids[0] ?? 0).querySelector('button[data-action="why"]')).toBeNull();
+    expect(toolsRoot(hl).querySelector('button[data-action="why"]')).not.toBeNull();
+  });
+
+  it.each(['disabled', 'deleted'] as const)(
+    'N2: a previous-generation hide whose rule was %s locally is dropped even when re-evaluation fails',
+    async (how) => {
+      const s = await setup({ retryMs: 60_000 });
+      const a = s.ids[0] ?? 0;
+      const b = s.ids[1] ?? 0;
+      s.decide(a, HIDE);
+      s.decide(b, HL);
+      await s.feed();
+      expect(isHidden(a)).toBe(true);
+      s.fail.add('rules.evaluate');
+      const next = how === 'disabled' ? [{ ...HIDE, enabled: false }, HL] : [HL];
+      await s.storage.set({ 'sbw:rules': next });
+      await vi.waitFor(() => {
+        expect(isHidden(a)).toBe(false);
+      });
+      expect(count('[data-sbw-stub]')).toBe(0);
+      // The highlight's rule is still enabled: its (stale) decoration stays.
+      expect(cardRoot(b).querySelector('[data-sbw-label]')).not.toBeNull();
+    },
+  );
+
+  it('N2: "Disable rule" then a failing re-evaluation never leaves "Hidden by rule: Unnamed rule"', async () => {
+    const s = await setup({ retryMs: 60_000 });
+    const a = s.ids[0] ?? 0;
+    s.decide(a, HIDE);
+    await s.feed();
+    s.fail.add('rules.evaluate');
+    // What the background does on rules.disable: store the rule disabled, broadcast rules.changed.
+    await s.storage.set({ 'sbw:rules': [{ ...HIDE, enabled: false }, HL] });
+    s.m.broadcast('rules.changed', undefined);
+    await vi.waitFor(() => {
+      expect(isHidden(a)).toBe(false);
+    });
+    expect(count('[data-sbw-stub]')).toBe(0);
+  });
+
+  it('N3: an unreadable settings record does not clear a broadcast kill override', async () => {
+    const s = await setup();
+    s.decide(s.ids[0] ?? 0, HIDE);
+    await s.feed();
+    s.m.broadcast('switches.changed', { killSwitch: true, writesAllowed: {} });
+    await s.overlay.scan();
+    expect(barText()).toBe('ShopBadwill paused (kill switch)');
+    await s.storage.set({ 'sbw:settings': { schemaVersion: 2, junk: true } });
+    await s.overlay.scan();
+    await tick();
+    expect(barText()).toBe('ShopBadwill paused (kill switch)');
+    expect(count('[data-sbw-stub], [data-sbw-tools]')).toBe(0);
+  });
+
+  it('N4: a storage read that throws pauses the overlay (fail closed); the tap still feeds the background', async () => {
+    const s = await setup({ storageGetThrows: true });
+    s.decide(s.ids[0] ?? 0, HIDE);
+    await s.feed();
+    expect(barText()).toBe('ShopBadwill paused (settings unreadable)');
+    expect(count('[data-sbw-stub], [data-sbw-tools]')).toBe(0);
+    expect(sentOf(s.m, 'rules.evaluate')).toEqual([]);
+    expect(sentOf(s.m, 'page.listings')).toHaveLength(1);
   });
 });
