@@ -615,6 +615,52 @@ describe('kill switch: disarm-all (R1, R2, R6)', () => {
     expect(shared.http.requests).toHaveLength(0);
   });
 
+  it('a disarm refused for a reason it did not expect is audited as a failure, never dropped silently', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1'), a2: armedSnipe('a2') } });
+    const { w, ctx } = await boot(shared);
+    const runner = getSnipeRunner(ctx);
+    if (runner === undefined) throw new Error('the snipe runner did not register');
+    const real = runner.dispatch.bind(runner);
+    // A refusal kill-disarm does not know (not finished, not sent): the snipe was NOT stopped.
+    vi.spyOn(runner, 'dispatch').mockImplementation(async (id, event, expectVersion) => {
+      if (id === 'a1' && event.type === 'disarm') {
+        return { kind: 'rejected', snipe: stored(shared, 'a1'), rejection: { reason: 'invalid-event', detail: 'a refusal nobody expected' } };
+      }
+      return real(id, event, expectVersion);
+    });
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => stored(shared, 'a2').state === 'killed' && audits(shared).some((e) => e.kind === KILL_DISARM_FAILED_KIND));
+    expect(stored(shared, 'a1').state).toBe('armed');
+    // a2's disarm wrote the snipes, so the pass ran again and retried a1: each failed try is audited.
+    const failed = audits(shared).filter((e) => e.kind === KILL_DISARM_FAILED_KIND);
+    expect(failed.length).toBeGreaterThanOrEqual(1);
+    for (const f of failed) {
+      expect(f.ref).toBe('a1');
+      expect(String(f.details.why)).toContain('a refusal nobody expected');
+    }
+    expect(audits(shared).some((e) => e.kind === 'snipe.disarm' && e.ref === 'a1')).toBe(false);
+  });
+
+  it('disarm-all still works when the badge cannot register', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1') } });
+    // Sorts before kill-disarm.ts: breaks the badge's first synchronous read.
+    const breakBadge: BackgroundModule = {
+      register: (ctx) => {
+        ctx.googleNeedsInteraction.get = () => {
+          throw new Error('the badge flag is broken');
+        };
+      },
+    };
+    const w = new LightWorker(shared, { ...JOB_MODULES, './a-break-badge.ts': breakBadge });
+    const ctx = await w.ready;
+    await flush();
+    expect(ctx.startup.registered.failed).toEqual([]);
+    expect(ctx.startup.registered.jobs).toContain('./kill-disarm.ts');
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => stored(shared, 'a1').state === 'killed');
+    expect(audits(shared).find((e) => e.kind === 'snipe.disarm')?.details).toMatchObject({ by: 'kill', why: KILL_DISARM_WHY });
+  });
+
   it('a new kill episode audits a still-sent snipe again (the dedupe is per episode)', async () => {
     const shared = makeShared({ snipes: { s1: sentSnipe('s1') } });
     const { w } = await boot(shared);

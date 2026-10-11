@@ -63,8 +63,6 @@ export function sentRefusalNote(id: string): string {
 }
 
 export function register(ctx: BackgroundContext): void {
-  registerBadge(ctx);
-
   /** Audit entries for sent snipes already written in this kill episode (R2: audited once). */
   let sentAudited = new Set<string>();
 
@@ -116,11 +114,12 @@ export function register(ctx: BackgroundContext): void {
         if (wrote) sentAudited.add(s.id);
         continue;
       }
-      // 'busy' cannot apply to a disarm (it is not an attempt event); a 'missing'
-      // snipe was removed meanwhile — nothing to stop, nothing to audit.
-      if (r.kind === 'busy') {
-        await audit(KILL_DISARM_FAILED_KIND, { itemId: s.itemId, ref: s.id, details: { why: r.detail } });
-      }
+      // A 'missing' snipe was removed meanwhile: nothing to stop, nothing to audit.
+      if (r.kind === 'missing') continue;
+      // Anything else ('busy' cannot apply to a disarm today; any other refusal)
+      // means this snipe was NOT stopped: say so, never drop it silently.
+      const why = r.kind === 'busy' ? r.detail : `${r.rejection.reason}: ${r.rejection.detail}`;
+      await audit(KILL_DISARM_FAILED_KIND, { itemId: s.itemId, ref: s.id, details: { why } });
     }
   };
 
@@ -169,4 +168,11 @@ export function register(ctx: BackgroundContext): void {
   });
   // The worker started (or the switch was already on before register): catch the already-on state.
   if (ctx.switches.view().killSwitch) trigger();
+
+  // The badge last, and isolated: the emergency stop above never depends on it.
+  try {
+    registerBadge(ctx);
+  } catch (e) {
+    console.warn('kill-disarm: the action badge could not register', e);
+  }
 }
