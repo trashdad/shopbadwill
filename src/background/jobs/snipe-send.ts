@@ -28,6 +28,7 @@
 //   whose amount is not that max sends nothing.
 // - R6. Any resolved reply, including `rejected-unknown`, is a `result`; the
 //   classifier handles it. It is never a reason to resend.
+// - A dry-run snipe sends nothing here either (the runner drops it first).
 //
 // Worker death between persist and send (R5) is the runner's own path: the
 // restart finds `sent {key}` stored with no reply, marks the attempt ambiguous
@@ -122,6 +123,15 @@ async function resolveAmbiguous(req: SendRequest, deps: SendDeps, error: unknown
  */
 export const IDEMPOTENT_SEND_STRATEGY: SendStrategy = {
   async send(req, deps) {
+    // A dry run never sends. The runner drops it before calling here, but a
+    // per-snipe dry run under live global bidding passes the adapter's write
+    // gate, so this strategy refuses it too.
+    if (req.snipe.dryRun) {
+      return {
+        kind: 'not-sent',
+        error: new BidNotSentError('paused', 'placeBid: a dry run never sends; nothing was sent'),
+      };
+    }
     // The wire amount is the snipe max. A request that names another amount
     // is damaged: send nothing rather than bid it.
     if (req.amount !== req.snipe.maxBid) {

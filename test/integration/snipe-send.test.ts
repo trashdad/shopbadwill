@@ -604,6 +604,42 @@ describe('T-101 rulings', () => {
     expect(sends).toHaveLength(0);
   });
 
+  it('a dry-run snipe sends nothing, even if a caller routes it here (the runner drops it first)', async () => {
+    const clock = new FakeClock(T0);
+    const log: string[] = [];
+    const sends: WireSend[] = [];
+    // A per-snipe dry run under live global bidding: the adapter's write gate
+    // would let a PlaceBid through, so the strategy must refuse it itself.
+    const api = scriptedApi({ place: ['not-sent', 'ok'], proof: 'no-change' }, log, sends, clock);
+    const deps = makeDeps(api, clock, () => END - 10 * SEC);
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest({ snipe: sentSnipe({ dryRun: true }) }), deps);
+
+    expect(outcome.kind).toBe('not-sent');
+    expect(sends).toHaveLength(0);
+    expect(log).toEqual([]);
+  });
+
+  it('R0: a booted background holds this strategy, registered once through the seam', async () => {
+    const w = new LightWorker(makeShared());
+    const ctx = await w.ready;
+    expect(ctx.startup.registered.jobs.filter((f) => f === './snipe-send.ts')).toHaveLength(1);
+    expect(ctx.startup.registered.failed.map((f) => f.file)).not.toContain('./snipe-send.ts');
+    expect((snipeSeams(ctx) as unknown as { sendStrategy: SendStrategy }).sendStrategy).toBe(IDEMPOTENT_SEND_STRATEGY);
+  });
+
+  it('R0: a failed registration leaves the runner on the default one-send strategy, never a looser one', async () => {
+    const broken: BackgroundModule = {
+      register: () => {
+        throw new Error('snipe-send failed to register');
+      },
+    };
+    const w = new LightWorker(makeShared(), { ...JOB_MODULES, './snipe-send.ts': broken });
+    const ctx = await w.ready;
+    expect(ctx.startup.registered.failed.map((f) => f.file)).toContain('./snipe-send.ts');
+    expect((snipeSeams(ctx) as unknown as { sendStrategy: SendStrategy }).sendStrategy).toBe(DEFAULT_SEND_STRATEGY);
+  });
+
   it('R1: the 1.5 s check reads serverNow() after the first send returns, not a value captured before it', async () => {
     const clock = new FakeClock(END - 10 * SEC); // local clock still has 10 s; the decision must not use it
     let left = 10 * SEC;
