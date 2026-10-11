@@ -94,6 +94,7 @@ function Get-SbwQueryArgs {
 #   - WakeToRun (the wake timer), StartWhenAvailable, battery-tolerant;
 #   - Exec action = the configured browser plus its profile arguments only;
 #   - ExecutionTimeLimit PT0S so the scheduler does not kill that browser;
+#   - Priority 4 (normal) so that browser does not run below normal;
 #   - DeleteExpiredTaskAfter PT10M so fired/orphaned tasks delete themselves;
 #   - InteractiveToken / LeastPrivilege principal for the current user.
 function New-SbwTaskXml {
@@ -121,6 +122,9 @@ function New-SbwTaskXml {
   $settings.ExecutionTimeLimit = 'PT0S'
   $settings.DeleteExpiredTaskAfter = 'PT10M'
   $settings.MultipleInstances = 2   # TASK_INSTANCES_IGNORE_NEW
+  # The default 7 is BELOW_NORMAL; the browser (and every child process it
+  # starts) would keep that for its whole life. 4 = NORMAL_PRIORITY_CLASS.
+  $settings.Priority = 4
 
   $trigger = $task.Triggers.Create(1)   # TASK_TRIGGER_TIME (one-off)
   $trigger.StartBoundary = $start

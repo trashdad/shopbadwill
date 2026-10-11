@@ -152,6 +152,11 @@ Describe 'companion task XML' {
       Assert-Equal ([string](Get-SbwTestXml).Task.Settings.DeleteExpiredTaskAfter) 'PT10M'
       Assert-Equal ([string](Get-SbwTestXml).Task.Settings.MultipleInstancesPolicy) 'IgnoreNew'
     }
+    It 'starts the browser at normal priority, not the Task Scheduler default of 7 (below normal)' {
+      # The launched browser and every child process inherit the task's
+      # priority class; 4 is NORMAL_PRIORITY_CLASS.
+      Assert-Equal ([string](Get-SbwTestXml).Task.Settings.Priority) '4'
+    }
     It 'uses the exact start boundary in LOCAL wall-clock time' {
       $wakeUtc = Get-SbwTestWakeUtc
       $expected = $wakeUtc.ToLocalTime().ToString('yyyy-MM-dd\THH:mm:ss')
