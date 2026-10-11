@@ -11,8 +11,11 @@
 // Fix round 3: the dialog's host is on the document, not in the card. A collapsed
 // card is `display:none`, which would hide a modal dialog inside it and leave
 // the page inert with nothing on screen.
+// Fix round 4: that host is `useDocumentModal` (shared with the stub's Why?).
+// When Why? is not on screen any more (the card collapsed), closing focuses a
+// visible control near the card instead (`refocus`).
 import { Component, type ComponentChildren, type VNode } from 'preact';
-import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 import type { MatchResult } from '../../domain/rules/schema';
 import type { Settings } from '../../domain/settings/schema';
@@ -20,9 +23,7 @@ import type { ItemId, Listing } from '../../domain/types';
 import type { MessagingClient } from '../../ports/messaging';
 import type { CardBadge, CardBadgeProps } from './badge-registry';
 import { QuickActions } from './quick-actions';
-import { createUiHost, type UiHost } from './shadow';
-import { TOOLS_CSS } from './styles';
-import { WhyButton, WhyDialog } from './why';
+import { returnFocus, useDocumentModal, WhyButton, WhyDialog } from './why';
 
 export interface CardToolsProps {
   itemId: ItemId;
@@ -37,38 +38,8 @@ export interface CardToolsProps {
   badges: readonly CardBadge[];
   cardRoot: Element;
   now: number;
-}
-
-/**
- * Renders `dialog` into a closed shadow host on the document, outside the card.
- * Re-renders on every commit so the dialog sees fresh props. Destroying the host
- * unmounts the dialog (and its cleanup leaves the top layer).
- */
-function useDocumentDialog(open: boolean, doc: Document, itemId: ItemId, dialog: VNode | null): void {
-  const modal = useRef<UiHost | null>(null);
-  useLayoutEffect(() => {
-    if (!open || dialog === null) {
-      modal.current?.destroy();
-      modal.current = null;
-      return;
-    }
-    let host = modal.current;
-    if (host === null || !host.host.isConnected) {
-      host?.destroy();
-      host = createUiHost(doc, 'sbw-why-modal', TOOLS_CSS, { 'data-sbw-why-modal': String(itemId) });
-      doc.documentElement.append(host.host);
-      modal.current = host;
-    } else {
-      host.host.setAttribute('data-sbw-why-modal', String(itemId));
-    }
-    host.render(dialog);
-  });
-  useLayoutEffect(() => {
-    return () => {
-      modal.current?.destroy();
-      modal.current = null;
-    };
-  }, []);
+  /** Focuses a visible control near the card (the stub's Why?, the handle, else the page pill). */
+  refocus?: () => void;
 }
 
 /** Drops a badge that throws (for this card) instead of taking the row down. */
@@ -108,14 +79,15 @@ export function CardTools(p: CardToolsProps): VNode {
         ruleName={p.ruleName}
         title={p.listing?.title ?? null}
         client={p.client}
+        refocus={p.refocus}
         onDone={() => {
           setWhyOpen(false);
-          whyButton.current?.focus();
+          returnFocus(whyButton.current, p.refocus);
         }}
       />
     );
   }
-  useDocumentDialog(dialog !== null, p.cardRoot.ownerDocument, p.itemId, dialog);
+  useDocumentModal(p.cardRoot.ownerDocument, p.itemId, dialog);
   const badgeProps: CardBadgeProps = {
     itemId: p.itemId,
     listing: p.listing,

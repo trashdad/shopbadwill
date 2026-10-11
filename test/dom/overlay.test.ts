@@ -211,6 +211,20 @@ function insideHidden(el: Element): boolean {
   }
   return false;
 }
+/** The closed root of the document-level host the Why? dialog of `id` is rendered into. */
+function modalRoot(id: number): ShadowRoot {
+  return closedRoot(document.querySelector(`sbw-why-modal[data-sbw-why-modal="${String(id)}"]`));
+}
+/** The focused element, through every shadow root (closed ones too). */
+function deepActive(): Element | null {
+  let a: Element | null = document.activeElement;
+  while (a !== null) {
+    const r = a.shadowRoot ?? uiRootForTest(a) ?? shadowRootForTest(a);
+    if (r?.activeElement == null) break;
+    a = r.activeElement;
+  }
+  return a;
+}
 function sentOf(m: FakeMessaging, type: string): unknown[] {
   return m.sent.filter((s) => s.type === type).map((s) => s.payload);
 }
@@ -223,6 +237,7 @@ afterEach(() => {
   current?.stop();
   current = null;
   document.body.replaceChildren();
+  for (const host of Array.from(document.querySelectorAll('sbw-why-modal'))) host.remove();
   document.documentElement.removeAttribute(NONCE_ATTR);
   vi.restoreAllMocks();
 });
@@ -384,18 +399,19 @@ describe('tap input (untrusted)', () => {
     const why = stubWhyRoot(id);
     click(button(why, 'why'), true);
     await tick();
-    const dialog = why.querySelector('[role="dialog"]');
+    const whyModal = modalRoot(id);
+    const dialog = whyModal.querySelector('[role="dialog"]');
     expect(norm(dialog?.textContent)).toContain(evil);
     expect(norm(dialog?.textContent)).toContain("title contains '<script>'");
 
     const tools = toolsRoot(s.ids[1] ?? 0);
     click(button(tools, 'why'), true);
     await tick();
-    const toolsDialog = openDialogs().find((d) => d.getRootNode() !== why);
+    const toolsDialog = openDialogs().find((d) => d.getRootNode() !== whyModal);
     expect(norm(toolsDialog?.textContent)).toContain(evil);
     const toolsDialogRoot = toolsDialog?.getRootNode();
 
-    for (const r of [why, tools, pageRoot(), ...(toolsDialogRoot instanceof ShadowRoot ? [toolsDialogRoot] : [])]) {
+    for (const r of [why, whyModal, tools, pageRoot(), ...(toolsDialogRoot instanceof ShadowRoot ? [toolsDialogRoot] : [])]) {
       expect(r.querySelector('script, img, b')).toBeNull();
     }
     expect(document.querySelectorAll('script').length).toBe(0);
@@ -585,9 +601,9 @@ describe('Why? popover', () => {
     s.decide(b, HL, ['bids: 0 (at most 1)']);
     await s.feed();
 
-    const stub = stubWhyRoot(a);
-    click(button(stub, 'why'), true);
+    click(button(stubWhyRoot(a), 'why'), true);
     await tick();
+    const stub = modalRoot(a);
     expect(Array.from(stub.querySelectorAll('[role="dialog"] li[data-reason]')).map((li) => li.textContent)).toEqual(details);
 
     const tools = toolsRoot(b);
@@ -648,7 +664,9 @@ describe('keyboard', () => {
     why.focus();
     pressEnter(why);
     await tick();
-    const dialog = root.querySelector<HTMLElement>('[role="dialog"]');
+    // The dialog lives in its own closed host on the document (fix round 4).
+    const modal = modalRoot(id);
+    const dialog = modal.querySelector<HTMLElement>('[role="dialog"]');
     expect(dialog).not.toBeNull();
     // A native modal <dialog> (top layer, inert page, native Escape).
     expect(dialog).toBeInstanceOf(HTMLDialogElement);
@@ -656,30 +674,30 @@ describe('keyboard', () => {
     expect(showModal).toHaveBeenCalledTimes(1);
     expect(why.getAttribute('aria-expanded')).toBe('true');
     // Focus moved into the dialog.
-    expect(dialog?.contains(root.activeElement)).toBe(true);
-    const inside = tabbables(dialog ?? root);
+    expect(dialog?.contains(modal.activeElement)).toBe(true);
+    const inside = tabbables(dialog ?? modal);
     expect(inside.length).toBeGreaterThan(0);
     // Tab from the last control wraps to the first; Shift+Tab from the first wraps to the last.
     inside[inside.length - 1]?.focus();
-    pressTab(root);
-    expect(root.activeElement).toBe(inside[0]);
-    pressTab(root, true);
-    expect(root.activeElement).toBe(inside[inside.length - 1]);
+    pressTab(modal);
+    expect(modal.activeElement).toBe(inside[0]);
+    pressTab(modal, true);
+    expect(modal.activeElement).toBe(inside[inside.length - 1]);
     // Escape closes and returns focus to Why?.
-    key(root.activeElement as HTMLElement, 'Escape');
+    key(modal.activeElement as HTMLElement, 'Escape');
     await tick();
-    expect(root.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.querySelector('sbw-why-modal')).toBeNull();
     expect(root.activeElement).toBe(why);
     expect(why.getAttribute('aria-expanded')).toBe('false');
 
     // The browser closing it natively (Escape via 'cancel', or close()) syncs the state too.
     pressEnter(why);
     await tick();
-    const again = root.querySelector('dialog');
+    const again = modalRoot(id).querySelector('dialog');
     expect(again?.open).toBe(true);
     again?.close();
     await tick();
-    expect(root.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.querySelector('sbw-why-modal')).toBeNull();
     expect(why.getAttribute('aria-expanded')).toBe('false');
     expect(root.activeElement).toBe(why);
   });
@@ -689,9 +707,9 @@ describe('keyboard', () => {
     const id = s.ids[0] ?? 0;
     s.decide(id, HIDE);
     await s.feed();
-    const root = stubWhyRoot(id);
-    click(button(root, 'why'), true);
+    click(button(stubWhyRoot(id), 'why'), true);
     await tick();
+    const root = modalRoot(id);
     const disable = button(root, 'disable-rule');
     expect(disable.getAttribute('data-rule-id')).toBe('r-hide');
     disable.click();
@@ -1407,5 +1425,85 @@ describe('fix round 3', () => {
     await tick();
     const dialog = openDialogs()[0];
     expect(norm(dialog?.querySelector('.pop-h')?.textContent)).toBe('Why this listing is highlighted');
+  });
+});
+
+describe('Opus check (fix round 4)', () => {
+  it('the stub Why? dialog is on the document too, so the page hiding its results cannot hide it', async () => {
+    const s = await setup();
+    const id = s.ids[0] ?? 0;
+    s.decide(id, HIDE);
+    await s.feed();
+    click(button(stubWhyRoot(id), 'why'), true);
+    await tick();
+    const dialog = openDialogs()[0];
+    if (dialog === undefined) throw new Error('no dialog');
+    const root = dialog.getRootNode();
+    if (!(root instanceof ShadowRoot)) throw new Error('dialog is not in a shadow root');
+    expect(root.host.parentElement).toBe(document.documentElement);
+    expect(root.host.shadowRoot).toBeNull(); // closed
+    // The page hides its results (a loading state, a responsive layout swap).
+    gridContainer().setAttribute('style', 'display:none');
+    expect(insideHidden(dialog)).toBe(false);
+    // Escape: Why? and the card are hidden, so focus goes to the page pill.
+    key(button(root, 'close-why'), 'Escape');
+    await tick();
+    expect(openDialogs()).toEqual([]);
+    expect(pageRoot().activeElement).toBe(button(pageRoot(), 'show-all'));
+  });
+
+  it('closing a tools Why? after its card collapsed focuses the stub Why? of that card', async () => {
+    const s = await setup();
+    const id = s.ids[0] ?? 0;
+    s.decide(id, HIDE);
+    await s.feed();
+    click(stubShow(id), true);
+    await tick();
+    click(button(toolsRoot(id), 'why'), true);
+    await tick();
+    click(button(pageRoot(), 'hide-again'), true);
+    await tick();
+    expect(isHidden(id)).toBe(true);
+    click(button(modalRoot(id), 'close-why'), true);
+    await tick();
+    expect(openDialogs()).toEqual([]);
+    expect(deepActive()).toBe(button(stubWhyRoot(id), 'why'));
+  });
+
+  it('a Why? dialog that goes away while focused (its rule turned off) leaves focus on the card tools handle', async () => {
+    const s = await setup();
+    const id = s.ids[0] ?? 0;
+    s.decide(id, HIDE);
+    await s.feed();
+    click(button(stubWhyRoot(id), 'why'), true);
+    await tick();
+    expect(openDialogs()).toHaveLength(1);
+    s.decideAll(id, 'none', []);
+    await s.storage.set({ 'sbw:rules': [{ ...HIDE, enabled: false }, HL] });
+    await vi.waitFor(() => {
+      expect(isHidden(id)).toBe(false);
+      expect(openDialogs()).toEqual([]);
+    });
+    await vi.waitFor(() => {
+      expect(deepActive()).toBe(button(toolsRoot(id), 'tools'));
+    });
+  });
+
+  it('while a stale hide shows as a highlight, the body lists only the rules that still count', async () => {
+    const s = await setup({ retryMs: 60_000 });
+    const id = s.ids[0] ?? 0;
+    s.decideAll(id, 'hide', [HIDE, HL]);
+    await s.feed();
+    s.fail.add('rules.evaluate');
+    await s.storage.set({ 'sbw:rules': [{ ...HIDE, enabled: false }, HL] });
+    await vi.waitFor(() => {
+      expect(isHidden(id)).toBe(false);
+    });
+    click(button(toolsRoot(id), 'why'), true);
+    await tick();
+    const dialog = openDialogs()[0];
+    expect(norm(dialog?.querySelector('.pop-h')?.textContent)).toBe('Why this listing is highlighted');
+    expect(Array.from(dialog?.querySelectorAll('.rule') ?? [], (p) => norm(p.textContent))).toEqual(['Highlight rule: Cheap glass']);
+    expect(Array.from(dialog?.querySelectorAll('[data-action="disable-rule"]') ?? [], (b) => b.getAttribute('data-rule-id'))).toEqual(['r-hl']);
   });
 });

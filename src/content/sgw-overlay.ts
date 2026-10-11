@@ -55,7 +55,7 @@ import { BADGES, type CardBadge } from './ui/badge-registry';
 import { CardTools } from './ui/card-tools';
 import { createOverlayDecorationUi } from './ui/decoration-ui';
 import { PageStatus, type PageView } from './ui/page-status';
-import { createUiHost, type UiHost } from './ui/shadow';
+import { createUiHost, rendered, type UiHost } from './ui/shadow';
 import { PAGE_CSS, TOOLS_CSS } from './ui/styles';
 import { Why } from './ui/why';
 
@@ -423,6 +423,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     retryTimer = undefined;
   }
 
+  /** A matched rule still counts for a stale result only if it is present and enabled here. */
+  const stillOn = (ruleId: string): boolean => rules.get(ruleId)?.enabled === true;
+
   /**
    * The page decoration for a shown result. Only hide and highlight decorate
    * (watch never does). A stale result (the rules changed since) counts only
@@ -433,7 +436,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   function decorationFor(shown: { result: MatchResult; stale: boolean } | null): Decoration {
     if (shown === null) return NONE;
     const { result, stale } = shown;
-    const counts = (ruleId: string): boolean => !stale || rules.get(ruleId)?.enabled === true;
+    const counts = (ruleId: string): boolean => !stale || stillOn(ruleId);
     let decision: 'hide' | 'highlight' | null = null;
     if (stale) {
       if (result.matched.some((x) => x.action === 'hide' && counts(x.ruleId))) decision = 'hide';
@@ -447,6 +450,37 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     const name = ruleName(m.ruleId);
     if (decision === 'hide') return { kind: 'hide', ruleId: m.ruleId, ruleName: name };
     return { kind: 'highlight', label: name, ruleId: m.ruleId, tone: rules.get(m.ruleId)?.tone ?? 'green' };
+  }
+
+  /**
+   * What Why? explains for a card decorated `kind`. A stale result lists only the
+   * rules that still count (the ones decorationFor used), so the body matches the
+   * decoration: no "Hide rule" for a rule just turned off on a card now shown as
+   * a highlight.
+   */
+  function explained(shown: { result: MatchResult; stale: boolean }, kind: 'hide' | 'highlight'): MatchResult {
+    if (!shown.stale) return shown.result;
+    return { ...shown.result, decision: kind, matched: shown.result.matched.filter((m) => stillOn(m.ruleId)) };
+  }
+
+  /**
+   * After a Why? dialog closed or went away and its own button cannot take focus
+   * (hidden, or gone): the card's stub Why? (or dim chip), else its tools
+   * handle, else the page pill. Only rendered controls take focus.
+   */
+  function refocusNear(root: Element): void {
+    if (stopped) return;
+    for (const ui of [whys.get(root), tools.get(root)]) {
+      if (ui?.focusFirst() === true) return;
+    }
+    const container = pageContainer;
+    if (container === null) return;
+    const where = container.getRootNode();
+    for (const b of Array.from(container.querySelectorAll<HTMLElement>('button'))) {
+      if (!rendered(b)) continue;
+      b.focus();
+      if ((where instanceof ShadowRoot ? where.activeElement : doc.activeElement) === b) return;
+    }
   }
 
   // ── decorations ──────────────────────────────────────────────────────────
@@ -497,6 +531,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
           badges,
           cardRoot: card.root,
           now: t,
+          refocus: () => {
+            refocusNear(card.root);
+          },
         }),
       );
     });
@@ -507,7 +544,20 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     if (ui === undefined || result === null || shown === null || !ui.host.isConnected) return;
     const title = listings.get(card.itemId)?.title ?? null;
     safe(() => {
-      ui.render(h(Why, { result, shown, ruleName, title, client }));
+      ui.render(
+        h(Why, {
+          result,
+          shown,
+          ruleName,
+          title,
+          client,
+          itemId: card.itemId,
+          doc,
+          refocus: () => {
+            refocusNear(card.root);
+          },
+        }),
+      );
     });
   }
 
@@ -520,7 +570,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
       // `kind` is the decoration on the card, which can differ from result.decision
       // while a stale hide has fallen back to an enabled highlight.
       const kind = deco.kind === 'hide' || deco.kind === 'highlight' ? deco.kind : null;
-      const result = kind === null ? null : (entry?.result ?? null);
+      const result = kind === null || entry === null ? null : explained(entry, kind);
       const prev = decorated.get(card.root);
       if (prev !== undefined && prev.card.itemId !== card.itemId) {
         // The site reused this card for another item.
