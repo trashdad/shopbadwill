@@ -1,0 +1,543 @@
+// T-86: the kill switch's disarm-all (src/background/jobs/kill-disarm.ts) and
+// the action badge (src/background/badge.ts), run inside the real background
+// composition root (main.ts) over fakes. The popup kill section's component is
+// tested in kill-popup.test.ts (its DOM tests need the happy-dom environment,
+// which breaks `node:util` imports on this machine — see T-57's report); its
+// pure reason formatting is tested here.
+//
+// No network: FakeHttp has no scripted routes, so any request fails loudly.
+// Snipe records are seeded directly into `sbw:snipes` (valid per SnipeSchema);
+// arming through `snipe.arm` is T-84's tested path and is not re-tested here.
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fakeBrowser } from 'wxt/testing/fake-browser';
+
+import type { AuditEntry } from '../../src/domain/audit/types';
+import { defaultSettings } from '../../src/domain/settings/defaults';
+import type { Settings } from '../../src/domain/settings/schema';
+import type { Snipe } from '../../src/domain/snipe/types';
+import { STORAGE_KEYS } from '../../src/domain/storage/schema';
+import type { BackgroundContext, BackgroundModule, RuntimePort } from '../../src/background/context';
+import { HANDLER_MODULES } from '../../src/background/handlers/index';
+import { JOB_MODULES } from '../../src/background/jobs/index';
+import { getSnipeRunner } from '../../src/background/jobs/snipe-runner';
+import { BADGE_DEFAULT_COLOR, KILL_BADGE_COLOR, registerBadge } from '../../src/background/badge';
+import {
+  KILL_DISARM_FAILED_KIND,
+  KILL_DISARM_WHY,
+  KILL_SNIPE_SENT_KIND,
+} from '../../src/background/jobs/kill-disarm';
+import { startBackground, type BackgroundBrowser, type BackgroundHandle } from '../../src/background/main';
+import type { MessageResponse, RouterSender } from '../../src/background/router';
+import { section as killSection } from '../../src/entrypoints/popup/sections/kill/index';
+import { killReasons } from '../../src/entrypoints/popup/sections/kill/reasons';
+import type { KeepAlive } from '../../src/ports/keep-alive';
+import { FakeAlarms } from '../fakes/ports/fake-alarms';
+import { FakeClock } from '../fakes/ports/fake-clock';
+import { FakeHttp } from '../fakes/ports/fake-http';
+import { FakeKeepAwake } from '../fakes/ports/fake-keepawake';
+import { FakeNotifier } from '../fakes/ports/fake-notifier';
+import { FakePermissions } from '../fakes/ports/fake-permissions';
+import { FakeStorageAreas } from '../fakes/ports/fake-storage';
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const SEC = 1000;
+const MIN = 60 * SEC;
+const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
+const EXT_ID = 'test-extension-id';
+const EXT_ORIGIN = `chrome-extension://${EXT_ID}/`;
+const UI: RouterSender = { id: EXT_ID, url: `${EXT_ORIGIN}popup.html` };
+
+const T0 = Date.UTC(2026, 9, 10, 15, 0, 0);
+/** Auction end, far enough in the future that nothing wakes or reads. */
+const END = T0 + 2 * HOUR;
+const META = { schemaVersion: 1, installedAt: T0 - DAY, lastMigrationAt: T0 - DAY };
+
+function settingsWith(killSwitch: boolean): Settings {
+  return { ...defaultSettings(), killSwitch };
+}
+
+const flush = async (rounds = 3): Promise<void> => {
+  for (let i = 0; i < rounds; i++) {
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  }
+};
+
+/** Waits until `cond` holds, draining the microtask/macrotask queues (fake time never advances). */
+async function waitUntil(cond: () => boolean | Promise<boolean>, rounds = 400): Promise<void> {
+  for (let i = 0; i < rounds; i++) {
+    if (await cond()) return;
+    await flush(1);
+  }
+  throw new Error('waitUntil: the condition was not reached');
+}
+
+// ── Snipe records, seeded into storage ───────────────────────────────────────
+
+function snipe(over: Partial<Snipe> & { id: string }): Snipe {
+  const { id, ...rest } = over;
+  return {
+    id,
+    itemId: 710000000 + id.length,
+    title: `Snipe ${id}`,
+    endTime: new Date(END).toISOString(),
+    endTimeAtArm: new Date(END).toISOString(),
+    maxBid: 2000,
+    leadMs: 8000,
+    fallback: 'skip',
+    dryRun: false,
+    state: 'armed',
+    armedAt: T0 - MIN,
+    attempt: {},
+    history: [{ at: T0 - MIN, from: 'draft', to: 'armed', why: 'arm' }],
+    ...rest,
+  };
+}
+
+function armedSnipe(id: string): Snipe {
+  return snipe({ id });
+}
+
+/** A snipe whose bid may already be out (R2): a disarm is refused by the reducer. */
+function sentSnipe(id: string): Snipe {
+  return snipe({
+    id,
+    state: 'sent',
+    attempt: { idempotencyKey: `${id}:key`, sentAt: T0 - 2 * MIN, ambiguous: true },
+    history: [
+      { at: T0 - 3 * MIN, from: 'draft', to: 'armed', why: 'arm' },
+      { at: T0 - 2 * MIN, from: 'firing', to: 'sent', why: 'sent' },
+    ],
+  });
+}
+
+function resolvedSnipe(id: string): Snipe {
+  return snipe({
+    id,
+    state: 'resolved',
+    outcome: 'won',
+    attempt: {
+      idempotencyKey: `${id}:key`,
+      sentAt: T0 - 3 * MIN,
+      reply: { kind: 'accepted', rawStatus: 200, rawResult: 0, messageText: 'Bid placed', isHighBidder: true, observedAt: T0 - 2 * MIN },
+    },
+    history: [
+      { at: T0 - 4 * MIN, from: 'draft', to: 'armed', why: 'arm' },
+      { at: T0 - 3 * MIN, from: 'firing', to: 'sent', why: 'sent' },
+      { at: T0 - 2 * MIN, from: 'sent', to: 'resolved', why: 'post-read' },
+    ],
+  });
+}
+
+function draftSnipe(id: string): Snipe {
+  return snipe({ id, state: 'draft', history: [] });
+}
+
+// ── The background over fakes ────────────────────────────────────────────────
+
+interface Shared {
+  clock: FakeClock;
+  areas: FakeStorageAreas;
+  alarms: FakeAlarms;
+  http: FakeHttp;
+  notifier: FakeNotifier;
+  keepAwake: FakeKeepAwake;
+  permissions: FakePermissions;
+}
+
+function makeShared(opts: { killSwitch?: boolean; snipes?: Record<string, Snipe> } = {}): Shared {
+  const clock = new FakeClock(T0);
+  const areas = new FakeStorageAreas();
+  areas.local.seed({
+    [STORAGE_KEYS.meta]: META,
+    [STORAGE_KEYS.settings]: settingsWith(opts.killSwitch ?? false),
+    ...(opts.snipes === undefined ? {} : { [STORAGE_KEYS.snipes]: opts.snipes }),
+  });
+  return {
+    clock,
+    areas,
+    alarms: new FakeAlarms(clock),
+    http: new FakeHttp(clock),
+    notifier: new FakeNotifier(),
+    keepAwake: new FakeKeepAwake({ available: true }),
+    permissions: new FakePermissions(),
+  };
+}
+
+function stored(shared: Shared, id: string): Snipe {
+  const all = shared.areas.local.dump()[STORAGE_KEYS.snipes] as Record<string, Snipe> | undefined;
+  const s = all?.[id];
+  if (s === undefined) throw new Error(`no stored snipe ${id}`);
+  return s;
+}
+
+function storedStates(shared: Shared): Record<string, Snipe['state']> {
+  const all = (shared.areas.local.dump()[STORAGE_KEYS.snipes] ?? {}) as Record<string, Snipe>;
+  return Object.fromEntries(Object.entries(all).map(([id, s]) => [id, s.state]));
+}
+
+function audits(shared: Shared): AuditEntry[] {
+  return Object.entries(shared.areas.local.dump())
+    .filter(([k]) => k.startsWith('sbw:audit:'))
+    .flatMap(([, v]) => v as AuditEntry[])
+    .sort((a, b) => a.seq - b.seq);
+}
+
+interface FakeEvent<L extends (...args: never[]) => unknown> {
+  readonly listeners: L[];
+  addListener(l: L): void;
+  removeListener(l: L): void;
+}
+function fakeEvent<L extends (...args: never[]) => unknown>(): FakeEvent<L> {
+  const listeners: L[] = [];
+  return {
+    listeners,
+    addListener: (l) => {
+      listeners.push(l);
+    },
+    removeListener: (l) => {
+      const i = listeners.indexOf(l);
+      if (i >= 0) listeners.splice(i, 1);
+    },
+  };
+}
+type MessageListener = (raw: unknown, sender: RouterSender, sendResponse: (r: unknown) => void) => boolean | undefined;
+
+class LightWorker {
+  readonly onMessage = fakeEvent<MessageListener>();
+  readonly onConnect = fakeEvent<(port: RuntimePort) => void>();
+  readonly handle: BackgroundHandle;
+  readonly ready: Promise<BackgroundContext>;
+
+  constructor(shared: Shared, jobModules?: Record<string, BackgroundModule>) {
+    const keepAlive: KeepAlive = { start: () => undefined, stop: () => undefined };
+    const browser = {
+      runtime: {
+        id: EXT_ID,
+        getURL: (p: string) => EXT_ORIGIN + p.replace(/^\//, ''),
+        sendMessage: () => Promise.reject(new Error('Receiving end does not exist.')),
+        onMessage: this.onMessage,
+        onConnect: this.onConnect,
+        onStartup: fakeEvent<() => void>(),
+        onInstalled: fakeEvent<(d: { reason: string; previousVersion?: string }) => void>(),
+      },
+      commands: { onCommand: fakeEvent<(command: string) => void>() },
+      tabs: { query: () => Promise.resolve([]), sendMessage: () => Promise.resolve(undefined) },
+      storage: fakeBrowser.storage,
+      alarms: fakeBrowser.alarms,
+    } satisfies BackgroundBrowser;
+    this.handle = startBackground({
+      browser,
+      ports: {
+        clock: shared.clock,
+        storage: shared.areas,
+        http: shared.http,
+        alarms: shared.alarms,
+        notifier: shared.notifier,
+        permissions: shared.permissions,
+        keepAwake: shared.keepAwake,
+        keepAlive,
+        random: () => 0,
+      },
+      log: () => undefined,
+      handlerModules: HANDLER_MODULES,
+      jobModules: jobModules ?? JOB_MODULES,
+    });
+    this.ready = this.handle.ready;
+  }
+
+  send(type: string, payload?: unknown): Promise<MessageResponse> {
+    const listener = this.onMessage.listeners[0];
+    if (listener === undefined) throw new Error('no onMessage listener');
+    return new Promise<MessageResponse>((resolve) => {
+      listener({ v: 1, type, reqId: `req-${type}`, ...(payload === undefined ? {} : { payload }) }, UI, (r) => {
+        resolve(r as MessageResponse);
+      });
+    });
+  }
+
+  async ok<T = unknown>(type: string, payload?: unknown): Promise<T> {
+    const r = await this.send(type, payload);
+    if (!r.ok) throw new Error(`${type} failed: ${r.error.code}: ${r.error.message}`);
+    return r.reply as T;
+  }
+}
+
+async function boot(shared: Shared): Promise<{ w: LightWorker; ctx: BackgroundContext }> {
+  const w = new LightWorker(shared);
+  const ctx = await w.ready;
+  await flush();
+  return { w, ctx };
+}
+
+// ── Badge helpers ────────────────────────────────────────────────────────────
+
+async function badgeText(): Promise<string> {
+  return fakeBrowser.action.getBadgeText({});
+}
+async function badgeBackground(): Promise<number[]> {
+  return fakeBrowser.action.getBadgeBackgroundColor({});
+}
+const RED_RGBA = [0xa1, 0x18, 0x1f, 255];
+const DEFAULT_RGBA = [0x5f, 0x5d, 0x5b, 255];
+
+beforeEach(() => {
+  vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  vi.spyOn(console, 'error').mockImplementation(() => undefined);
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// ── T-86 brief: tests first ──────────────────────────────────────────────────
+
+describe('kill switch: disarm-all (R1, R2, R6)', () => {
+  it('kill.set disarms every armed snipe within one tick, audits each, and never stops a sent snipe', async () => {
+    const shared = makeShared({
+      snipes: {
+        a1: armedSnipe('a1'),
+        a2: armedSnipe('a2'),
+        s1: sentSnipe('s1'),
+        r1: resolvedSnipe('r1'),
+        d1: draftSnipe('d1'),
+      },
+    });
+    const { w } = await boot(shared);
+    expect(await badgeText()).toBe('3'); // armed count: a1, a2 and the sent s1
+
+    await w.ok('kill.set', { on: true });
+    // R6: everything lands within one tick — states, the reducer's audits and the sent refusal.
+    await waitUntil(
+      () =>
+        stored(shared, 'a1').state === 'killed' &&
+        stored(shared, 'a2').state === 'killed' &&
+        audits(shared).filter((e) => e.kind === 'snipe.disarm').length === 2 &&
+        audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND),
+    );
+
+    // R6: one tick — no fake time (or alarm) was needed.
+    expect(shared.clock.now()).toBe(T0);
+    // Every armed snipe is killed; the sent one is NOT stopped; finished ones are untouched.
+    expect(storedStates(shared)).toEqual({ a1: 'killed', a2: 'killed', s1: 'sent', r1: 'resolved', d1: 'draft' });
+    const a1 = stored(shared, 'a1');
+    expect(a1.outcome).toBe('killed');
+    expect(a1.outcomeDetail).toBe('Kill switch or disarm before firing; no bid sent.');
+    expect(a1.history.at(-1)).toMatchObject({ from: 'armed', to: 'killed' });
+    const s1 = stored(shared, 's1');
+    expect(s1.history).toHaveLength(2); // the disarm was refused: nothing more happened
+    expect(s1.outcome).toBeUndefined(); // never claims the snipe was stopped
+
+    // Each snipe is audited: two accepted disarms and the expected sent refusal (R2).
+    const all = audits(shared);
+    expect(all.map((e) => e.kind)).toContain('kill.on');
+    const disarms = all.filter((e) => e.kind === 'snipe.disarm');
+    expect(disarms).toHaveLength(2);
+    for (const d of disarms) {
+      expect(d.actor).toBe('snipe');
+      expect(d.details.by).toBe('kill');
+      expect(d.details.why).toBe(KILL_DISARM_WHY);
+      expect(d.ref === 'a1' || d.ref === 'a2').toBe(true);
+    }
+    const sentAudits = all.filter((e) => e.kind === KILL_SNIPE_SENT_KIND);
+    expect(sentAudits).toHaveLength(1);
+    expect(sentAudits[0]?.ref).toBe('s1');
+    expect(sentAudits[0]?.details.note).toBe('kill: snipe s1 already sent; outcome pending');
+    expect(all.filter((e) => e.kind === KILL_DISARM_FAILED_KIND)).toHaveLength(0);
+
+    // R3: the badge shows KILL in red while the kill switch is on.
+    expect(await badgeText()).toBe('KILL');
+    expect(await badgeBackground()).toEqual(RED_RGBA);
+  });
+
+  it('the Alt+Shift+K shortcut path (setKill with source shortcut) disarms the same way', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1') } });
+    const { ctx } = await boot(shared);
+    // main.ts's command listener calls switches.setKill(true, 'shortcut'); disarm-all
+    // subscribes to the switch change, so the source must not matter.
+    await ctx.switches.setKill(true, 'shortcut');
+    await waitUntil(() => stored(shared, 'a1').state === 'killed');
+    expect(shared.clock.now()).toBe(T0);
+    const killOn = audits(shared).filter((e) => e.kind === 'kill.on');
+    expect(killOn).toHaveLength(1);
+    expect(killOn[0]?.details.source).toBe('shortcut');
+    expect(stored(shared, 'a1').outcome).toBe('killed');
+  });
+
+  it('turning kill off again leaves killed snipes disarmed; re-arming needs the explicit arm path (R4)', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1'), a2: armedSnipe('a2') } });
+    const { w } = await boot(shared);
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => stored(shared, 'a1').state === 'killed' && stored(shared, 'a2').state === 'killed');
+    const historyA1 = stored(shared, 'a1').history.length;
+
+    await w.ok('kill.set', { on: false });
+    await flush();
+    // Kill off does NOT re-arm anything.
+    expect(storedStates(shared)).toEqual({ a1: 'killed', a2: 'killed' });
+    expect(stored(shared, 'a1').history).toHaveLength(historyA1);
+
+    // A restarted worker (kill still off) does not re-arm them either.
+    const second = await boot(shared);
+    await flush();
+    expect(storedStates(shared)).toEqual({ a1: 'killed', a2: 'killed' });
+
+    // The reducer refuses anything further on a killed snipe: the only way back
+    // is a NEW snipe through snipe.arm (T-84's tested path).
+    const runner = getSnipeRunner(second.ctx);
+    if (runner === undefined) throw new Error('the snipe runner did not register');
+    const arm = await runner.dispatch('a1', { type: 'arm', now: shared.clock.now() });
+    expect(arm.kind).toBe('rejected');
+    if (arm.kind === 'rejected') expect(arm.rejection.reason).toBe('terminal');
+    const disarm = await runner.dispatch('a1', { type: 'disarm', now: shared.clock.now(), by: 'user', why: 'again' });
+    expect(disarm.kind).toBe('rejected');
+    if (disarm.kind === 'rejected') expect(disarm.rejection.reason).toBe('terminal');
+  });
+
+  it('a worker that starts while the kill switch is on disarms the armed snipes at startup', async () => {
+    const shared = makeShared({ killSwitch: true, snipes: { a1: armedSnipe('a1'), s1: sentSnipe('s1') } });
+    const { w } = await boot(shared);
+    // The switch was loaded before register(); the subscriber must catch the already-on state.
+    await waitUntil(() => stored(shared, 'a1').state === 'killed');
+    expect(storedStates(shared)).toEqual({ a1: 'killed', s1: 'sent' });
+    expect(await badgeText()).toBe('KILL');
+    expect(await badgeBackground()).toEqual(RED_RGBA);
+    const all = audits(shared);
+    expect(all.some((e) => e.kind === 'snipe.disarm' && e.ref === 'a1' && e.details.by === 'kill')).toBe(true);
+    expect(all.some((e) => e.kind === KILL_SNIPE_SENT_KIND && e.ref === 's1')).toBe(true);
+    // The startup disarm-all needed no message at all.
+    expect(typeof w.send).toBe('function');
+  });
+
+  it('a sent snipe is audited only once per kill episode, even when the switch view changes again', async () => {
+    const shared = makeShared({ snipes: { s1: sentSnipe('s1') } });
+    const { ctx, w } = await boot(shared);
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND));
+    // Another switch change while kill stays on (e.g. a dry-run setting) re-runs disarm-all.
+    ctx.switches.noteSettings({ ...settingsWith(true), dryRun: { favorites: false, calendar: true, bidding: true } });
+    await flush();
+    expect(audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND)).toHaveLength(1);
+    expect(stored(shared, 's1').state).toBe('sent');
+  });
+});
+
+describe('action badge (R3)', () => {
+  it('shows the armed count when kill is off and clears when nothing is armed', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1'), s1: sentSnipe('s1'), d1: draftSnipe('d1') } });
+    await boot(shared);
+    expect(await badgeText()).toBe('2');
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+
+    const empty = makeShared();
+    await boot(empty);
+    expect(await badgeText()).toBe('');
+  });
+
+  it('switches to KILL (red) on kill on and back to the live count on kill off', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1'), s1: sentSnipe('s1') } });
+    const { w } = await boot(shared);
+    expect(await badgeText()).toBe('2');
+
+    await w.ok('kill.set', { on: true });
+    await waitUntil(async () => (await badgeText()) === 'KILL');
+    expect(await badgeBackground()).toEqual(RED_RGBA);
+
+    await w.ok('kill.set', { on: false });
+    await waitUntil(async () => (await badgeText()) === '1'); // only the sent snipe still lives
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+  });
+
+  it('shows ! when Google needs interaction, unless kill or the armed count take over', async () => {
+    const shared = makeShared();
+    const { ctx } = await boot(shared);
+    expect(await badgeText()).toBe('');
+    ctx.googleNeedsInteraction.set(true);
+    await waitUntil(async () => (await badgeText()) === '!');
+    expect(await badgeBackground()).toEqual(DEFAULT_RGBA);
+    ctx.googleNeedsInteraction.set(false);
+    await waitUntil(async () => (await badgeText()) === '');
+  });
+
+  it('follows snipe changes from storage and is idempotent', async () => {
+    const shared = makeShared({ snipes: { a1: armedSnipe('a1'), a2: armedSnipe('a2'), s1: sentSnipe('s1') } });
+    const { ctx } = await boot(shared);
+    await waitUntil(async () => (await badgeText()) === '3');
+
+    const spy = vi.spyOn(fakeBrowser.action, 'setBadgeText');
+    // Another context arms a snipe: storage.onChanged must recompute the count.
+    const all = (shared.areas.local.dump()[STORAGE_KEYS.snipes] ?? {}) as Record<string, Snipe>;
+    await shared.areas.local.set({ [STORAGE_KEYS.snipes]: { ...all, a3: armedSnipe('a3') } });
+    await waitUntil(async () => (await badgeText()) === '4');
+    expect(spy).toHaveBeenCalledWith({ text: '4' });
+
+    // A switch change that does not affect the badge (a dry-run flip) recomputes but writes nothing.
+    const calls = spy.mock.calls.length;
+    ctx.switches.noteSettings({ ...settingsWith(false), dryRun: { favorites: false, calendar: true, bidding: true } });
+    await flush();
+    expect(spy.mock.calls.length).toBe(calls);
+    expect(await badgeText()).toBe('4');
+  });
+
+  it('registerBadge is exported and writes nothing before the first state is known', () => {
+    // The badge writer must be the single owner of the action badge: registering it
+    // in an empty background leaves the badge empty rather than stale.
+    expect(typeof registerBadge).toBe('function');
+    expect(KILL_BADGE_COLOR).toBe('#a1181f');
+    expect(BADGE_DEFAULT_COLOR).toBe('#5f5d5b');
+  });
+});
+
+describe('popup kill section helpers (R5)', () => {
+  const disarmKill: AuditEntry = {
+    seq: 4,
+    at: T0,
+    actor: 'snipe',
+    kind: 'snipe.disarm',
+    itemId: 710000004,
+    ref: 'a1',
+    details: { event: 'disarm', from: 'armed', to: 'killed', outcome: 'killed', by: 'kill', why: 'stopped before it could bid' },
+  };
+  const disarmAnomaly: AuditEntry = {
+    seq: 3,
+    at: T0 - MIN,
+    actor: 'snipe',
+    kind: 'snipe.disarm',
+    itemId: 710000003,
+    ref: 'a2',
+    details: { event: 'disarm', from: 'waking', to: 'killed', outcome: 'killed', by: 'anomaly', why: 'three reads in a row failed' },
+  };
+  const sentRefusal: AuditEntry = {
+    seq: 2,
+    at: T0 - 2 * MIN,
+    actor: 'system',
+    kind: KILL_SNIPE_SENT_KIND,
+    ref: 's1',
+    details: { note: 'kill: snipe s1 already sent; outcome pending' },
+  };
+  const unrelated: AuditEntry = { seq: 1, at: T0 - 3 * MIN, actor: 'user', kind: 'kill.on', details: { source: 'kill.set' } };
+
+  it('is registered as the popup kill section', () => {
+    expect(killSection.id).toBe('kill');
+    expect(typeof killSection.Component).toBe('function');
+  });
+
+  it('killReasons filters and caps the audit entries', () => {
+    expect(killReasons([disarmKill, disarmAnomaly, sentRefusal, unrelated], 3)).toEqual([
+      { at: disarmKill.at, text: 'Kill switch a1: stopped before it could bid' },
+      { at: disarmAnomaly.at, text: 'Auto-stopped a2: three reads in a row failed' },
+      { at: sentRefusal.at, text: 'kill: snipe s1 already sent; outcome pending' },
+    ]);
+    expect(killReasons([disarmKill, disarmAnomaly, sentRefusal], 2).map((r) => r.text)).toEqual([
+      'Kill switch a1: stopped before it could bid',
+      'Auto-stopped a2: three reads in a row failed',
+    ]);
+    expect(killReasons([unrelated])).toEqual([]);
+    const noBy: AuditEntry = { seq: 9, at: T0, actor: 'snipe', kind: 'snipe.disarm', details: {} };
+    expect(killReasons([noBy])).toEqual([]);
+    const userDisarm: AuditEntry = { seq: 8, at: T0, actor: 'snipe', kind: 'snipe.disarm', ref: 'a1', details: { by: 'user', why: 'I changed my mind' } };
+    expect(killReasons([userDisarm])).toEqual([]); // user disarms are not auto-kills
+  });
+});
