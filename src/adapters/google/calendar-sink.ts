@@ -102,7 +102,7 @@ export const COOLDOWN_BASE_MS = 60_000;
 export const COOLDOWN_CAP_MS = 60 * 60_000;
 export const SYNC_STATE_KEY = 'sbw:calendarSync';
 /** Event title prefixes once the outcome is known. */
-export const OUTCOME_LABEL: Readonly<Record<Outcome, string>> = { won: 'WON', lost: 'LOST', 'ended-early': 'ENDED' };
+export const OUTCOME_LABEL: Readonly<Record<Outcome, string>> = { won: 'WON', lost: 'LOST', 'ended-early': 'ENDED EARLY' };
 const MAX_BUMPS = 3;
 const MAX_ERROR_CHARS = 200;
 
@@ -282,7 +282,7 @@ function alreadyMatches(ev: GcalEvent, body: GcalEventBody): boolean {
 }
 
 function stripLabel(summary: string): string {
-  return summary.replace(/^(WON|LOST|ENDED): /, '');
+  return summary.replace(/^(WON|LOST|ENDED EARLY): /, '');
 }
 
 /** The patch that stamps an outcome: retitle, clear reminders, set sbwState. */
