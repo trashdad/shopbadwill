@@ -3,8 +3,10 @@
 // outcomes.ts enforces the timing), decides the outcome of a tracked item the
 // T-84 snipe path did not settle:
 //
-//   won / lost      from the read (isHighBidder; an anonymous read still proves
-//                   a loss when the final price is above every snipe max),
+//   won / lost      from the read's high-bidder flag (null on the anonymous
+//                   background read, C6) or, for a loss only, the over-max rule
+//                   (final price above the user's snipe max, see overMaxLimit),
+//                   whose notification says just that ("Over your max"),
 //                   stamped on the calendar through T-67's CalendarSink (R3,
 //                   R7: it obeys writesAllowed('calendar') and is not gated by
 //                   the SGW session), recorded on the TrackedItem, notified once;
@@ -26,6 +28,7 @@
 // and never notifies twice (the `notify.outcome` marker row is written before
 // the send, R6).
 import type { AuditLog } from '../../../domain/audit/types';
+import { formatMoney } from '../../../domain/money';
 import type { Snipe, SnipeEvent } from '../../../domain/snipe/types';
 import type { Repo } from '../../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../../domain/storage/schema';
@@ -63,10 +66,48 @@ export function stampedOutcome(hash: string): OutcomeKind | undefined {
   return outcome !== undefined && STAMPED_OUTCOMES.has(outcome) ? (outcome as OutcomeKind) : undefined;
 }
 
-/** The OS notification for one outcome. Plain text, no price: the calendar carries the final price. */
-export function outcomeNotification(t: TrackedItem, outcome: OutcomeKind): Notification {
+/** A loss inferred from the price alone: what the copy may say about it. */
+export interface OverMax {
+  maxBid: Cents;
+  /** Absent when the price was never recorded (a crash-recovered stamp). */
+  finalPrice?: Cents;
+}
+
+/** The reducer's `why` for a snipe skipped because the user already led (T-80's verify-failed). */
+const ALREADY_HIGH_WHY = 'verify-failed: already-high';
+
+/**
+ * The max the over-max rule may compare the final price with, or undefined
+ * when the rule does not apply. The rule ("final price above every max →
+ * lost") is sound only when the user's bids were our snipes: a dry run is not
+ * a bid, and a snipe skipped because the user already led proves a bid
+ * ShopBadwill never saw.
+ */
+export function overMaxLimit(snipes: readonly Snipe[]): Cents | undefined {
+  if (snipes.some((s) => s.history.some((h) => h.why === ALREADY_HIGH_WHY))) return undefined;
+  let max = 0;
+  for (const s of snipes) if (!s.dryRun && s.maxBid > max) max = s.maxBid;
+  return max > 0 ? max : undefined;
+}
+
+/**
+ * The OS notification for one outcome. Plain text. A loss inferred from the
+ * price says only that (ShopBadwill cannot see bids placed on SGW directly),
+ * never "you did not win".
+ */
+export function outcomeNotification(t: TrackedItem, outcome: OutcomeKind, overMax?: OverMax): Notification {
   const title = truncateTitle(t.title, 50);
   const url = itemUrl(t.itemId);
+  if (outcome === 'lost' && overMax !== undefined) {
+    const price = overMax.finalPrice === undefined ? 'The final price was' : `The final price, ${formatMoney(overMax.finalPrice)}, was`;
+    return {
+      id: OUTCOME_NOTIFY_PREFIX + String(t.itemId),
+      title: `Over your max: ${title}`,
+      message: `${price} above your max of ${formatMoney(overMax.maxBid)}. ${url}`,
+      priority: 1,
+      openUrlOnClick: url,
+    };
+  }
   const heading = outcome === 'won' ? 'WON' : outcome === 'lost' ? 'LOST' : 'ENDED EARLY';
   const message =
     outcome === 'won'
@@ -97,6 +138,31 @@ export async function recordOutcome(
     return { ...cur, [itemId]: { ...t, outcome, updatedAt: repo.now() } };
   });
   await audit.append({ actor: 'daily-job', kind: 'outcome.recorded', itemId, details: { outcome: outcome ?? 'unknown', ...details } });
+}
+
+/**
+ * Why a recorded loss is a loss, for its copy. The newest `outcome.recorded`
+ * row says so (`basis`). A row without one is a crash-recovered stamp: with a
+ * usable snipe max, a post-end loss can only have come from the over-max rule
+ * (the background read is anonymous, C6), so the copy says that, without a price.
+ */
+async function lossBasis(ctx: BackgroundContext, itemId: ItemId): Promise<OverMax | undefined> {
+  let before: number | undefined;
+  let row: Record<string, unknown> | undefined;
+  while (row === undefined) {
+    const page = await ctx.audit.list({ limit: AUDIT_PAGE, kinds: ['outcome.recorded'], ...(before === undefined ? {} : { before }) });
+    row = page.find((e) => e.itemId === itemId)?.details;
+    const last = page.at(-1);
+    if (page.length < AUDIT_PAGE || last === undefined) break;
+    before = last.seq;
+  }
+  if (row?.basis === 'over-max' && typeof row.maxBid === 'number') {
+    return { maxBid: row.maxBid, ...(typeof row.finalPrice === 'number' ? { finalPrice: row.finalPrice } : {}) };
+  }
+  if (row?.basis !== undefined) return undefined;
+  const snipes = Object.values(await ctx.repo.get(STORAGE_KEYS.snipes)).filter((s) => s.itemId === itemId && s.state !== 'draft');
+  const maxBid = overMaxLimit(snipes);
+  return maxBid === undefined ? undefined : { maxBid };
 }
 
 /** Whether a `notify.outcome` row for the item exists (the never-twice marker, R6). */
@@ -145,9 +211,10 @@ export async function notifyOutcome(
     await alarms.create(OUTCOME_NOTIFY_PREFIX + String(itemId), { when: until });
     return 'deferred';
   }
+  const overMax = outcome === 'lost' ? await lossBasis(ctx, itemId) : undefined;
   await audit.append({ actor: 'daily-job', kind: NOTIFY_OUTCOME_KIND, itemId, details: { outcome } });
   try {
-    await notifier.notify(outcomeNotification(t, outcome));
+    await notifier.notify(outcomeNotification(t, outcome, overMax));
     return 'sent';
   } catch (e) {
     await audit.append({
@@ -286,28 +353,31 @@ export async function executePostEnd(step: JobStep, deps: PostEndDeps): Promise<
     return { kind: 'postEnd', detail };
   }
 
-  // No live snipe: the read decides. An anonymous read still proves a loss when
-  // the final price is above every snipe max (the same inference T-87's judge uses).
+  // No live snipe: the read decides. The background read is anonymous (C6:
+  // isHighBidder is null), so it can prove a win only with the high-bidder
+  // flag, and a loss only by the over-max rule (final price above the user's
+  // max; see overMaxLimit for when that rule holds). Anything else is unknown.
   // First, though: the calendar link's stamp record (R3) may already carry the
   // outcome of a postEnd run that crashed between its stamp and this recording —
   // trust the persisted record over the anonymous read (the stamp is the proof).
   const stamped = stampedOutcome((await repo.get(STORAGE_KEYS.calendar)).links[itemId]?.lastSyncedHash ?? '');
   const high = detail.isHighBidder;
   let outcome: TrackedItem['outcome'];
+  let basis: Record<string, string | number> = {};
   if (stamped !== undefined) {
     outcome = stamped;
-  } else if (high === true) {
-    outcome = 'won';
-  } else if (high === false) {
-    outcome = 'lost';
+  } else if (high === true || high === false) {
+    outcome = high ? 'won' : 'lost';
+    basis = { basis: 'high-bidder' };
   } else {
-    const maxBid = Math.max(0, ...snipes.map((s) => s.maxBid));
-    outcome = maxBid > 0 && detail.currentPrice > maxBid ? 'lost' : 'unknown';
+    const maxBid = overMaxLimit(snipes);
+    outcome = maxBid !== undefined && detail.currentPrice > maxBid ? 'lost' : 'unknown';
+    if (outcome === 'lost' && maxBid !== undefined) basis = { basis: 'over-max', maxBid };
   }
 
   if (outcome === 'won' || outcome === 'lost') {
     if (stamped === undefined) await stampOutcome(ctx, itemId, outcome, detail.currentPrice);
-    await recordOutcome(repo, audit, itemId, outcome, { from: 'read', finalPrice: detail.currentPrice });
+    await recordOutcome(repo, audit, itemId, outcome, { from: 'read', finalPrice: detail.currentPrice, ...basis });
     await notifyOutcome(ctx, itemId, outcome);
   } else {
     await recordOutcome(repo, audit, itemId, 'unknown', { from: 'read' });

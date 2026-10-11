@@ -5,15 +5,18 @@
 //
 // Per tracked item (R2: only ones with a snipe or a calendar event; never again
 // once its outcome is recorded):
-//   - a T-84 snipe whose outcome already decided the result (won, outbid,
-//     below-minimum, late, ended) is recorded from the snipe's persisted
-//     outcome: no read, no stamp, no notification (the snipe path did them);
+//   - a T-84 snipe whose outcome already decided the result (won or outbid
+//     settled by its outcome read; below-minimum, late, ended) is recorded
+//     from the snipe's persisted outcome: no read, no stamp, no notification
+//     (the snipe path did them);
 //   - a calendar link carrying a `stamped:<outcome>` record (CalendarSink.stamp)
 //     recovers a postEnd run that crashed before recording its outcome;
 //   - a snipe with a send in flight (`firing`, `sent`, `fallback-applied`)
 //     defers to the runner, which owns that outcome;
 //   - otherwise, at least 2 minutes after the end, the item gets its one
-//     postEnd read.
+//     postEnd read. A read that settles nothing (still open, or failed) is
+//     retried with a delay, at most MAX_POST_END_READS in all; then the item
+//     is recorded `unknown`.
 //
 // The tick obeys the lane budget: a `budget` or `paused` refusal stops the tick
 // quietly and the item is retried on a later tick, never in a loop (R2). The
@@ -23,7 +26,7 @@
 // spending (R5).
 import type { AuditLog } from '../../domain/audit/types';
 import type { CalendarLink } from '../../domain/calendar/types';
-import type { Snipe, SnipeOutcome } from '../../domain/snipe/types';
+import type { Snipe } from '../../domain/snipe/types';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import type { EpochMs, ItemId, TrackedItem } from '../../domain/types';
 import { SgwApiError } from '../../ports/errors';
@@ -54,14 +57,26 @@ const MID_FLIGHT: ReadonlySet<Snipe['state']> = new Set(['firing', 'sent', 'fall
 const PRE_FIRE: ReadonlySet<Snipe['state']> = new Set(['armed', 'waking', 'verified']);
 const DECIDED: ReadonlySet<TrackedItem['outcome']> = new Set(['won', 'lost', 'ended-early', 'unknown']);
 
+/**
+ * T-87 calls a win (or an outbid) final, and T-84 stamps it, only when the
+ * outcome read saw the item. Settled any other way (`post-read failed` after
+ * about 7 days, or a reply alone) it is "Leading" / "Outbid when the bid went
+ * in": nothing proves it, so it decides nothing here and the item gets its own read.
+ */
+function settledByOutcomeRead(s: Pick<Snipe, 'history'>): boolean {
+  return s.history.at(-1)?.why === 'post-read';
+}
+
 /** The T-84 snipe outcomes whose stamp and notification already decided the calendar result. */
-export function decisiveOutcome(outcome: SnipeOutcome | undefined): OutcomeKind | undefined {
-  switch (outcome) {
+export function decisiveOutcome(s: Pick<Snipe, 'outcome' | 'history'>): OutcomeKind | undefined {
+  switch (s.outcome) {
     case 'won':
-      return 'won';
+      return settledByOutcomeRead(s) ? 'won' : undefined;
     case 'outbid':
+      return settledByOutcomeRead(s) ? 'lost' : undefined;
     case 'below-minimum':
     case 'late':
+      // T-84's own "Lost" results (its copy says so whether or not it knew the price).
       return 'lost';
     case 'ended':
       return 'ended-early';
@@ -174,7 +189,7 @@ export function planOutcomeWork(
       continue;
     }
     // R3: the T-84 path already decided (its stamp and notification went out).
-    const decisive = itemSnipes.map((s) => decisiveOutcome(s.outcome)).find((o): o is OutcomeKind => o !== undefined);
+    const decisive = itemSnipes.map((s) => decisiveOutcome(s)).find((o): o is OutcomeKind => o !== undefined);
     if (decisive !== undefined) {
       plans.push({ kind: 'record', itemId: t.itemId, outcome: decisive, via: 'snipe' });
       continue;

@@ -285,17 +285,35 @@ const outcomes = (r: Rig) => r.repo.get(STORAGE_KEYS.tracked).then((t) => Object
 
 // ── Pure classification helpers ──────────────────────────────────────────────
 
+/** The last history entry of a snipe the T-84 runner settled, by how it settled. */
+const settledBy = (why: string): Snipe['history'] => [
+  { at: T0 - 60 * MIN, from: 'draft', to: 'armed', why: 'armed' },
+  { at: T0 - 5 * MIN, from: 'sent', to: 'resolved', why },
+];
+
 describe('outcome classification helpers', () => {
   it('decisiveOutcome maps the T-84 snipe outcomes that already stamped the calendar', () => {
-    expect(decisiveOutcome('won')).toBe('won');
-    expect(decisiveOutcome('outbid')).toBe('lost');
-    expect(decisiveOutcome('below-minimum')).toBe('lost');
-    expect(decisiveOutcome('late')).toBe('lost');
-    expect(decisiveOutcome('ended')).toBe('ended-early');
-    expect(decisiveOutcome('killed')).toBeUndefined();
-    expect(decisiveOutcome('dry-run')).toBeUndefined();
-    expect(decisiveOutcome('network')).toBeUndefined();
-    expect(decisiveOutcome(undefined)).toBeUndefined();
+    const snipe = (outcome: Snipe['outcome'], why = 'post-read') => ({ outcome, history: settledBy(why) });
+    expect(decisiveOutcome(snipe('won'))).toBe('won');
+    expect(decisiveOutcome(snipe('outbid'))).toBe('lost');
+    expect(decisiveOutcome(snipe('below-minimum'))).toBe('lost');
+    expect(decisiveOutcome(snipe('late'))).toBe('lost');
+    expect(decisiveOutcome(snipe('ended'))).toBe('ended-early');
+    expect(decisiveOutcome(snipe('killed'))).toBeUndefined();
+    expect(decisiveOutcome(snipe('dry-run'))).toBeUndefined();
+    expect(decisiveOutcome(snipe('network'))).toBeUndefined();
+    expect(decisiveOutcome(snipe(undefined))).toBeUndefined();
+  });
+
+  it('decisiveOutcome: a win or an outbid settled without the outcome read ("Leading") decides nothing', () => {
+    // T-87 judges these with no ItemDetail: final is false, T-84 neither stamps nor says "Won".
+    for (const why of ['post-read failed', 'result: accepted']) {
+      expect(decisiveOutcome({ outcome: 'won', history: settledBy(why) })).toBeUndefined();
+      expect(decisiveOutcome({ outcome: 'outbid', history: settledBy(why) })).toBeUndefined();
+    }
+    // T-84's own "Lost" results stay decisive however they settled.
+    expect(decisiveOutcome({ outcome: 'late', history: settledBy('result: closed') })).toBe('lost');
+    expect(decisiveOutcome({ outcome: 'below-minimum', history: settledBy('result: below-minimum') })).toBe('lost');
   });
 
   it('stampedOutcome reads the calendar link stamp record', () => {
@@ -398,7 +416,7 @@ describe('post-end outcome detection', () => {
     const r = await rig();
     await track(r, 14);
     await seedEvent(r, 14, 'Pyrex bowl 14');
-    await seedSnipe(r, { itemId: 14, state: 'resolved', outcome: 'won' });
+    await seedSnipe(r, { itemId: 14, state: 'resolved', outcome: 'won', history: settledBy('post-read') });
 
     await r.tick();
     expect(await outcomes(r)).toMatchObject({ 14: 'won' });
@@ -439,7 +457,7 @@ describe('post-end outcome detection', () => {
     await r.repo.update(STORAGE_KEYS.snipes, (cur) => {
       const snipe = cur[snipeId];
       if (snipe === undefined) return cur;
-      return { ...cur, [snipeId]: { ...snipe, state: 'resolved', outcome: 'outbid' } };
+      return { ...cur, [snipeId]: { ...snipe, state: 'resolved', outcome: 'outbid', history: settledBy('post-read') } };
     });
     await r.tick();
     expect(reads(r)).toHaveLength(0);
@@ -569,7 +587,7 @@ describe('post-end outcome detection', () => {
     expect(reads(r)).toHaveLength(1);
   });
 
-  it('a final price above the snipe max proves a loss even without the high-bidder flag', async () => {
+  it('a final price above the snipe max is recorded lost, and the notification says only what the price proves', async () => {
     const r = await rig();
     await track(r, 26);
     await seedEvent(r, 26, 'Pyrex bowl 26');
@@ -579,6 +597,13 @@ describe('post-end outcome detection', () => {
     await r.tick();
     expect(await outcomes(r)).toMatchObject({ 26: 'lost' });
     expect((await eventOf(r, 26))?.summary).toBe('LOST: Pyrex bowl 26');
+    // ShopBadwill cannot see bids placed on SGW directly: the copy states the
+    // price fact, never "you did not win".
+    expect(r.notifier.sent).toHaveLength(1);
+    expect(r.notifier.sent[0]?.notification.title).toBe('Over your max: Pyrex bowl 26');
+    expect(r.notifier.sent[0]?.notification.message).toBe(
+      'The final price, $12.99, was above your max of $10.00. https://shopgoodwill.com/item/26',
+    );
   });
 
   it('notifications disabled: the outcome is stamped and recorded silently', async () => {
@@ -884,5 +909,111 @@ describe('post-end reads stay bounded', () => {
     expect(attempts).toBe(1);
     expect(await outcomes(r)).toMatchObject({ 46: 'won' });
     expect(r.notifier.sent).toHaveLength(1);
+  });
+});
+
+// ── Final check (Opus): claim only what the data proves ──────────────────────
+
+describe('post-end claims only what the data proves', () => {
+  it('a T-84 win settled without the outcome read ("Leading") is never recorded or stamped WON', async () => {
+    const r = await rig();
+    r.google.connected = true;
+    await track(r, 47);
+    await seedEvent(r, 47, 'Pyrex bowl 47');
+    await seedSnipe(r, {
+      itemId: 47,
+      state: 'resolved',
+      outcome: 'won',
+      maxBid: 2000,
+      attempt: { sentAt: T0 - 6 * MIN, idempotencyKey: 'k-47' },
+      history: settledBy('post-read failed'),
+    });
+    // The anonymous read cannot see the high bidder, and the price is under the max.
+    r.api.details.set(47, closedDetail(47, { isHighBidder: null, currentPrice: 1500 }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 47: 'unknown' });
+    expect(reads(r)).toHaveLength(1);
+    const synced = syncFor(r.ctx).syncNow('after');
+    await settle(r.clock);
+    await synced;
+    // The sync may refresh the open event, but never stamps it.
+    expect((await eventOf(r, 47))?.summary).toBe('Pyrex bowl 47');
+    expect((await eventOf(r, 47))?.extendedProperties.private.sbwState).toBe('open');
+    expect(r.notifier.sent).toHaveLength(0);
+  });
+
+  it('a dry-run snipe placed no bid: no loss is inferred from its max', async () => {
+    const r = await rig();
+    await track(r, 48);
+    await seedEvent(r, 48, 'Pyrex bowl 48');
+    await seedSnipe(r, { itemId: 48, state: 'resolved', outcome: 'dry-run', dryRun: true, maxBid: 1000, history: settledBy('post-read: dry run measured') });
+    r.api.details.set(48, closedDetail(48, { isHighBidder: null, currentPrice: 1299 }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 48: 'unknown' });
+    expect((await eventOf(r, 48))?.summary).toBe('Pyrex bowl 48');
+    expect(r.notifier.sent).toHaveLength(0);
+  });
+
+  it('a snipe skipped because you already led shows a bid ShopBadwill never saw: no loss is inferred', async () => {
+    const r = await rig();
+    await track(r, 49);
+    await seedEvent(r, 49, 'Pyrex bowl 49');
+    await seedSnipe(r, {
+      itemId: 49,
+      state: 'resolved',
+      outcome: 'skipped',
+      maxBid: 1000,
+      history: [
+        { at: T0 - 60 * MIN, from: 'draft', to: 'armed', why: 'armed' },
+        { at: T0 - 6 * MIN, from: 'armed', to: 'waking', why: 'wake' },
+        { at: T0 - 6 * MIN, from: 'waking', to: 'resolved', why: 'verify-failed: already-high' },
+      ],
+    });
+    r.api.details.set(49, closedDetail(49, { isHighBidder: null, currentPrice: 1299 }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 49: 'unknown' });
+    expect((await eventOf(r, 49))?.summary).toBe('Pyrex bowl 49');
+    expect(r.notifier.sent).toHaveLength(0);
+  });
+
+  it('quiet hours: a deferred over-max notification keeps the over-max copy', async () => {
+    const r = await rig({ now: T0_QUIET, quiet: { from: '22:00', to: '06:00' } });
+    await track(r, 50);
+    await seedEvent(r, 50, 'Pyrex bowl 50');
+    await seedSnipe(r, { itemId: 50, state: 'resolved', outcome: 'killed', maxBid: 1000 });
+    r.api.details.set(50, closedDetail(50, { isHighBidder: null, currentPrice: 1299, endTime: new Date(T0_QUIET - 5 * MIN).toISOString() }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 50: 'lost' });
+    expect(r.notifier.sent).toHaveLength(0);
+
+    r.clock.advance(6 * 60 * MIN + 10 * MIN);
+    await settle(r.clock);
+    expect(r.notifier.sent).toHaveLength(1);
+    expect(r.notifier.sent[0]?.notification.title).toBe('Over your max: Pyrex bowl 50');
+    expect(r.notifier.sent[0]?.notification.message).toBe(
+      'The final price, $12.99, was above your max of $10.00. https://shopgoodwill.com/item/50',
+    );
+  });
+
+  it('a crash-recovered LOST stamp on a sniped item keeps the over-max copy, without a price it never saw', async () => {
+    const r = await rig();
+    await track(r, 51);
+    await seedEvent(r, 51, 'Pyrex bowl 51');
+    await seedSnipe(r, { itemId: 51, state: 'resolved', outcome: 'killed', maxBid: 1000 });
+    await r.repo.update(STORAGE_KEYS.calendar, (c) => ({
+      ...c,
+      links: { ...c.links, 51: { ...(c.links[51] as NonNullable<(typeof c.links)[number]>), lastSyncedHash: 'stamped:lost' } },
+    }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 51: 'lost' });
+    expect(reads(r)).toHaveLength(0);
+    expect(r.notifier.sent).toHaveLength(1);
+    expect(r.notifier.sent[0]?.notification.title).toBe('Over your max: Pyrex bowl 51');
+    expect(r.notifier.sent[0]?.notification.message).toBe('The final price was above your max of $10.00. https://shopgoodwill.com/item/51');
   });
 });
