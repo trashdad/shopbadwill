@@ -9,7 +9,8 @@
     - wakeAtUtc:  valid ISO UTC time, in the future, no more than 30 days ahead
     - browser:    exactly 'chrome' or 'firefox'
     - profile:    known profile name or path; no `"`, `&`, `|`, `<`, `>`, `^`,
-                  `%`, `!` or newlines
+                  `%`, `!`, newlines, PowerShell backticks or `$(` / `${`
+                  subexpressions, and no `..` path segment
 #>
 
 $SbwMaxFrameBytes = 1048576
@@ -54,7 +55,11 @@ function Read-SbwBytes {
 # --------------------------------------------------------------- validation (R2)
 
 $SbwSnipeIdRegex = '^[A-Za-z0-9_-]{1,64}$'
-$SbwProfileForbiddenRegex = '["&|<>^%!\r\n]'
+# Backtick is literal inside this single-quoted class. `$` is checked separately
+# so a profile may not carry a PowerShell subexpression.
+$SbwProfileForbiddenRegex = '["&|<>^%!\r\n`]'
+$SbwProfileSubexprRegex = '\$[\(\{]'
+$SbwProfileTraversalRegex = '(^|[\\/])\.\.([\\/]|$)'
 $SbwTaskNameRegex = '^ShopBadwill-snipe-[A-Za-z0-9_-]{1,64}$'
 
 function Test-SbwSnipeId {
@@ -66,7 +71,10 @@ function Test-SbwSnipeId {
 # with none of the R2-forbidden characters.
 function Test-SbwProfileValue {
   param([string]$Value)
-  ($Value.Length -ge 1) -and ($Value.Length -le 260) -and ($Value -cnotmatch $SbwProfileForbiddenRegex)
+  ($Value.Length -ge 1) -and ($Value.Length -le 260) -and
+    ($Value -cnotmatch $SbwProfileForbiddenRegex) -and
+    ($Value -cnotmatch $SbwProfileSubexprRegex) -and
+    ($Value -cnotmatch $SbwProfileTraversalRegex)
 }
 
 # Strict message shape: exactly the allowed keys, nothing else.

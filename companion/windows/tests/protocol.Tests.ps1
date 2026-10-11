@@ -119,6 +119,27 @@ Describe 'schedule validation (R2, verbatim)' {
       Assert-Equal (Get-SbwScheduleError -Msg $m -Now (Get-SbwTestNow) -Config (New-SbwTestConfig)) 'bad-request'
     }
   }
+  It 'refuses shell and traversal payloads even when that profile is the configured one' {
+    # Configured to the payload on purpose: an allowlist-only check would accept it.
+    foreach ($bad in @(
+        'a"b', 'a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b',
+        "a`nb", "a`rb", 'pre`post', '$(calc)', 'a$(Get-Date)b',
+        '..\..\Windows\System32', 'foo/../bar', 'foo\..\bar', '..'
+      )) {
+      $cfg = New-SbwTestConfig
+      $cfg.chrome = [pscustomobject]@{ exePath = 'C:\browser\chrome.exe'; profile = $bad }
+      $json = @{ op = 'schedule'; snipeId = 'a'; wakeAtUtc = '2026-10-10T13:00:00.000Z'; browser = 'chrome'; profile = $bad } | ConvertTo-Json -Compress
+      $err = Get-SbwScheduleError -Msg ($json | ConvertFrom-Json) -Now (Get-SbwTestNow) -Config $cfg
+      Assert-Equal $err 'bad-request' $bad
+    }
+  }
+  It 'refuses injection payloads in snipeId' {
+    foreach ($bad in @('a&b', 'a|b', 'a^b', 'a%b', 'a"b', 'pre`post', '$(calc)', '..\..\x', "a`nb", 'has space')) {
+      $json = @{ op = 'schedule'; snipeId = $bad; wakeAtUtc = '2026-10-10T13:00:00.000Z'; browser = 'chrome'; profile = 'Default' } | ConvertTo-Json -Compress
+      $err = Get-SbwScheduleError -Msg ($json | ConvertFrom-Json) -Now (Get-SbwTestNow) -Config (New-SbwTestConfig)
+      Assert-Equal $err 'bad-request' $bad
+    }
+  }
   It 'refuses a profile that is not the configured known profile' {
     $m = ConvertFrom-SbwTestJson '{"op":"schedule","snipeId":"a","wakeAtUtc":"2026-10-10T13:00:00.000Z","browser":"chrome","profile":"Profile 9"}'
     Assert-Equal (Get-SbwScheduleError -Msg $m -Now (Get-SbwTestNow) -Config (New-SbwTestConfig)) 'unknown-profile'
@@ -167,8 +188,9 @@ Describe 'profile value checks shared with install.ps1' {
     Assert-True (Test-SbwProfileValue 'C:\Users\me\Chrome User Data')
     Assert-False (Test-SbwProfileValue '')
     Assert-False (Test-SbwProfileValue ('x' * 261))
-    foreach ($bad in @('a"b', 'a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', "a`nb")) {
-      Assert-False (Test-SbwProfileValue $bad)
+    Assert-True (Test-SbwProfileValue 'foo..bar')
+    foreach ($bad in @('a"b', 'a&b', 'a|b', 'a<b', 'a>b', 'a^b', 'a%b', 'a!b', "a`nb", 'pre`post', '$(calc)', 'a$(Get-Date)b', '..\..\Windows\System32', 'foo/../bar', 'foo\..\bar', '..')) {
+      Assert-False (Test-SbwProfileValue $bad) $bad
     }
   }
 }
