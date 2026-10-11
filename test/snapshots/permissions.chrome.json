@@ -2,7 +2,8 @@
   "manifest_version": 3,
   "permissions": [
     "storage",
-    "alarms"
+    "alarms",
+    "sidePanel"
   ],
   "optional_permissions": [
     "notifications",
