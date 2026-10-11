@@ -712,9 +712,14 @@ describe('the send gate does not depend on disarm-all', () => {
     const runner = getSnipeRunner(ctx);
     if (runner === undefined) throw new Error('the snipe runner did not register');
     await seedFiring(shared);
-    await runner.drive('x1');
+    const driven = runner.drive('x1');
     await waitUntil(() => bidRequests(shared).length > 0);
     expect(bidRequests(shared)[0]).toContain('ItemBid/ShowBidModal');
+    // T-101's idempotent strategy retries the provably-unsent bid; its second
+    // ShowBidModal waits on the snipe lane's 1 s gap (a fake-clock timer), so
+    // let the retry drain before awaiting the drive.
+    shared.clock.advance(10 * SEC);
+    await driven;
   });
 
   it('a fire due in the same tick as the kill sends nothing, even with disarm-all stalled', async () => {
