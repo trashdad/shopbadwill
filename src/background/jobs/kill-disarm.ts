@@ -116,9 +116,8 @@ export function register(ctx: BackgroundContext): void {
       }
       // A 'missing' snipe was removed meanwhile: nothing to stop, nothing to audit.
       if (r.kind === 'missing') continue;
-      // Anything else ('busy' cannot apply to a disarm today; any other refusal)
-      // means this snipe was NOT stopped: say so, never drop it silently.
-      const why = r.kind === 'busy' ? r.detail : `${r.rejection.reason}: ${r.rejection.detail}`;
+      // Any other refusal means this snipe was NOT stopped: say so, never drop it silently.
+      const why = `${r.rejection.reason}: ${r.rejection.detail}`;
       await audit(KILL_DISARM_FAILED_KIND, { itemId: s.itemId, ref: s.id, details: { why } });
     }
   };
