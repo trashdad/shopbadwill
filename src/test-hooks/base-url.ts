@@ -77,12 +77,16 @@ function isMappedLoopback(host: string): boolean {
   return ((high >> 8) & 0xff) === 127;
 }
 
-/** Loopback (127.0.0.0/8, ::1, localhost) or the reserved `.test` TLD. Judged on the parsed host. */
+/**
+ * Loopback (127.0.0.0/8, ::1, localhost) or a name under the reserved `.test`
+ * TLD. Judged on the parsed host. A bare `test` is a single label, which a DNS
+ * search suffix can resolve off the machine, so it is refused.
+ */
 function isLoopbackOrTest(url: URL): boolean {
   const host = canonicalHost(url);
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host === '[::1]') return true;
-  if (host === 'test' || host.endsWith('.test')) return true;
+  if (host.endsWith('.test')) return true;
   if (isLoopbackV4(host)) return true;
   return isMappedLoopback(host);
 }

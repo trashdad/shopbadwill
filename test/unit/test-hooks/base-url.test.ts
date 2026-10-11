@@ -116,6 +116,9 @@ describe('sbw:test:baseUrl', () => {
       'http://sgw.test.evil.com',
       'http://localhost.evil.com',
       'http://nottest',
+      // A bare single label is not a `.test` name: a DNS search suffix can resolve it off the machine.
+      'http://test',
+      'http://test.:8787',
     ];
     for (const raw of rejected) {
       const port = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
