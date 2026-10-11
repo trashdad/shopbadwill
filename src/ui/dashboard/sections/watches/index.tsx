@@ -6,6 +6,7 @@ import { PORT_NAMES } from '../../../../messaging/protocol';
 import { describeError } from '../../../components/describeError';
 import { PacificTime } from '../../../time';
 import { ErrorAlert, LoadNotice, useLoad } from '../../parts';
+import { connectResilient } from '../../reconnect';
 import { isPolicySkip, policySkipReason } from '../../policy';
 import type { SectionDef, SectionProps } from '../../registry';
 
@@ -118,17 +119,27 @@ export function WatchesSection(props: SectionProps): VNode {
   const { client } = props;
   const [watches, reloadWatches] = useLoad(() => client.send('watches.list', undefined), [client]);
   const [rules] = useLoad(() => client.send('rules.list', undefined), [client]);
-  const [initial] = useLoad(() => client.send('job.status', undefined), [client]);
+  const [initial, reloadInitial] = useLoad(() => client.send('job.status', undefined), [client]);
   const [live, setLive] = useState<JobRun | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
 
+  // An MV3 worker restart drops the port: reconnect, then re-fetch what was missed.
   useEffect(
     () =>
-      client.connect(PORT_NAMES.jobProgress, (tick) => {
-        setLive(tick);
-        if (tick.status !== 'running') reloadWatches();
-      }),
+      connectResilient(
+        client,
+        PORT_NAMES.jobProgress,
+        (tick) => {
+          setLive(tick);
+          if (tick.status !== 'running') reloadWatches();
+        },
+        () => {
+          setLive(null);
+          reloadInitial();
+          reloadWatches();
+        },
+      ),
     [client],
   );
 

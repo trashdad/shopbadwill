@@ -1,9 +1,10 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Rule } from '../../src/domain/rules/schema';
 import type { JobRun, Watch } from '../../src/domain/watches/schema';
+import { App as OptionsApp } from '../../src/entrypoints/options/App';
 import { PORT_NAMES } from '../../src/messaging/protocol';
 import { Dashboard } from '../../src/ui/dashboard/Dashboard';
 import { FAVORITE_SKIP_PREFIX } from '../../src/ui/dashboard/policy';
@@ -11,7 +12,10 @@ import { loadSections, type SectionDef } from '../../src/ui/dashboard/registry';
 import { builtinModules } from '../../src/ui/dashboard/sections';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
 
-afterEach(cleanup);
+afterEach(() => {
+  vi.useRealTimers();
+  cleanup();
+});
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0, 0);
 
@@ -259,5 +263,81 @@ describe('dashboard matches and health', () => {
     expect(screen.getByText(/12 \/ 120/)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /open health options/i }));
     expect(opened).toEqual(['health']);
+  });
+});
+
+describe('dashboard resilience and small branches', () => {
+  it('reconnects the progress port with backoff, then refetches status and clears stale progress', async () => {
+    let status: JobRun | null = null;
+    const m = new FakeMessaging();
+    m.handle('watches.list', () => [watch()]);
+    m.handle('rules.list', () => [rule()]);
+    m.handle('job.status', () => status);
+    m.handle('job.runNow', () => undefined);
+    m.handle('tracked.list', () => []);
+    m.handle('health.get', () => healthReply());
+    m.handle('audit.list', () => []);
+    render(h(Dashboard, { client: m, sections: loadSections(builtinModules), userTz: 'UTC', openOptions: () => undefined }));
+    await screen.findByText('Vintage cameras');
+    await waitFor(() => {
+      expect(m.openPorts(PORT_NAMES.jobProgress)).toBe(1);
+    });
+    m.emitTick(PORT_NAMES.jobProgress, run());
+    await screen.findByRole('progressbar');
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: /^run now$/i }).disabled).toBe(true);
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const statusCalls = (): number => m.sent.filter((x) => x.type === 'job.status').length;
+    const before = statusCalls();
+    status = null;
+    m.disconnectPorts(PORT_NAMES.jobProgress);
+    expect(m.openPorts(PORT_NAMES.jobProgress)).toBe(0);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(m.openPorts(PORT_NAMES.jobProgress)).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(m.openPorts(PORT_NAMES.jobProgress)).toBe(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(statusCalls()).toBe(before + 1);
+    expect(screen.queryByRole('progressbar')).toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: /^run now$/i }).disabled).toBe(false);
+
+    // Still down (no tick arrived): the next wait is 2 s.
+    m.disconnectPorts(PORT_NAMES.jobProgress);
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(m.openPorts(PORT_NAMES.jobProgress)).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(m.openPorts(PORT_NAMES.jobProgress)).toBe(1);
+  });
+
+  it('treats a bad_reply as unavailable', async () => {
+    const m = new FakeMessaging();
+    m.handle('watches.list', () => 'not a list' as never); // fails the reply schema: the fake raises bad_reply
+    render(h(Dashboard, { client: m, sections: loadSections(builtinModules), userTz: 'UTC', openOptions: () => undefined }));
+    expect(await screen.findByText(/watches is unavailable/i)).toBeTruthy();
+  });
+
+  it('shows a Watch.lastError policy skip as skipped, and a real one as an alert', async () => {
+    setup({
+      watches: [
+        watch({ lastError: `${FAVORITE_SKIP_PREFIX}paused` }),
+        watch({ id: 'w2', name: 'Second', lastError: 'search failed' }),
+      ],
+    });
+    expect(await screen.findByText(/Favorite skipped \(policy\): paused/)).toBeTruthy();
+    const alerts = screen.getAllByRole('alert');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.textContent).toContain('search failed');
+  });
+
+  it('options page honours the #health hash by focusing that section heading', async () => {
+    const sections = loadSections(builtinModules);
+    window.location.hash = '#health';
+    const m = new FakeMessaging();
+    render(h(OptionsApp, { client: m, sections: [{ id: 'health', title: 'Health', order: 1, Component: () => h('p', null, 'x') }] }));
+    await waitFor(() => {
+      expect(document.activeElement?.id).toBe('heading-health');
+    });
+    expect(sections.length).toBeGreaterThan(0);
+    window.location.hash = '';
   });
 });

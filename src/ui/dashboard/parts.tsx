@@ -10,9 +10,9 @@ export type Load<T> =
   | { kind: 'error'; message: string }
   | { kind: 'ok'; value: T };
 
-/** A missing background handler is "unavailable" (a parallel card may not have landed), not an error. */
+/** A missing background handler (or a reply that does not match what this build expects) is "unavailable" (a parallel card may not have landed), not an error. */
 export function toLoadFailure(e: unknown): Load<never> {
-  if (e instanceof MessagingError && (e.code === 'no_handler' || e.code === 'unknown_type')) return { kind: 'unavailable' };
+  if (e instanceof MessagingError && (e.code === 'no_handler' || e.code === 'unknown_type' || e.code === 'bad_reply')) return { kind: 'unavailable' };
   return { kind: 'error', message: describeError(e) };
 }
 

@@ -162,9 +162,10 @@ describe.each(TARGETS)('%s production manifest', (target) => {
     expect(manifestOf(target).version).toBe(pkg.version);
   });
 
-  it('requires only storage and alarms (plus no-prompt identity on Firefox)', () => {
+  it('requires only storage and alarms (plus sidePanel on Chrome, no-prompt identity on Firefox)', () => {
     // Firefox cannot make `identity` optional (it is PermissionNoPrompt only).
-    const required = target === 'firefox' ? ['storage', 'alarms', 'identity'] : ['storage', 'alarms'];
+    const required = target === 'firefox' ? ['storage', 'alarms', 'identity'] : ['storage', 'alarms', 'sidePanel'];
+    // sidePanel: WXT adds it once the Chrome sidepanel entrypoint exists (T-01 ruling D, PLAN section 2.5).
     expect(manifestOf(target).permissions).toEqual(required);
   });
 
