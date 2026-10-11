@@ -85,6 +85,7 @@ const EXPECTED = {
     'snipe.list',
     'kill.set',
     'health.get',
+    'health.clearSticky',
     'audit.list',
     'audit.undo',
   ],
@@ -217,6 +218,7 @@ describe('replies', () => {
       sessionState: 'ok' | 'expiring' | 'expired' | 'logged-out';
       google: AuthStatus;
       budget: ReturnType<RequestScheduler['stats']>;
+      sticky?: Array<{ endpoint: string; at: EpochMs; detail: string; features: string[] }> | undefined;
     }>();
     expectTypeOf<MsgReply<'audit.list'>>().toEqualTypeOf<AuditEntry[]>();
     // No `reply` in §3.12: the response carries nothing.
@@ -273,6 +275,7 @@ type SpecMsg =
   | { type: 'snipe.list' }
   | { type: 'kill.set'; payload: { on: boolean } }
   | { type: 'health.get' }
+  | { type: 'health.clearSticky'; payload: { endpoint: string } }
   | { type: 'audit.list'; payload: { limit: number; before?: number } }
   | { type: 'audit.undo'; payload: { seq: number } }
   | { type: 'rules.changed' }

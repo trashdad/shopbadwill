@@ -5,7 +5,14 @@
 //   sessionState: SgwSession.state();
 //   google:       GoogleAuthProvider.status() (no network);
 //   budget:       RequestScheduler.stats().
+//   sticky:       the sticky schema failures and the features each blocks (T-30b).
 // It only reads; it never runs a health check (that costs SGW requests).
+//
+// `health.clearSticky` (T-30b R2, ui only): the user checked a sticky failure and
+// resumes. It removes that one entry (through T-30's recordSchemaSuccess, which
+// also recomposes the report), audits `health.resume`, and re-evaluates the
+// switches at once. Stale, clock and session failures are untouched: they clear
+// only through probes or real state.
 import type { AuthStatus } from '../../domain/calendar/types';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import type { BackgroundContext } from '../context';
@@ -25,6 +32,22 @@ export function register(ctx: BackgroundContext): void {
       sessionState,
       google,
       budget: ctx.scheduler.stats(),
+      sticky: ctx.switches.stickyFailures(),
     };
+  });
+
+  ctx.router.register('health.clearSticky', async ({ endpoint }) => {
+    const before = await ctx.repo.find(STORAGE_KEYS.healthProbe);
+    if (before === undefined || !before.sticky.some((x) => x.endpoint === endpoint)) return undefined;
+    await ctx.health.recordSchemaSuccess(endpoint);
+    ctx.switches.noteHealthProbe(await ctx.repo.find(STORAGE_KEYS.healthProbe));
+    const report = await ctx.health.last();
+    if (report !== null) ctx.switches.noteHealthReport(report);
+    try {
+      await ctx.audit.append({ actor: 'user', kind: 'health.resume', details: { endpoint, action: 'user resumed after checking' } });
+    } catch {
+      // An audit failure never undoes the resume (the report's own health.recovered entry is separate).
+    }
+    return undefined;
   });
 }

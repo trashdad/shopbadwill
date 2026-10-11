@@ -113,6 +113,8 @@ export const MsgSchema = z.discriminatedUnion('type', [
   signal('snipe.list'),
   msg('kill.set', z.object({ on: z.boolean() })),
   signal('health.get'),
+  /** The user checked a sticky schema failure and resumes its feature (T-30b, R2). Refused from content scripts. */
+  msg('health.clearSticky', z.object({ endpoint: z.string().min(1) })),
   msg('audit.list', z.object({ limit: z.number().int().positive(), before: z.number().int().nonnegative().optional() })),
   msg('audit.undo', z.object({ seq: z.number().int().nonnegative() })),
 
@@ -173,6 +175,7 @@ export const MSG_SENDER = Object.freeze({
   'snipe.list': 'ui',
   'kill.set': 'ui',
   'health.get': 'ui',
+  'health.clearSticky': 'ui',
   'audit.list': 'ui',
   'audit.undo': 'ui',
   'rules.changed': 'background',
@@ -219,6 +222,20 @@ export const MsgReplySchemas = Object.freeze({
     sessionState: SgwSessionStateSchema,
     google: AuthStatusSchema,
     budget: RequestSchedulerStatsSchema,
+    /**
+     * T-30b: the sticky per-endpoint schema failures (from `sbw:healthProbe`) with the write
+     * features each one blocks. Optional: absent from older replies.
+     */
+    sticky: z
+      .array(
+        z.object({
+          endpoint: z.string().min(1),
+          at: EpochMsSchema,
+          detail: z.string(),
+          features: z.array(z.string()),
+        }),
+      )
+      .optional(),
   }),
   'audit.list': z.array(AuditEntrySchema),
 } as const satisfies Partial<Record<MsgType, z.ZodType>>);
