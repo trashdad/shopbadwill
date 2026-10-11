@@ -36,7 +36,7 @@ function Get-SbwSchTasksPath { 'C:\sbw-no-such\schtasks.exe' }
 # $PSScriptRoot is unreliable inside It blocks under Pester 3.4; a function
 # resolves it against its defining file, which works under both 3.4 and 5.x.
 function Get-SbwInstallSource {
-  Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\install.ps1') -Raw
+  Get-SbwTestText '..\install.ps1'
 }
 
 Describe 'host manifests (R3)' {
@@ -95,10 +95,10 @@ Describe 'extension id validation' {
 
 # File-scoped on purpose: $PSScriptRoot inside It is empty under Pester 5.
 function Get-SbwUninstallSource {
-  Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1') -Raw
+  Get-SbwTestText '..\uninstall.ps1'
 }
 function Get-SbwCompanionDoc {
-  Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\..\..\docs\COMPANION.md') -Raw
+  Get-SbwTestText '..\..\..\docs\COMPANION.md'
 }
 
 Describe 'reg argument arrays' {
@@ -219,9 +219,9 @@ Describe 'uninstall task-name allowlist' {
 
 Describe 'uninstall -DataDir survives dot-sourcing install.ps1' {
   It 'saves the argument before install.ps1 rebinds DataDir' {
-    $src = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1') -Raw
+    $src = Get-SbwUninstallSource
     $capture = $src.IndexOf('SbwUninstallDataDir')
-    $dot = $src.IndexOf('"$PSScriptRoot\install.ps1"')
+    $dot = $src.IndexOf(('$' + 'PSScriptRoot\install.ps1'))
     Assert-True ($capture -ge 0) 'missing capture of -DataDir'
     Assert-True ($dot -gt $capture) 'capture must precede the dot-source'
     Assert-Match $src 'Get-SbwDataDir -Explicit \$script:SbwUninstallDataDir'
@@ -307,7 +307,7 @@ Describe 'registry scope' {
     Assert-Equal (Get-SbwChromeRegKey) 'HKCU\Software\Google\Chrome\NativeMessagingHosts'
     Assert-Equal (Get-SbwFirefoxRegKey) 'HKCU\Software\Mozilla\NativeMessagingHosts'
     foreach ($rel in @('..\install.ps1', '..\uninstall.ps1')) {
-      $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot $rel))
+      $src = Get-SbwTestText $rel
       Assert-NotMatch $src 'HKLM' $rel
     }
   }
@@ -332,9 +332,13 @@ Describe 'COMPANION.md power guidance (R5)' {
 
 Describe 'Pester runner' {
   It 'uses -Path on Pester 5 and -Script on earlier Pester' {
-    $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'run.ps1'))
+    $src = Get-SbwTestText 'run.ps1'
     Assert-Match $src '\$module\.Version\.Major -ge 5'
     Assert-Match $src 'Invoke-Pester -Path'
     Assert-Match $src 'Invoke-Pester -Script'
+  }
+  It 'keeps the script-root variable out of It blocks and helpers in test files' {
+    $bad = @(Test-SbwTestsUseScriptRootOnlyToDotSource -TestsDir (Get-SbwTestPath '.'))
+    Assert-Equal $bad.Count 0 ($bad -join ', ')
   }
 }

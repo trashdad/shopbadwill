@@ -103,7 +103,7 @@ Describe 'native-messaging framing' {
 
 Describe 'host loop uses the frame helpers' {
   It 'replies through New-SbwOutboundFrame and reads through Read-SbwHostFrame' {
-    $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\host\shopbadwill-host.ps1'))
+    $src = Get-SbwTestText '..\host\shopbadwill-host.ps1'
     Assert-Match $src 'Read-SbwHostFrame'
     Assert-Match $src 'New-SbwOutboundFrame'
     Assert-NotMatch $src 'ConvertTo-SbwFrame'

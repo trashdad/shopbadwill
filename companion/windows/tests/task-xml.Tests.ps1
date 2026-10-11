@@ -175,9 +175,9 @@ function Remove-SbwPsComments {
 
 Describe 'production scripts do not shell out' {
   It 'host, install, and uninstall contain no Invoke-Expression, iex, cmd /c, or ComSpec' {
-    $files = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '..\host') -Filter '*.ps1' -File)
-    $files += Get-Item -LiteralPath (Join-Path $PSScriptRoot '..\install.ps1')
-    $files += Get-Item -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1')
+    $files = @(Get-ChildItem -LiteralPath (Get-SbwTestPath '..\host') -Filter '*.ps1' -File)
+    $files += Get-Item -LiteralPath (Get-SbwTestPath '..\install.ps1')
+    $files += Get-Item -LiteralPath (Get-SbwTestPath '..\uninstall.ps1')
     foreach ($f in $files) {
       $code = Remove-SbwPsComments -Text ([IO.File]::ReadAllText($f.FullName))
       Assert-NotMatch $code 'Invoke-Expression' $f.Name

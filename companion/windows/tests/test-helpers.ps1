@@ -63,3 +63,34 @@ function Remove-TestTempDir {
   param([string]$Path)
   if ($Path -and (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $Path -Recurse -Force }
 }
+
+# $PSScriptRoot inside an It block is empty under Pester 5 (and unreliable under
+# 3.4). These helpers are defined in this file, so their $PSScriptRoot is the
+# tests directory on both versions.
+function Get-SbwTestPath {
+  param([string]$RelativePath)
+  Join-Path $PSScriptRoot $RelativePath
+}
+
+function Get-SbwTestText {
+  param([string]$RelativePath)
+  [IO.File]::ReadAllText((Get-SbwTestPath $RelativePath))
+}
+
+# Returns "file:line" for any *.Tests.ps1 use of $PSScriptRoot that is not a
+# file-scope dot-source. Line comments are ignored.
+function Test-SbwTestsUseScriptRootOnlyToDotSource {
+  param([string]$TestsDir)
+  $bad = @()
+  foreach ($f in @(Get-ChildItem -LiteralPath $TestsDir -Filter '*.Tests.ps1')) {
+    $i = 0
+    foreach ($line in [IO.File]::ReadAllLines($f.FullName)) {
+      $i++
+      if ($line.Trim().StartsWith('#')) { continue }
+      if ($line -notmatch '\$PSScriptRoot') { continue }
+      if ($line -match '^\s*\.\s+"\$PSScriptRoot\\') { continue }
+      $bad += "$($f.Name):$i"
+    }
+  }
+  $bad
+}
