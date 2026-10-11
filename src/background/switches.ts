@@ -189,12 +189,19 @@ export class Switches implements GlobalSwitches {
     return Promise.resolve(this.verdictNow(feature));
   }
 
-  /** The synchronous answer behind writesAllowed (T-26's `writesAllowedNow`, asked right before a write is sent). */
-  verdictNow(feature: WriteFeature): Verdict {
+  /**
+   * The synchronous answer behind writesAllowed (T-26's `writesAllowedNow`, asked right before a write is sent).
+   *
+   * `ignoreDryRun` skips only the dry-run condition (T-84). A dry-run snipe uses it so its
+   * fallback audit and its window checks see the live verdict: kill, storage repair, health
+   * (T-30b sticky scoping and a schema failure flagged but not yet stored) and the session.
+   * `writesAllowed` and `view` never pass it, so the dry run still blocks real writes.
+   */
+  verdictNow(feature: WriteFeature, opts?: { ignoreDryRun?: boolean }): Verdict {
     if (!this.isLoaded) return { ok: false, why: WHY.starting };
     if (this.problem !== null) return { ok: false, why: WHY.storage(this.problem.reason) };
     if (this.killSwitchOn()) return { ok: false, why: WHY.kill };
-    if (this.dryRun[feature]) return { ok: false, why: WHY.dryRun };
+    if (opts?.ignoreDryRun !== true && this.dryRun[feature]) return { ok: false, why: WHY.dryRun };
     const now = this.deps.clock.now();
     if (this.healthFailing(now, feature)) return { ok: false, why: WHY.health };
     if (feature === 'calendar') return { ok: true }; // Google writes: the SGW session does not gate them

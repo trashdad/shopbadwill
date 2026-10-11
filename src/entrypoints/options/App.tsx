@@ -30,6 +30,9 @@ export function App(props: { client: MessagingClient; sections: readonly Section
       </a>
       <header>
         <h1>ShopBadwill options</h1>
+        <p class="sbw-hint">
+          <a href="onboarding.html">Run setup again</a>
+        </p>
         <nav aria-label="Options sections">
           <ul>
             {props.sections.map((s) => (

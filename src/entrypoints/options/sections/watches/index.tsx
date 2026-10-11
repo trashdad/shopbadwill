@@ -190,7 +190,7 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
     : !calendarConnected
     ? 'Connect Google Calendar in the Google Calendar section to turn this on.'
     : !calendarOn
-      ? 'Calendar events are turned off in Settings. Turn them on to use this.'
+      ? 'Calendar events are turned off. Turn them on in the Google Calendar section.'
       : 'Adds matches to your calendar.';
 
   /** undefined until settings load (or when they fail): the note then does not claim the current state. */

@@ -86,6 +86,7 @@ const EXPECTED = {
     'snipe.arm',
     'snipe.disarm',
     'snipe.list',
+    'timing.awake',
     'kill.set',
     'health.get',
     'health.clearSticky',
@@ -112,6 +113,7 @@ const WITH_REPLY = [
   'snipe.prepare',
   'snipe.arm',
   'snipe.list',
+  'timing.awake',
   'health.get',
   'audit.list',
 ];
@@ -216,6 +218,7 @@ describe('replies', () => {
     }>();
     expectTypeOf<MsgReply<'snipe.arm'>>().toEqualTypeOf<Snipe>();
     expectTypeOf<MsgReply<'snipe.list'>>().toEqualTypeOf<Snipe[]>();
+    expectTypeOf<MsgReply<'timing.awake'>>().toEqualTypeOf<EpochMs[]>();
     expectTypeOf<MsgReply<'health.get'>>().toEqualTypeOf<{
       sgw: HealthReport | null;
       session: SgwSessionRecord['expiresAt'] | null;
@@ -242,6 +245,11 @@ describe('replies', () => {
     expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 1299 }).success).toBe(false);
     expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': { shipping: 499, handling: 100 } }).success).toBe(false);
     expect(MsgReplySchemas['job.status'].safeParse(null).success).toBe(true);
+    // timing.awake is the persisted sbw:awake history (epoch ms), or an empty array.
+    expect(MsgReplySchemas['timing.awake'].safeParse([]).success).toBe(true);
+    expect(MsgReplySchemas['timing.awake'].safeParse([1_791_400_000_000]).success).toBe(true);
+    expect(MsgReplySchemas['timing.awake'].safeParse([-1]).success).toBe(false);
+    expect(MsgReplySchemas['timing.awake'].safeParse({ beats: [] }).success).toBe(false);
   });
 
   it('rejects landedCost.get when itemIds is longer than 40 (R5)', () => {
@@ -293,6 +301,7 @@ type SpecMsg =
   | { type: 'snipe.arm'; payload: { snipe: Omit<Snipe, 'state' | 'history' | 'armedAt'>; typedConfirmation?: string } }
   | { type: 'snipe.disarm'; payload: { id: string } }
   | { type: 'snipe.list' }
+  | { type: 'timing.awake' }
   | { type: 'kill.set'; payload: { on: boolean } }
   | { type: 'health.get' }
   | { type: 'health.clearSticky'; payload: { endpoint: string } }
@@ -326,6 +335,7 @@ describe('payload types', () => {
       writesAllowed: Record<string, boolean>;
     }>();
     expectTypeOf<MsgPayload<'settings.get'>>().toEqualTypeOf<undefined>();
+    expectTypeOf<MsgPayload<'timing.awake'>>().toEqualTypeOf<undefined>();
     expectTypeOf<Extract<Msg, { type: 'favorites.sync' }>>().toEqualTypeOf<{ type: 'favorites.sync' }>();
   });
 });

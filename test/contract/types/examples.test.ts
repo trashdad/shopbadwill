@@ -104,6 +104,7 @@ const EXPECTED_SCHEMAS: Record<string, string[]> = {
     'GoogleClient',
     'HealthProbe',
     'QuarantineRecord',
+    'SnipeRunnerRecord',
   ],
   'src/messaging/protocol.ts': ['Msg', 'MsgEnvelope', 'SnipeCountdownTick'],
 };

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "entries": {
+    "snp-1": {
+      "outbox": [
+        {
+          "kind": "placeBid",
+          "snipeId": "snp-1",
+          "amount": 2000
+        }
+      ],
+      "preflightAt": 1791400000000,
+      "preflightNotBefore": 1791390000000,
+      "atRisk": "session-expiring",
+      "readFailures": 1,
+      "lastReadAt": 1791400005000,
+      "unconfirmedAt": 1791400300000
+    }
+  }
+}
