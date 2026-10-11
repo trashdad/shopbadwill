@@ -342,8 +342,10 @@ describe('T-36 brief', () => {
     }
 
     // A new module in the map is registered with the context, and its handler serves.
+    // (T-85 registered ui.openSnipe for real, so the probe uses the one content-only
+    // type no built-in module registers yet: landedCost.get, with its valid reply.)
     const handlerProbe = vi.fn((ctx: BackgroundContext) => {
-      ctx.router.register('ui.openSnipe', () => undefined);
+      ctx.router.register('landedCost.get', () => ({}));
     });
     const jobProbe = vi.fn();
     const h = boot({
@@ -360,7 +362,7 @@ describe('T-36 brief', () => {
         failed: [],
       }),
     );
-    expect(await h.send('ui.openSnipe', { itemId: 1 }, CONTENT)).toEqual({ ok: true });
+    expect(await h.send('landedCost.get', { itemIds: [1] }, CONTENT)).toEqual({ ok: true, reply: {} });
     // The pre-existing modules registered too (T-53, T-58).
     expect((await h.send('audit.list', { limit: 5 })).ok).toBe(true);
   });
