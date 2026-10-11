@@ -1,0 +1,7 @@
+# Firefox E2E harness (T-12, S-6). Install with the transitive pins:
+#   python -m pip install -r test/e2e/firefox/requirements.txt -c test/e2e/firefox/constraints.txt
+# Python 3.14. Selenium Manager fetches geckodriver when it is not on PATH.
+selenium==4.50.0
+pytest==9.1.1
+# Throwaway self-signed certificate for the https://shopgoodwill.com/ fixture site.
+cryptography==50.0.2

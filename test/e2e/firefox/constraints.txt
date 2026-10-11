@@ -1,0 +1,29 @@
+# Exact versions of the Firefox harness's transitive Python dependencies (T-12).
+#   python -m pip install -r test/e2e/firefox/requirements.txt -c test/e2e/firefox/constraints.txt
+# CI then runs test/e2e/firefox/check_pins.py, which fails if any package in the
+# dependency closure of requirements.txt is unpinned here or installed at another version.
+#
+# To update: install requirements.txt into a fresh venv, then copy `pip freeze`
+# here without pip and the three direct pins. Resolved on CPython 3.14; the Linux
+# closure is the same set without colorama (a Windows-only pytest dependency).
+attrs==26.1.0
+certifi==2026.7.22
+cffi==2.1.1
+colorama==0.4.6
+h11==0.16.0
+idna==3.20
+iniconfig==2.3.1
+outcome==1.3.0.post0
+packaging==26.3
+pluggy==1.6.0
+pycparser==3.0
+Pygments==2.21.0
+PySocks==1.7.1
+sniffio==1.3.1
+sortedcontainers==2.4.0
+trio==0.34.0
+trio-websocket==0.12.2
+typing_extensions==4.16.0
+urllib3==2.8.0
+websocket-client==1.9.2
+wsproto==1.3.2

@@ -1,0 +1,20 @@
+{
+  "invalidBecause": "killSwitch is a boolean",
+  "path": [
+    "payload",
+    "killSwitch"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-13",
+    "type": "settings.set",
+    "payload": {
+      "dryRun": {
+        "favorites": false,
+        "calendar": true,
+        "bidding": true
+      },
+      "killSwitch": "yes"
+    }
+  }
+}

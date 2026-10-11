@@ -1,0 +1,11 @@
+{
+  "invalidBecause": "reqId is non-empty",
+  "path": [
+    "reqId"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "",
+    "type": "calendar.connect"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "invalidBecause": "a detail step's reason is new-match or calendar",
+  "path": [
+    "reason"
+  ],
+  "value": {
+    "kind": "detail",
+    "itemId": 279250057,
+    "reason": "manual"
+  }
+}

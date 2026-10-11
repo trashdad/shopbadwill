@@ -1,0 +1,6 @@
+{
+  "ruleId": "r-pyrex",
+  "conditionIndex": 0,
+  "field": "title",
+  "detail": "title contains 'pyrex' (whole word)"
+}

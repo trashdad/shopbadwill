@@ -1,0 +1,6 @@
+{
+  "minIntervalMs": 120000,
+  "jitterMs": 15000,
+  "maxConcurrent": 1,
+  "dailyBudget": 120
+}

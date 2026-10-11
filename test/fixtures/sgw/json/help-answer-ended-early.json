@@ -1,0 +1,481 @@
+{
+  "helpCenterLists": [
+    {
+      "label": "Getting Started",
+      "value": "1",
+      "items": [
+        {
+          "label": "What is ShopGoodwill?",
+          "value": "welcome",
+          "items": null
+        },
+        {
+          "label": "Are there fees?",
+          "value": "are-there-fees",
+          "items": null
+        },
+        {
+          "label": "Why is ShopGoodwill.com safe?",
+          "value": "why-is-it-safe",
+          "items": null
+        },
+        {
+          "label": "What is ShopGoodwill.com?",
+          "value": "about-shopgoodwill",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "Registration",
+      "value": "2",
+      "items": [
+        {
+          "label": "How do I sign up?",
+          "value": "sign-up-to-register",
+          "items": null
+        },
+        {
+          "label": "Can I become a seller on ShopGoodwill.com?",
+          "value": "can-i-become-a-seller-on-shopgoodwillcom",
+          "items": null
+        },
+        {
+          "label": "Can I register from outside the United States?",
+          "value": "can-i-register-from-outside-the-united-states",
+          "items": null
+        },
+        {
+          "label": "Can I have more than one account on ShopGoodwill.com?",
+          "value": "can-i-have-more-than-one-account-on-shopgoodwill",
+          "items": null
+        },
+        {
+          "label": "Why is my country not listed?",
+          "value": "77",
+          "items": null
+        },
+        {
+          "label": "Can I register using an APO or FPO address?",
+          "value": "can-i-register-using-an-apo-or-fpo-address",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "My Account",
+      "value": "3",
+      "items": [
+        {
+          "label": "Can I retract a bid?",
+          "value": "can-i-retract-a-bid",
+          "items": null
+        },
+        {
+          "label": "How do I reset my password?",
+          "value": "i-cannot-remember-my-password",
+          "items": null
+        },
+        {
+          "label": "How do I update/change my ShopGoodwill.com address, email or password?",
+          "value": "how-do-i-update-change-my-shopgoodwill-address-email-or-password",
+          "items": null
+        },
+        {
+          "label": "Can I change my Username?",
+          "value": "can-i-change-my-username",
+          "items": null
+        },
+        {
+          "label": "Can I use a P.O. or A.P.O. Box as my shipping address?",
+          "value": "can-i-use-a-po-or-apo-box-as-my-shipping-addr",
+          "items": null
+        },
+        {
+          "label": "Can I get a payment deadline extension?",
+          "value": "can-i-get-an-extension-on-payments-due",
+          "items": null
+        },
+        {
+          "label": "How do I hide my Username?",
+          "value": "",
+          "items": null
+        },
+        {
+          "label": "How do I close or delete my Account?",
+          "value": "how-do-i-close-my-account",
+          "items": null
+        },
+        {
+          "label": "How do I use the Personal Shopper?",
+          "value": "how-do-i-set-up-personal-shopper-searches",
+          "items": null
+        },
+        {
+          "label": "Why can't I bid on more than 15 Items?",
+          "value": "why-cant-i-bid-on-more-than-15-items-as-a-new",
+          "items": null
+        },
+        {
+          "label": "What is a non-paying bidder?",
+          "value": "74",
+          "items": null
+        },
+        {
+          "label": "What is MY SHOPGOODWILL?",
+          "value": "overview-of-my-shopgoodwill",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "Auctions",
+      "value": "4",
+      "items": [
+        {
+          "label": "How do I view items from a specific Goodwill location?",
+          "value": "how-do-i-view-items-listed-by-my-local-goodwi",
+          "items": null
+        },
+        {
+          "label": "Does ShopGoodwill.com auction cars?",
+          "value": "does-shopgoodwill-auction-automobiles",
+          "items": null
+        },
+        {
+          "label": "What are \"Last chance\" auctions?",
+          "value": "what-are-ending-today-and-last-chance-auction",
+          "items": null
+        },
+        {
+          "label": "Why was my bid in the last seconds of an auction not accepted?",
+          "value": "i-tried-bidding-on-an-item-in-the-last-second",
+          "items": null
+        },
+        {
+          "label": "Why did the auction I was bidding on end early?",
+          "value": "why-did-the-auction-i-was-bidding-on-end-early",
+          "items": null
+        },
+        {
+          "label": "Why won't the system accept my bid?",
+          "value": "why-wont-the-system-accept-my-bid",
+          "items": null
+        },
+        {
+          "label": "What do the letters MIB, NIB, etc. in the item title or description mean?",
+          "value": "what-do-the-letters-mib-nib-etc-in-the-item-title-or-description-mean",
+          "items": null
+        },
+        {
+          "label": "How do I create a Saved Search?",
+          "value": "how-do-i-create-a-saved-search",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "Bidding on a item",
+      "value": "5",
+      "items": [
+        {
+          "label": "Why was the winning bid less than the bid increment amount higher than my bid?",
+          "value": "why-did-the-winning-bid-win-the-auction-if-it",
+          "items": null
+        },
+        {
+          "label": "How do I find auctions to bid on?",
+          "value": "find-an-auction-item-to-bid-on",
+          "items": null
+        },
+        {
+          "label": "How do I place a bid?",
+          "value": "place-your-bid",
+          "items": null
+        },
+        {
+          "label": "What is Automatic (Proxy) Bidding?",
+          "value": "automatic-proxy-bidding",
+          "items": null
+        },
+        {
+          "label": "Who sets the starting price?",
+          "value": "starting-price",
+          "items": null
+        },
+        {
+          "label": "Reserve Price",
+          "value": "reserve-price",
+          "items": null
+        },
+        {
+          "label": "Why did I lose the auction when my bid was higher than the Buy It Now price?",
+          "value": "dutch-auction",
+          "items": null
+        },
+        {
+          "label": "Buy It Now Item - Auction and Non-Auction",
+          "value": "buy-it-now-item---auction-and-non-auction",
+          "items": null
+        },
+        {
+          "label": "What is a Stock Item?",
+          "value": "stock-item",
+          "items": null
+        },
+        {
+          "label": "What is a pure Buy Now item?",
+          "value": "pure-buy-now",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "Monitoring an auction",
+      "value": "6",
+      "items": [
+        {
+          "label": "How do I receive Account notification?",
+          "value": "receive-notification-emails",
+          "items": null
+        },
+        {
+          "label": "What are Out Bid notifications?",
+          "value": "receive-outbid-emails",
+          "items": null
+        },
+        {
+          "label": "Overview of MY SHOPGOODWILL",
+          "value": "using-my-shopgoodwill",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "Checkout",
+      "value": "7",
+      "items": [
+        {
+          "label": "How do I proceed with a won auction?",
+          "value": "purchasing-an-item",
+          "items": null
+        },
+        {
+          "label": "What forms of payment does ShopGoodwill.com accept?",
+          "value": "what-forms-of-payment-does-shopgoodwill-accept",
+          "items": null
+        },
+        {
+          "label": "Why was my payment declined?",
+          "value": "why-was-my-payment-declined",
+          "items": null
+        },
+        {
+          "label": "Why was my credit card charged twice?",
+          "value": "why-was-my-credit-card-charged-twice",
+          "items": null
+        },
+        {
+          "label": "Does ShopGoodwill.com accept PayPal?",
+          "value": "does-shopgoodwill-accept-paypal",
+          "items": null
+        },
+        {
+          "label": "Can I pay with a pre-paid or gift-card credit card?",
+          "value": "can-i-pay-with-a-pre-paid-credit-card-or-gift-card",
+          "items": null
+        },
+        {
+          "label": "How do I combine items?",
+          "value": "how-do-i-combine-items",
+          "items": null
+        },
+        {
+          "label": "Why am I being charged tax?",
+          "value": "why-am-i-being-charged-tax",
+          "items": null
+        },
+        {
+          "label": "How do I submit my Tax Exempt status?",
+          "value": "i-am-tax-exempt-how-do-i-submit-my-tax-exempt",
+          "items": null
+        },
+        {
+          "label": "How do I pay for an Item? - Checkout Process",
+          "value": "checkout-process",
+          "items": null
+        },
+        {
+          "label": "What is the I3 Retail Delivery Fee?",
+          "value": "what-is-co-rdf",
+          "items": null
+        },
+        {
+          "label": "How is tax calculated?",
+          "value": "how-is-tax-calculated",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "Shipping",
+      "value": "8",
+      "items": [
+        {
+          "label": "How are orders shipped?",
+          "value": "order-shipment",
+          "items": null
+        },
+        {
+          "label": "Can I ship to an address different from my account address?",
+          "value": "can-i-ship-to-an-address-different-from-my-ac",
+          "items": null
+        },
+        {
+          "label": "When will my item ship?",
+          "value": "when-will-my-item-ship",
+          "items": null
+        },
+        {
+          "label": "How are items shipped?",
+          "value": "how-are-items-shipped",
+          "items": null
+        },
+        {
+          "label": "How are shipping and handling charges determined?",
+          "value": "how-are-shipping-and-handling-charges-determined",
+          "items": null
+        },
+        {
+          "label": "Why can't I combine some items for shipping?",
+          "value": "why-cant-i-combine-some-items-for-shipping",
+          "items": null
+        },
+        {
+          "label": "Why is the shipping weight higher than the item weight?",
+          "value": "why-does-the-shipping-weight-state-30-lbs-or-70-lbs-when-the-item-weighs-less-than-that",
+          "items": null
+        },
+        {
+          "label": "Pickup - Can items be picked up from the selling Goodwill location?",
+          "value": "can-items-be-picked-up-from-the-selling-goodw",
+          "items": null
+        },
+        {
+          "label": "Does ShopGoodwill.com ship internationally?",
+          "value": "do-you-ship-internationally",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "My Orders",
+      "value": "9",
+      "items": [
+        {
+          "label": "How do I view the items I have won?",
+          "value": "how-do-i-view-items-i-have-won",
+          "items": null
+        },
+        {
+          "label": "Are my purchases tax deductible?",
+          "value": "are-my-purchases-tax-deductible",
+          "items": null
+        },
+        {
+          "label": "How do I view my purchase history?",
+          "value": "how-do-i-view-my-purchase-history",
+          "items": null
+        },
+        {
+          "label": "How can I receive a tax refund on items purchased for resale?",
+          "value": "how-can-i-receive-a-tax-refund-on-items-purch",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "Returns",
+      "value": "10",
+      "items": [
+        {
+          "label": "Can an item be returned if it was damaged during shipping?",
+          "value": "can-an-item-be-returned-if-it-was-damaged-during-shipping",
+          "items": null
+        }
+      ]
+    },
+    {
+      "label": "General Help And Support",
+      "value": "11",
+      "items": [
+        {
+          "label": "How do I contact a seller?",
+          "value": "how-do-i-contact-a-seller",
+          "items": null
+        },
+        {
+          "label": "I contacted a seller but have not received a response. How soon can I expect a response?",
+          "value": "i-contacted-a-seller-but-did-not-receive-a-response-how-soon-can-i-expect-a-response",
+          "items": null
+        },
+        {
+          "label": "How can I find or contact my nearest Goodwill retail store?",
+          "value": "how-can-i-contactfind-my-nearest-goodwill-ret",
+          "items": null
+        },
+        {
+          "label": "Why is old order information showing on my account?",
+          "value": "i-see-old-auction-info-how-do-i-set-browser-cache",
+          "items": null
+        },
+        {
+          "label": "How do I enable Cookies?",
+          "value": "how-do-i-enable-cookies",
+          "items": null
+        },
+        {
+          "label": "How do I enable Javascript?",
+          "value": "how-do-i-enable-javascript",
+          "items": null
+        },
+        {
+          "label": "How do I contact the Site Administrators?",
+          "value": "contact-us",
+          "items": null
+        },
+        {
+          "label": "What are the current known issues?",
+          "value": "current-known-issues",
+          "items": null
+        },
+        {
+          "label": "What is ShopGoodwill.com about?",
+          "value": "what-is-new-shopgoodwill-all-about",
+          "items": null
+        },
+        {
+          "label": "Why are my payments going to Goodwill of P3?",
+          "value": "why-are-my-payments-going-to-goodwill-of-oran",
+          "items": null
+        },
+        {
+          "label": "Why was my account inactivated?",
+          "value": "covid-19",
+          "items": null
+        },
+        {
+          "label": "Why are there ads?",
+          "value": "why-are-there-ads",
+          "items": null
+        }
+      ]
+    }
+  ],
+  "question": "Why did the auction I was bidding on end early?",
+  "answer": "<p>Occasionally errors are made and a listing cannot be completed as scheduled.</p><p><br></p><p>Reasons for ending listings early may include:</p><p>&gt; The item is no longer available for sale</p><p>&gt; There was a significant error and/or discrepancy in the listing description</p><p>&gt; The item was lost or broken</p><p>&gt; The item was prohibited</p><p><br></p><p>If the auction you were bidding on ended early, your bid will be retracted and you will receive an email indicating the reason for the retraction.</p>",
+  "lastUpdatedOn": "2024-04-23T12:55:11.503",
+  "version": "4.0.0.0",
+  "apiVersion": "4.0.0.0",
+  "octopusReleaseNumber": "na"
+}

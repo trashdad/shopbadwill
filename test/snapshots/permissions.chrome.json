@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "permissions": [
+    "storage",
+    "alarms",
+    "sidePanel"
+  ],
+  "optional_permissions": [
+    "notifications",
+    "identity",
+    "sidePanel",
+    "background",
+    "power",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "https://shopgoodwill.com/*",
+    "https://buyerapi.shopgoodwill.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://oauth2.googleapis.com/*",
+    "https://www.googleapis.com/*",
+    "https://ntfy.sh/*"
+  ],
+  "content_script_matches": [
+    [
+      "https://shopgoodwill.com/*"
+    ],
+    [
+      "https://shopgoodwill.com/*"
+    ]
+  ],
+  "web_accessible_resources": null,
+  "externally_connectable": null,
+  "content_security_policy": null,
+  "commands": {
+    "kill-switch": {
+      "suggested_key": {
+        "default": "Alt+Shift+K"
+      },
+      "description": "Kill switch: stop all ShopBadwill automation"
+    }
+  },
+  "minimum_chrome_version": "148",
+  "oauth2": {
+    "scopes": [
+      "https://www.googleapis.com/auth/calendar.app.created"
+    ]
+  },
+  "browser_specific_settings": null
+}

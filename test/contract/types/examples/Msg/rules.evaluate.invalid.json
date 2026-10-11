@@ -1,0 +1,13 @@
+{
+  "invalidBecause": "listings are required",
+  "path": [
+    "payload",
+    "listings"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-6",
+    "type": "rules.evaluate",
+    "payload": {}
+  }
+}

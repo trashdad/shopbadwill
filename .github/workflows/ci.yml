@@ -1,0 +1,214 @@
+name: CI
+
+# Runs on every push to dev and on pull requests into main (PR #1: dev -> main).
+# Job chain: static -> unit -> contract -> integration -> e2e-chromium -> e2e-firefox.
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: 'true'
+  # Dummy value so the production manifest has its `oauth2` block, which the
+  # permission snapshot covers (the id itself is never snapshotted).
+  SBW_GOOGLE_CLIENT_ID: ci-dummy.apps.googleusercontent.com
+
+jobs:
+  static:
+    name: static (lint, types, builds, permissions, bundle, web-ext)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0 - version comes from package.json "packageManager"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm exec tsx scripts/check-actions-pinned.ts
+      - run: pnpm build
+      - run: pnpm build:firefox
+      - run: pnpm check:permissions
+      - run: pnpm check:prod-bundle
+      - run: pnpm lint:webext
+
+  unit:
+    name: unit (Vitest unit + dom)
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:unit
+      - run: pnpm test:dom
+
+  contract:
+    name: contract
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:contract
+
+  integration:
+    name: integration
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:integration
+
+  e2e-chromium:
+    name: e2e-chromium (headless chromium channel)
+    needs: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Build the test extension (SBW_TEST=1, mode "test")
+        run: pnpm build:test
+      - name: Start the fake servers and wait for them
+        run: |
+          pnpm fake:sgw > fake-sgw.log 2>&1 &
+          pnpm fake:google > fake-google.log 2>&1 &
+          for port in 8787 8788; do
+            for i in $(seq 1 60); do
+              if curl -s -o /dev/null "http://127.0.0.1:${port}/"; then
+                echo "port ${port} is up"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "fake server on ${port} did not start" >&2
+                cat fake-sgw.log fake-google.log >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+      # Passes with zero specs until T-39 lands (scripts/run-playwright.ts).
+      # Chromium has no display on the runner; the `chromium` channel runs headless.
+      - run: pnpm test:e2e:chromium
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+            fake-sgw.log
+            fake-google.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  e2e-firefox:
+    name: e2e-firefox (geckodriver)
+    needs: e2e-chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Allowed to fail until the harness (T-12) has run green on GitHub's Linux
+    # runner; then remove this line to make the job required (S-6).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: |
+            test/e2e/firefox/requirements.txt
+            test/e2e/firefox/constraints.txt
+      - run: pnpm install --frozen-lockfile
+      # Direct pins in requirements.txt, every transitive one in constraints.txt;
+      # check_pins.py fails if anything in the closure is unpinned or off-pin.
+      - name: Install the Firefox harness (Selenium, pytest), pinned
+        run: |
+          python -m pip install -r test/e2e/firefox/requirements.txt -c test/e2e/firefox/constraints.txt
+          python test/e2e/firefox/check_pins.py
+      # ubuntu-latest ships Firefox stable and geckodriver (GECKOWEBDRIVER); the
+      # harness uses both (test/e2e/firefox/harness/firefox.py). geckodriver
+      # must be >= 0.36 for --allow-system-access.
+      - name: Firefox and geckodriver versions
+        run: |
+          firefox --version
+          "${GECKOWEBDRIVER}/geckodriver" --version
+      # The harness serves its own fixture page (https://shopgoodwill.com/ via a
+      # local proxy). The fake servers are for specs that call buyerapi/Google.
+      - name: Start the fake servers and wait for them
+        run: |
+          pnpm fake:sgw > fake-sgw.log 2>&1 &
+          pnpm fake:google > fake-google.log 2>&1 &
+          for port in 8787 8788; do
+            for i in $(seq 1 60); do
+              if curl -s -o /dev/null "http://127.0.0.1:${port}/"; then
+                echo "port ${port} is up"
+                break
+              fi
+              if [ "$i" -eq 60 ]; then
+                echo "fake server on ${port} did not start" >&2
+                cat fake-sgw.log fake-google.log >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+      # Builds the Firefox test extension (.output/firefox-mv3-test), then runs
+      # pytest in test/e2e/firefox: temporary install via Selenium/geckodriver,
+      # headless Firefox.
+      - name: Firefox E2E (build:test + pytest)
+        run: pnpm test:e2e:firefox
+      - name: Upload Firefox E2E artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: firefox-e2e
+          path: |
+            test-results/firefox/
+            fake-sgw.log
+            fake-google.log
+          if-no-files-found: ignore
+          retention-days: 7

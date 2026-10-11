@@ -1,0 +1,12 @@
+{
+  "invalidBecause": "a quarantine record says why",
+  "path": [
+    "error"
+  ],
+  "value": {
+    "at": 1791400000000,
+    "value": {
+      "schemaVersion": 1
+    }
+  }
+}

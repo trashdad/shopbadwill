@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "an access token is non-empty",
+  "path": [
+    "token"
+  ],
+  "value": {
+    "token": "",
+    "expiresAt": 1791403600000
+  }
+}

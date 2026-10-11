@@ -1,0 +1,11 @@
+# pnpm settings (single package; no workspace packages).
+
+# Dependency build scripts are blocked unless listed here.
+allowBuilds:
+  # Verifies/links the platform binary that tsx uses.
+  esbuild: true
+  # Only copies the browser service worker into a public dir; we use msw/node.
+  msw: false
+  # Only a fallback that downloads a native binding when the prebuilt optional
+  # dependency is missing; the prebuilt binding is installed normally.
+  unrs-resolver: false

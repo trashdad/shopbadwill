@@ -1,0 +1,11 @@
+{
+  "invalidBecause": "reqId is a string",
+  "path": [
+    "reqId"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": null,
+    "type": "calendar.syncNow"
+  }
+}
