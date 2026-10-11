@@ -117,7 +117,6 @@ function OutcomeRow(props: { snipe: Snipe; tz: string }): VNode {
         {snipe.dryRun ? <span class="sbw-tag">{DRY_RUN_LABEL}</span> : null}
       </p>
       <p>{o.message}</p>
-      {o.extraDetail === undefined ? null : <p class="sbw-muted">{o.extraDetail}</p>}
     </li>
   );
 }

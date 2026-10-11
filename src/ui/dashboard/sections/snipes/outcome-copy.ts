@@ -1,29 +1,37 @@
 // T-85 R6: the outcome list repeats each outcome's OWN heading and message —
 // the T-80b/T-87 classifier copy, never re-worded. A terminal snipe stores
-// only `outcome` and `outcomeDetail` (the classifier's `detail`), so the copy
-// is re-derived by running classifyOutcome on the snipe as stored (its
-// attempt.reply survives restarts; the measured timing too). Abort-driven
-// outcomes are matched on the stored outcome and, where several aborts share
-// it ('skipped'), on the stored detail, which is the classifier's own text.
-// Snipes settled through T-83's fallback carry T-83's copy in outcomeDetail
-// (it ends with "No bid was placed." or names the early proxy bid); it is
-// shown verbatim with T-83's own headings.
-import { classifyOutcome, type AbortReason, type Classification } from '../../../../domain/snipe/outcome';
+// only `outcome` and `outcomeDetail` (the classifier's `detail`), so the
+// settle-time copy is re-derived by running classifyOutcome on the snipe as
+// stored, with the inputs the reducer used for the event that settled it (the
+// last history entry names it). A candidate is accepted only when it
+// reproduces the stored detail exactly: several settles share an outcome
+// ('network' is both "No bid was sent" and "Unconfirmed"), and a near match
+// would show the wrong copy.
+//
+// A settle by the outcome read (`post-read`) used an ItemDetail the snipe does
+// not store, so it cannot be re-derived: the row shows that settle's heading
+// and the stored classifier text verbatim. Snipes settled through T-83's
+// fallback carry T-83's copy in outcomeDetail; it is shown verbatim with
+// T-83's own headings.
+import { classifyOutcome, type AbortReason, type Classification, type OutcomeContext } from '../../../../domain/snipe/outcome';
 import type { Snipe, SnipeOutcome } from '../../../../domain/snipe/types';
 
 export interface OutcomeDisplay {
-  /** The classifier's notification title: `Heading: title`. Shown verbatim. */
+  /** The settle-time notification title: `Heading: title`. Shown verbatim. */
   title: string;
-  /** The classifier's notification message. Shown verbatim. */
+  /** The settle-time notification message, or the stored classifier text when it cannot be re-derived. */
   message: string;
-  /** The classifier's `final` flag (a non-final win reads "Leading"). */
+  /** The classifier's `final` flag (a non-final win reads "Leading"); false when unknown. */
   final: boolean;
   outcome: SnipeOutcome;
-  /** The stored classifier detail when it adds something the re-derived message lacks. */
-  extraDetail?: string;
 }
 
 const ABORTS: readonly AbortReason[] = ['killed', 'cap', 'auth', 'ended', 'extended', 'price', 'already-high', 'missed', 'network'];
+
+/** The reducer's `why` for a settle by the outcome read (src/domain/snipe/state-machine.ts onPostRead). */
+const READ_SETTLES: ReadonlySet<string> = new Set(['post-read', 'post-read: dry run measured']);
+/** The reducer's `why` prefix for T-80b's not-sent settle; the rest is the (clipped) reason it passed as abortDetail. */
+const NOT_SENT_WHY = 'not-sent: ';
 
 /** T-83's fallback copy: it is the only copy ending "No bid was placed." or naming the early proxy. */
 function isFallbackCopy(s: Snipe): boolean {
@@ -33,72 +41,74 @@ function isFallbackCopy(s: Snipe): boolean {
   );
 }
 
-function fallbackHeading(outcome: SnipeOutcome): string {
-  // The classifier's own headings (src/domain/snipe/outcome.ts), used verbatim
-  // when the stored snipe cannot reproduce the settle-time classification.
-  const HEADING: Record<SnipeOutcome, string> = {
-    won: 'Won',
-    outbid: 'Lost',
-    'below-minimum': 'Lost',
-    auth: 'Not bid',
-    network: 'Not bid',
-    late: 'Lost',
-    ended: 'Ended early',
-    extended: 'Extended',
-    'cap-blocked': 'Blocked',
-    killed: 'Stopped',
-    'dry-run': 'Dry run',
-    'fallback-proxy-placed': 'Early bid',
-    skipped: 'Snipe skipped',
-  };
-  return HEADING[outcome];
+/** As classifyOutcome decides it with no reply in hand: could a bid have gone out? */
+function bidMayHaveGone(s: Snipe): boolean {
+  if (s.attempt.notSent === true) return false;
+  const r = s.attempt.reply;
+  if (r !== undefined) return r.kind === 'accepted' || r.kind === 'outbid' || r.kind === 'rejected-unknown';
+  return s.attempt.sentAt !== undefined || s.attempt.ambiguous === true;
 }
 
-/** The classifier copy for a terminal snipe, or null when the snipe has no outcome. */
+/**
+ * The heading the classifier (or T-83) gave this outcome, for a settle that
+ * cannot be re-derived. 'network' is "Unconfirmed" whenever a bid may be out:
+ * it must never read "Not bid" then. A win or loss read by the outcome read is
+ * shown as final ("Won" / "Lost"): that read runs after the end, and its
+ * stored text says "Won" / "Outbid" either way.
+ */
+function heading(s: Snipe, outcome: SnipeOutcome, byRead: boolean): string {
+  switch (outcome) {
+    case 'won':
+      return 'Won';
+    case 'outbid':
+    case 'below-minimum':
+    case 'late':
+      return 'Lost';
+    case 'auth':
+      return 'Not bid';
+    case 'network':
+      return bidMayHaveGone(s) ? 'Unconfirmed' : 'Not bid';
+    case 'ended':
+      return 'Ended early';
+    case 'extended':
+      return byRead ? 'Extended' : 'Not bid: end time changed';
+    case 'cap-blocked':
+      return 'Blocked';
+    case 'killed':
+      return 'Stopped';
+    case 'dry-run':
+      return 'Dry run';
+    case 'fallback-proxy-placed':
+      return 'Early bid';
+    case 'skipped':
+      return 'Snipe skipped';
+  }
+}
+
+/** The classifier runs the reducer could have made for this settle, most specific first. */
+function candidates(s: Snipe, userTz: string): Classification[] {
+  const why = s.history.at(-1)?.why ?? '';
+  const reply = s.attempt.ambiguous === true ? null : (s.attempt.reply ?? null);
+  const run = (ctx: OutcomeContext): Classification => classifyOutcome(s, reply, null, { userTz, ...ctx });
+  const out: Classification[] = [];
+  if (why.startsWith(NOT_SENT_WHY)) out.push(run({ abort: 'network', abortDetail: why.slice(NOT_SENT_WHY.length) }));
+  out.push(run({}));
+  if (s.dryRun) out.push(run({ dryRunMeasureFailed: true }));
+  for (const abort of ABORTS) out.push(classifyOutcome(s, null, null, { userTz, abort }));
+  return out;
+}
+
+/** The settle-time copy for a terminal snipe, or null when the snipe has no outcome. */
 export function outcomeDisplay(s: Snipe, userTz: string): OutcomeDisplay | null {
   const outcome = s.outcome;
   if (outcome === undefined) return null;
-  if (isFallbackCopy(s)) {
-    return { title: `${fallbackHeading(outcome)}: ${s.title}`, message: s.outcomeDetail ?? '', final: false, outcome };
+  const stored = s.outcomeDetail;
+  const byRead = READ_SETTLES.has(s.history.at(-1)?.why ?? '');
+  if (!isFallbackCopy(s) && !byRead) {
+    const c = candidates(s, userTz).find((x) => x.outcome === outcome && (stored === undefined || x.detail === stored));
+    if (c !== undefined) return { title: c.notify.title, message: c.notify.message, final: c.final, outcome };
   }
-  const reply = s.attempt.reply ?? null;
-  const direct = classifyOutcome(s, reply, null, { userTz });
-  let c = direct.outcome === outcome ? direct : null;
-  if (
-    c === null &&
-    outcome === 'network' &&
-    (s.attempt.notSent === true || (s.attempt.sentAt === undefined && s.attempt.ambiguous !== true))
-  ) {
-    // A pre-send network failure (or a proven not-sent): settled with abort 'network'.
-    c = classifyOutcome(s, reply, null, { userTz, abort: 'network' });
-  }
-  if (c === null) {
-    let first: Classification | null = null;
-    for (const abort of ABORTS) {
-      const cand = classifyOutcome(s, reply, null, { userTz, abort });
-      if (cand.outcome !== outcome) continue;
-      if (first === null) first = cand;
-      // The stored detail is the settle-time classifier text: accept the
-      // candidate only when it reproduces it exactly (several aborts share an
-      // outcome, and a wrong abort would show the wrong copy). Without a stored
-      // detail there is nothing to compare, so the first outcome match wins.
-      if (s.outcomeDetail === undefined || cand.detail === s.outcomeDetail) {
-        c = cand;
-        break;
-      }
-    }
-    if (c === null && s.outcomeDetail === undefined) c = first;
-  }
-  if (c === null) {
-    // No classifier run reproduces the settle-time copy (e.g. a win from a
-    // post-read whose reply is not stored): show the stored copy verbatim.
-    return { title: `${fallbackHeading(outcome)}: ${s.title}`, message: s.outcomeDetail ?? '', final: false, outcome };
-  }
-  return {
-    title: c.notify.title,
-    message: c.notify.message,
-    final: c.final,
-    outcome,
-    ...(s.outcomeDetail !== undefined && s.outcomeDetail !== c.detail ? { extraDetail: s.outcomeDetail } : {}),
-  };
+  // T-83's copy, a settle by the outcome read, or one no classifier run
+  // reproduces: the stored text verbatim, under that settle's heading.
+  return { title: `${heading(s, outcome, byRead)}: ${s.title}`, message: stored ?? '', final: false, outcome };
 }

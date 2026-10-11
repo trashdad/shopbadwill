@@ -11,8 +11,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { badge as snipeLinkBadge } from '../../src/content/ui/badges/snipe-link';
 import { formatMoney } from '../../src/domain/money';
-import { classifyOutcome } from '../../src/domain/snipe/outcome';
-import type { Snipe } from '../../src/domain/snipe/types';
+import { reduce } from '../../src/domain/snipe/state-machine';
+import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { formatDual } from '../../src/domain/time/pacific';
@@ -442,37 +442,134 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
     });
   });
 
-  it('the outcome list uses each outcome’s own classifier copy; a non-final win shows Leading', async () => {
-    const won = snipe({
-      id: 'w1',
-      dryRun: false,
-      state: 'resolved',
-      outcome: 'won',
-      attempt: {
-        sentAt: END_MS - 8000,
-        reply: { kind: 'accepted', rawStatus: 200, rawResult: 0, messageText: '', isHighBidder: true, observedAt: END_MS - 8000 },
-      },
-      measured: { firedAt: END_MS - 8100, rttMs: 100 },
-      history: [{ at: NOW, from: 'sent', to: 'resolved', why: 'post-read' }],
+  describe('the outcome list repeats the copy the reducer settled with (R6)', () => {
+    // Each stored snipe below is produced by the real reducer from the event
+    // that settles it, so the row is compared with the notification that went
+    // out at settle time, not with a copy the test re-derives.
+    const OK_CAPS = { ok: true, violations: [] as string[] };
+    const SENT_AT = END_MS - 8000;
+    const accepted = (isHighBidder: boolean | null) => ({
+      kind: 'accepted' as const,
+      rawStatus: 200,
+      rawResult: 0,
+      messageText: '',
+      isHighBidder,
+      observedAt: SENT_AT + 300,
     });
-    const killed = snipe({
-      id: 'k1',
-      dryRun: false,
-      state: 'killed',
-      outcome: 'killed',
-      attempt: {},
-      history: [{ at: NOW, from: 'armed', to: 'killed', why: 'disarm:user' }],
+    const sentLive = (title: string, attempt: Partial<Snipe['attempt']> = {}): Snipe =>
+      snipe({
+        id: title,
+        title,
+        dryRun: false,
+        state: 'sent',
+        fireAt: SENT_AT,
+        measured: { firedAt: SENT_AT, rttMs: 100, offsetMs: 0 },
+        attempt: { sentAt: SENT_AT, idempotencyKey: `key-${title}`, ...attempt },
+        history: [{ at: SENT_AT, from: 'firing', to: 'sent', why: 'sent' }],
+      });
+    const firingDry = (title: string): Snipe =>
+      snipe({
+        id: title,
+        title,
+        dryRun: true,
+        state: 'firing',
+        fireAt: SENT_AT,
+        measured: { firedAt: SENT_AT, rttMs: 100, offsetMs: 0 },
+        history: [{ at: SENT_AT, from: 'verified', to: 'firing', why: 'fire' }],
+      });
+    const closedRead = (over: Partial<ItemDetail> = {}): ItemDetail =>
+      detail({ isClosed: true, serverTime: '2026-10-08T02:18:40.000Z', currentPrice: 1500, minimumBid: 1550, ...over });
+    /** The stored snipe and the notification the reducer emitted when it settled. */
+    function settle(s: Snipe, e: SnipeEvent): { stored: Snipe; title: string; message: string } {
+      const r = reduce(s, e, OK_CAPS, { timeZone: TZ });
+      expect(r.rejection).toBeNull();
+      const n = r.effects.find((x) => x.kind === 'notify');
+      if (n?.kind !== 'notify') throw new Error('the settle emitted no notification');
+      return { stored: r.next, title: n.title, message: n.message };
+    }
+    const rowOf = async (title: string): Promise<HTMLElement> =>
+      (await screen.findByText((_, el) => el?.tagName === 'STRONG' && el.textContent.endsWith(`: ${title}`))).closest(
+        'li',
+      ) as HTMLElement;
+
+    it('a proven not-sent bid (T-80b/T-84b) reads "No bid was sent", never Unconfirmed', async () => {
+      const ns = settle(sentLive('Not-sent bowl'), { type: 'not-sent', now: SENT_AT + 50, reason: 'the request never left (offline)' });
+      expect(ns.title).toBe('Not bid: Not-sent bowl');
+      expect(ns.message).toMatch(/^No bid was sent \(the request never left \(offline\)\)/);
+      setup({ snipes: [ns.stored] });
+      const row = await rowOf('Not-sent bowl');
+      expect(within(row).getByText(ns.title)).toBeTruthy();
+      expect(within(row).getByText(ns.message)).toBeTruthy();
+      expect(row.textContent).not.toMatch(/Unconfirmed|may have been placed/);
     });
-    setup({ snipes: [won, killed] });
-    const leading = classifyOutcome(won, won.attempt.reply ?? null, null, { userTz: TZ });
-    const stopped = classifyOutcome(killed, null, null, { userTz: TZ, abort: 'killed' });
-    expect(leading.notify.title.startsWith('Leading:')).toBe(true);
-    expect(leading.final).toBe(false);
-    expect(await screen.findByText(leading.notify.title)).toBeTruthy();
-    expect(screen.getByText(leading.notify.message)).toBeTruthy();
-    expect(screen.queryByText(/^Won:/)).toBeNull();
-    expect(screen.getByText(stopped.notify.title)).toBeTruthy();
-    expect(screen.getByText(stopped.notify.message)).toBeTruthy();
+
+    it('a kill disarm (T-86) and a reply-only win (post-read failed: Leading) repeat their own copy', async () => {
+      const killed = settle(snipe({ id: 'k1', title: 'Killed bowl', dryRun: false }), {
+        type: 'disarm',
+        now: NOW,
+        by: 'kill',
+        why: 'stopped before it could bid',
+      });
+      const leading = settle(sentLive('Leading bowl', { reply: accepted(true) }), { type: 'post-read-failed', now: END_MS + 7 * 86_400_000 });
+      const unconfirmed = settle(sentLive('Ambiguous bowl', { ambiguous: true }), { type: 'post-read-failed', now: END_MS + 7 * 86_400_000 });
+      expect(killed.title).toBe('Stopped: Killed bowl');
+      expect(leading.title).toBe('Leading: Leading bowl');
+      expect(unconfirmed.title).toBe('Unconfirmed: Ambiguous bowl');
+      setup({ snipes: [killed.stored, leading.stored, unconfirmed.stored] });
+      for (const x of [killed, leading, unconfirmed]) {
+        const row = await rowOf(x.stored.title);
+        expect(within(row).getByText(x.title)).toBeTruthy();
+        expect(within(row).getByText(x.message)).toBeTruthy();
+      }
+      expect(screen.queryByText(/^Won:/)).toBeNull();
+    });
+
+    it('a dry run settled by its measure read, or with the measure failed, repeats its own copy', async () => {
+      const measured = settle(firingDry('Measured dry bowl'), {
+        type: 'post-read',
+        now: SENT_AT + 200,
+        detail: detail({ currentPrice: 1500, minimumBid: 1550, serverTime: '2026-10-08T02:18:22.200Z' }),
+      });
+      const failed = settle(firingDry('Failed dry bowl'), { type: 'post-read-failed', now: SENT_AT + 60_000 });
+      setup({ snipes: [measured.stored, failed.stored] });
+      for (const x of [measured, failed]) {
+        const row = await rowOf(x.stored.title);
+        expect(within(row).getByText(x.title)).toBeTruthy();
+        expect(within(row).getByText(x.message)).toBeTruthy();
+        expect(within(row).getByText(DRY_RUN)).toBeTruthy();
+      }
+      expect(screen.queryByText(/could not be read, so the result is unknown/)).toBeNull();
+    });
+
+    it('a win or a loss settled by the outcome read keeps its heading and never claims the item was not read', async () => {
+      const won = settle(sentLive('Won bowl', { reply: accepted(true) }), {
+        type: 'post-read',
+        now: END_MS + 5000,
+        detail: closedRead({ isHighBidder: true }),
+      });
+      const lost = settle(sentLive('Lost bowl', { reply: accepted(true) }), {
+        type: 'post-read',
+        now: END_MS + 5000,
+        detail: closedRead({ isHighBidder: false, currentPrice: 2500 }),
+      });
+      // A tie read anonymously: the read saw the item, and still cannot say who leads.
+      const unsure = settle(sentLive('Unsure bowl', { ambiguous: true }), {
+        type: 'post-read',
+        now: END_MS + 5000,
+        detail: closedRead({ isHighBidder: null, currentPrice: 2000 }),
+      });
+      expect(won.title).toBe('Won: Won bowl');
+      expect(lost.title).toBe('Lost: Lost bowl');
+      expect(unsure.title).toBe('Unconfirmed: Unsure bowl');
+      setup({ snipes: [won.stored, lost.stored, unsure.stored] });
+      for (const x of [won, lost, unsure]) {
+        const row = await rowOf(x.stored.title);
+        // The heading the reducer used, and its own stored classifier text.
+        expect(within(row).getByText(x.title)).toBeTruthy();
+        expect(within(row).getByText(x.stored.outcomeDetail ?? '<missing>')).toBeTruthy();
+        expect(row.textContent).not.toMatch(/could not be read|Leading/);
+      }
+    });
   });
 
   it('the exposure meter counts armed, sent and unconfirmed snipes against the daily cap', async () => {
