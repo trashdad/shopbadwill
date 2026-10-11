@@ -9,6 +9,10 @@
 // - the `quote` step executor: same cache, the run's lane, nothing when the
 //   feature is off; a fetched quote is audited without the ZIP.
 // - the badge's pure helpers and the visible-id batcher (one message per batch).
+import { readFileSync } from 'node:fs';
+import { Window } from 'happy-dom';
+import { h, render } from 'preact';
+import { act } from 'preact/test-utils';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import type { BackgroundContext } from '../../../src/background/context';
@@ -20,7 +24,7 @@ import {
   QUOTE_CACHE_TTL_MS,
   type LandedCostHandlers,
 } from '../../../src/background/handlers/landed-cost';
-import { executeQuoteStep } from '../../../src/background/jobs/steps/quote';
+import quoteExecutor, { executeQuoteStep } from '../../../src/background/jobs/steps/quote';
 import { createRouter, type Router, type RouterSender } from '../../../src/background/router';
 import { createAuditLog } from '../../../src/domain/audit/log';
 import { defaultSettings } from '../../../src/domain/settings/defaults';
@@ -31,7 +35,8 @@ import type { ItemId, Listing } from '../../../src/domain/types';
 import type { JobRun, JobStep } from '../../../src/domain/watches/schema';
 import type { LandedCostQuote } from '../../../src/messaging/protocol';
 import { SgwApiError } from '../../../src/ports/errors';
-import { badgeLine, flushLandedCostBatch, requestLandedCost } from '../../../src/content/ui/badges/landed-cost';
+import type { MessagingClient } from '../../../src/ports/messaging';
+import { badge, badgeLine, flushLandedCostBatch, requestLandedCost } from '../../../src/content/ui/badges/landed-cost';
 import { FakeClock } from '../../fakes/ports/fake-clock';
 import { FakeMessaging } from '../../fakes/ports/fake-messaging';
 import { FakeSgwApi } from '../../fakes/ports/fake-sgw-api';
@@ -86,7 +91,7 @@ const seedQuote = (id: ItemId, zip: string = ZIP, shipping = 500, handling = 100
   api.shipping.set(`${String(id)}:${zip}`, { shipping, handling });
 };
 const cache = (): Promise<Record<ItemId, QuoteCacheEntry>> => repo.get(STORAGE_KEYS.quoteCache);
-const env = (type: string, payload: unknown): Record<string, unknown> => ({ v: 1, reqId: `r-${type}`, type, payload });
+const env = (type: string, payload: unknown, reqId = `r-${type}`): Record<string, unknown> => ({ v: 1, reqId, type, payload });
 
 beforeEach(async () => {
   clock = new FakeClock(T0);
@@ -108,8 +113,8 @@ beforeEach(async () => {
 });
 
 describe('landedCost.get handler', () => {
-  const get = async (ids: ItemId[], sender: RouterSender = CONTENT): Promise<QuoteReply> => {
-    const r = await router.handle(env('landedCost.get', { itemIds: ids }), sender);
+  const get = async (ids: ItemId[], sender: RouterSender = CONTENT, reqId = 'r-landedCost.get'): Promise<QuoteReply> => {
+    const r = await router.handle(env('landedCost.get', { itemIds: ids }, reqId), sender);
     if (!r.ok) throw new Error(JSON.stringify(r));
     return r.reply as QuoteReply;
   };
@@ -224,6 +229,25 @@ describe('landedCost.get handler', () => {
     expect(quoteCalls()).toHaveLength(41);
   });
 
+  it('a hash-only URL change is not a new page view and does not reset the budget', async () => {
+    for (let id = 1; id <= 40; id++) seedQuote(id);
+    await get(Array.from({ length: 40 }, (_, i) => i + 1));
+    seedQuote(41);
+    const hashed = { id: EXT_ID, url: `${URL_A}#${String(Date.now())}`, tab: { id: 3 } };
+    await expect(handlers.get([41], { sender: hashed, senderClass: 'content' })).rejects.toMatchObject({ kind: 'budget' });
+    expect(quoteCalls()).toHaveLength(MAX_QUOTE_REQUESTS_PER_PAGE_VIEW);
+  });
+
+  it('a fresh request id from the content script does not reset the page-view budget', async () => {
+    for (let id = 1; id <= 40; id++) seedQuote(id);
+    await get(Array.from({ length: 40 }, (_, i) => i + 1), CONTENT, 'req-a');
+    seedQuote(41);
+    const r = await router.handle(env('landedCost.get', { itemIds: [41] }, 'req-b-fresh'), CONTENT);
+    expect(r.ok).toBe(false);
+    expect(quoteCalls()).toHaveLength(MAX_QUOTE_REQUESTS_PER_PAGE_VIEW);
+    expect(JSON.stringify(r)).not.toContain(ZIP);
+  });
+
   it('refuses more than 40 ids in one message before any request', async () => {
     await expect(handlers.get(Array.from({ length: 41 }, (_, i) => i + 1), { sender: CONTENT, senderClass: 'content' })).rejects.toMatchObject({
       kind: 'schema',
@@ -254,6 +278,96 @@ describe('landedCost.get handler', () => {
       1: null,
       2: { shipping: 500, handling: 100, pickup: false },
     });
+  });
+
+  it('counts a failed quote toward the 40', async () => {
+    api.failNext('shippingQuote', 'network');
+    expect(await get([1])).toEqual({ 1: null });
+    for (let id = 2; id <= 40; id++) seedQuote(id);
+    await get(Array.from({ length: 39 }, (_, i) => i + 2));
+    expect(quoteCalls()).toHaveLength(40);
+    seedQuote(41);
+    await expect(handlers.get([41], { sender: CONTENT, senderClass: 'content' })).rejects.toMatchObject({ kind: 'budget' });
+    expect(quoteCalls()).toHaveLength(40);
+  });
+
+  it('answers a fully cached message after the budget is spent, and does not call SGW', async () => {
+    for (let id = 1; id <= 40; id++) seedQuote(id);
+    const first = await get(Array.from({ length: 40 }, (_, i) => i + 1));
+    expect(await get([1, 40])).toEqual({ 1: first[1], 40: first[40] });
+    expect(quoteCalls()).toHaveLength(40);
+  });
+
+  it('an invalid stored quote cache parses to empty, then a real quote is fetched', async () => {
+    await repo.setRaw(STORAGE_KEYS.quoteCache, { 1: { shipping: 'nope', homeZip: ZIP } });
+    expect(await repo.get(STORAGE_KEYS.quoteCache)).toEqual({});
+    seedQuote(1);
+    expect(await get([1])).toEqual({ 1: { shipping: 500, handling: 100, pickup: false } });
+    expect(quoteCalls()).toHaveLength(1);
+    expect(JSON.stringify(await cache())).not.toContain(ZIP);
+  });
+
+  it('makes NO request when the in-memory kill switch is on, even if settings still say off', async () => {
+    seedQuote(1);
+    await get([1]);
+    expect(quoteCalls()).toHaveLength(1);
+    const killed = createLandedCostHandlers({
+      api,
+      repo,
+      clock,
+      pages: { findItem: (id) => pages.get(id) },
+      killSwitchOn: () => true,
+    });
+    expect(await killed.get([1], { sender: CONTENT, senderClass: 'content' })).toEqual({ 1: null });
+    expect(quoteCalls()).toHaveLength(1);
+  });
+
+  it('makes NO request when the read gate is blocked, and still serves a cached quote', async () => {
+    seedQuote(1);
+    seedQuote(2);
+    await get([1]);
+    expect(quoteCalls()).toHaveLength(1);
+    const gated = createLandedCostHandlers({
+      api,
+      repo,
+      clock,
+      pages: { findItem: (id) => pages.get(id) },
+      readsBlocked: () => true,
+    });
+    expect(await gated.get([1, 2], { sender: CONTENT, senderClass: 'content' })).toEqual({
+      1: { shipping: 500, handling: 100, pickup: false },
+      2: null,
+    });
+    expect(quoteCalls()).toHaveLength(1);
+  });
+
+  it('refuses 41 copies of one id: the cap is the message length, before dedupe', async () => {
+    seedQuote(1);
+    await expect(handlers.get(Array.from({ length: 41 }, () => 1), { sender: CONTENT, senderClass: 'content' })).rejects.toMatchObject({
+      kind: 'schema',
+    });
+    expect(quoteCalls()).toEqual([]);
+  });
+
+  it('zod refuses more than 40 item ids before the handler runs', async () => {
+    const ids = Array.from({ length: 41 }, (_, i) => i + 1);
+    const r = await router.handle(env('landedCost.get', { itemIds: ids }), CONTENT);
+    expect(r).toMatchObject({ ok: false, error: { code: 'invalid_message' } });
+    expect(quoteCalls()).toEqual([]);
+    expect(JSON.stringify(r)).not.toContain(ZIP);
+  });
+
+  it('a scheduler budget error is rethrown without the ZIP', async () => {
+    api.shippingQuote = () => Promise.reject(new SgwApiError('budget', `lane spent for ${ZIP}`));
+    const err = await handlers.get([1], { sender: CONTENT, senderClass: 'content' }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SgwApiError);
+    if (!(err instanceof SgwApiError)) throw new Error('expected a budget refusal');
+    expect(err.kind).toBe('budget');
+    expect(err.message).not.toContain(ZIP);
+    expect(JSON.stringify(err)).not.toContain(ZIP);
   });
 
   it('the budget error never carries the ZIP', async () => {
@@ -346,6 +460,57 @@ describe('quote step executor', () => {
     api.failNext('shippingQuote', 'network');
     await expect(executeQuoteStep(step, deps())).rejects.toMatchObject({ kind: 'network' });
   });
+
+  it('is { kind: quote, run } and quotes on the background lane even when the run drains on interactive', async () => {
+    expect(quoteExecutor).toMatchObject({ kind: 'quote', run: executeQuoteStep });
+    seedQuote(101);
+    expect(await executeQuoteStep(step, { ...deps(), lane: 'interactive' })).toEqual({
+      kind: 'quote',
+      quote: { shipping: 500, handling: 100 },
+    });
+    expect(quoteArgs()).toEqual([[101, ZIP, 'background']]);
+  });
+
+  it('does nothing when the in-memory kill switch is on and settings are not updated yet', async () => {
+    seedQuote(101);
+    const switches = new FakeSwitches() as FakeSwitches & { view: () => { killSwitch: boolean } };
+    switches.view = () => ({ killSwitch: true });
+    expect(await executeQuoteStep(step, { ...deps(), switches })).toEqual({ kind: 'quote', quote: null });
+    expect(quoteCalls()).toEqual([]);
+    expect(await audit.list({ limit: 5 })).toEqual([]);
+  });
+
+  it('does not call SGW when the read gate is closed, and the refusal carries no ZIP', async () => {
+    seedQuote(101);
+    const ctx = {
+      scheduler: {
+        stats: () => ({ paused: { until: null, reason: `paused near ${ZIP}` }, lanes: {}, cacheHits: 0 }),
+      },
+    } as unknown as BackgroundContext;
+    const err = await executeQuoteStep(step, { ...deps(), ctx }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SgwApiError);
+    if (!(err instanceof SgwApiError)) throw new Error('expected the read gate to refuse');
+    expect(err.kind).toBe('paused');
+    expect(err.message).not.toContain(ZIP);
+    expect(quoteCalls()).toEqual([]);
+  });
+
+  it('strips homeZip out of an error it propagates', async () => {
+    api.shippingQuote = () => Promise.reject(new SgwApiError('network', `no route to ${ZIP}`, { status: 503 }));
+    const err = await executeQuoteStep(step, deps()).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SgwApiError);
+    if (!(err instanceof SgwApiError)) throw new Error('expected a network error');
+    expect(err.kind).toBe('network');
+    expect(err.status).toBe(503);
+    expect(err.message).not.toContain(ZIP);
+    expect(JSON.stringify(await audit.list({ limit: 5 }))).not.toContain(ZIP);
+  });
 });
 
 describe('shared helpers', () => {
@@ -378,7 +543,10 @@ describe('landed-cost badge', () => {
       text: 'Landed $18.99',
       title: 'Current $12.99 + shipping $5.00 + handling $1.00',
     });
+    // 10 + 20 + 30 cents. Summing the dollar amounts 0.10 + 0.20 + 0.30 is not 0.60 in binary floating point.
+    expect(badgeLine({ shipping: 20, handling: 30, pickup: false }, 10)?.text).toBe('Landed $0.60');
     expect(badgeLine(null, 1299)).toBeNull();
+    expect(JSON.stringify(badgeLine({ shipping: 20, handling: 30, pickup: false }, 10))).not.toContain(ZIP);
   });
 
   it('requestLandedCost batches every visible id into ONE message and resolves each entry', async () => {
@@ -405,5 +573,116 @@ describe('landed-cost badge', () => {
     const a = requestLandedCost(fake, 7);
     flushLandedCostBatch(fake);
     expect(await a).toBeNull();
+  });
+
+  it('renders text only: no innerHTML, and homeZip is not in the badge module', () => {
+    const src = readFileSync(new URL('../../../src/content/ui/badges/landed-cost.tsx', import.meta.url), 'utf8');
+    expect(src).not.toMatch(/\.innerHTML|dangerouslySetInnerHTML/);
+    expect(src).not.toMatch(/homeZip/);
+  });
+
+  it('asks only for cards the IntersectionObserver reports as visible, in one batch', async () => {
+    const window = new Window();
+    const prevDocument = globalThis.document;
+    const prevObserver = globalThis.IntersectionObserver;
+    const observers: FakeObserver[] = [];
+    class FakeObserver {
+      readonly observed: Element[] = [];
+      constructor(private readonly cb: (entries: Array<{ isIntersecting: boolean; target: Element }>) => void) {
+        observers.push(this);
+      }
+      observe(target: Element): void {
+        this.observed.push(target);
+      }
+      disconnect(): void {
+        /* the badge drops the card once it has been seen */
+      }
+      unobserve(): void {
+        /* unused */
+      }
+      takeRecords(): [] {
+        return [];
+      }
+      fire(isIntersecting: boolean): void {
+        const target = this.observed[0];
+        if (target === undefined) throw new Error('observed nothing');
+        this.cb([{ isIntersecting, target }]);
+      }
+    }
+    globalThis.document = window.document as unknown as Document;
+    globalThis.IntersectionObserver = FakeObserver as unknown as typeof IntersectionObserver;
+    const doc = window.document;
+    const host = doc.createElement('div');
+    doc.body.appendChild(host);
+    const cardA = doc.createElement('article');
+    const cardB = doc.createElement('article');
+    const sent: ItemId[][] = [];
+    const client: MessagingClient = {
+      send: (_type, payload) => {
+        const ids = (payload as { itemIds: ItemId[] }).itemIds;
+        sent.push(ids);
+        const reply: Record<ItemId, LandedCostQuote | null> = {};
+        for (const id of ids) {
+          reply[id] =
+            id === 2 ? { shipping: 0, handling: 0, pickup: true } : { shipping: 20, handling: 30, pickup: false };
+        }
+        return Promise.resolve(reply as never);
+      },
+      connect: () => () => undefined,
+      onBroadcast: () => () => undefined,
+    };
+    const settings = defaultSettings();
+    settings.features.landedCost = true;
+    try {
+      await act(() => {
+        render(
+          h('div', null, [
+            h(badge.Component, {
+              itemId: 1,
+              listing: listing(1, { currentPrice: 10 }),
+              settings,
+              client,
+              cardRoot: cardA as unknown as Element,
+              now: T0,
+            }),
+            h(badge.Component, {
+              itemId: 2,
+              listing: listing(2, { currentPrice: 10 }),
+              settings,
+              client,
+              cardRoot: cardB as unknown as Element,
+              now: T0,
+            }),
+          ]),
+          host,
+        );
+      });
+      expect(observers).toHaveLength(2);
+      expect(observers[0]?.observed[0]).toBe(cardA);
+      expect(observers[1]?.observed[0]).toBe(cardB);
+      expect(sent).toEqual([]);
+      await act(() => {
+        observers[0]?.fire(false);
+        observers[1]?.fire(false);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sent).toEqual([]);
+      await act(async () => {
+        observers[0]?.fire(true);
+        observers[1]?.fire(true);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(sent).toEqual([[1, 2]]);
+      const chips = [...host.querySelectorAll('.chip')];
+      expect(chips.map((chip) => chip.textContent)).toEqual(['Landed $0.60', 'Pickup only']);
+      for (const chip of chips) expect(chip.childElementCount).toBe(0);
+      expect(host.innerHTML).not.toContain(ZIP);
+    } finally {
+      render(null, host);
+      flushLandedCostBatch(client);
+      globalThis.document = prevDocument;
+      globalThis.IntersectionObserver = prevObserver;
+      window.close();
+    }
   });
 });

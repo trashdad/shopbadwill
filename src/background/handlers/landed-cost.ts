@@ -3,8 +3,12 @@
 //
 // - Content senders only (R5), and at most 40 item ids per message.
 // - NO SGW request when any of these holds (R3): `features.landedCost` is off
-//   (the default), `homeZip` is unset or invalid, or the kill switch is on.
-//   Those answer null for every item.
+//   (the default), `homeZip` is unset or invalid, the kill switch is on
+//   (persisted settings or the in-memory switch, which can lead the write),
+//   or the read gate is blocked (scheduler pause, interactive backoff, or a
+//   spent interactive budget). The kill switch answers null for every item,
+//   including a cached one. A blocked read gate still answers a cached quote
+//   and answers null for anything that would have been fetched.
 // - A pickup-only item (from the page's own `page.listings` data) answers
 //   `{ shipping: 0, handling: 0, pickup: true }` with no request (R1).
 // - Otherwise quotes come from the 24 h `sbw:quoteCache` (keyed by item, the
@@ -16,7 +20,8 @@
 //   before anything is sent. Cached quotes are never re-fetched within 24 h.
 // - `homeZip` is personal (R4): it is only ever passed to `shippingQuote` and
 //   hashed for the cache; it is never logged, audited, stored or put in an
-//   error.
+//   error. A scheduler `budget` error whose message contains the ZIP is
+//   rethrown as a fresh error with a fixed message.
 import type { Settings } from '../../domain/settings/schema';
 import type { Repo } from '../../domain/storage/repo';
 import { STORAGE_KEYS, type QuoteCacheEntry } from '../../domain/storage/schema';
@@ -42,6 +47,18 @@ const QUOTE_LANE: Lane = 'interactive';
 const MAX_PAGE_VIEWS = 20;
 /** The same shape the adapter accepts before anything is sent. */
 const US_ZIP = /^\d{5}(-\d{4})?$/;
+
+/**
+ * The page-view id is the document URL without its fragment. A content script
+ * cannot mint a new budget by appending `#…` (or by sending a fresh request
+ * id: the key never reads the message). A different path or query is a new
+ * page view.
+ */
+function pageViewUrl(url: string | undefined): string {
+  if (url === undefined) return '';
+  const hash = url.indexOf('#');
+  return hash === -1 ? url : url.slice(0, hash);
+}
 
 /** True for a US ZIP ("12345" or "12345-6789"), like SgwApiAdapter. */
 export function isValidZip(zip: string): boolean {
@@ -109,12 +126,59 @@ function gate(settings: Settings): Gate {
   return { ok: true, zip };
 }
 
+/** A thrown probe is treated as blocked (fail closed). */
+function flagOn(probe: (() => boolean) | undefined): boolean {
+  if (probe === undefined) return false;
+  try {
+    return probe();
+  } catch {
+    return true;
+  }
+}
+
+/** True when the error text or its enumerable fields contain the home ZIP. */
+function errorHasZip(err: SgwApiError, zip: string): boolean {
+  if (zip === '') return false;
+  if (err.message.includes(zip)) return true;
+  try {
+    return JSON.stringify(err).includes(zip);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The scheduler's read gate for the interactive lane (R3): a global pause, a
+ * missing lane, a backoff still in the future, or a spent daily budget.
+ * Same rule as DailyJobRunner.laneBlocked.
+ */
+function interactiveReadsBlocked(ctx: BackgroundContext): boolean {
+  const stats = ctx.scheduler.stats();
+  if (stats.paused !== undefined) return true;
+  // A partial stats record (a lane the scheduler has not published) is blocked.
+  const lane = (stats.lanes as Partial<typeof stats.lanes>).interactive;
+  if (lane === undefined) return true;
+  const now = ctx.clock.now();
+  return (lane.backoffUntil !== undefined && lane.backoffUntil > now) || lane.usedToday >= lane.budget;
+}
+
 export interface LandedCostDeps {
   api: Pick<SgwApi, 'shippingQuote'>;
   repo: Repo;
   clock: Clock;
   /** The page's own listing data: pickup-only is answered without a request. */
   pages: Pick<PageStore, 'findItem'>;
+  /**
+   * Live kill switch. Settings can still say off while this is already on
+   * (the in-memory switch is set before the persist). Omit in unit tests
+   * that only flip `settings.killSwitch`.
+   */
+  killSwitchOn?: () => boolean;
+  /**
+   * Read gate. A blocked gate serves the cache and does not call SGW.
+   * Omit when the test has no scheduler.
+   */
+  readsBlocked?: () => boolean;
 }
 
 export interface LandedCostHandlers {
@@ -122,27 +186,31 @@ export interface LandedCostHandlers {
 }
 
 export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandlers {
-  const { api, repo, clock, pages } = deps;
+  const { api, repo, clock, pages, killSwitchOn, readsBlocked } = deps;
 
-  // Quote requests sent per page view, keyed by sending tab + page URL (R3).
+  // Quote requests sent per page view, keyed by sending tab + URL without the
+  // fragment (R3). Not a client-supplied id: a new reqId cannot reset it.
   const sent = new Map<string, number>();
 
-  const pageViewKey = (hctx: HandlerContext): string => `${String(tabIdOf(hctx.sender) ?? '')}|${hctx.sender.url ?? ''}`;
+  const pageViewKey = (hctx: HandlerContext): string => `${String(tabIdOf(hctx.sender) ?? '')}|${pageViewUrl(hctx.sender.url)}`;
 
   /**
    * Reserves `n` quote requests against the page view, synchronously: no await
    * between the check and the write, so concurrent messages can never
    * overspend the 40-request budget. Older page views of the same tab are
-   * dropped; the map itself is bounded.
+   * dropped; the map itself is bounded. Re-inserting the current key makes it
+   * the newest, so a busy tab is not the one evicted.
    */
   const reserve = (hctx: HandlerContext, n: number): void => {
     const key = pageViewKey(hctx);
-    sent.set(key, (sent.get(key) ?? 0) + n);
+    const next = (sent.get(key) ?? 0) + n;
+    sent.delete(key);
+    sent.set(key, next);
     const tabPrefix = `${String(tabIdOf(hctx.sender) ?? '')}|`;
     for (const k of [...sent.keys()]) if (k.startsWith(tabPrefix) && k !== key) sent.delete(k);
     while (sent.size > MAX_PAGE_VIEWS) {
       const oldest = sent.keys().next();
-      if (oldest.done === true) break;
+      if (oldest.done === true || oldest.value === key) break;
       sent.delete(oldest.value);
     }
   };
@@ -150,17 +218,20 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
   return {
     async get(itemIds, hctx) {
       requireContent('landedCost.get', hctx);
-      const ids = [...new Set(itemIds)];
-      if (ids.length > MAX_LANDED_COST_IDS_PER_MESSAGE) {
+      // R5: the cap is the message length, before dedupe. 41 copies of one id
+      // are still 41 ids.
+      if (itemIds.length > MAX_LANDED_COST_IDS_PER_MESSAGE) {
         throw new SgwApiError(
           'schema',
-          `landedCost.get: at most ${String(MAX_LANDED_COST_IDS_PER_MESSAGE)} item ids per message (got ${String(ids.length)})`,
+          `landedCost.get: at most ${String(MAX_LANDED_COST_IDS_PER_MESSAGE)} item ids per message (got ${String(itemIds.length)})`,
         );
       }
+      const ids = [...new Set(itemIds)];
 
       const g = gate(await repo.get(STORAGE_KEYS.settings));
       const reply: Record<ItemId, LandedCostQuote | null> = {};
-      if (!g.ok) {
+      // The kill switch answers nothing, including a quote already in the cache.
+      if (!g.ok || flagOn(killSwitchOn)) {
         for (const id of ids) reply[id] = null;
         return reply;
       }
@@ -182,6 +253,12 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
       }
 
       if (needed.length > 0) {
+        // Re-check after the cache reads, before any reservation or send.
+        // A blocked read gate keeps the cached answers above and skips the rest.
+        if (flagOn(killSwitchOn) || flagOn(readsBlocked)) {
+          for (const id of needed) reply[id] = null;
+          return reply;
+        }
         if ((sent.get(pageViewKey(hctx)) ?? 0) + needed.length > MAX_QUOTE_REQUESTS_PER_PAGE_VIEW) {
           throw new SgwApiError(
             'budget',
@@ -190,14 +267,25 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
         }
         reserve(hctx, needed.length);
         for (const id of needed) {
+          if (flagOn(killSwitchOn) || flagOn(readsBlocked)) {
+            reply[id] = null;
+            continue;
+          }
           let quote: CachedQuote | null;
           try {
             quote = await api.shippingQuote(id, g.zip, QUOTE_LANE);
           } catch (e) {
             // A refusal from the scheduler (paused/budget) or a failure must not
-            // take the other badges down: the item reads as "no quote". R4:
-            // these errors carry no ZIP.
-            if (e instanceof SgwApiError && e.kind === 'budget') throw e;
+            // take the other badges down: the item reads as "no quote". A
+            // `budget` error is rethrown so the page stops, and its message is
+            // replaced when it contains the ZIP (R4): the router logs thrown
+            // errors.
+            if (e instanceof SgwApiError && e.kind === 'budget') {
+              if (errorHasZip(e, g.zip)) {
+                throw new SgwApiError('budget', 'landed cost: the quote lane refused the request');
+              }
+              throw e;
+            }
             quote = null;
           }
           if (quote === null) {
@@ -224,6 +312,8 @@ export function register(ctx: BackgroundContext): void {
     repo: ctx.repo,
     clock: ctx.clock,
     pages: ctx.pages,
+    killSwitchOn: () => ctx.switches.view().killSwitch,
+    readsBlocked: () => interactiveReadsBlocked(ctx),
   });
   ctx.router.register('landedCost.get', (payload, hctx) => handlers.get(payload.itemIds, hctx));
 }

@@ -243,6 +243,13 @@ describe('replies', () => {
     expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': { shipping: 499, handling: 100 } }).success).toBe(false);
     expect(MsgReplySchemas['job.status'].safeParse(null).success).toBe(true);
   });
+
+  it('rejects landedCost.get when itemIds is longer than 40 (R5)', () => {
+    const ids = Array.from({ length: 41 }, (_, i) => i + 1);
+    const result = MsgEnvelopeSchema.safeParse({ v: 1, reqId: 'r-cap', type: 'landedCost.get', payload: { itemIds: ids } });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain('43004');
+  });
 });
 
 // §3.12 verbatim, minus `reply` (see MsgReply above).

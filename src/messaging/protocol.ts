@@ -70,7 +70,8 @@ export const MsgSchema = z.discriminatedUnion('type', [
    * with `undo: { kind: 'disableRule', ref: ruleId }`.
    */
   msg('rules.disable', z.object({ ruleId: z.string().min(1) })),
-  msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema) })),
+  /** R5: at most 40 item ids. The TypeScript payload type stays `ItemId[]`. */
+  msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema).max(40) })),
   msg('quick.hideSeller', z.object({ sellerId: z.number().int(), sellerName: z.string() })),
   /** A non-empty term: an empty one would hide every listing. */
   msg('quick.hideKeyword', z.object({ term: z.string().min(1) })),

@@ -524,7 +524,7 @@ Approved by the controller (T-57 rulings R1, R2) and made in `task/T-57`.
 - The badge computes landed = the card's current price + shipping + handling.
 - Pickup-only items answer `{ shipping: 0, handling: 0, pickup: true }` with no SGW request.
 - The entry schema is module-private (`LandedCostQuoteSchema`); only the type `LandedCostQuote` is exported, so the locked schema surface in `test/contract/types/examples.test.ts` is unchanged.
-- `test/contract/types/messages.test.ts` pins the new reply type and validation examples. No other consumer of the reply existed (the handler and the badge are new in T-57), and the request payload `{ itemIds: ItemId[] }` is unchanged.
+- `test/contract/types/messages.test.ts` pins the new reply type and validation examples. No other consumer of the reply existed (the handler and the badge are new in T-57). The request payload's TypeScript type stays `{ itemIds: ItemId[] }`; the runtime zod schema caps `itemIds` at 40 (R5).
 
 ### R2: the `sbw:quoteCache` storage key
 
