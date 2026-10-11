@@ -66,7 +66,7 @@ const unexpected: string[] = [];
 
 async function fulfil(route: Route): Promise<void> {
   const req = route.request();
-  const decision = decideRequest(req.url());
+  const decision = decideRequest(req.url(), { serviceWorker: req.serviceWorker() !== null });
   if (decision.action === 'continue') {
     await route.continue();
     return;
@@ -181,8 +181,9 @@ test('rules created in options decorate the fake SGW search page, survive an SPA
     const reply = await callHook(options, 'sbw:test:baseUrl', { sgw: FAKE_BUYERAPI, google: FAKE_GOOGLE });
     expect(reply).toEqual({ ok: true, value: { sgw: FAKE_BUYERAPI, google: FAKE_GOOGLE } });
     await options.close();
-    // The rewritten background fetch must reach the fake buyerapi. continue()
-    // would drop it on the dead proxy and this status would never come back.
+    // The rewritten background fetch must reach the fake buyerapi. The route
+    // aborts a service-worker request that still names the prod origin, so
+    // this status comes back only if the hook really rewrote the URL.
     const status = await worker.evaluate(async () => {
       const response = await fetch('https://buyerapi.shopgoodwill.com/__log');
       return response.status;

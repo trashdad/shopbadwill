@@ -29,6 +29,27 @@ describe('chromium E2E network policy', () => {
     });
   });
 
+  it('aborts a service-worker request that still names prod buyerapi: sbw:test:baseUrl did not rewrite it', () => {
+    // Playwright routes the extension's service-worker requests too. Mapping
+    // this one to the fake would let a broken hook pass the spec unseen.
+    expect(decideRequest('https://buyerapi.shopgoodwill.com/__log', { serviceWorker: true })).toEqual({
+      action: 'abort',
+      unexpected: true,
+    });
+    // The rewritten request is fetched from the fake buyerapi.
+    expect(decideRequest('http://127.0.0.1:8787/__log', { serviceWorker: true })).toEqual({
+      action: 'fetch',
+      url: 'http://127.0.0.1:8787/__log',
+      bucket: 'local',
+    });
+    // The page's own search XHR is not the background's: it still goes to the fake buyerapi.
+    expect(decideRequest('https://buyerapi.shopgoodwill.com/api/Search/ItemListing', { serviceWorker: false })).toEqual({
+      action: 'fetch',
+      url: `${FAKE_BUYERAPI}/api/Search/ItemListing`,
+      bucket: 'buyerapi',
+    });
+  });
+
   it('fulfills the fake-server ports locally instead of continuing them', () => {
     // continue() would send the browser through the dead proxy (--proxy-server=127.0.0.1:9).
     for (const port of ['8787', '8788', '8789']) {
