@@ -216,6 +216,45 @@ describe('dashboard snipes: money guards (tests first)', () => {
     expect(armSent(m)).toHaveLength(0);
   });
 
+  it('the daily cap still remaining counts a sent bid and an Unconfirmed one (T-80b), not a proven not-sent one', async () => {
+    vi.useFakeTimers({ now: new Date(NOW), toFake: ['Date'] });
+    // Cap $50. A sent $15 bid ending the same day and an Unconfirmed $10 one
+    // resolved today leave $25 of landed cost; this item's $9 shipping and $1
+    // handling leave $15.00 of bid. A not-sent $20 attempt counts for nothing.
+    const sent = snipe({
+      id: 'sent1',
+      title: 'Sent bowl',
+      dryRun: false,
+      state: 'sent',
+      maxBid: 1500,
+      attempt: { sentAt: NOW - 1000, idempotencyKey: 'k' },
+    });
+    const resolved = (id: string, attempt: Partial<Snipe['attempt']>, maxBid: number): Snipe =>
+      snipe({
+        id,
+        title: `Resolved ${id}`,
+        dryRun: false,
+        state: 'resolved',
+        outcome: 'network',
+        maxBid,
+        attempt: { sentAt: NOW - 1000, idempotencyKey: id, ...attempt },
+        history: [{ at: NOW, from: 'sent', to: 'resolved', why: 'post-read failed' }],
+      });
+    const { m } = setup({
+      s: settings({ snipe: { ...settings().snipe, caps: { ...generousCaps, perDayMax: 5000 } } }),
+      snipes: [sent, resolved('u1', { ambiguous: true }, 1000), resolved('ns1', { notSent: true }, 2000)],
+    });
+    await prepare(m);
+    const review = (): HTMLButtonElement => screen.getByRole<HTMLButtonElement>('button', { name: /^review and arm$/i });
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '15.00' } });
+    expect(review().disabled).toBe(false);
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '15.01' } });
+    expect(review().disabled).toBe(true);
+    fireEvent.click(review());
+    expect(await screen.findByText(/per-day: \$50\.01 would exceed the \$50\.00 daily cap/)).toBeTruthy();
+    expect(armSent(m)).toHaveLength(0);
+  });
+
   it('the typo guard requires the retyped amount to equal the max', async () => {
     const { m } = setup({ s: settings({ snipe: { ...settings().snipe, caps: generousCaps } }) });
     await prepare(m);
@@ -374,6 +413,10 @@ describe('dashboard snipes: money guards (tests first)', () => {
     fireEvent.click(screen.getByRole('button', { name: /^review and arm$/i }));
     const confirm = (await screen.findByText(/^review your snipe$/i)).closest('div') as HTMLElement;
     expect(within(confirm).getByText(DRY_RUN)).toBeTruthy();
+    // The line that reports the arm names it a dry run with the same words.
+    fireEvent.click(screen.getByRole('button', { name: /^arm snipe$/i }));
+    expect(await screen.findByText(/^Snipe armed\./)).toBeTruthy();
+    expect(screen.getByText(/^Snipe armed\./).textContent).toContain(DRY_RUN);
   });
 });
 
@@ -440,6 +483,21 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
     await waitFor(() => {
       expect(m.sent.some((s) => s.type === 'snipe.disarm' && (s.payload as { id: string }).id === 's1')).toBe(true);
     });
+  });
+
+  it('a sent snipe offers no disarm: the bid may already be out (the reducer and the kill switch refuse it)', async () => {
+    setup({
+      snipes: [
+        snipe({ id: 'armed1', title: 'Armed bowl', dryRun: false }),
+        snipe({ id: 'sent1', title: 'Sent bowl', dryRun: false, state: 'sent', attempt: { sentAt: NOW, idempotencyKey: 'k' } }),
+      ],
+    });
+    const list = await screen.findByRole('list', { name: 'Armed snipes' });
+    const sentRow = within(list).getByRole('link', { name: 'Sent bowl' }).closest('li') as HTMLElement;
+    const armedRow = within(list).getByRole('link', { name: 'Armed bowl' }).closest('li') as HTMLElement;
+    expect(within(armedRow).getByRole('button', { name: /^disarm/i })).toBeTruthy();
+    expect(within(sentRow).queryByRole('button', { name: /^disarm/i })).toBeNull();
+    expect(within(sentRow).getByText(/A bid may already be out: it cannot be stopped now\./)).toBeTruthy();
   });
 
   describe('the outcome list repeats the copy the reducer settled with (R6)', () => {

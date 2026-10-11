@@ -93,9 +93,15 @@ function SnipeRow(props: {
         <br />
         Ends <PacificTime ms={endMs} userTz={props.tz} /> · max <Money cents={snipe.maxBid} />
       </p>
-      <button type="button" class="sbw-secondary" disabled={props.busy} aria-label={`Disarm ${snipe.title}`} onClick={props.onDisarm}>
-        Disarm
-      </button>
+      {state === 'sent' ? (
+        // The reducer refuses every disarm after `sent` (the kill switch's too):
+        // offering the button would suggest the bid can still be stopped.
+        <p class="sbw-warn">A bid may already be out: it cannot be stopped now.</p>
+      ) : (
+        <button type="button" class="sbw-secondary" disabled={props.busy} aria-label={`Disarm ${snipe.title}`} onClick={props.onDisarm}>
+          Disarm
+        </button>
+      )}
     </li>
   );
 }

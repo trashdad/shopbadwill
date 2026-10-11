@@ -314,7 +314,7 @@ export function ArmForm(props: ArmFormProps): VNode {
       .then(
         (armedSnipe) => {
           setArming(false);
-          setStatus(`Snipe armed${armedSnipe.dryRun ? ' (dry run — no bid will be placed)' : ''}.`);
+          setStatus(armedSnipe.dryRun ? `Snipe armed. ${DRY_RUN_LABEL}.` : 'Snipe armed.');
           setPrep(null);
           setPlanned(null);
           setAmount('');
