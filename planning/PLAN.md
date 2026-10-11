@@ -1680,3 +1680,10 @@ Each is recorded with its reason in `docs/CONTRACT-DECISIONS.md`; the code is au
 | `FavoritesReconciler.desired(…, favorites)` required | T-53 | the already-favorited check needs the list; an optional argument would silently drop it |
 | `config.ts` endpoint auth gains `'optional'` (itemDetail: bearer on the snipe lane only) | T-26 | `isHighBidder` is only meaningful on an authenticated read |
 | Audit `disableRule` undo ref = rule id | T-58 | no writer existed; the first writer must follow it |
+| `SgwSession.reportRejected(bearer)` (bearer-scoped; ignored unless it matches the held token); `expiring` = < 72 h; rejected-identity history in new key `sbw:sgwSessionRejection` | T-28 | S-2: ~30-day tokens with IP/UA claims; a late 401 must not poison a newer token |
+| New optional storage keys `sbw:googleClient` (client id/secret, written only by options), `sbw:healthReport` (local; failures survive restarts), `sbw:healthProbe` (probe age, last good probes, sticky per-endpoint failures, firstSeenAt) | T-70, T-30 | token-record race; fail-closed health across restarts |
+| `AuthStatus.refreshTokenExpiresAt?` | T-70 | S-4: Testing-mode refresh tokens expire in 7 days |
+| `Snipe.attempt.reply?: BidResult` (ReduceContext.reply removed); one reply per attempt | T-80 | the bid reply must survive a worker restart |
+| §3.3 fail-closed rule: calendar writes are not gated by the SGW session (still by SGW health, kill, dryRun.calendar); sticky schema failures block only the feature(s) their endpoint maps to | T-36, T-30b | Google writes don't depend on SGW login; a broken favorites endpoint must not stop snipes |
+| Messages `health.clearSticky {endpoint}` (ui only, audited) and `health.get` reply `sticky?` list | T-30b | write-endpoint sticky failures can't self-clear; the user resumes after checking |
+| `SgwDom` no longer marks `data-sbw-seen` (port comment stale) | T-27 | nothing read it; leave no site-DOM residue |
