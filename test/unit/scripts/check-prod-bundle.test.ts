@@ -41,6 +41,7 @@ const TOKEN_FIXTURES: [token: string, code: string][] = [
   ['SBW_TEST', 'if (globalThis.SBW_TEST) hook();'],
   ['__scenario', 'const s = state.__scenario;'],
   ['sbw:test', 'port.onMessage("sbw:test:state", h);'],
+  ['sgw.test', 'const host = "sgw.test";'],
   ['innerHTML', 'el.innerHTML = userText;'],
   ['eval(', 'eval("1+1");'],
   ['new Function', 'const f = new Function("return 1");'],

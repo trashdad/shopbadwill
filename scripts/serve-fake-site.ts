@@ -22,7 +22,7 @@ export const SEARCH_API = 'https://buyerapi.shopgoodwill.com/api/Search/ItemList
 export const SEARCH_PATH_PREFIX = '/categories/listing';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const FIXTURE_HTML = path.join(ROOT, 'test/fixtures/sgw/html/search-grid-logged-out.html');
+export const FIXTURE_HTML = path.join(ROOT, 'test/fixtures/sgw/html/search-grid-logged-out.html');
 
 export interface FakeSite {
   url: string;

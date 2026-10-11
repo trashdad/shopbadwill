@@ -11,15 +11,15 @@
 //     → an SPA page change (the fake site's paginator: pushState + the same
 //       search XHR to the fake buyerapi on 127.0.0.1:8787, through the route)
 //       after which everything is still correct
-//     → the kill switch (the real Alt+Shift+K command), which clears the
-//       decorations.
+//     → the kill switch (the popup's one kill control: one click turns it on),
+//       which clears the decorations.
 //
-// Every request is either fulfilled by the route or served by one of the local
-// fake servers. Anything else is aborted and recorded; the test fails if a
-// request to a host beyond the known set was ever attempted. The background's
-// own base URLs are overridden to the fake servers through the real
-// `sbw:test:baseUrl` test hook (called from the options page), so no request
-// from the extension can leave the machine either.
+// Every request is either fulfilled by the route from a local fake server or
+// aborted. Anything else is recorded; the test fails if a request to a host
+// beyond the known set was ever attempted. The background's own base URLs are
+// overridden to the fake servers through the real `sbw:test:baseUrl` test hook
+// (called from the options page), so no request from the extension can leave
+// the machine either.
 //
 // The fake buyerapi clock is pinned to 2026-10-08T00:00:00 Pacific, so the
 // open-auction set (and therefore which cards are on page 1 and page 2) is
@@ -45,10 +45,8 @@ import {
   testExtensionDir,
   type Opened,
 } from './fixtures';
+import { decideRequest, FAKE_BUYERAPI, FAKE_GOOGLE } from './network';
 
-const SITE = 'http://127.0.0.1:8789'; // serve-fake-site: the fake SGW page
-const BUYERAPI = 'http://127.0.0.1:8787'; // fake:sgw
-const GOOGLE = 'http://127.0.0.1:8788'; // fake:google
 const SEARCH_URL = 'https://shopgoodwill.com/categories/listing?layout=grid&p=1';
 
 // Card ids on page 1 (clock pinned to 2026-10-08T00:00:00 PT, sort by end time).
@@ -59,9 +57,6 @@ const LODGE = '279250311'; // "Heavy Cast Iron Skillet 12 inch Lodge (Local Pick
 const FIESTA_2 = '280000037'; // "Fiesta lot #38"
 const LODGE_2 = '280000086'; // "Lodge lot #87"
 
-/** Sanitized placeholder images in the committed fixture: expected, never loaded. */
-const KNOWN_NOISE = new Set(['img.test']);
-
 let context: BrowserContext;
 let worker: Worker;
 let siteHits = 0; // requests answered by the fake site server (through the route)
@@ -71,50 +66,30 @@ const unexpected: string[] = [];
 
 async function fulfil(route: Route): Promise<void> {
   const req = route.request();
-  const url = new URL(req.url());
-  if (url.hostname === 'shopgoodwill.com') {
-    // The hostname override: the real URL is served by the local fake site
-    // (sgw.test), fetched through the route with the Host header rewritten.
-    siteHits += 1;
-    const res = await route.fetch({
-      url: `${SITE}${url.pathname}${url.search}`,
-      headers: { ...req.headers(), host: 'sgw.test' },
-    });
-    await route.fulfill({ response: res });
-    return;
-  }
-  if (url.hostname === 'buyerapi.shopgoodwill.com') {
-    // The page's own search XHR (and any background call) reaches the fake buyerapi.
-    buyerHits += 1;
-    const res = await route.fetch({
-      url: `${BUYERAPI}${url.pathname}${url.search}`,
-      method: req.method(),
-      headers: req.headers(),
-      postData: req.postData() ?? undefined,
-    });
-    await route.fulfill({ response: res });
-    return;
-  }
-  if (url.hostname === '127.0.0.1' && (url.port === '8787' || url.port === '8788' || url.port === '8789')) {
-    // The test build's own calls (the sbw:test:baseUrl override): straight to the fakes.
+  const decision = decideRequest(req.url());
+  if (decision.action === 'continue') {
     await route.continue();
     return;
   }
-  if (url.protocol === 'chrome-extension:' || url.protocol === 'about:') {
-    await route.continue();
-    return;
-  }
-  if (KNOWN_NOISE.has(url.hostname)) {
+  if (decision.action === 'abort') {
+    if (decision.unexpected) unexpected.push(req.url());
     await route.abort();
     return;
   }
-  unexpected.push(req.url());
-  await route.abort();
+  if (decision.bucket === 'site') siteHits += 1;
+  if (decision.bucket === 'buyerapi') buyerHits += 1;
+  const res = await route.fetch({
+    url: decision.url,
+    method: req.method(),
+    headers: decision.bucket === 'site' ? { ...req.headers(), host: 'sgw.test' } : req.headers(),
+    postData: req.postData() ?? undefined,
+  });
+  await route.fulfill({ response: res });
 }
 
 /** Pins the fake buyerapi clock so the open-auction set (and the page split) never drifts. */
 async function pinBuyerApiClock(): Promise<void> {
-  const res = await fetch(`${BUYERAPI}/__scenario`, {
+  const res = await fetch(`${FAKE_BUYERAPI}/__scenario`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ reset: true, serverNowMs: pacificNaiveToEpoch('2026-10-08T00:00:00') }),
@@ -203,9 +178,16 @@ test('rules created in options decorate the fake SGW search page, survive an SPA
 
   await test.step('the base URLs point at the fake servers (sbw:test:baseUrl)', async () => {
     const options = await openOptions();
-    const reply = await callHook(options, 'sbw:test:baseUrl', { sgw: BUYERAPI, google: GOOGLE });
-    expect(reply).toEqual({ ok: true, value: { sgw: BUYERAPI, google: GOOGLE } });
+    const reply = await callHook(options, 'sbw:test:baseUrl', { sgw: FAKE_BUYERAPI, google: FAKE_GOOGLE });
+    expect(reply).toEqual({ ok: true, value: { sgw: FAKE_BUYERAPI, google: FAKE_GOOGLE } });
     await options.close();
+    // The rewritten background fetch must reach the fake buyerapi. continue()
+    // would drop it on the dead proxy and this status would never come back.
+    const status = await worker.evaluate(async () => {
+      const response = await fetch('https://buyerapi.shopgoodwill.com/__log');
+      return response.status;
+    });
+    expect(status).toBe(200);
   });
 
   await test.step('rules are created in options: Highlight Fiesta, Hide Lodge, Watch Pyrex', async () => {
@@ -282,13 +264,16 @@ test('rules created in options decorate the fake SGW search page, survive an SPA
   });
 
   await test.step('the kill switch clears the decorations', async () => {
-    // The popup's kill switch: "Stop all automation". (The Alt+Shift+K command
-    // is the same switch, but headless Chromium does not route synthetic keys
-    // to extension commands, so the button is the reliable real path.)
+    // T-86: the popup has one kill control. Kill on is one click ("Stop all
+    // automation"); kill off asks first. Alt+Shift+K is the same kill.set, but
+    // headless Chromium does not route synthetic keys to extension commands.
     const id = new URL(worker.url()).host;
     const popup = await context.newPage();
     await popup.goto(`chrome-extension://${id}/popup.html`);
-    await popup.locator('button.kill-button').click();
+    const kill = popup.locator('button.kill-button');
+    await expect(kill).toHaveCount(1);
+    await expect(kill).toContainText('Stop all automation');
+    await kill.click();
     await expect(popup.locator('[data-testid="kill-state"]')).toContainText('STOPPED');
     await popup.close();
     // The broadcast reached the search page: every decoration is gone.
@@ -296,13 +281,13 @@ test('rules created in options decorate the fake SGW search page, survive an SPA
     await expect(search.locator('[data-sbw-hidden], [data-sbw-highlight], sbw-stub-row')).toHaveCount(0);
   });
 
-  void test.step('no request ever left the machine', () => {
+  await search.close();
+
+  await test.step('no request ever left the machine', () => {
     expect(siteHits, 'the page came from the fake site server').toBeGreaterThanOrEqual(1);
     expect(buyerHits, 'the page search XHR went to the fake buyerapi (initial + SPA)').toBeGreaterThanOrEqual(2);
-    expect(unexpected).toEqual([]);
+    expect(unexpected, `unexpected hosts: ${unexpected.join(', ')}`).toEqual([]);
   });
-
-  await search.close();
 });
 
 test.beforeAll(async () => {

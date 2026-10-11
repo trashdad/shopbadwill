@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { buildSearchPage, fakeSiteScript, SEARCH_API, startFakeSite, type FakeSite } from '../../../scripts/serve-fake-site';
+import { buildSearchPage, fakeSiteScript, FIXTURE_HTML, SEARCH_API, startFakeSite, type FakeSite } from '../../../scripts/serve-fake-site';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const FIXTURE = readFileSync(path.join(ROOT, 'test/fixtures/sgw/html/search-grid-logged-out.html'), 'utf8');
@@ -66,5 +66,19 @@ describe('scripts/serve-fake-site', () => {
       const res = await fetch(`${site.url}/shopgoodwill/favorites`);
       expect(res.status).toBe(404);
     });
+
+    it('stops cleanly and then refuses connections', async () => {
+      const started = await startFakeSite({ port: 0 });
+      const url = started.url;
+      await started.close();
+      await expect(fetch(url)).rejects.toThrow();
+    });
+  });
+
+  it('reads only the committed sanitized search fixture, never raw/', () => {
+    const fixturePath = FIXTURE_HTML.replaceAll('\\', '/');
+    expect(fixturePath).toMatch(/test\/fixtures\/sgw\/html\/search-grid-logged-out\.html$/);
+    expect(fixturePath).not.toMatch(/\/raw\//);
+    expect(FIXTURE).toContain('Search Results: Pyrex | ShopGoodwill.com');
   });
 });
