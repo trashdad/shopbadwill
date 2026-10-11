@@ -185,6 +185,15 @@ describe('auto-kill reasons (text only)', () => {
     expect(box.querySelector('script, img, a')).toBeNull();
   });
 
+  it('lists a disarm the kill switch could not complete, so the user knows a snipe may still be armed', async () => {
+    const failed: AuditEntry = { seq: 9, at: T0, actor: 'system', kind: 'kill.disarm-failed', ref: 's9', details: { why: 'storage write failed' } };
+    setupSection([failed, unrelated]);
+    const box = await screen.findByTestId('kill-section-reasons');
+    await waitFor(() => {
+      expect(box.textContent).toContain('Kill switch could not stop s9: storage write failed (retrying)');
+    });
+  });
+
   it('sends no kill.set, and reloads the list when the switch changes', async () => {
     const m = new FakeMessaging();
     let calls = 0;

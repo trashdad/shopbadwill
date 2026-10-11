@@ -7,8 +7,10 @@
 //     audit of an accepted disarm; 'kill' comes from jobs/kill-disarm.ts,
 //     'anomaly' from the snipe runner's auto-kill);
 //   - 'kill.snipe-sent' (jobs/kill-disarm.ts, R2: a sent snipe the kill switch
-//     could not stop). The constant is not imported from the background (that
-//     would bundle the runner into the popup).
+//     could not stop);
+//   - 'kill.disarm-failed' (jobs/kill-disarm.ts: a refused or failed disarm,
+//     retried on the next pass). The constants are not imported from the
+//     background (that would bundle the runner into the popup).
 import type { AuditEntry } from '../../../../domain/audit/types';
 
 export interface KillReason {
@@ -18,6 +20,7 @@ export interface KillReason {
 
 export const KILL_REASON_LIMIT = 3;
 const KILL_SNIPE_SENT_KIND = 'kill.snipe-sent';
+const KILL_DISARM_FAILED_KIND = 'kill.disarm-failed';
 
 /** The last auto-kill lines of `entries` (newest first, per the audit.list contract), at most `limit`. */
 export function killReasons(entries: readonly AuditEntry[], limit: number = KILL_REASON_LIMIT): KillReason[] {
@@ -28,6 +31,10 @@ export function killReasons(entries: readonly AuditEntry[], limit: number = KILL
       const ref = typeof e.ref === 'string' && e.ref !== '' ? ` ${e.ref}` : '';
       const why = typeof e.details.why === 'string' && e.details.why !== '' ? `: ${e.details.why}` : '';
       out.push({ at: e.at, text: `${who}${ref}${why}` });
+    } else if (e.kind === KILL_DISARM_FAILED_KIND) {
+      const ref = typeof e.ref === 'string' && e.ref !== '' ? ` ${e.ref}` : ' a snipe';
+      const why = typeof e.details.why === 'string' && e.details.why !== '' ? `: ${e.details.why}` : '';
+      out.push({ at: e.at, text: `Kill switch could not stop${ref}${why} (retrying)` });
     } else if (e.kind === KILL_SNIPE_SENT_KIND) {
       const note = e.details.note;
       out.push({ at: e.at, text: typeof note === 'string' && note !== '' ? note : 'kill: a sent snipe was left running; outcome pending' });
