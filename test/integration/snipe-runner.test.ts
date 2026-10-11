@@ -554,6 +554,11 @@ class Worker {
 }
 
 /** The earliest wall time at which a live timer or an alarm is due. */
+/** Only the snipe runner's alarms; other registered modules (T-52's `sbw:tick`) keep their own. */
+async function snipeAlarms(shared: Shared): Promise<Awaited<ReturnType<FakeAlarms['getAll']>>> {
+  return (await shared.alarms.getAll()).filter((a) => a.name.startsWith('sbw:snipe:'));
+}
+
 function nextDue(shared: Shared): number | undefined {
   const timers = (shared.clock as unknown as { timers: Map<number, { at: number }> }).timers;
   let min: number | undefined;
@@ -1006,7 +1011,7 @@ describe('money safety carries', () => {
     await runTo(shared, END + 8 * HOUR);
     expect(stored(shared).state).toBe('resolved');
     expect(shared.sgw.placeBids).toHaveLength(1);
-    expect(await shared.alarms.getAll()).toEqual([]);
+    expect(await snipeAlarms(shared)).toEqual([]);
   });
 
   it('fallbackDecision comes before the kill: an anomaly in the window places the early proxy once, through `sent`', async () => {
@@ -1437,7 +1442,7 @@ describe('lanes, preflight and health alarms', () => {
     for (const a of await shared.alarms.getAll()) await shared.alarms.clear(a.name);
 
     await boot(shared);
-    const names = (await shared.alarms.getAll()).map((a) => a.name).sort();
+    const names = (await snipeAlarms(shared)).map((a) => a.name).sort();
     expect(names).toEqual([snipeAlarmName('s1', 'health1'), snipeAlarmName('s1', 'preflight'), snipeAlarmName('s1', 'wake')].sort());
     await runTo(shared, END + 2 * MIN);
     expect(stored(shared).state).toBe('resolved');
@@ -1590,7 +1595,7 @@ describe('snipe handlers', () => {
     expect(stored(other)).toMatchObject({ state: 'killed', outcome: 'killed' });
     await runTo(other, END + 2 * MIN);
     expect(other.sgw.details).toHaveLength(1);
-    expect(await other.alarms.getAll()).toEqual([]);
+    expect(await snipeAlarms(other)).toEqual([]);
   });
 
   it('snipe.prepare returns the detail, the estimated all-in and the caps for the next acceptable bid', async () => {
