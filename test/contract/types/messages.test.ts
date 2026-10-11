@@ -31,6 +31,7 @@ import {
   MsgSchema,
   PORT_NAMES,
   PortTickSchemas,
+  type LandedCostQuote,
   type Msg,
   type MsgEnvelope,
   type MsgPayload,
@@ -196,7 +197,8 @@ describe('replies', () => {
 
   it('types replies as §3.12 declares them', () => {
     expectTypeOf<MsgReply<'rules.evaluate'>>().toEqualTypeOf<MatchResult[]>();
-    expectTypeOf<MsgReply<'landedCost.get'>>().toEqualTypeOf<Record<ItemId, Cents | null>>();
+    // T-57 contract change (R1): the reply value now carries shipping, handling and pickup.
+    expectTypeOf<MsgReply<'landedCost.get'>>().toEqualTypeOf<Record<ItemId, LandedCostQuote | null>>();
     expectTypeOf<MsgReply<'settings.get'>>().toEqualTypeOf<Settings>();
     expectTypeOf<MsgReply<'rules.list'>>().toEqualTypeOf<Rule[]>();
     expectTypeOf<MsgReply<'rules.preview'>>().toEqualTypeOf<{ matched: number; total: number; ids: ItemId[] }>();
@@ -229,8 +231,16 @@ describe('replies', () => {
   });
 
   it('validates a reply against its schema', () => {
-    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 1299, '279250058': null }).success).toBe(true);
-    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 12.99 }).success).toBe(false);
+    // T-57 (R1): entries are { shipping, handling, pickup } or null.
+    expect(
+      MsgReplySchemas['landedCost.get'].safeParse({
+        '279250057': { shipping: 499, handling: 100, pickup: false },
+        '279250058': { shipping: 0, handling: 0, pickup: true },
+        '279250059': null,
+      }).success,
+    ).toBe(true);
+    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 1299 }).success).toBe(false);
+    expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': { shipping: 499, handling: 100 } }).success).toBe(false);
     expect(MsgReplySchemas['job.status'].safeParse(null).success).toBe(true);
   });
 });

@@ -510,3 +510,29 @@ Approved by the controller in the T-32 review (fix round 1, ruling on concern 1)
 - `test/dom/overlay.test.ts`: the trusted-click check.
 
 **Follow-up for the next PLAN edit.** Add `rules.disable` to PLAN §3.12 (content → background) and §2.4 rule 3, and to contracts.md.
+
+## T-57 contract change: landedCost.get reply and `sbw:quoteCache`
+
+Approved by the controller (T-57 rulings R1, R2) and made in `task/T-57`.
+
+### R1: the `landedCost.get` reply value
+
+**Before:** `MsgReplySchemas['landedCost.get']` was `record(ItemId, Cents | null)`, which cannot carry the brief's `pickup` flag.
+
+**Change** (`src/messaging/protocol.ts`): the reply is now `record(ItemId, { shipping: Cents; handling: Cents; pickup: boolean } | null)`.
+
+- The badge computes landed = the card's current price + shipping + handling.
+- Pickup-only items answer `{ shipping: 0, handling: 0, pickup: true }` with no SGW request.
+- The entry schema is module-private (`LandedCostQuoteSchema`); only the type `LandedCostQuote` is exported, so the locked schema surface in `test/contract/types/examples.test.ts` is unchanged.
+- `test/contract/types/messages.test.ts` pins the new reply type and validation examples. No other consumer of the reply existed (the handler and the badge are new in T-57), and the request payload `{ itemIds: ItemId[] }` is unchanged.
+
+### R2: the `sbw:quoteCache` storage key
+
+**Change** (`src/domain/storage/schema.ts`, plus the Repo default in `src/domain/storage/repo.ts`): one new optional key `STORAGE_KEYS.quoteCache = 'sbw:quoteCache'` (area `local`), `record(ItemId, { shipping, handling, zip-hash, fetchedAt })`.
+
+- `zip-hash` is the SHA-256 hex of the home ZIP: the ZIP itself is never stored, and a ZIP change misses the cache.
+- The 24 h TTL runs from `fetchedAt` (readers compute it; the record has no `expiresAt`).
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration. An invalid record parses to empty (the Repo default `{}` after quarantine).
+- The entry schema is module-private (`QuoteCacheEntrySchema`), like `SgwSessionRejectionSchema`, so the locked example list is unchanged; `test/contract/types/storage.test.ts` pins the new key, its area and a sample value.
+
+**Follow-up for the next PLAN edit.** Add `sbw:quoteCache` to PLAN §2.3 and the new reply shape to §3.12 and contracts.md.
