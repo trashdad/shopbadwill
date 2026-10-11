@@ -1093,6 +1093,56 @@ describe('dry run (C4)', () => {
     expect(done[0]).toMatchObject({ id: 's1', outcome: 'dry-run' });
   });
 
+  it('dry run: a pending placeBid schema failure is the live health verdict, so the fallback is not "would have placed"', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    await runTo(shared, wakeAt() + ALARM_DELAY + 10 * SEC);
+    expect(stored(shared)).toMatchObject({ state: 'waking', dryRun: true });
+    ctx.switches.flagSchemaFailure({ endpoint: 'placeBid', message: 'drift', at: shared.clock.now() });
+    shared.sgw.detailFaults.push(net(), net(), net());
+    await runTo(shared, END + 2 * MIN);
+
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+    const fb = audits(shared).find((a) => a.kind === 'snipe.fallback');
+    expect(fb?.details).toMatchObject({ writesAllowed: false, degradedBecause: 'writes-blocked', applied: 'skip' });
+    const said = shared.notifier.sent.map((n) => n.notification.message).join('\n');
+    expect(said).not.toMatch(/would have placed/i);
+  });
+
+  it('dry run: a favorites-only pending schema failure still counts bidding writes as allowed', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    await runTo(shared, wakeAt() + ALARM_DELAY + 10 * SEC);
+    ctx.switches.flagSchemaFailure({ endpoint: 'addFavorite', message: 'drift', at: shared.clock.now() });
+    shared.sgw.detailFaults.push(net(), net(), net());
+    await runTo(shared, END + 2 * MIN);
+
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+    const fb = audits(shared).find((a) => a.kind === 'snipe.fallback');
+    expect(fb?.details).toMatchObject({ writesAllowed: true, applied: 'early-proxy' });
+    expect(shared.notifier.sent.find((n) => n.notification.title.startsWith('Dry run'))?.notification.message).toMatch(/would have placed/);
+  });
+
+  it('an invalid sbw:snipeRunner fails closed: a stored firing bid is not replayed', async () => {
+    const shared = makeShared();
+    const first = await boot(shared, { crashAfterSet: crashOn('firing') });
+    await arm(first.w);
+    await runTo(shared, FIRE_LOCAL + 100);
+    expect(stored(shared).state).toBe('firing');
+    expect(runnerRecord(shared).entries.s1?.outbox.map((e) => e.kind)).toContain('placeBid');
+    shared.areas.local.seed({ [RUNNER_KEY]: { version: 1, entries: { s1: { outbox: 'not-an-array' } } } });
+
+    await boot(shared);
+    await runTo(shared, END + 2 * MIN);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(stored(shared).state).toBe('killed');
+  });
+
   it('dry run: a fallback is decided with writesAllowed ignoring the dry run ("would have placed"), and sends nothing', async () => {
     const shared = makeShared({ settings: settingsWith() });
     const { w } = await boot(shared);

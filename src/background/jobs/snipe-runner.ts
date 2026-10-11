@@ -17,8 +17,8 @@
 //   (`ctx.sendWrite`, writesAllowed checked again there). A refused `sent`
 //   drops the effect: nothing is sent.
 // - Effects outbox. A commit writes the next state and the accepted event's
-//   effects atomically (`sbw:snipes` and the runner-private `sbw:snipeRunner`
-//   in ONE storage.local.set). Effects run in order and leave the outbox once
+//   effects atomically (`sbw:snipes` and `sbw:snipeRunner` in ONE
+//   storage.local.set). Effects run in order and leave the outbox once
 //   done, so a worker that dies after a commit replays them on restart, money
 //   only through the reducer's guards. A stale money effect after `sent` is
 //   refused as `already-sent` and dropped.
@@ -35,8 +35,9 @@
 // - fallbackDecision (T-83) runs inside the reducer on `disarm(anomaly)`, on
 //   the snipe as it is before the kill (C3). The kill switch disarms with
 //   `by: 'kill'` and asks for no fallback. A dry-run snipe passes
-//   `writesAllowed` with the dry-run condition ignored, so its audit shows what
-//   the live fallback would do; a dry run still sends nothing.
+//   `writesAllowed` from `verdictNow('bidding', { ignoreDryRun: true })`, so
+//   its audit shows the live verdict (kill, health including a pending schema
+//   failure, session) without the dry-run condition. A dry run still sends nothing.
 // - Live safety: a PlaceBid leaves only when the snipe is not a dry run, the
 //   reducer emitted `placeBid` (or an early proxy), `verdictNow('bidding')`
 //   allows it, and the adapter's own gate agrees.
@@ -51,28 +52,25 @@
 // completion event (T-90). The SnipeHost comes from the factory in
 // adapters/browser/snipe-host.ts, keyed by the S-7 verdict (T-116 adds the
 // runner page). The `sbw:snipe-countdown` port is served here (§3.12).
-import { z } from 'zod';
-
 import { createSnipeHost, type SelectedSnipeHost } from '../../adapters/browser/snipe-host';
 import { bidMayHaveBeenSent, PLACE_BID_TIMEOUT_MS } from '../../adapters/sgw/bid';
 import { SgwClockAdapter } from '../../adapters/sgw/clock-adapter';
-import { SHIPPING_MARK, STICKY_MARK } from '../../adapters/sgw/health';
 import { checkCaps, confirmsAmount, spentToday, typoCheck } from '../../domain/snipe/caps';
 import { classifyOutcome } from '../../domain/snipe/outcome';
 import { isoMs, preflight, PREFLIGHT_LEAD_MS, type PreflightContext, type PreflightReason } from '../../domain/snipe/preflight';
 import { capsForEvent, reduce, WAKE_BEFORE_FIRE_MS, type ReduceContext, type Rejection } from '../../domain/snipe/state-machine';
 import { assessClock, computeFireAt, MAX_RTT_MS, planClockSamples, toLocalFireAt } from '../../domain/snipe/timing';
-import { EffectSchema, SnipeIdSchema, type CapsResult, type Effect, type Snipe, type SnipeEvent } from '../../domain/snipe/types';
+import { type CapsResult, type Effect, type Snipe, type SnipeEvent } from '../../domain/snipe/types';
 import { formatDual } from '../../domain/time/pacific';
-import { STORAGE_KEYS, STORAGE_RECORDS } from '../../domain/storage/schema';
-import { BidResultSchema, EpochMsSchema, type BidResult, type Cents, type EpochMs, type ItemDetail, type ItemId, type Lane } from '../../domain/types';
+import { SnipeRunnerRecordSchema, STORAGE_KEYS, STORAGE_RECORDS, type SnipeRunnerRecord } from '../../domain/storage/schema';
+import { BidResultSchema, type BidResult, type Cents, type EpochMs, type ItemDetail, type ItemId, type Lane } from '../../domain/types';
 import type { Settings } from '../../domain/settings/schema';
 import { PORT_NAMES, SnipeCountdownTickSchema } from '../../messaging/protocol';
 import type { Clock } from '../../ports/clock';
 import { SgwApiError } from '../../ports/errors';
 import type { SgwApi } from '../../ports/sgw-api';
 import { errorText, type BackgroundContext, type RuntimePort } from '../context';
-import { HEALTH_WINDOW_MS, WHY } from '../switches';
+import { WHY, type Verdict } from '../switches';
 
 // ── Policy ──────────────────────────────────────────────────────────────────
 
@@ -85,8 +83,8 @@ export const SNIPE_ALARM_PREFIX = 'sbw:snipe:';
 export const SNIPE_ALARM_KINDS = ['health24', 'health1', 'preflight', 'wake', 'recover', 'postread'] as const;
 export type SnipeAlarmKind = (typeof SNIPE_ALARM_KINDS)[number];
 
-/** The runner-private storage record: per snipe, the effects outbox and the runner's bookkeeping. */
-export const RUNNER_KEY = 'sbw:snipeRunner';
+/** `sbw:snipeRunner`: per snipe, the effects outbox and the runner's bookkeeping. */
+export const RUNNER_KEY = STORAGE_KEYS.snipeRunner;
 
 /** S-7: 20 s heartbeats (Firefox stretched them to 26.9 s; the idle timeout is 30 s). Do not raise. */
 export const KEEP_ALIVE_INTERVAL_MS = 20_000;
@@ -282,27 +280,10 @@ export function getSnipeRunner(ctx: BackgroundContext): SnipeRunner | undefined 
   return RUNNERS.get(ctx);
 }
 
-// ── The runner record (`sbw:snipeRunner`) ──────────────────────────────────
+// ── The runner record (`sbw:snipeRunner`, SnipeRunnerRecordSchema) ───────────
 
-const EntrySchema = z.object({
-  /** Effects of accepted events not yet executed, in order. */
-  outbox: z.array(EffectSchema),
-  /** When the T-15 min preflight ran. */
-  preflightAt: EpochMsSchema.optional(),
-  /** The preflight was "not due" (the end moved later): not before this. */
-  preflightNotBefore: EpochMsSchema.optional(),
-  /** An AuthHealth failure before T-15 min (the preflight decides). */
-  atRisk: z.string().optional(),
-  /** Failed outcome (or dry-run measure) reads, and when the last one was tried. */
-  readFailures: z.number().int().nonnegative().optional(),
-  lastReadAt: EpochMsSchema.optional(),
-  /** When the user was told the outcome is unconfirmed. */
-  unconfirmedAt: EpochMsSchema.optional(),
-});
-type Entry = z.infer<typeof EntrySchema>;
-
-const RunnerRecordSchema = z.object({ version: z.literal(1), entries: z.record(SnipeIdSchema, EntrySchema) });
-type RunnerRecord = z.infer<typeof RunnerRecordSchema>;
+type Entry = SnipeRunnerRecord['entries'][string];
+type RunnerRecord = SnipeRunnerRecord;
 
 const SNIPES_SCHEMA = STORAGE_RECORDS[STORAGE_KEYS.snipes].schema;
 
@@ -432,6 +413,13 @@ export class SnipeRunner {
   private readonly alarmsSet = new Set<string>();
   /** Snipes with a send in flight in this worker. */
   private readonly inFlight = new Set<string>();
+  /**
+   * Snipes inside a window read. `flagSchemaFailure` notifies switches during
+   * that read; react() must not disarm for it, or the audit says "health check
+   * failed" instead of the read's own reason (schema drift). The kill switch
+   * still stops the snipe. The step checks again once the read returns.
+   */
+  private readonly reading = new Set<string>();
   /** Why a money effect was dropped (the close-out disarm says it). */
   private readonly closeWhy = new Map<string, { by: 'kill' | 'anomaly'; why: string }>();
   private readonly degradedNoted = new Set<string>();
@@ -707,14 +695,14 @@ export class SnipeRunner {
       timeZone: settings.locale.timeZone,
       sessionUsable,
       // C4: a dry run asks with the dry-run condition ignored (it still never sends).
-      writesAllowed: s.dryRun ? this.writesIgnoringDryRun(sessionUsable) : this.ctx.switches.verdictNow('bidding').ok,
+      writesAllowed: this.biddingVerdict(s).ok,
     };
   }
 
   private async readRunner(): Promise<RunnerRecord> {
     const raw = await this.ctx.storage.local.get<unknown>(RUNNER_KEY);
     if (raw === undefined) return emptyRecord();
-    const parsed = RunnerRecordSchema.safeParse(raw);
+    const parsed = SnipeRunnerRecordSchema.safeParse(raw);
     if (parsed.success) return parsed.data;
     // Fail closed: no outbox means no money effect is ever replayed from it.
     if (!this.runnerInvalidNoted) {
@@ -726,11 +714,11 @@ export class SnipeRunner {
 
   /** ONE storage write for both keys: the state and its outbox never diverge. */
   private async write(all: Record<string, Snipe>, rec: RunnerRecord): Promise<void> {
-    await this.ctx.storage.local.set({ [STORAGE_KEYS.snipes]: SNIPES_SCHEMA.parse(all), [RUNNER_KEY]: RunnerRecordSchema.parse(rec) });
+    await this.ctx.storage.local.set({ [STORAGE_KEYS.snipes]: SNIPES_SCHEMA.parse(all), [RUNNER_KEY]: SnipeRunnerRecordSchema.parse(rec) });
   }
 
   private async writeRecord(rec: RunnerRecord): Promise<void> {
-    await this.ctx.storage.local.set({ [RUNNER_KEY]: RunnerRecordSchema.parse(rec) });
+    await this.ctx.storage.local.set({ [RUNNER_KEY]: SnipeRunnerRecordSchema.parse(rec) });
   }
 
   /** Runner-record-only change under the snipes lock. */
@@ -1254,14 +1242,13 @@ export class SnipeRunner {
     const now = this.ctx.clock.now();
     const tz = settings.locale.timeZone;
     const others = Object.values(all).filter((o) => o.id !== fresh.id);
-    const sessionUsable = usableSession(state);
     const pctx: PreflightContext = {
       now,
       timeZone: tz,
       session: { state, token: token === null ? null : { expiresAt: token.expiresAt } },
       clockOffset: this.ctx.sgwClock.offset(),
       keepAwake: await this.keepAwakeState(fresh, settings),
-      writesAllowed: fresh.dryRun ? this.writesIgnoringDryRun(sessionUsable) : this.ctx.switches.verdictNow('bidding').ok,
+      writesAllowed: this.biddingVerdict(fresh).ok,
       detail,
       caps: { limits: settings.snipe.caps, others, spentToday: spentToday(others, now, tz) },
     };
@@ -1340,7 +1327,7 @@ export class SnipeRunner {
 
   /** In the window: kill switch → disarm(kill); blocked bidding (health, session, storage) → disarm(anomaly) + fallback. */
   private async checkAnomaly(s: Snipe): Promise<boolean> {
-    const a = this.anomaly(s, usableSession(await this.ctx.session.state()));
+    const a = this.anomaly(s);
     if (a === null) return false;
     const r = await this.commit(s.id, { type: 'disarm', now: this.ctx.clock.now(), by: a.by, why: a.why });
     return r.kind === 'accepted';
@@ -1350,51 +1337,31 @@ export class SnipeRunner {
   private async react(id: string): Promise<void> {
     const s = this.cache.get(id);
     if (s === undefined || !(s.state === 'waking' || s.state === 'verified' || s.state === 'firing')) return;
-    const a = this.anomaly(s, usableSession(await this.ctx.session.state()));
+    const a = this.anomaly(s);
     if (a === null) return;
+    // The in-progress read records schema drift itself. A health disarm here would hide that.
+    if (this.reading.has(id) && a.by !== 'kill') return;
     // A firing snipe is only stopped by the kill switch here; its money gate handles the rest.
     if (s.state === 'firing' && a.by !== 'kill') return;
     const r = await this.commit(id, { type: 'disarm', now: this.ctx.clock.now(), by: a.by, why: a.why });
     if (r.kind === 'accepted') void this.drive(id);
   }
 
-  private anomaly(s: Snipe, sessionUsable: boolean): { by: 'kill' | 'anomaly'; why: string } | null {
-    const v = this.ctx.switches.verdictNow('bidding');
+  /**
+   * The live bidding verdict. A dry-run snipe ignores only the dry-run condition,
+   * so kill, health (sticky scoping and a pending flagged failure), storage and
+   * the session still stop it. A live snipe sees the dry run too.
+   */
+  private biddingVerdict(s: Snipe): Verdict {
+    return this.ctx.switches.verdictNow('bidding', { ignoreDryRun: s.dryRun });
+  }
+
+  private anomaly(s: Snipe): { by: 'kill' | 'anomaly'; why: string } | null {
+    const v = this.biddingVerdict(s);
     if (v.ok) return null;
     const why = v.why ?? 'bidding is blocked';
     if (why === WHY.kill) return { by: 'kill', why: 'the kill switch is on' };
-    if (!s.dryRun || why !== WHY.dryRun) return { by: 'anomaly', why: `bidding is blocked: ${why}` };
-    // A dry run walks the live path: the checks after the dry-run condition.
-    if (this.healthBlocksBidding()) return { by: 'anomaly', why: `bidding is blocked: ${WHY.health}` };
-    if (!sessionUsable) return { by: 'anomaly', why: 'bidding is blocked: the SGW session cannot bid' };
-    return null;
-  }
-
-  /** writesAllowed('bidding') with the dry-run condition ignored (C4: only a dry run's fallback audit and checks use it). */
-  private writesIgnoringDryRun(sessionUsable: boolean): boolean {
-    const v = this.ctx.switches.verdictNow('bidding');
-    if (v.ok) return true;
-    if (v.why !== WHY.dryRun) return false;
-    return !this.healthBlocksBidding() && sessionUsable;
-  }
-
-  /**
-   * Whether health blocks bidding, for a dry run only (the live verdict stops
-   * at the dry-run check first). Mirrors Switches.healthFailing for 'bidding'
-   * (T-30b: a report failing only through sticky endpoint failures blocks just
-   * the features those endpoints affect). A schema failure the API flagged but
-   * T-30 has not stored yet is not visible here.
-   */
-  private healthBlocksBidding(): boolean {
-    const r = this.ctx.switches.healthReport();
-    const now = this.ctx.clock.now();
-    if (r === null || r.ok || now - r.checkedAt >= HEALTH_WINDOW_MS) return false;
-    const failing = r.checks.filter((c) => !c.ok);
-    const stickyOnly =
-      failing.length > 0 && failing.every((c) => c.detail !== undefined && c.detail.startsWith(STICKY_MARK) && !c.detail.includes(`; ${SHIPPING_MARK}`));
-    if (!stickyOnly) return true;
-    const sticky = this.ctx.switches.stickyFailures();
-    return sticky.length === 0 || sticky.some((f) => f.features.includes('bidding'));
+    return { by: 'anomaly', why: `bidding is blocked: ${why}` };
   }
 
   // ── Reads ─────────────────────────────────────────────────────────────
@@ -1417,6 +1384,7 @@ export class SnipeRunner {
   /** A window read (sample or verify): errors counted; schema drift and repeated errors are anomalies. */
   private async windowRead(s: Snipe, sess: WindowSession): Promise<{ detail?: ItemDetail; rttMs?: number; kind?: ReadErrorKind; anomaly?: string }> {
     const sentAt = this.ctx.clock.now();
+    this.reading.add(s.id);
     try {
       const detail = await this.readItem(s, 'snipe', true);
       sess.consecutiveErrors = 0;
@@ -1430,6 +1398,8 @@ export class SnipeRunner {
         return { kind, anomaly: `repeated errors: ${String(sess.consecutiveErrors)} failed reads in a row (${errorText(e)})` };
       }
       return { kind };
+    } finally {
+      this.reading.delete(s.id);
     }
   }
 

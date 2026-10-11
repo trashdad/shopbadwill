@@ -434,3 +434,29 @@ A schema failure flagged by the API but not yet stored (`flagSchemaFailure`) is 
 **Tests.** `test/integration/background-main.test.ts` (T-30b block), `test/dom/options-google.test.ts` (sticky failures).
 
 **Follow-up for the next PLAN edit.** Add `health.clearSticky` to PLAN §3.12 and the `sticky` field to the `health.get` reply; add the feature scoping to §3.3.
+
+## T-84 contract change: optional storage key `sbw:snipeRunner`
+
+Source: controller ruling on T-84 concern 5.
+
+The snipe runner keeps its effect outbox and per-snipe bookkeeping in `sbw:snipeRunner`, and writes that record in the same `storage.local.set` as `sbw:snipes`. That is what makes the state and the outbox atomic. The key was private. It is now a storage record.
+
+`STORAGE_KEYS.snipeRunner = 'sbw:snipeRunner'` (area `local`, `SnipeRunnerRecordSchema`): `{ version: 1, entries: Record<SnipeId, { outbox: Effect[], preflightAt?, preflightNotBefore?, atRisk?, readFailures?, lastReadAt?, unconfirmedAt? }> }`. `outbox` is the reducer's effects, in order. The bookkeeping fields are the runner's own (when preflight ran, an AuthHealth warning, outcome-read retries, the Unconfirmed alert).
+
+Optional. A profile with no record is "nothing pending". No migration, and `sbw:meta.schemaVersion` stays 1.
+
+An invalid record fail-closes. The runner parses it with `SnipeRunnerRecordSchema` and, on failure, treats the outbox as empty. Nothing is replayed, so a corrupt record cannot send a bid. The repo quarantines the record if something reads it through `find`.
+
+**Tests.** `test/contract/types/storage.test.ts`, `test/contract/types/examples/SnipeRunnerRecord.*.json`, and the snipe-runner integration test that corrupts the record and expects no PlaceBid.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-84: `verdictNow(feature, { ignoreDryRun: true })`
+
+Source: controller ruling on T-84 concern 4.
+
+A dry-run snipe has to ask "would live bidding be allowed?" without the dry-run condition, so its fallback audit can say "would have placed" only when a live snipe would have been allowed to send. `Switches.verdictNow` stopped at `dryRun[feature]` before health and the session, and the runner kept a private copy of the health check. That copy missed a schema failure `flagSchemaFailure` had recorded but T-30 had not stored yet.
+
+`verdictNow(feature, { ignoreDryRun: true })` skips only that one condition. Kill, storage repair, health (including T-30b sticky scoping and a pending flagged failure) and the session check are unchanged. `writesAllowed` and `view` never pass the option, so a dry run still blocks a real write. The runner uses this verdict for a dry-run snipe's `writesAllowed` and for its window anomaly check, and no longer mirrors `healthFailing`.
+
+**Tests.** `test/integration/background-main.test.ts` ("verdictNow ignoreDryRun") and `test/integration/snipe-runner.test.ts` (a pending `placeBid` failure does not audit "would have placed"; a favorites-only pending failure still does).

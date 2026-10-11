@@ -1,0 +1,8 @@
+{
+  "invalidBecause": "the runner record version is not 1, so it must not be replayed",
+  "path": ["version"],
+  "value": {
+    "version": 2,
+    "entries": {}
+  }
+}
