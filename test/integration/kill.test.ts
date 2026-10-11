@@ -23,7 +23,7 @@ import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import type { BackgroundContext, BackgroundModule, RuntimePort } from '../../src/background/context';
 import { HANDLER_MODULES } from '../../src/background/handlers/index';
 import { JOB_MODULES } from '../../src/background/jobs/index';
-import { getSnipeRunner } from '../../src/background/jobs/snipe-runner';
+import { DEFAULT_SEND_STRATEGY, getSnipeRunner, RUNNER_KEY, snipeSeams } from '../../src/background/jobs/snipe-runner';
 import { BADGE_DEFAULT_COLOR, KILL_BADGE_COLOR, registerBadge } from '../../src/background/badge';
 import {
   KILL_DISARM_FAILED_KIND,
@@ -62,6 +62,22 @@ const META = { schemaVersion: 1, installedAt: T0 - DAY, lastMigrationAt: T0 - DA
 function settingsWith(killSwitch: boolean): Settings {
   return { ...defaultSettings(), killSwitch };
 }
+
+/** Live bidding: no dry run anywhere (the send-gate tests need a bid that WOULD go out). */
+function liveSettings(): Settings {
+  const s = defaultSettings();
+  s.snipe.enabled = true;
+  s.dryRun = { favorites: false, calendar: false, bidding: false };
+  return s;
+}
+
+function b64url(value: unknown): string {
+  return Buffer.from(JSON.stringify(value)).toString('base64url');
+}
+const SESSION_EXP = T0 + 30 * DAY;
+const BEARER = `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url({ BuyerId: '42', exp: Math.floor(SESSION_EXP / 1000), jti: 'token-1' })}.c2ln`;
+const SESSION = { bearer: BEARER, capturedAt: T0 - MIN, expiresAt: SESSION_EXP, buyerId: '42', source: 'tap' };
+const SGW_API = 'https://buyerapi.shopgoodwill.com/api/';
 
 const flush = async (rounds = 3): Promise<void> => {
   for (let i = 0; i < rounds; i++) {
@@ -141,6 +157,23 @@ function draftSnipe(id: string): Snipe {
   return snipe({ id, state: 'draft', history: [] });
 }
 
+/** A snipe further along than `armed` but not yet `sent`: every one of these can still be stopped. */
+function laterSnipe(id: string, state: 'fallback-applied' | 'waking' | 'verified' | 'firing'): Snipe {
+  const path: Array<[Snipe['state'], Snipe['state']]> = {
+    'fallback-applied': [['draft', 'armed'], ['armed', 'fallback-applied']] as Array<[Snipe['state'], Snipe['state']]>,
+    waking: [['draft', 'armed'], ['armed', 'waking']] as Array<[Snipe['state'], Snipe['state']]>,
+    verified: [['draft', 'armed'], ['armed', 'waking'], ['waking', 'verified']] as Array<[Snipe['state'], Snipe['state']]>,
+    firing: [['draft', 'armed'], ['armed', 'waking'], ['waking', 'verified'], ['verified', 'firing']] as Array<[Snipe['state'], Snipe['state']]>,
+  }[state];
+  return snipe({
+    id,
+    state,
+    sellerId: 955353,
+    ...(state === 'verified' || state === 'firing' ? { fireAt: END - 8000, measured: { offsetMs: 0, rttMs: 150 } } : {}),
+    history: path.map(([from, to], i) => ({ at: T0 - (path.length - i) * SEC, from, to, why: to })),
+  });
+}
+
 // ── The background over fakes ────────────────────────────────────────────────
 
 interface Shared {
@@ -153,12 +186,13 @@ interface Shared {
   permissions: FakePermissions;
 }
 
-function makeShared(opts: { killSwitch?: boolean; snipes?: Record<string, Snipe> } = {}): Shared {
+function makeShared(opts: { killSwitch?: boolean; snipes?: Record<string, Snipe>; live?: boolean } = {}): Shared {
   const clock = new FakeClock(T0);
   const areas = new FakeStorageAreas();
   areas.local.seed({
     [STORAGE_KEYS.meta]: META,
-    [STORAGE_KEYS.settings]: settingsWith(opts.killSwitch ?? false),
+    [STORAGE_KEYS.settings]: opts.live === true ? { ...liveSettings(), killSwitch: opts.killSwitch ?? false } : settingsWith(opts.killSwitch ?? false),
+    ...(opts.live === true ? { [STORAGE_KEYS.sgwSession]: SESSION } : {}),
     ...(opts.snipes === undefined ? {} : { [STORAGE_KEYS.snipes]: opts.snipes }),
   });
   return {
@@ -540,6 +574,62 @@ describe('kill switch: disarm-all (R1, R2, R6)', () => {
     expect(stored(shared, 's1').outcome).toBeUndefined();
   });
 
+  it('kill disarms every state that can still bid: armed, fallback-applied, waking, verified and firing', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    // Stored after boot: this worker's runner never drove them (no window, no
+    // reconcile), so its own in-window reaction cannot stop them. Only
+    // disarm-all can, and it must not skip any pre-send state.
+    const seeded = {
+      a1: armedSnipe('a1'),
+      f1: laterSnipe('f1', 'fallback-applied'),
+      w1: laterSnipe('w1', 'waking'),
+      v1: laterSnipe('v1', 'verified'),
+      x1: laterSnipe('x1', 'firing'),
+      s1: sentSnipe('s1'),
+    };
+    await shared.areas.local.set({ [STORAGE_KEYS.snipes]: seeded });
+    await flush();
+    // Kill is off: nothing is touched.
+    expect(storedStates(shared)).toEqual({ a1: 'armed', f1: 'fallback-applied', w1: 'waking', v1: 'verified', x1: 'firing', s1: 'sent' });
+
+    await w.ok('kill.set', { on: true });
+    await waitUntil(
+      () =>
+        audits(shared).filter((e) => e.kind === 'snipe.disarm').length === 5 &&
+        audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND),
+    );
+    expect(shared.clock.now()).toBe(T0);
+    expect(storedStates(shared)).toEqual({ a1: 'killed', f1: 'killed', w1: 'killed', v1: 'killed', x1: 'killed', s1: 'sent' });
+    const disarms = audits(shared).filter((e) => e.kind === 'snipe.disarm');
+    expect(Object.fromEntries(disarms.map((d) => [d.ref, d.details.from]))).toEqual({
+      a1: 'armed',
+      f1: 'fallback-applied',
+      w1: 'waking',
+      v1: 'verified',
+      x1: 'firing',
+    });
+    for (const d of disarms) expect(d.details).toMatchObject({ by: 'kill', why: KILL_DISARM_WHY, to: 'killed' });
+    expect(stored(shared, 's1').history).toHaveLength(2);
+    expect(stored(shared, 's1').outcome).toBeUndefined();
+    expect(shared.http.requests).toHaveLength(0);
+  });
+
+  it('a new kill episode audits a still-sent snipe again (the dedupe is per episode)', async () => {
+    const shared = makeShared({ snipes: { s1: sentSnipe('s1') } });
+    const { w } = await boot(shared);
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND).length === 1);
+    await w.ok('kill.set', { on: false });
+    await flush();
+    expect(audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND)).toHaveLength(1);
+
+    await w.ok('kill.set', { on: true });
+    await waitUntil(() => audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND).length === 2);
+    expect(stored(shared, 's1').state).toBe('sent');
+    expect(stored(shared, 's1').outcome).toBeUndefined();
+  });
+
   it('a sent snipe is audited only once per kill episode, even when another pass runs', async () => {
     const shared = makeShared({ snipes: { s1: sentSnipe('s1') } });
     const { w } = await boot(shared);
@@ -551,6 +641,93 @@ describe('kill switch: disarm-all (R1, R2, R6)', () => {
     await flush();
     expect(audits(shared).filter((e) => e.kind === KILL_SNIPE_SENT_KIND)).toHaveLength(1);
     expect(stored(shared, 's1').state).toBe('sent');
+  });
+});
+
+// Disarm-all is defence in depth. The runner checks verdictNow('bidding')
+// before it commits `sent`, and the API adapter asks writesAllowed again right
+// before the request leaves. These tests keep disarm-all out of the way (stalled,
+// or unable to help because `sent` is already stored) and check that no bid
+// request leaves.
+describe('the send gate does not depend on disarm-all', () => {
+  /** A live snipe whose fire has just been committed: its PlaceBid effect waits in the outbox. */
+  async function seedFiring(shared: Shared): Promise<void> {
+    await shared.areas.local.set({
+      [STORAGE_KEYS.snipes]: { x1: laterSnipe('x1', 'firing') },
+      [RUNNER_KEY]: { version: 1, entries: { x1: { outbox: [{ kind: 'placeBid', snipeId: 'x1', amount: 2000 }] } } },
+    });
+  }
+  const bidRequests = (shared: Shared): string[] => shared.http.requests.map((r) => r.url).filter((u) => u.startsWith(`${SGW_API}ItemBid/`));
+
+  it('control: with kill off, the same setup does send a bid request', async () => {
+    const shared = makeShared({ live: true });
+    const { ctx } = await boot(shared);
+    const runner = getSnipeRunner(ctx);
+    if (runner === undefined) throw new Error('the snipe runner did not register');
+    await seedFiring(shared);
+    await runner.drive('x1');
+    await waitUntil(() => bidRequests(shared).length > 0);
+    expect(bidRequests(shared)[0]).toContain('ItemBid/ShowBidModal');
+  });
+
+  it('a fire due in the same tick as the kill sends nothing, even with disarm-all stalled', async () => {
+    const shared = makeShared({ live: true });
+    const { ctx } = await boot(shared);
+    const runner = getSnipeRunner(ctx);
+    if (runner === undefined) throw new Error('the snipe runner did not register');
+    // Disarm-all never gets its snipe list: it is as slow as it can be.
+    const list = vi.spyOn(runner, 'list').mockReturnValue(new Promise(() => undefined));
+    await seedFiring(shared);
+
+    // The fire timer and the kill in the same tick.
+    const driven = runner.drive('x1');
+    void ctx.switches.setKill(true, 'shortcut');
+    await driven;
+    await waitUntil(() => stored(shared, 'x1').state === 'killed');
+
+    expect(list).toHaveBeenCalled(); // disarm-all did start, and is stuck
+    expect(bidRequests(shared)).toEqual([]);
+    expect(String(audits(shared).find((e) => e.kind === 'bid.not-sent')?.details.why)).toMatch(/kill switch/);
+    // The runner closed it on its own (by kill); disarm-all's disarm never ran.
+    const disarm = audits(shared).find((e) => e.kind === 'snipe.disarm');
+    expect(disarm?.details).toMatchObject({ by: 'kill', from: 'firing', to: 'killed' });
+    expect(disarm?.details.why).not.toBe(KILL_DISARM_WHY);
+    expect(stored(shared, 'x1').attempt.idempotencyKey).toBeUndefined();
+  });
+
+  it('a kill that lands after `sent` is stored, just before the request: nothing leaves, and the snipe is never called stopped', async () => {
+    const shared = makeShared({ live: true });
+    let storedAtSend: Snipe['state'] | undefined;
+    const probe: BackgroundModule = {
+      register: (ctx) => {
+        snipeSeams(ctx).setSendStrategy({
+          send: (req, deps) => {
+            storedAtSend = stored(shared, req.snipe.id).state;
+            void ctx.switches.setKill(true, 'shortcut'); // the kill lands now
+            return DEFAULT_SEND_STRATEGY.send(req, deps);
+          },
+        });
+      },
+    };
+    const w = new LightWorker(shared, { ...JOB_MODULES, './zz-probe.ts': probe });
+    const ctx = await w.ready;
+    await flush();
+    const runner = getSnipeRunner(ctx);
+    if (runner === undefined) throw new Error('the snipe runner did not register');
+    await seedFiring(shared);
+    await runner.drive('x1');
+    await waitUntil(() => audits(shared).some((e) => e.kind === KILL_SNIPE_SENT_KIND && e.ref === 'x1'));
+
+    expect(storedAtSend).toBe('sent'); // persist before send
+    expect(bidRequests(shared)).toEqual([]); // the adapter's own gate refused it
+    const s = stored(shared, 'x1');
+    expect(s.state).toBe('sent'); // a bid may be out as far as the reducer knows: never killed
+    expect(s.history.some((h) => h.to === 'killed')).toBe(false);
+    expect(audits(shared).find((e) => e.kind === KILL_SNIPE_SENT_KIND && e.ref === 'x1')?.details.note).toBe(
+      'kill: snipe x1 already sent; outcome pending',
+    );
+    expect(audits(shared).some((e) => e.kind === 'snipe.disarm' && e.ref === 'x1')).toBe(false);
+    expect(await badgeText()).toBe('KILL');
   });
 });
 
