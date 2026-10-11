@@ -1856,7 +1856,7 @@ describe('R4: the runner model as a property of the real runner', () => {
 });
 
 describe('auto-kill on anomalies (clock, latency, schema drift)', () => {
-  it('latency: round trips over 2 s at the wake fail the clock check and apply the fallback', async () => {
+  it('latency: a 60-second check slower than 2 s is an anomaly, and the fallback applies', async () => {
     const shared = makeShared();
     const { w } = await boot(shared);
     await arm(w);
