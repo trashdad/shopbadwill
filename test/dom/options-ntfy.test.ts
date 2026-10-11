@@ -100,6 +100,8 @@ function app(opts: {
   clock?: Clock;
   minIntervalMs?: number;
   order?: string[];
+  /** settings.set fails (the background refused or is not responding). */
+  saveFails?: boolean;
 } = {}) {
   const fake = new FakeMessaging();
   const saved: unknown[] = [];
@@ -108,6 +110,7 @@ function app(opts: {
   fake.handle('settings.get', () => s);
   fake.handle('settings.set', (p) => {
     order.push('save');
+    if (opts.saveFails === true) throw new Error('storage is full');
     saved.push(p);
     return undefined;
   });
@@ -127,7 +130,11 @@ function app(opts: {
   return { fake, saved, order };
 }
 
-const ntfyOn = (topic = TOPIC): Settings => ({ ...defaultSettings(), ntfy: { enabled: true, server: NTFY_SERVER, topic } });
+/** Phone push on, with calendar events on (the sink is fed by calendar sync). */
+const ntfyOn = (topic = TOPIC): Settings => {
+  const s = defaultSettings();
+  return { ...s, calendar: { ...s.calendar, enabled: true }, ntfy: { enabled: true, server: NTFY_SERVER, topic } };
+};
 
 describe('NtfySection', () => {
   it('registers as a valid section', () => {
@@ -331,7 +338,8 @@ describe('NtfySection', () => {
       order,
     });
     fireEvent.click(await screen.findByRole('button', { name: 'Generate topic' }));
-    const status = await screen.findByText(/already-scheduled pushes may still arrive/i);
+    const status = await screen.findByText(/the topic was not changed/i);
+    expect(status.textContent).toMatch(/could not be cancelled/i);
     expect(saved).toHaveLength(0);
     expect((await screen.findByLabelText<HTMLInputElement>('Topic')).value).toBe(TOPIC);
     expect(order).not.toContain('clear');
@@ -362,6 +370,60 @@ describe('NtfySection', () => {
       expect(saved).toHaveLength(1);
       expect((saved[0] as { ntfy: { enabled: boolean } }).ntfy.enabled).toBe(false);
     }
+  });
+
+  it('says phone push is now off when a DELETE fails, not only that pushes may arrive', async () => {
+    const { saved } = app({
+      permissions: new FakePermissions({ origins: [NTFY_ORIGIN] }),
+      settings: ntfyOn(),
+      http: recordingHttp([], 503),
+      scheduled: memoryStore(storedSeqs(), []),
+      minIntervalMs: 0,
+    });
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    const status = await screen.findByText(/already-scheduled pushes may still arrive/i);
+    expect(saved).toHaveLength(1);
+    expect(status.textContent).toMatch(/phone push is off/i);
+  });
+
+  it('keeps the save error when turning off cannot cancel and cannot save either', async () => {
+    app({
+      permissions: new FakePermissions({ origins: [NTFY_ORIGIN] }),
+      settings: ntfyOn(),
+      http: recordingHttp([], 503),
+      scheduled: memoryStore(storedSeqs(), []),
+      minIntervalMs: 0,
+      saveFails: true,
+    });
+    const toggle = await screen.findByLabelText<HTMLInputElement>('Phone push (ntfy.sh)');
+    fireEvent.click(toggle);
+    // Settled: the button is usable again and the toggle went back on.
+    await waitFor(() => {
+      expect(toggle.disabled).toBe(false);
+      expect(screen.getByRole('status').textContent).toMatch(/may still arrive/i);
+    });
+    const text = screen.getByRole('status').textContent;
+    expect(text).toMatch(/could not save phone push/i);
+    expect(text).not.toMatch(/phone push is off/i);
+    expect(toggle.checked).toBe(true);
+  });
+
+  it('the Firefox note does not claim the browser asks for anything', async () => {
+    app({ settings: ntfyOn(), firefox: true });
+    const note = (await screen.findByText(/technicalAndInteraction/)).closest('p');
+    expect(note?.textContent).not.toMatch(/\basks?\b/i);
+    expect(note?.textContent).toMatch(/titles and end times/i);
+  });
+
+  it('warns that nothing is sent while calendar events are off (the sink is fed by calendar sync)', async () => {
+    const off = defaultSettings();
+    app({ settings: { ...off, calendar: { ...off.calendar, enabled: false }, ntfy: { enabled: true, server: NTFY_SERVER, topic: TOPIC } } });
+    expect((await screen.findByText(/calendar events are off/i)).textContent).toMatch(/nothing is sent/i);
+    cleanup();
+
+    app({ settings: ntfyOn() });
+    await screen.findByText('Auction titles and end times are sent to ntfy.sh.');
+    expect(screen.queryByText(/calendar events are off/i)).toBeNull();
   });
 
   it('turning phone push on, or off with nothing scheduled, makes no request', async () => {

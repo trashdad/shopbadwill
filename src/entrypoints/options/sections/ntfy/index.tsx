@@ -39,7 +39,9 @@ export interface NtfySectionProps extends SectionProps {
   minIntervalMs?: number;
 }
 
-const MAY_STILL_ARRIVE = 'Already-scheduled pushes may still arrive.';
+const MAY_STILL_ARRIVE = 'Already-scheduled pushes may still arrive: they could not be cancelled.';
+const TOPIC_KEPT =
+  'The topic was not changed: the pushes already scheduled on it could not be cancelled. Try again later.';
 
 function hasScheduled(state: NtfyState): boolean {
   return Object.values(state.items).some((item) => item.entries.some((entry) => entry.status === 'scheduled'));
@@ -94,18 +96,22 @@ export function NtfySection(props: NtfySectionProps): VNode {
   const ntfy: NtfyGroup = settings.ntfy ?? { enabled: false, server: NTFY_SERVER, topic: '' };
   const unsupportedServer = ntfy.server !== NTFY_SERVER;
 
-  const save = (next: NtfyGroup, what: string, mask = false): Promise<void> => {
+  /** Saves the group (restoring the old one on failure) and resolves with the line to show. */
+  const persist = (next: NtfyGroup, what: string, mask: boolean): Promise<Msg & { saved: boolean }> => {
     const previous = settings;
     setSettings({ ...settings, ntfy: next });
     return client.send('settings.set', { ntfy: next }).then(
-      () => {
-        setStatus({ message: `Saved: ${mask ? maskTopic(next.topic) : what}.`, tone: 'ok' });
-      },
+      () => ({ saved: true, message: `Saved: ${mask ? maskTopic(next.topic) : what}.`, tone: 'ok' as const }),
       (e: unknown) => {
         setSettings(previous);
-        setStatus({ message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' });
+        return { saved: false, message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' as const };
       },
     );
+  };
+
+  const save = async (next: NtfyGroup, what: string, mask = false): Promise<void> => {
+    const { message, tone } = await persist(next, what, mask);
+    setStatus({ message, tone });
   };
 
   // Cancel while the old topic and the host permission are still in force.
@@ -142,8 +148,18 @@ export function NtfySection(props: NtfySectionProps): VNode {
       } catch {
         cancelOk = false;
       }
-      if (forceSave || cancelOk) await save(next, what, mask);
-      if (!cancelOk) setStatus({ message: MAY_STILL_ARRIVE, tone: 'error' });
+      if (cancelOk) {
+        await save(next, what, mask);
+      } else if (forceSave) {
+        // Turning off still turns off (the sink makes no request once it is saved off).
+        const result = await persist(next, what, mask);
+        setStatus({
+          message: result.saved ? `Phone push is off. ${MAY_STILL_ARRIVE}` : `${result.message} ${MAY_STILL_ARRIVE}`,
+          tone: 'error',
+        });
+      } else {
+        setStatus({ message: TOPIC_KEPT, tone: 'error' });
+      }
       retiring.current = false;
       setBusy(false);
     })();
@@ -216,9 +232,15 @@ export function NtfySection(props: NtfySectionProps): VNode {
         <p class="sbw-hint">Auction titles and end times are sent to ntfy.sh.</p>
         {firefox ? (
           <p class="sbw-hint">
-            On Firefox, turning this on also asks for the optional <code>technicalAndInteraction</code> data-collection
-            permission; ShopBadwill collects nothing beyond what is described here.
+            On Firefox, ShopBadwill declares this as optional <code>technicalAndInteraction</code> data collection: the
+            auction titles and end times above, sent only while phone push is on.
           </p>
+        ) : null}
+        {ntfy.enabled && !settings.calendar.enabled ? (
+          <Status
+            message="Calendar events are off, so nothing is sent: phone push follows the auctions calendar sync tracks."
+            tone="error"
+          />
         ) : null}
         {unsupportedServer ? (
           <Status
