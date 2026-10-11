@@ -639,6 +639,33 @@ describe('privacy', () => {
       expect(s.mock.calls.flat().map(String).join('\n')).not.toContain('ntfy.sh/');
     }
   });
+
+  it('the topic never reaches the audit log, sbw:ntfy or console on the success paths either (R3)', async () => {
+    const spies = ['log', 'warn', 'error', 'info', 'debug'].map((m) =>
+      vi.spyOn(console, m as 'log' | 'warn' | 'error' | 'info' | 'debug').mockImplementation(() => undefined),
+    );
+    const r = rig();
+    await r.sink.upsert(desiredEvent(7, 2 * HOUR)); // published
+    await r.sink.upsert(desiredEvent(8, 5 * DAY)); // deferred
+    await r.sink.upsert(desiredEvent(7, 4 * HOUR)); // cancelled, then published again
+    installNtfy(r.requests, r.clock, () => ({ status: 429 }));
+    await r.sink.upsert(desiredEvent(9, 2 * HOUR)); // rate-limited
+    r.clock.advance(61_000);
+    installNtfy(r.requests, r.clock, () => ({ status: 400 }));
+    await r.sink.upsert(desiredEvent(10, 2 * HOUR)); // failed: http 400
+    installNtfy(r.requests, r.clock);
+    await r.sink.remove(7); // cancelled
+    r.restart({ enabled: false });
+    await r.sink.upsert(desiredEvent(11, 2 * HOUR)); // status: disabled
+
+    expect(new Set(r.audit.kinds)).toEqual(
+      new Set(['ntfy.published', 'ntfy.deferred', 'ntfy.cancelled', 'ntfy.rate-limited', 'ntfy.failed', 'ntfy.status']),
+    );
+    const secret = TOPIC.slice('sbw-'.length);
+    const stored = JSON.stringify([r.audit.entries, r.store.state]);
+    expect(stored).not.toContain(secret);
+    for (const s of spies) expect(s.mock.calls.flat().map(String).join('\n')).not.toContain(secret);
+  });
 });
 
 // ── Registration (R1: register from ntfy-reminders.ts) ───────────────────────
