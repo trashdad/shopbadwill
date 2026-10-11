@@ -15,7 +15,7 @@ $SbwTaskPrefix = 'ShopBadwill-'
 
 function Get-SbwTaskName {
   param([string]$SnipeId)
-  "$SbwTaskPrefix" + 'snipe-' + $SnipeId
+  $SbwTaskPrefix + $SnipeId
 }
 
 function Test-SbwIsPath {

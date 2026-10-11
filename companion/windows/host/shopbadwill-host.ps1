@@ -9,7 +9,7 @@
   to run this task" Task Scheduler definition (WakeToRun XML, generated
   in-memory via the COM API) and registers it with `schtasks /Create /XML`;
   at fire time the task launches the configured browser with the user's
-  profile. Task names are always `ShopBadwill-snipe-<snipeId>`; cancel and list
+  profile. Task names are always `ShopBadwill-<snipeId>`; cancel and list
   only ever see or touch those names. Every message is validated strictly
   (controller ruling R2): the extension is treated as untrusted.
 
@@ -46,6 +46,7 @@ function Invoke-SbwSchedule {
     if ($err) { return New-SbwErrorResponse -Op 'schedule' -Error $err }
     $wt = Get-SbwWakeTime -Text ([string]$Msg.wakeAtUtc) -Now $Now
     $taskName = Get-SbwTaskName -SnipeId ([string]$Msg.snipeId)
+    if ($taskName -cnotmatch $SbwTaskNameRegex) { return New-SbwErrorResponse -Op 'schedule' -Error 'bad-request' }
     $browserCfg = $Config.PSObject.Properties[[string]$Msg.browser].Value
     if (-not (Test-Path -LiteralPath ([string]$browserCfg.exePath))) {
       return New-SbwErrorResponse -Op 'schedule' -Error 'browser-not-found'
@@ -84,6 +85,7 @@ function Invoke-SbwCancel {
     $err = Get-SbwCancelError -Msg $Msg
     if ($err) { return New-SbwErrorResponse -Op 'cancel' -Error $err }
     $taskName = Get-SbwTaskName -SnipeId ([string]$Msg.snipeId)
+    if ($taskName -cnotmatch $SbwTaskNameRegex) { return New-SbwErrorResponse -Op 'cancel' -Error 'bad-request' }
     $run = Invoke-SchTasks -SchTasksPath ([string]$Config.schtasksPath) -ArgList (Get-SbwCancelArgs -TaskName $taskName)
     $alreadyGone = $run.Output -match 'cannot find'
     if ($run.ExitCode -ne 0 -and -not $alreadyGone) {
@@ -108,9 +110,15 @@ function Invoke-SbwList {
     $live = @()
     foreach ($row in $rows) {
       if ($null -eq $row) { continue }
-      $taskName = Get-SbwTaskName -SnipeId ([string]$row.snipeId)
+      $snipeId = [string]$row.snipeId
+      # State is local, but it is not a trust boundary: a tampered snipeId must
+      # not become a schtasks /TN for some other task.
+      if (-not (Test-SbwSnipeId -Value $snipeId)) { continue }
+      $taskName = Get-SbwTaskName -SnipeId $snipeId
+      if ($taskName -cnotmatch $SbwTaskNameRegex) { continue }
       $run = Invoke-SchTasks -SchTasksPath ([string]$Config.schtasksPath) -ArgList (Get-SbwQueryArgs -TaskName $taskName)
       if ($run.ExitCode -ne 0) { continue }   # the OS deleted the fired task: prune
+      $row.taskName = $taskName
       $live += $row
     }
     if ($live.Count -ne $rows.Count) { Write-SbwState -DataDir ([string]$Config.dataDir) -Rows $live }

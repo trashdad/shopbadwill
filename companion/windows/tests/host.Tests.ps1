@@ -66,10 +66,10 @@ Describe 'host schedule dispatch' {
     $resp = Invoke-SbwMessage -Json $json -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
     Assert-Equal $resp.ok $true
     Assert-Equal $resp.op 'schedule'
-    Assert-Equal $resp.taskName 'ShopBadwill-snipe-abc-123'
+    Assert-Equal $resp.taskName 'ShopBadwill-abc-123'
     Assert-Equal $resp.wakeAtUtc '2026-10-10T13:00:00.000Z'
     Assert-Equal $script:sbwCalls.Count 1
-    Assert-Equal $script:sbwCalls[0] '/Create /TN ShopBadwill-snipe-abc-123 /XML C:\fake-data\ShopBadwill-snipe-abc-123.xml /F'
+    Assert-Equal $script:sbwCalls[0] '/Create /TN ShopBadwill-abc-123 /XML C:\fake-data\ShopBadwill-abc-123.xml /F'
     Assert-Equal $script:sbwState.Count 1
     Assert-Equal $script:sbwState[0].snipeId 'abc-123'
     Assert-Match $script:sbwXml '<WakeToRun>true</WakeToRun>'
@@ -136,21 +136,21 @@ Describe 'host cancel dispatch' {
     $null = Invoke-SbwMessage -Json '{"op":"schedule","snipeId":"s1","wakeAtUtc":"2026-10-10T13:00:00.000Z","browser":"chrome","profile":"Default"}' -Config $cfg -Now (Get-SbwTestNow)
     $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"s1"}' -Config $cfg -Now (Get-SbwTestNow)
     Assert-Equal $resp.ok $true
-    Assert-Equal $resp.taskName 'ShopBadwill-snipe-s1'
+    Assert-Equal $resp.taskName 'ShopBadwill-s1'
     Assert-Equal $script:sbwState.Count 0
-    Assert-Equal $script:sbwCalls[1] '/Delete /TN ShopBadwill-snipe-s1 /F'
+    Assert-Equal $script:sbwCalls[1] '/Delete /TN ShopBadwill-s1 /F'
   }
   It 'cancel of an unknown snipe is idempotent (task already gone)' {
     Reset-SbwFakes
     $script:sbwDeleteMissing = $true
     $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"nope"}' -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
     Assert-Equal $resp.ok $true
-    Assert-Equal $script:sbwCalls[0] '/Delete /TN ShopBadwill-snipe-nope /F'
+    Assert-Equal $script:sbwCalls[0] '/Delete /TN ShopBadwill-nope /F'
   }
   It 'cancel never touches a non-prefixed task name' {
     Reset-SbwFakes
     $resp = Invoke-SbwMessage -Json '{"op":"cancel","snipeId":"a"}' -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
-    Assert-Equal $script:sbwCalls[0] '/Delete /TN ShopBadwill-snipe-a /F'
+    Assert-Equal $script:sbwCalls[0] '/Delete /TN ShopBadwill-a /F'
     Assert-NotMatch $script:sbwCalls[0] '(/TN a )'
   }
   It 'reports a real delete failure' {
@@ -179,8 +179,8 @@ Describe 'host list dispatch' {
     Assert-Equal $resp.tasks.Count 2
     Assert-Equal $resp.tasks[0].snipeId 'sooner'
     Assert-Equal $resp.tasks[1].snipeId 'later'
-    Assert-Equal $resp.tasks[0].taskName 'ShopBadwill-snipe-sooner'
-    Assert-Equal $resp.tasks[1].taskName 'ShopBadwill-snipe-later'
+    Assert-Equal $resp.tasks[0].taskName 'ShopBadwill-sooner'
+    Assert-Equal $resp.tasks[1].taskName 'ShopBadwill-later'
   }
   It 'prunes state rows whose task is gone and queries only prefixed names' {
     Reset-SbwFakes
@@ -193,8 +193,22 @@ Describe 'host list dispatch' {
     Assert-Equal $resp.tasks.Count 0
     Assert-Equal $script:sbwState.Count 0
     foreach ($call in $script:sbwCalls) {
-      if ($call -like '/Query*') { Assert-Match $call '/Query /TN ShopBadwill-snipe-' }
+      if ($call -like '/Query*') { Assert-Match $call '/Query /TN ShopBadwill-' }
     }
+  }
+  It 'ignores a poisoned state row and reports only the computed ShopBadwill- name' {
+    Reset-SbwFakes
+    $script:sbwState = @(
+      [pscustomobject]@{ snipeId = '..\..\Windows'; taskName = '\Microsoft\Windows\Foo'; wakeAtUtc = '2026-10-10T13:00:00.000Z'; browser = 'chrome'; profile = 'Default' }
+      [pscustomobject]@{ snipeId = 'kept'; taskName = 'NotOurs'; wakeAtUtc = '2026-10-10T14:00:00.000Z'; browser = 'chrome'; profile = 'Default' }
+    )
+    $resp = Invoke-SbwMessage -Json '{"op":"list"}' -Config (New-SbwTestConfig) -Now (Get-SbwTestNow)
+    Assert-Equal $resp.ok $true
+    Assert-Equal $resp.tasks.Count 1
+    Assert-Equal $resp.tasks[0].snipeId 'kept'
+    Assert-Equal $resp.tasks[0].taskName 'ShopBadwill-kept'
+    Assert-Equal $script:sbwCalls.Count 1
+    Assert-Equal $script:sbwCalls[0] '/Query /TN ShopBadwill-kept /FO CSV /NH'
   }
 }
 

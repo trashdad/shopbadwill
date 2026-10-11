@@ -6,6 +6,33 @@
 . "$PSScriptRoot\..\install.ps1"
 . "$PSScriptRoot\..\uninstall.ps1"
 
+# Replace the real schtasks/reg wrappers for this file. A test that called the
+# real commands would be a defect (controller ruling R1).
+$script:sbwSchtasksCalls = @()
+$script:sbwRegCalls = @()
+$script:sbwQueryCsv = ''
+function Invoke-SbwSchtasks {
+  param([string]$SchTasksPath, [string[]]$ArgList)
+  if ($SchTasksPath -notlike 'C:\sbw-no-such\*') { throw "refusing unexpected schtasks path: $SchTasksPath" }
+  $script:sbwSchtasksCalls += ,(@($ArgList))
+  if ($ArgList -ccontains '/Query') { return @{ ExitCode = 0; Output = [string]$script:sbwQueryCsv } }
+  $tn = $null
+  for ($i = 0; $i -lt $ArgList.Count; $i++) {
+    if ($ArgList[$i] -ceq '/TN') { $tn = [string]$ArgList[$i + 1] }
+  }
+  if ($tn -cnotmatch '^ShopBadwill-[A-Za-z0-9_-]{1,64}$') { throw "refusing to delete non-owned task: $tn" }
+  @{ ExitCode = 0; Output = '' }
+}
+function Invoke-SbwReg {
+  param([string[]]$ArgList)
+  $script:sbwRegCalls += ,(@($ArgList))
+  foreach ($a in @($ArgList)) {
+    if ([string]$a -like 'HKLM*') { throw "refusing HKLM write: $a" }
+  }
+  0
+}
+function Get-SbwSchTasksPath { 'C:\sbw-no-such\schtasks.exe' }
+
 # $PSScriptRoot is unreliable inside It blocks under Pester 3.4; a function
 # resolves it against its defining file, which works under both 3.4 and 5.x.
 function Get-SbwInstallSource {
@@ -85,26 +112,110 @@ Describe 'launcher .cmd content' {
 }
 
 Describe 'uninstall task-name allowlist' {
-  It 'only returns ShopBadwill-snipe-* names from the state file' {
+  It 'only returns ShopBadwill-<snipeId> names from the state file' {
     $tmp = New-TestTempDir
     $statePath = Join-Path $tmp 'state.json'
     @{ version = 1; tasks = @(
-        @{ snipeId = 'a'; taskName = 'ShopBadwill-snipe-a' },
-        @{ snipeId = 'b'; taskName = 'ShopBadwill-snipe-b_c-2' },
+        @{ snipeId = 'a'; taskName = 'ShopBadwill-a' },
+        @{ snipeId = 'b'; taskName = 'ShopBadwill-b_c-2' },
         @{ snipeId = 'x'; taskName = 'evil' },
-        @{ snipeId = 'y'; taskName = 'ShopBadwill-snipe-' + ('e' * 65) },
-        @{ snipeId = 'z'; taskName = 'ShopBadwill-snipe-..\x' },
-        @{ snipeId = 'w'; taskName = 'NotOurs' }
+        @{ snipeId = 'y'; taskName = 'ShopBadwill-' + ('e' * 65) },
+        @{ snipeId = 'z'; taskName = 'ShopBadwill-..\x' },
+        @{ snipeId = 'w'; taskName = 'NotOurs' },
+        @{ snipeId = 'm'; taskName = '\Microsoft\Windows\Foo' }
       ) } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $statePath -Encoding UTF8
     $names = @(Get-SbwStateTaskNames -StatePath $statePath)
     Assert-Equal $names.Count 2
-    Assert-Equal $names[0] 'ShopBadwill-snipe-a'
-    Assert-Equal $names[1] 'ShopBadwill-snipe-b_c-2'
+    Assert-Equal $names[0] 'ShopBadwill-a'
+    Assert-Equal $names[1] 'ShopBadwill-b_c-2'
     Remove-TestTempDir $tmp
+  }
+  It 'unions state and schtasks query output, and drops every foreign name' {
+    $csv = @(
+      '"\Microsoft\Windows\UpdateOrchestrator\Schedule Scan","N/A","Ready"'
+      '"\ShopBadwill-abc","N/A","Ready"'
+      '"\ShopBadwill-evil & calc","N/A","Ready"'
+      '"\Folder\ShopBadwill-abc","N/A","Ready"'
+      '"ShopBadwill-plain","N/A","Ready"'
+      '"\ShopBadwill-..\x","N/A","Ready"'
+      '"\ShopBadwill-abc\child","N/A","Ready"'
+    ) -join "`r`n"
+    $names = @(Get-SbwTaskNamesToRemove -StateNames @('ShopBadwill-fromstate', 'evil', 'ShopBadwill-..\x', 'NotOurs') -QueryCsv $csv)
+    Assert-Equal $names.Count 3
+    Assert-True ($names -ccontains 'ShopBadwill-abc')
+    Assert-True ($names -ccontains 'ShopBadwill-plain')
+    Assert-True ($names -ccontains 'ShopBadwill-fromstate')
+    foreach ($n in $names) { Assert-Match $n '^ShopBadwill-[A-Za-z0-9_-]{1,64}$' $n }
   }
   It 'returns nothing when there is no state file' {
     $tmp = New-TestTempDir
     Assert-Equal @(Get-SbwStateTaskNames -StatePath (Join-Path $tmp 'state.json')).Count 0
+    Remove-TestTempDir $tmp
+  }
+}
+
+Describe 'uninstall -DataDir survives dot-sourcing install.ps1' {
+  It 'saves the argument before install.ps1 rebinds DataDir' {
+    $src = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1') -Raw
+    $capture = $src.IndexOf('SbwUninstallDataDir')
+    $dot = $src.IndexOf('"$PSScriptRoot\install.ps1"')
+    Assert-True ($capture -ge 0) 'missing capture of -DataDir'
+    Assert-True ($dot -gt $capture) 'capture must precede the dot-source'
+    Assert-Match $src 'Get-SbwDataDir -Explicit \$script:SbwUninstallDataDir'
+  }
+  It 'resolves the saved data dir rather than the clobbered parameter' {
+    $script:SbwUninstallDataDir = 'C:\sbw-probe-not-real'
+    Assert-Equal (Get-SbwUninstallDataDir) 'C:\sbw-probe-not-real'
+  }
+  It 'deletes only ShopBadwill- tasks and the files install added' {
+    $tmp = New-TestTempDir
+    $script:SbwUninstallDataDir = $tmp
+    $script:sbwSchtasksCalls = @()
+    $script:sbwRegCalls = @()
+    $script:sbwQueryCsv = @(
+      '"\Microsoft\Windows\UpdateOrchestrator\Schedule Scan","N/A","Ready"'
+      '"\ShopBadwill-abc","N/A","Ready"'
+      '"\Folder\ShopBadwill-abc","N/A","Ready"'
+    ) -join "`r`n"
+    foreach ($name in @('config.json', 'state.json', 'chrome-manifest.json', 'firefox-manifest.json', 'shopbadwill-host.cmd')) {
+      Set-Content -LiteralPath (Join-Path $tmp $name) -Value '{}' -Encoding ASCII
+    }
+    Set-Content -LiteralPath (Join-Path $tmp 'ShopBadwill-abc.xml') -Value '<Task/>' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $tmp 'notes.txt') -Value 'keep' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $tmp 'not-ours.xml') -Value '<no/>' -Encoding ASCII
+    @{ version = 1; tasks = @(@{ snipeId = 'fromstate'; taskName = 'ShopBadwill-fromstate' }) } |
+      ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $tmp 'state.json') -Encoding ASCII
+
+    Invoke-SbwUninstall
+
+    $deleted = @()
+    foreach ($call in @($script:sbwSchtasksCalls)) {
+      $args = @($call)
+      # The recorder stores one argument array per call; unwrap a single nested array.
+      if ($args.Count -eq 1 -and $args[0] -is [System.Array]) { $args = @($args[0]) }
+      if ($args -ccontains '/Delete') {
+        for ($i = 0; $i -lt $args.Count; $i++) {
+          if ($args[$i] -ceq '/TN') { $deleted += [string]$args[$i + 1] }
+        }
+      }
+    }
+    Assert-Equal $deleted.Count 2
+    Assert-True ($deleted -ccontains 'ShopBadwill-abc')
+    Assert-True ($deleted -ccontains 'ShopBadwill-fromstate')
+    Assert-Equal $script:sbwRegCalls.Count 2
+    foreach ($call in @($script:sbwRegCalls)) {
+      $args = @($call)
+      if ($args.Count -eq 1 -and $args[0] -is [System.Array]) { $args = @($args[0]) }
+      $joined = $args -join ' '
+      Assert-Match $joined 'HKCU\\'
+      Assert-NotMatch $joined 'HKLM'
+      Assert-Match $joined 'com\.shopbadwill\.companion'
+    }
+    Assert-False (Test-Path -LiteralPath (Join-Path $tmp 'config.json'))
+    Assert-False (Test-Path -LiteralPath (Join-Path $tmp 'shopbadwill-host.cmd'))
+    Assert-False (Test-Path -LiteralPath (Join-Path $tmp 'ShopBadwill-abc.xml'))
+    Assert-True (Test-Path -LiteralPath (Join-Path $tmp 'notes.txt'))
+    Assert-True (Test-Path -LiteralPath (Join-Path $tmp 'not-ours.xml'))
     Remove-TestTempDir $tmp
   }
 }

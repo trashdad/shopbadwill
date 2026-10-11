@@ -60,7 +60,7 @@ $SbwSnipeIdRegex = '^[A-Za-z0-9_-]{1,64}$'
 $SbwProfileForbiddenRegex = '["&|<>^%!\r\n`]'
 $SbwProfileSubexprRegex = '\$[\(\{]'
 $SbwProfileTraversalRegex = '(^|[\\/])\.\.([\\/]|$)'
-$SbwTaskNameRegex = '^ShopBadwill-snipe-[A-Za-z0-9_-]{1,64}$'
+$SbwTaskNameRegex = '^ShopBadwill-[A-Za-z0-9_-]{1,64}$'
 
 function Test-SbwSnipeId {
   param([string]$Value)

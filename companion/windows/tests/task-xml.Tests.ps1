@@ -5,10 +5,11 @@
 . "$PSScriptRoot\..\host\task-xml.ps1"
 
 Describe 'Get-SbwTaskName' {
-  It 'builds names that are always prefixed ShopBadwill-' {
-    Assert-Equal (Get-SbwTaskName -SnipeId 'abc-123') 'ShopBadwill-snipe-abc-123'
-    Assert-Equal (Get-SbwTaskName -SnipeId 'x_y.Z9') 'ShopBadwill-snipe-x_y.Z9'
-    Assert-True ((Get-SbwTaskName -SnipeId 'x').StartsWith('ShopBadwill-'))
+  It 'builds names that are always ShopBadwill-<snipeId>' {
+    Assert-Equal (Get-SbwTaskName -SnipeId 'abc-123') 'ShopBadwill-abc-123'
+    Assert-Equal (Get-SbwTaskName -SnipeId 'x_y-Z9') 'ShopBadwill-x_y-Z9'
+    Assert-Match (Get-SbwTaskName -SnipeId 'abc-123') '^ShopBadwill-[A-Za-z0-9_-]{1,64}$'
+    Assert-Equal (Get-SbwTaskName -SnipeId ('a' * 64)) ('ShopBadwill-' + ('a' * 64))
   }
 }
 
@@ -54,7 +55,7 @@ Describe 'New-SbwTaskXml' {
   # reliably visible to It blocks under Pester 5 (discovery vs run).
   function Get-SbwTestXmlText {
     $wakeUtc = [datetimeoffset]::Parse('2026-10-20T06:15:00.000Z')
-    New-SbwTaskXml -TaskName 'ShopBadwill-snipe-test' -WakeAtUtc $wakeUtc `
+    New-SbwTaskXml -TaskName 'ShopBadwill-test' -WakeAtUtc $wakeUtc `
       -Execute 'C:\Windows\System32\cmd.exe' -Arguments '/c start "" "C:\Chrome\chrome.exe" "--profile-directory=Default"' `
       -UserId 'MYDOM\me'
   }
@@ -105,12 +106,12 @@ Describe 'New-SbwTaskXml' {
 
 Describe 'schtasks argument arrays' {
   It 'schedule: /Create /TN <prefixed name> /XML <file> /F' {
-    Assert-ArrayEqual (Get-SbwScheduleArgs -TaskName 'ShopBadwill-snipe-x' -XmlPath 'C:\d\x.xml') @('/Create', '/TN', 'ShopBadwill-snipe-x', '/XML', 'C:\d\x.xml', '/F')
+    Assert-ArrayEqual (Get-SbwScheduleArgs -TaskName 'ShopBadwill-x' -XmlPath 'C:\d\x.xml') @('/Create', '/TN', 'ShopBadwill-x', '/XML', 'C:\d\x.xml', '/F')
   }
   It 'cancel: /Delete /TN <prefixed name> /F' {
-    Assert-ArrayEqual (Get-SbwCancelArgs -TaskName 'ShopBadwill-snipe-x') @('/Delete', '/TN', 'ShopBadwill-snipe-x', '/F')
+    Assert-ArrayEqual (Get-SbwCancelArgs -TaskName 'ShopBadwill-x') @('/Delete', '/TN', 'ShopBadwill-x', '/F')
   }
   It 'query: /Query /TN <prefixed name> /FO CSV /NH' {
-    Assert-ArrayEqual (Get-SbwQueryArgs -TaskName 'ShopBadwill-snipe-x') @('/Query', '/TN', 'ShopBadwill-snipe-x', '/FO', 'CSV', '/NH')
+    Assert-ArrayEqual (Get-SbwQueryArgs -TaskName 'ShopBadwill-x') @('/Query', '/TN', 'ShopBadwill-x', '/FO', 'CSV', '/NH')
   }
 }

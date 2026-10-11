@@ -185,16 +185,16 @@ describe.skipIf(process.platform !== 'win32')(
     })) as WakeResponse;
     expect(resp.ok).toBe(true);
     expect(resp.op).toBe('schedule');
-    expect(resp.taskName).toBe('ShopBadwill-snipe-test123');
+    expect(resp.taskName).toBe('ShopBadwill-test123');
     expect(resp.wakeAtUtc).toBe(wakeAtUtc);
 
     // The host invoked schtasks with the exact argument array, one line per call.
     const log = readFileSync(schtasksLog, 'utf8');
-    expect(log).toContain('/Create /TN ShopBadwill-snipe-test123 /XML');
+    expect(log).toContain('/Create /TN ShopBadwill-test123 /XML');
     expect(log).toContain('/F');
 
     // The generated XML (written next to state.json) carries the wake settings.
-    const xmlPath = path.join(dataDir, 'ShopBadwill-snipe-test123.xml');
+    const xmlPath = path.join(dataDir, 'ShopBadwill-test123.xml');
     expect(existsSync(xmlPath)).toBe(true);
     const xml = readFileSync(xmlPath, 'utf16le');
     expect(xml).toContain('<WakeToRun>true</WakeToRun>');
@@ -208,7 +208,7 @@ describe.skipIf(process.platform !== 'win32')(
     const tasks = resp.tasks as Array<Record<string, unknown>>;
     expect(tasks).toHaveLength(1);
     expect(tasks[0]?.snipeId).toBe('test123');
-    expect(tasks[0]?.taskName).toBe('ShopBadwill-snipe-test123');
+    expect(tasks[0]?.taskName).toBe('ShopBadwill-test123');
     expect(tasks[0]?.wakeAtUtc).toBe(wakeAtUtc);
   });
 
@@ -269,9 +269,9 @@ describe.skipIf(process.platform !== 'win32')(
   it('cancel removes the task with a prefixed /Delete', async () => {
     const resp = (await client.send({ op: 'cancel', snipeId: 'test123' })) as WakeResponse;
     expect(resp.ok).toBe(true);
-    expect(resp.taskName).toBe('ShopBadwill-snipe-test123');
+    expect(resp.taskName).toBe('ShopBadwill-test123');
     const log = readFileSync(schtasksLog, 'utf8');
-    expect(log).toContain('/Delete /TN ShopBadwill-snipe-test123 /F');
+    expect(log).toContain('/Delete /TN ShopBadwill-test123 /F');
 
     const after = (await client.send({ op: 'list' })) as WakeResponse;
     expect(after.tasks).toEqual([]);

@@ -59,13 +59,13 @@ an unexpected host failure (retry; details on stderr).
 ## Responses
 
 ```jsonc
-{ "ok": true, "op": "schedule", "taskName": "ShopBadwill-snipe-abc-123",
+{ "ok": true, "op": "schedule", "taskName": "ShopBadwill-abc-123",
   "wakeAtUtc": "2026-10-11T05:00:00.000Z" }
 
-{ "ok": true, "op": "cancel", "taskName": "ShopBadwill-snipe-abc-123" }
+{ "ok": true, "op": "cancel", "taskName": "ShopBadwill-abc-123" }
 
 { "ok": true, "op": "list", "tasks": [
-  { "snipeId": "abc-123", "taskName": "ShopBadwill-snipe-abc-123",
+  { "snipeId": "abc-123", "taskName": "ShopBadwill-abc-123",
     "wakeAtUtc": "2026-10-11T05:00:00.000Z", "browser": "chrome",
     "profile": "Default" }
 ] }
@@ -79,7 +79,7 @@ rows whose scheduled task the OS already deleted). Re-scheduling the same
 
 ## Task names
 
-Always `ShopBadwill-snipe-<snipeId>`. `cancel` and `list` (and
+Always `ShopBadwill-<snipeId>`. `cancel` and `list` (and
 `uninstall.ps1`) only ever see or touch names with the `ShopBadwill-` prefix.
 
 ## What the wake task does

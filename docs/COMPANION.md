@@ -14,7 +14,7 @@ leaves the browser.
   and/or `HKCU\Software\Mozilla\NativeMessagingHosts` and writes the config to
   `%LOCALAPPDATA%\ShopBadwill\companion\`.
 - When a snipe is armed, the extension asks the host to `schedule`; the host
-  registers a one-off `ShopBadwill-snipe-<id>` task (`WakeToRun`,
+  registers a one-off `ShopBadwill-<id>` task (`WakeToRun`,
   `StartWhenAvailable`) whose action launches the browser detached with your
   profile. `cancel` removes it; `list` reports it. Protocol:
   `companion/windows/PROTOCOL.md`.
@@ -121,7 +121,7 @@ $R = 'C:\tools\shopbadwill-wt\T-110'
 powershell -ExecutionPolicy Bypass -File "$R\companion\windows\uninstall.ps1"     # append -WhatIf for a dry run
 ```
 
-It deletes only `ShopBadwill-snipe-*` tasks, removes both registry values and
+It deletes only `ShopBadwill-*` tasks, removes both registry values and
 the data dir. It never changes power settings: revert any manual power-plan
 changes with the commands above. Restart the browsers afterwards.
 
