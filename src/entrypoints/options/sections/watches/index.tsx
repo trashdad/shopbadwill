@@ -36,9 +36,9 @@ export interface WatchesSectionProps extends SectionProps {
 type Msg = { message: string; tone: 'ok' | 'error' };
 
 /** The most recently used ShopGoodwill search tab in any window; the options page itself is never one. */
-async function activeTabUrl(): Promise<string | undefined> {
+export async function activeTabUrl(): Promise<string | undefined> {
   try {
-    const tabs = await browser.tabs.query({ url: ['https://shopgoodwill.com/*', 'https://www.shopgoodwill.com/*'] });
+    const tabs = await browser.tabs.query({ url: ['https://shopgoodwill.com/*'] });
     return pickSearchTab(tabs);
   } catch {
     return undefined;

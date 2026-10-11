@@ -1,14 +1,15 @@
 // T-55: the Watches options section, driven through FakeMessaging.
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { browser } from 'wxt/browser';
 
 import type { AuthStatus } from '../../src/domain/calendar/types';
 import type { Rule } from '../../src/domain/rules/schema';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import { WatchSchema, type Watch } from '../../src/domain/watches/schema';
 import { loadSections } from '../../src/entrypoints/options/registry';
-import { section, WatchesSection } from '../../src/entrypoints/options/sections/watches';
+import { activeTabUrl, section, WatchesSection } from '../../src/entrypoints/options/sections/watches';
 import { RulesSection } from '../../src/entrypoints/options/sections/rules';
 import { MATCH_ALL_RULE_ID, pickSearchTab } from '../../src/entrypoints/options/sections/watches/draft';
 import { MessagingError } from '../../src/messaging/errors';
@@ -335,6 +336,27 @@ describe('options: Watches', () => {
     expect(pickSearchTab([])).toBeUndefined();
   });
 
+  it('chooses the apex search tab when tabs.query rejects an unpermitted host', async () => {
+    const apex = 'https://shopgoodwill.com/categories/listing?st=pyrex';
+    const permitted = 'https://shopgoodwill.com/*';
+    // The callback overload types this as returning void. The fake still hands the tab list to `await`.
+    const query = vi.spyOn(browser.tabs, 'query').mockImplementation((info) => {
+      const patterns = info.url === undefined ? [] : Array.isArray(info.url) ? info.url : [info.url];
+      if (patterns.length !== 1 || patterns[0] !== permitted) {
+        throw new Error(`tabs.query rejected unpermitted url pattern: ${patterns.join(', ')}`);
+      }
+      return [
+        { url: 'https://shopgoodwill.com/item/1', lastAccessed: 99 },
+        { url: apex, lastAccessed: 10 },
+      ] as never;
+    });
+    try {
+      await expect(activeTabUrl()).resolves.toBe(apex);
+    } finally {
+      query.mockRestore();
+    }
+  });
+
   it('opens the paste field when no SGW search tab is open', async () => {
     app({ tab: undefined });
     click('Use my current tab');
@@ -405,39 +427,8 @@ describe('options: Watches', () => {
 });
 
 describe('rules section: deleting a rule that watches use', () => {
-  const w = (id: string, ruleIds: string[]): Watch => ({
-    id, name: id, enabled: true, query: { searchText: id, categoryIds: [], sellerIds: [], page: 1 },
-    ruleIds, maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
-  });
-
-  it('names the watch count, deletes, and removes the id from those watches', async () => {
-    const fake = new FakeMessaging();
-    const watches = [w('a', ['r1', 'r2']), w('b', ['r1']), w('c', ['r2'])];
-    const deleted: string[] = [];
-    fake.handle('rules.list', () => [rule('r1', { name: 'Pyrex' })]);
-    fake.handle('rules.delete', ({ id }) => {
-      deleted.push(id);
-      return undefined;
-    });
-    fake.handle('watches.list', () => watches);
-    fake.handle('watches.save', (x) => {
-      const i = watches.findIndex((y) => y.id === x.id);
-      watches[i] = x;
-      return undefined;
-    });
-    render(h(RulesSection, { client: fake }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete Pyrex' }));
-    await screen.findByText(/Used by 2 watches; they will stop matching\./);
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete Pyrex' }));
-    await waitFor(() => {
-      expect(deleted).toEqual(['r1']);
-      expect(watches.map((x) => x.ruleIds)).toEqual([['r2'], [], ['r2']]);
-    });
-});
-
-describe('rules section: deleting a rule that watches use', () => {
-  const w = (id: string, ruleIds: string[]): Watch => ({
-    id, name: id, enabled: true, query: { searchText: id, categoryIds: [], sellerIds: [], page: 1 },
+  const w = (id: string, ruleIds: string[], name = id): Watch => ({
+    id, name, enabled: true, query: { searchText: id, categoryIds: [], sellerIds: [], page: 1 },
     ruleIds, maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: NOW, seenItemIds: [],
   });
 
@@ -465,5 +456,27 @@ describe('rules section: deleting a rule that watches use', () => {
       expect(watches.map((x) => x.ruleIds)).toEqual([['r2'], [], ['r2']]);
     });
   });
-});
+
+  it('shows an error when saving a watch fails after the rule is deleted', async () => {
+    const fake = new FakeMessaging();
+    const watches = [w('a', ['r1', 'r2'], 'Bowl'), w('b', ['r1'], 'Lamp'), w('c', ['r2'], 'Vase')];
+    fake.handle('rules.list', () => [rule('r1', { name: 'Pyrex' })]);
+    fake.handle('rules.delete', () => undefined);
+    fake.handle('watches.list', () => watches);
+    fake.handle('watches.save', (x) => {
+      if (x.id === 'b') throw new Error('disk full');
+      const i = watches.findIndex((y) => y.id === x.id);
+      watches[i] = x;
+      return undefined;
+    });
+    render(h(RulesSection, { client: fake }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete Pyrex' }));
+    await screen.findByText(/Used by 2 watches; they will stop matching\./);
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete Pyrex' }));
+    const status = await screen.findByText(/could not update these watches: Lamp\./);
+    expect(status.closest('[role="status"]')?.getAttribute('data-tone')).toBe('error');
+    expect(status.textContent).toContain(
+      'Deleted "Pyrex", but could not update these watches: Lamp. Open them to remove the missing rule.',
+    );
+  });
 });
