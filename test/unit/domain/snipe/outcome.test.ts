@@ -402,3 +402,43 @@ describe('T-87c: no-bid abort reasons', () => {
     });
   }
 });
+
+describe('T-80b: not-sent proof and the unconfirmed post-read-failed copy', () => {
+  it('abort network with a detail says plainly "No bid was sent (…)"', () => {
+    const r = classifyOutcome(snipe({ attempt: { sentAt: END_MS - 8000, notSent: true } }), null, null, {
+      abort: 'network',
+      abortDetail: 'the bid modal could not be read',
+    });
+    expect(r.outcome).toBe('network');
+    expect(r.notify.message).toMatch(/^No bid was sent \(the bid modal could not be read\)/);
+    expect(r.notify.message).toContain('not an outbid');
+    expect(r.notify.message).not.toContain('may have been placed');
+    expect(r.notify.message).not.toContain('Unconfirmed');
+    expect(r.stamp).toBeNull();
+    expect(r.report.outcome).toBe('network');
+  });
+
+  it('abort network without a detail still says "No bid was sent"', () => {
+    const r = classifyOutcome(snipe({ attempt: {}, measured: undefined }), null, null, { abort: 'network' });
+    expect(r.notify.message).toMatch(/^No bid was sent\./);
+    expect(r.stamp).toBeNull();
+  });
+
+  it('attempt.notSent forces the abort path even though sentAt is recorded', () => {
+    const r = classifyOutcome(snipe({ attempt: { sentAt: END_MS - 8000, notSent: true } }), null, null, {
+      abort: 'network',
+      abortDetail: 'nothing was sent',
+    });
+    expect(r.outcome).toBe('network');
+    expect(r.notify.message).toMatch(/^No bid was sent/);
+    expect(r.notify.message).not.toContain('may have been placed');
+    // No abort note: the bid provably never went out, it was not "stopped".
+    expect(r.notify.message).not.toContain('Stopped');
+  });
+
+  it('without the notSent proof, sentAt still routes to the judge path (Unconfirmed)', () => {
+    const r = classifyOutcome(snipe({ attempt: { sentAt: END_MS - 8000 } }), null, null, { abort: 'network' });
+    expect(r.notify.message).toContain('Unconfirmed');
+    expect(r.notify.message).not.toMatch(/^No bid was sent/);
+  });
+});

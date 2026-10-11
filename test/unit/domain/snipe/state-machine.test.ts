@@ -178,6 +178,8 @@ const E = {
   }),
   ambiguous: (now = RESULT_LOCAL): SnipeEvent => ({ type: 'ambiguous', now }),
   postRead: (d: ItemDetail = closedDetail(), now = POST_LOCAL): SnipeEvent => ({ type: 'post-read', now, detail: d }),
+  postReadFailed: (now = POST_LOCAL): SnipeEvent => ({ type: 'post-read-failed', now }),
+  notSent: (reason = 'the bid modal could not be read', now = RESULT_LOCAL): SnipeEvent => ({ type: 'not-sent', now, reason }),
   preflightFailed: (reason: string, now = PREFLIGHT_AT): SnipeEvent => ({ type: 'preflight-failed', now, reason }),
   applyFallback: (mode: 'early-proxy' | 'skip', now = VERIFY_AT): SnipeEvent => ({ type: 'apply-fallback', now, mode }),
 };
@@ -200,6 +202,8 @@ const CANON: Record<EventType, SnipeEvent> = {
   result: E.result(),
   ambiguous: E.ambiguous(),
   'post-read': E.postRead(),
+  'post-read-failed': E.postReadFailed(),
+  'not-sent': E.notSent(),
   'preflight-failed': E.preflightFailed('clock'),
   'apply-fallback': E.applyFallback('early-proxy'),
 };
@@ -292,6 +296,8 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     result: '✗ not-armed',
     ambiguous: '✗ not-armed',
     'post-read': '✗ not-armed',
+    'post-read-failed': '✗ not-armed',
+    'not-sent': '✗ not-armed',
     'preflight-failed': '✗ not-armed',
     'apply-fallback': '✗ not-armed',
   },
@@ -306,6 +312,8 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     result: '✗ not-sent',
     ambiguous: '✗ not-sent',
     'post-read': '✗ not-sent',
+    'post-read-failed': '✗ not-sent',
+    'not-sent': '✗ not-firing',
     'preflight-failed': 'resolved | fallback-applied (guards: invalid-event)',
     'apply-fallback': 'resolved | fallback-applied',
   },
@@ -320,6 +328,8 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     result: '✗ not-sent',
     ambiguous: '✗ not-sent',
     'post-read': '✗ not-sent',
+    'post-read-failed': '✗ not-sent',
+    'not-sent': '✗ not-sent',
     'preflight-failed': '✗ fallback-applied',
     'apply-fallback': '✗ fallback-applied',
   },
@@ -334,6 +344,8 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     result: '✗ not-sent',
     ambiguous: '✗ not-sent',
     'post-read': '✗ not-sent',
+    'post-read-failed': '✗ not-sent',
+    'not-sent': '✗ not-firing',
     'preflight-failed': '✗ step-passed',
     'apply-fallback': 'resolved | fallback-applied',
   },
@@ -348,6 +360,8 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     result: '✗ not-sent',
     ambiguous: '✗ not-sent',
     'post-read': '✗ not-sent',
+    'post-read-failed': '✗ not-sent',
+    'not-sent': '✗ not-firing',
     'preflight-failed': '✗ step-passed',
     'apply-fallback': 'resolved | fallback-applied',
   },
@@ -361,7 +375,10 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     sent: 'sent (guards: dry-run, already-sent, invalid-event)',
     result: '✗ not-sent',
     ambiguous: '✗ not-sent',
+    // Only a dry run's measure read: a live firing snipe has sent nothing to settle.
     'post-read': 'resolved (guards: not-sent, invalid-event)',
+    'post-read-failed': '✗ not-sent',
+    'not-sent': '✗ not-sent',
     'preflight-failed': '✗ step-passed',
     'apply-fallback': '✗ step-passed',
   },
@@ -376,6 +393,8 @@ const EXPECTED: Record<SnipeState, Record<EventType, string>> = {
     result: 'sent | resolved (guards: dry-run, duplicate)',
     ambiguous: 'sent (guards: dry-run, duplicate)',
     'post-read': 'resolved (guards: invalid-event)',
+    'post-read-failed': 'resolved (guards: dry-run)',
+    'not-sent': 'resolved (guards: dry-run, duplicate)',
     'preflight-failed': '✗ already-sent',
     'apply-fallback': '✗ already-sent',
   },
@@ -610,9 +629,9 @@ describe('R3: sent is terminal for sending', () => {
     expect(reduce(s, E.sent('k-new'), CAPS_OK, CTX).rejection?.reason).toBe('already-sent');
   });
 
-  it('after sent, only result, ambiguous and post-read are accepted', () => {
+  it('after sent, only result, ambiguous, post-read, post-read-failed and not-sent are accepted', () => {
     const accepted = EVENT_TYPES.filter((t) => reduce(inState('sent'), CANON[t], CAPS_OK, CTX).rejection === null);
-    expect(accepted.sort()).toEqual(['ambiguous', 'post-read', 'result']);
+    expect(accepted.sort()).toEqual(['ambiguous', 'not-sent', 'post-read', 'post-read-failed', 'result']);
     for (const by of ['user', 'kill', 'anomaly'] as const) {
       expect(reduce(inState('sent'), E.disarm(by), CAPS_OK, CTX).rejection?.reason).toBe('already-sent');
     }
@@ -690,6 +709,139 @@ describe('ambiguous → post-read → won | outbid | network through classifyOut
 
   it('a post-read for another item is rejected', () => {
     expect(reduce(inState('sent'), E.postRead(closedDetail({ itemId: 1 })), CAPS_OK, CTX).rejection?.reason).toBe('invalid-event');
+  });
+});
+
+// ── T-80b R1: post-read-failed settles a snipe the runner can never read ────
+
+describe('R1: post-read-failed resolves a sent snipe whose outcome read gave up', () => {
+  it('with no reply recorded: Unconfirmed, never "Not bid", no money effect', () => {
+    const s = inState('sent');
+    vi.mocked(classifyOutcome).mockClear();
+    const r = reduce(s, E.postReadFailed(), CAPS_OK, CTX);
+    expect(vi.mocked(classifyOutcome)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[1]).toBeNull();
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[2]).toBeNull();
+    expect(r.rejection).toBeNull();
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'network' });
+    const message = ofKind(r.effects, 'notify')[0]?.message ?? '';
+    expect(message).toMatch(/Unconfirmed/);
+    expect(message).toContain('Check ShopGoodwill');
+    expect(message).not.toMatch(NO_BID_CLAIM);
+    expect(money(r.effects)).toEqual([]);
+    expect(ofKind(r.effects, 'readDetail')).toEqual([]);
+    expect(kinds(r.effects)).toEqual(['notify', 'audit', 'holdKeepAwake']);
+    expect(ofKind(r.effects, 'audit')[0]?.entry.kind).toBe('snipe.post-read-failed');
+  });
+
+  it('after ambiguous: judged with no reply, Unconfirmed, never "Not bid"', () => {
+    const s = reduce(inState('sent'), E.ambiguous(), CAPS_OK, CTX).next;
+    vi.mocked(classifyOutcome).mockClear();
+    const r = reduce(s, E.postReadFailed(), CAPS_OK, CTX);
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[1]).toBeNull();
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'network' });
+    expect(ofKind(r.effects, 'notify')[0]?.message).not.toMatch(NO_BID_CLAIM);
+  });
+
+  it('with a recorded reply: judged with the reply, never "Not bid"', () => {
+    const reply = bid('rejected-unknown', { rawStatus: 200, rawResult: 7, messageText: 'odd' });
+    const s = reduce(inState('sent'), E.result(reply), CAPS_OK, CTX).next;
+    vi.mocked(classifyOutcome).mockClear();
+    const r = reduce(s, E.postReadFailed(), CAPS_OK, CTX);
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[1]).toEqual(reply);
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'network' });
+    expect(ofKind(r.effects, 'notify')[0]?.message).not.toMatch(NO_BID_CLAIM);
+  });
+
+  it('is terminal: nothing more is accepted', () => {
+    const r = reduce(inState('sent'), E.postReadFailed(), CAPS_OK, CTX);
+    expect(reduce(r.next, E.postRead(closedDetail()), CAPS_OK, CTX).rejection?.reason).toBe('terminal');
+  });
+
+  it('is refused outside sent with a typed reason', () => {
+    for (const state of ['draft', 'armed', 'fallback-applied', 'waking', 'verified', 'firing'] as const) {
+      expect(reduce(inState(state), E.postReadFailed(), CAPS_OK, CTX).rejection?.reason).toBe(
+        state === 'draft' ? 'not-armed' : 'not-sent',
+      );
+    }
+  });
+});
+
+// ── T-80b R2: not-sent resolves a bid that provably never went out ───────────
+
+describe('R2: not-sent proves the bid never went out', () => {
+  it('resolves through classifyOutcome(abort network) with "No bid was sent (reason)" copy', () => {
+    const s = inState('sent');
+    vi.mocked(classifyOutcome).mockClear();
+    const r = reduce(s, E.notSent('the bid modal could not be read'), CAPS_OK, CTX);
+    expect(vi.mocked(classifyOutcome)).toHaveBeenCalledTimes(1);
+    const [arg, bidArg, postArg, ctx] = vi.mocked(classifyOutcome).mock.calls[0] ?? [];
+    expect(arg?.attempt.notSent).toBe(true);
+    expect(bidArg).toBeNull();
+    expect(postArg).toBeNull();
+    expect(ctx).toMatchObject({ abort: 'network' });
+    expect(r.rejection).toBeNull();
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'network', attempt: { notSent: true } });
+    const message = ofKind(r.effects, 'notify')[0]?.message ?? '';
+    expect(message).toMatch(/^No bid was sent/);
+    expect(message).toContain('the bid modal could not be read');
+    // It must not take the judge path: no "may have been placed" hedging.
+    expect(message).not.toContain('Unconfirmed');
+    expect(message).not.toContain('may have been placed');
+    expect(money(r.effects)).toEqual([]);
+    expect(kinds(r.effects)).toEqual(['notify', 'audit', 'holdKeepAwake']);
+    expect(ofKind(r.effects, 'audit')[0]?.entry.kind).toBe('bid.not-sent');
+  });
+
+  it('records the proof on the attempt, so it survives a restart', () => {
+    const r = reduce(inState('sent'), E.notSent('nothing was sent'), CAPS_OK, CTX);
+    const persisted = SnipeSchema.parse(JSON.parse(JSON.stringify(r.next)));
+    expect(persisted.attempt.notSent).toBe(true);
+    expect(persisted.state).toBe('resolved');
+  });
+
+  it('is refused after a reply or an ambiguity (duplicate), and never claims "no bid" after ambiguous', () => {
+    const replied = deepFreeze(reduce(inState('sent'), E.result(bid('accepted', { isHighBidder: true })), CAPS_OK, CTX).next);
+    expect(reduce(replied, E.notSent(), CAPS_OK, CTX)).toMatchObject({
+      next: replied,
+      effects: [],
+      rejection: { reason: 'duplicate' },
+    });
+    const ambiguous = deepFreeze(reduce(inState('sent'), E.ambiguous(), CAPS_OK, CTX).next);
+    const refused = reduce(ambiguous, E.notSent(), CAPS_OK, CTX);
+    expect(refused).toMatchObject({ next: ambiguous, effects: [], rejection: { reason: 'duplicate' } });
+    expect(ambiguous.attempt.ambiguous).toBe(true);
+    const after = reduce(ambiguous, E.postRead(closedDetail({ isHighBidder: null, currentPrice: 2000 })), CAPS_OK, CTX);
+    expect(after.next.outcomeDetail).not.toMatch(NO_BID_CLAIM);
+    expect(ofKind(after.effects, 'notify')[0]?.message).not.toMatch(NO_BID_CLAIM);
+  });
+
+  it('is refused for a dry-run snipe (and so is post-read-failed)', () => {
+    expect(reduce(inState('sent', { dryRun: true }), E.notSent(), CAPS_OK, CTX).rejection?.reason).toBe('dry-run');
+    expect(reduce(inState('sent', { dryRun: true }), E.postReadFailed(), CAPS_OK, CTX).rejection?.reason).toBe('dry-run');
+  });
+
+  it('is refused outside sent with a typed reason', () => {
+    for (const state of ['draft', 'armed', 'fallback-applied', 'waking', 'verified', 'firing'] as const) {
+      const reason = reduce(inState(state), E.notSent(), CAPS_OK, CTX).rejection?.reason;
+      expect(reason).toBe(
+        state === 'draft'
+          ? 'not-armed'
+          : state === 'firing' || state === 'fallback-applied'
+            ? 'not-sent'
+            : 'not-firing',
+      );
+    }
+  });
+
+  it('is terminal: the snipe leaves exposure (resolved) and never emits money after', () => {
+    const r = reduce(inState('sent'), E.notSent(), CAPS_OK, CTX);
+    expect(r.next.state).toBe('resolved');
+    for (const type of EVENT_TYPES) {
+      const after = reduce(r.next, CANON[type], CAPS_OK, CTX);
+      expect(after.rejection?.reason).toBe('terminal');
+      expect(money(after.effects)).toEqual([]);
+    }
   });
 });
 
@@ -1239,6 +1391,8 @@ const arbBody: fc.Arbitrary<Body> = fc.oneof(
   fc.record({ type: fc.constant('result' as const), result: arbResult }),
   fc.constant({ type: 'ambiguous' as const }),
   fc.record({ type: fc.constant('post-read' as const), detail: arbDetail }),
+  fc.constant({ type: 'post-read-failed' as const }),
+  fc.record({ type: fc.constant('not-sent' as const), reason: fc.constantFrom('the bid modal could not be read', 'the write gate refused') }),
   fc.record({
     type: fc.constant('preflight-failed' as const),
     reason: fc.constantFrom('ended', 'price', 'auth', 'clock', 'keep-awake', 'cap', 'bogus'),
@@ -1280,6 +1434,8 @@ const WHEN: Record<EventType, number> = {
   result: RESULT_LOCAL,
   ambiguous: RESULT_LOCAL,
   'post-read': POST_LOCAL,
+  'post-read-failed': POST_LOCAL,
+  'not-sent': RESULT_LOCAL,
   'preflight-failed': PREFLIGHT_AT,
   'apply-fallback': VERIFY_AT,
 };
@@ -1300,7 +1456,11 @@ function guidedBody(s: Snipe, step: PropStep): Body {
     case 'fallback-applied':
       return { type: 'sent', key: 'k1' };
     case 'sent':
-      return step.body.type === 'result' || step.body.type === 'ambiguous' || step.body.type === 'post-read'
+      return step.body.type === 'result' ||
+        step.body.type === 'ambiguous' ||
+        step.body.type === 'post-read' ||
+        step.body.type === 'post-read-failed' ||
+        step.body.type === 'not-sent'
         ? step.body
         : { type: 'post-read', detail: closedDetail() };
     case 'resolved':

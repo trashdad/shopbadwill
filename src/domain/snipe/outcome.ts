@@ -14,6 +14,7 @@ export type AbortReason =
   | 'killed'
   | 'cap'
   | 'auth'
+  /** The bid provably never went out (T-80b's `not-sent`, e.g. a BidNotSentError); also a network failure before the send. */
   | 'network'
   | 'ended'
   /** End moved before the bid was sent (soft close / verify-failed extended). */
@@ -30,6 +31,11 @@ export interface OutcomeContext {
   userTz?: string;
   /** Set when the snipe stopped before a bid result existed. */
   abort?: AbortReason;
+  /**
+   * Extra text for the abort copy, in parentheses after "No bid was sent":
+   * T-80b's `not-sent` passes the BidNotSentError's message here.
+   */
+  abortDetail?: string;
 }
 
 export interface OutcomeTiming {
@@ -172,9 +178,11 @@ export function classifyOutcome(
   let showEnd = true;
 
   const bidMayHaveGone =
-    bidResult === null
-      ? snipe.attempt.sentAt !== undefined || snipe.attempt.ambiguous === true
-      : bidResult.kind === 'accepted' || bidResult.kind === 'outbid' || bidResult.kind === 'rejected-unknown';
+    snipe.attempt.notSent === true
+      ? false // T-80b: proven not sent, whatever the attempt record says.
+      : bidResult === null
+        ? snipe.attempt.sentAt !== undefined || snipe.attempt.ambiguous === true
+        : bidResult.kind === 'accepted' || bidResult.kind === 'outbid' || bidResult.kind === 'rejected-unknown';
   // An abort never overrides evidence that a bid went out: fall through to the judge path.
   const abort = bidMayHaveGone ? undefined : ctx.abort;
   const abortNote =
@@ -199,10 +207,12 @@ export function classifyOutcome(
     message = 'Not bid: you were signed out of ShopGoodwill. Sign in before the next snipe.';
     detail = 'No valid session at verify time; no bid sent.';
   } else if (abort === 'network') {
+    // T-80b: plain copy for a bid that provably never went out (BidNotSentError).
     outcome = 'network';
     heading = 'Not bid';
-    message = 'Not bid: could not reach ShopGoodwill (network problem). This is not an outbid.';
-    detail = 'Network failure before the bid was sent.';
+    const why = ctx.abortDetail !== undefined && ctx.abortDetail !== '' ? ` (${ctx.abortDetail})` : '';
+    message = `No bid was sent${why}. This is not an outbid.`;
+    detail = `The bid provably never went out${why}; nothing was sent.`;
   } else if (abort === 'ended') {
     outcome = 'ended';
     heading = 'Ended early';
