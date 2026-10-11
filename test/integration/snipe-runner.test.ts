@@ -307,13 +307,31 @@ class WorkerStorage implements Storage {
     private readonly base: FakeStorage,
     private readonly area: 'local' | 'session',
     private readonly life: Life,
-    private readonly crash: { after?: CrashPredicate; failAfter?: CrashPredicate; kill: () => void },
+    private readonly crash: {
+      after?: CrashPredicate;
+      failAfter?: CrashPredicate;
+      /** Fake ms a matching write takes to land (a slow disk); the worker's clock runs it. */
+      slow?: (area: 'local' | 'session', entries: Record<string, unknown>) => number;
+      later: (fn: () => void, ms: number) => void;
+      kill: () => void;
+    },
   ) {}
   get<T>(key: string): Promise<T | undefined> {
     if (this.life.dead) return never();
     return this.base.get<T>(key).then((v) => (this.life.dead ? never<T | undefined>() : v));
   }
   set(entries: Record<string, unknown>): Promise<void> {
+    if (this.life.dead) return never();
+    const delay = this.crash.slow?.(this.area, entries) ?? 0;
+    if (delay > 0) {
+      // Lands after `delay`; a worker that dies first never stores it.
+      return new Promise<void>((resolve) => {
+        this.crash.later(resolve, delay);
+      }).then(() => this.store(entries));
+    }
+    return this.store(entries);
+  }
+  private store(entries: Record<string, unknown>): Promise<void> {
     if (this.life.dead) return never();
     const p = this.base.set(entries);
     if (this.crash.after?.(this.area, entries) === true) {
@@ -382,6 +400,8 @@ type MessageListener = (raw: unknown, sender: RouterSender, sendResponse: (r: un
 
 interface WorkerOptions {
   crashAfterSet?: CrashPredicate;
+  /** Fake ms the matching write takes before it is stored. */
+  slowSet?: (area: 'local' | 'session', entries: Record<string, unknown>) => number;
   /** The matching write is stored, then reported as failed (the worker stays alive). */
   failAfterSet?: CrashPredicate;
   jobModules?: Record<string, BackgroundModule>;
@@ -414,6 +434,10 @@ class Worker {
       },
       ...(opts.crashAfterSet ? { after: opts.crashAfterSet } : {}),
       ...(opts.failAfterSet ? { failAfter: opts.failAfterSet } : {}),
+      ...(opts.slowSet ? { slow: opts.slowSet } : {}),
+      later: (fn: () => void, ms: number) => {
+        this.clock.setTimeout(fn, ms);
+      },
     };
     const areas: StorageAreas = {
       local: new WorkerStorage(shared.areas.local, 'local', life, crash),
@@ -1074,6 +1098,24 @@ describe('money safety carries', () => {
 });
 
 describe('money path edges (final check)', () => {
+  it('persist before send: with a slow storage write, ShowBidModal and PlaceBid wait until `sent` is stored', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared, { slowSet: (area, entries) => (crashOn('sent')(area, entries) ? 3 * SEC : 0) });
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 2 * SEC);
+    // The `sent` write has not landed yet: nothing has left.
+    expect(stored(shared).state).toBe('firing');
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+
+    await runTo(shared, END + 2 * MIN);
+    expect(shared.sgw.modals[0]).toBeGreaterThanOrEqual(FIRE_LOCAL + 3 * SEC);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(shared.sgw.placeBids[0]?.stored?.state).toBe('sent');
+    expect(shared.sgw.placeBids[0]?.stored?.attempt.idempotencyKey).toMatch(/^s1:/);
+    expect(stored(shared).state).toBe('resolved');
+  });
+
   it('a `sent` write that is stored but reports a failure sends nothing, and the snipe still exits through the outcome read', async () => {
     const shared = makeShared();
     let armed = true;
