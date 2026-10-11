@@ -307,7 +307,7 @@ class WorkerStorage implements Storage {
     private readonly base: FakeStorage,
     private readonly area: 'local' | 'session',
     private readonly life: Life,
-    private readonly crash: { after?: CrashPredicate; kill: () => void },
+    private readonly crash: { after?: CrashPredicate; failAfter?: CrashPredicate; kill: () => void },
   ) {}
   get<T>(key: string): Promise<T | undefined> {
     if (this.life.dead) return never();
@@ -319,6 +319,10 @@ class WorkerStorage implements Storage {
     if (this.crash.after?.(this.area, entries) === true) {
       this.crash.kill();
       return never();
+    }
+    // The write is stored, but its promise reports a failure (the worker lives on).
+    if (this.crash.failAfter?.(this.area, entries) === true) {
+      return p.then(() => Promise.reject(new Error('storage.local.set failed after the write')));
     }
     return p.then(() => (this.life.dead ? never<undefined>() : undefined));
   }
@@ -378,6 +382,8 @@ type MessageListener = (raw: unknown, sender: RouterSender, sendResponse: (r: un
 
 interface WorkerOptions {
   crashAfterSet?: CrashPredicate;
+  /** The matching write is stored, then reported as failed (the worker stays alive). */
+  failAfterSet?: CrashPredicate;
   jobModules?: Record<string, BackgroundModule>;
 }
 
@@ -407,6 +413,7 @@ class Worker {
         this.kill();
       },
       ...(opts.crashAfterSet ? { after: opts.crashAfterSet } : {}),
+      ...(opts.failAfterSet ? { failAfter: opts.failAfterSet } : {}),
     };
     const areas: StorageAreas = {
       local: new WorkerStorage(shared.areas.local, 'local', life, crash),
@@ -1063,6 +1070,126 @@ describe('money safety carries', () => {
     const notSent = audits(shared).find((a) => a.kind === 'bid.not-sent');
     expect(notSent?.details).toMatchObject({ effect: 'placeBid', afterSent: true });
     expect(stored(shared).state).toBe('resolved');
+  });
+});
+
+describe('money path edges (final check)', () => {
+  it('a `sent` write that is stored but reports a failure sends nothing, and the snipe still exits through the outcome read', async () => {
+    const shared = makeShared();
+    let armed = true;
+    const { w } = await boot(shared, {
+      failAfterSet: (area, entries) => {
+        if (!armed || !crashOn('sent')(area, entries)) return false;
+        armed = false;
+        return true;
+      },
+    });
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 5 * SEC);
+    expect(w.life.dead).toBe(false);
+    expect(stored(shared).state).toBe('sent');
+    // The write's outcome is unknown to the runner: it never sends on it.
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+
+    // Same worker: the stored `sent` with no reply is ambiguous, read, and settled. It never stays `sent`.
+    await runTo(shared, END + 10 * MIN);
+    const s = stored(shared);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.ambiguous).toBe(true);
+    expect(s.history.filter((h) => h.to === 'sent' && h.from !== 'sent')).toHaveLength(1);
+  });
+
+  it('a money effect whose amount is not the snipe max is never sent: the amount comes only from Snipe.maxBid', async () => {
+    const shared = makeShared();
+    const first = await boot(shared, { crashAfterSet: crashOn('firing') });
+    await arm(first.w);
+    await runTo(shared, FIRE_LOCAL + 100);
+    expect(first.w.life.dead).toBe(true);
+    const rec = runnerRecord(shared);
+    const entry = rec.entries.s1;
+    if (entry === undefined) throw new Error('no runner entry');
+    entry.outbox = entry.outbox.map((e) => (e.kind === 'placeBid' ? { ...e, amount: MAX * 10 } : e));
+    shared.areas.local.seed({ [RUNNER_KEY]: rec });
+
+    await boot(shared);
+    await runTo(shared, END + 2 * MIN);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(stored(shared).state).toBe('killed');
+    expect(String(audits(shared).find((a) => a.kind === 'bid.not-sent')?.details.why)).toMatch(/amount/);
+  });
+
+  it('the kill switch during a window read stops the snipe at once, without waiting for the read', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    const verifyAt = END - SKEW - 60 * SEC;
+    await runTo(shared, verifyAt - 10);
+    expect(stored(shared).state).toBe('waking');
+    shared.sgw.detailFaults.push({ hang: true });
+    await runTo(shared, verifyAt + 100);
+    expect(shared.sgw.details.at(-1)?.at).toBeGreaterThanOrEqual(verifyAt);
+    expect(stored(shared).state).toBe('waking');
+
+    const killedAt = shared.clock.now();
+    await w.ok('kill.set', { on: true });
+    await flush();
+    const s = stored(shared);
+    expect(transitions(s).at(-1)).toBe('waking>killed');
+    expect((s.history.at(-1)?.at ?? 0) - killedAt).toBeLessThan(SEC);
+    expect(s.history.at(-1)?.why).toBe('disarm:kill');
+
+    await runTo(shared, END + 2 * MIN);
+    expect(stored(shared).state).toBe('killed');
+    expect(audits(shared).find((a) => a.kind === 'snipe.disarm')?.details).toMatchObject({ by: 'kill' });
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+  });
+
+  it('a health failure during a window read that then succeeds still stops the snipe before the fire', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    const verifyAt = END - SKEW - 60 * SEC;
+    await runTo(shared, verifyAt - 10);
+    expect(stored(shared).state).toBe('waking');
+    shared.sgw.latency = 1500; // a slow but usable verify read (under the 2 s latency bound)
+    await runTo(shared, verifyAt + 500);
+    expect(stored(shared).state).toBe('waking');
+    await shared.areas.local.set({
+      [STORAGE_KEYS.healthReport]: { ok: false, checkedAt: shared.clock.now(), configVersion: 'test', checks: [{ name: 'detail-schema', ok: false, detail: 'drift' }] },
+    });
+    await runTo(shared, verifyAt + 3 * SEC);
+    shared.sgw.latency = LATENCY;
+    await runTo(shared, END + 2 * MIN);
+
+    const s = stored(shared);
+    expect(s.state).toBe('killed');
+    expect(s.history.some((h) => h.to === 'firing')).toBe(false);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(String(audits(shared).find((a) => a.kind === 'snipe.disarm')?.details.why)).toMatch(/health/);
+  });
+
+  it('the kill switch between ShowBidModal and PlaceBid: nothing on the wire, and the sent snipe is read, never killed', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 600);
+    expect(stored(shared).state).toBe('sent');
+    expect(shared.sgw.modals).toHaveLength(1);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+
+    await w.ok('kill.set', { on: true });
+    await runTo(shared, END + 10 * MIN);
+    const s = stored(shared);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(s.state).toBe('resolved');
+    expect(s.attempt.ambiguous).toBe(true);
+    expect(s.history.some((h) => h.to === 'killed')).toBe(false);
+    expect(audits(shared).find((a) => a.kind === 'bid.not-sent')?.details).toMatchObject({ effect: 'placeBid', afterSent: true });
   });
 });
 

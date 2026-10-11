@@ -886,6 +886,11 @@ export class SnipeRunner {
       await drop('anomaly', 'a dry run never sends');
       return;
     }
+    // The reducer's money effect is always this snipe's max. Anything else is a damaged outbox: send nothing.
+    if (eff.snipeId !== id || eff.amount !== s.maxBid) {
+      await drop('anomaly', `the stored bid amount or snipe does not match the snipe's max (${String(eff.amount)} for ${String(s.maxBid)})`);
+      return;
+    }
     const verdict = this.ctx.switches.verdictNow('bidding');
     if (!verdict.ok) {
       const why = verdict.why ?? 'bidding is blocked';
@@ -906,7 +911,15 @@ export class SnipeRunner {
     const key = `${id}:${crypto.randomUUID()}`;
     // The attempt is this runner's from here: outside attempt events are refused until its reply is recorded.
     this.inFlight.add(id);
-    const sent = await this.commit(id, { type: 'sent', now, key }, { consume: [eff] });
+    let sent: CommitResult;
+    try {
+      sent = await this.commit(id, { type: 'sent', now, key }, { consume: [eff] });
+    } catch (e) {
+      // The write may or may not be stored: never send on it. A stored `sent` with no reply is then
+      // read as ambiguous by sentStep, which the in-flight mark must not block.
+      this.inFlight.delete(id);
+      throw e;
+    }
     // Never send unless `sent` was accepted AND persisted (the commit awaited the write).
     if (sent.kind !== 'accepted') {
       this.inFlight.delete(id);
