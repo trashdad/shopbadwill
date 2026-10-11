@@ -17,8 +17,10 @@
 //
 // Everything else is `ok: true` plus a warning notification from THIS module
 // (the runner acts only on `ok: false`): a session expiring soon but after the
-// end, Google disconnected (or needing interaction), a failing health report,
-// keep-awake unavailable. R4: one notification per snipe per check, deduped
+// end, Google disconnected (or needing interaction) only when the calendar is
+// on, a failing health report, keep-awake unavailable. Keep-awake readiness
+// matches the runner: tier T1 and the `power` permission, not `background`.
+// R4: one notification per snipe per check, deduped
 // across restarts through the audit log (`snipe.auth-warn`, ref = snipe id,
 // details.check), never a new storage key. Quiet hours hold a warning back only
 // while the end stays more than 1 h away after the window ends; the deferred
@@ -101,10 +103,12 @@ export interface AuthHealthSnapshot {
   sessionRecordExpiresAt: EpochMs | null;
   /** null when the status could not be read. */
   google: AuthStatus | null;
+  /** Google warnings exist only while the user has the calendar turned on. */
+  calendarEnabled: boolean;
   healthReport: HealthReport | null;
   keepAwakeAvailable: boolean;
+  /** The runner's keep-awake gate: the `power` permission. `background` is not part of it. */
   powerGranted: boolean;
-  backgroundGranted: boolean;
   tier: Settings['snipe']['tier'];
   timeZone: string;
 }
@@ -176,7 +180,7 @@ export function assessAuthHealth(
     );
   }
 
-  if (snap.google !== null) {
+  if (snap.calendarEnabled && snap.google !== null) {
     if (snap.google.connected && snap.google.needsInteraction) {
       warnings.push(`Google Calendar needs you to sign in again. ${RECONNECT_GOOGLE}.`);
     } else if (!snap.google.connected && snap.google.configured) {
@@ -201,7 +205,7 @@ export function assessAuthHealth(
       warnings.push(
         'Keep awake is not available in this browser, so the computer may sleep before the bid. Choose tier T0, or keep the computer awake yourself.',
       );
-    } else if (!snap.powerGranted || !snap.backgroundGranted) {
+    } else if (!snap.powerGranted) {
       warnings.push(`Keep awake is not turned on, so the computer may sleep before the bid. ${TURN_ON_KEEP_AWAKE}.`);
     }
   }
@@ -266,14 +270,13 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
 
   const gather = async (): Promise<AuthHealthSnapshot & { now: EpochMs; quiet: Settings['notifications']['quietHours'] }> => {
     const settings = deps.settings();
-    const [sessionState, token, record, google, healthReport, powerGranted, backgroundGranted] = await Promise.all([
+    const [sessionState, token, record, google, healthReport, powerGranted] = await Promise.all([
       safe(() => deps.session.state(), null),
       safe(() => deps.session.current(), null),
       safe(() => deps.sessionRecord(), null),
       safe(() => deps.google.status(), null),
       safe(() => deps.health.last(), null),
       safe(() => deps.permissions.contains({ permissions: ['power'] }), false),
-      safe(() => deps.permissions.contains({ permissions: ['background'] }), false),
     ]);
     return {
       now: deps.clock.now(),
@@ -281,10 +284,10 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
       tokenExpiresAt: token?.expiresAt ?? null,
       sessionRecordExpiresAt: record?.expiresAt ?? null,
       google,
+      calendarEnabled: settings.calendar.enabled,
       healthReport,
       keepAwakeAvailable: deps.keepAwake.available,
       powerGranted,
-      backgroundGranted,
       tier: settings.snipe.tier,
       timeZone: settings.locale.timeZone,
       quiet: settings.notifications.quietHours,

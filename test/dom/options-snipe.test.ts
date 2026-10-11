@@ -5,6 +5,10 @@
 // src/ui/permissions.ts (I-21), and Firefox hides the T1 controls. R6: this
 // section never touches the bidding dry-run switch or the dry-run counters,
 // and says so plainly. R7: text only, no innerHTML.
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -42,6 +46,23 @@ describe('SnipeSection', () => {
     expect(permissions.requested).toEqual([]);
     fireEvent.click(screen.getByRole('button', { name: 'Turn on Keep awake' }));
     await screen.findByText('Keep awake is on: Chrome may keep the computer awake and start at login.');
+    expect(permissions.requested).toEqual([{ permissions: ['background', 'power'] }]);
+  });
+
+  it('requests the permissions synchronously in the click, before any await', async () => {
+    const permissions = new FakePermissions();
+    const orig = permissions.request.bind(permissions);
+    let duringClick = false;
+    permissions.request = (p) => {
+      expect(duringClick).toBe(true);
+      return orig(p);
+    };
+    app({ permissions });
+    await screen.findByRole('button', { name: 'Turn on Keep awake' });
+    expect(permissions.requested).toEqual([]);
+    duringClick = true;
+    fireEvent.click(screen.getByRole('button', { name: 'Turn on Keep awake' }));
+    duringClick = false;
     expect(permissions.requested).toEqual([{ permissions: ['background', 'power'] }]);
   });
 
@@ -91,6 +112,30 @@ describe('SnipeSection', () => {
     });
   });
 
+  it('parses caps through the money module, including grouped dollars and a single decimal', async () => {
+    const { saved } = app({ settings: defaultSettings() });
+    fireEvent.input(await screen.findByLabelText('Per item (USD)'), { target: { value: '$1,299.50' } });
+    fireEvent.input(screen.getByLabelText('Per day (USD)'), { target: { value: '12.5' } });
+    fireEvent.input(screen.getByLabelText('Open exposure (USD)'), { target: { value: '0' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save caps' }));
+    await waitFor(() => {
+      expect(saved).toHaveLength(1);
+    });
+    expect(saved[0]).toMatchObject({
+      snipe: {
+        caps: { perItemMax: 129950, perDayMax: 1250, openExposureMax: 0, typoMultiplier: 3, typoAbsolute: 2500 },
+      },
+    });
+  });
+
+  it('rejects a three-decimal cap without saving', async () => {
+    const { saved } = app({ settings: defaultSettings() });
+    fireEvent.input(await screen.findByLabelText('Per item (USD)'), { target: { value: '12.999' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save caps' }));
+    await screen.findByText(/Enter each cap in dollars/);
+    expect(saved).toHaveLength(0);
+  });
+
   it('rejects a malformed cap amount without saving', async () => {
     const { saved } = app({ settings: defaultSettings() });
     fireEvent.input(await screen.findByLabelText('Per item (USD)'), { target: { value: 'abc' } });
@@ -121,6 +166,20 @@ describe('SnipeSection', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save timing' }));
     await screen.findByText(/whole number of seconds/);
     expect(saved).toHaveLength(2);
+
+    fireEvent.input(lead, { target: { value: '6' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save timing' }));
+    await waitFor(() => {
+      expect(saved).toHaveLength(3);
+    });
+    expect(saved[2]).toMatchObject({ snipe: { defaultLeadMs: 6000 } });
+
+    fireEvent.input(lead, { target: { value: '15' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save timing' }));
+    await waitFor(() => {
+      expect(saved).toHaveLength(4);
+    });
+    expect(saved[3]).toMatchObject({ snipe: { defaultLeadMs: 15000 } });
   });
 
   it('saves the default fallback', async () => {
@@ -154,6 +213,40 @@ describe('SnipeSection', () => {
     expect(saved[0]).not.toHaveProperty('dryRun');
   });
 
+  it('echoes a non-default dry-run count and cannot roll a newer completedDryRuns back (T-90)', async () => {
+    const loaded = defaultSettings();
+    loaded.snipe.completedDryRuns = 2;
+    loaded.snipe.requiredDryRuns = 9;
+    loaded.dryRun.bidding = true;
+    let stored = structuredClone(loaded);
+    const fake = new FakeMessaging();
+    const saved: Array<Record<string, unknown>> = [];
+    fake.handle('settings.get', () => structuredClone(stored));
+    fake.handle('settings.set', (p) => {
+      saved.push(p);
+      if (p.snipe !== undefined) {
+        // settings.set (T-90) keeps the counter the dry-run job owns.
+        stored = { ...stored, snipe: { ...p.snipe, completedDryRuns: stored.snipe.completedDryRuns } };
+      }
+      return undefined;
+    });
+    render(h(SnipeSection, { client: fake, permissions: new FakePermissions(), firefox: false }));
+    await screen.findByLabelText('Sniping');
+    stored = { ...stored, snipe: { ...stored.snipe, completedDryRuns: 6 } };
+    fireEvent.click(screen.getByLabelText('Sniping'));
+    await waitFor(() => {
+      expect(saved).toHaveLength(1);
+    });
+    const group = saved[0]?.['snipe'] as Record<string, unknown>;
+    expect(group['enabled']).toBe(true);
+    expect(group['completedDryRuns']).toBe(2);
+    expect(group['requiredDryRuns']).toBe(9);
+    expect(saved[0]).not.toHaveProperty('dryRun');
+    expect(stored.snipe.completedDryRuns).toBe(6);
+    expect(stored.snipe.enabled).toBe(true);
+    expect(stored.dryRun.bidding).toBe(true);
+  });
+
   it('says plainly that sniping stays in dry-run mode while bidding is in dry-run (R6)', async () => {
     const s = defaultSettings();
     const { saved } = app({
@@ -169,9 +262,34 @@ describe('SnipeSection', () => {
     expect(snipeGroup['requiredDryRuns']).toBe(5);
   });
 
+  it('does not say snipes stay dry-run when bidding dry-run is off, or when sniping is off', async () => {
+    const live = defaultSettings();
+    live.snipe.enabled = true;
+    live.dryRun.bidding = false;
+    app({ settings: live });
+    await screen.findByLabelText('Sniping');
+    expect(screen.queryByText(/dry-run mode/)).toBeNull();
+    cleanup();
+
+    app({ settings: defaultSettings() });
+    await screen.findByLabelText('Sniping');
+    expect(screen.queryByText(/do not place real bids/)).toBeNull();
+  });
+
   it('links the OS power guidance to docs/COMPANION.md', async () => {
     app({ settings: defaultSettings() });
     const link = await screen.findByRole('link', { name: /OS power guidance/ });
     expect(link.getAttribute('href')).toBe('https://github.com/trashdad/shopbadwill/blob/dev/docs/COMPANION.md');
+  });
+
+  it('builds the section from text, with no HTML sink', () => {
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../src/entrypoints/options/sections/snipe/index.tsx'),
+      'utf8',
+    );
+    const withoutComments = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    expect(withoutComments).not.toMatch(
+      /\b(innerHTML|outerHTML|insertAdjacentHTML|dangerouslySetInnerHTML|createContextualFragment)\b|document\.write/,
+    );
   });
 });

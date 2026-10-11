@@ -184,7 +184,22 @@ describe('T-91 auth-health: ok:false only when the snipe would certainly fail (R
     expect(await make().check(snipe(), '24h')).toEqual({ ok: true });
 
     session.token = { bearer: 'test-bearer', expiresAt: at - 1, buyerId: '1' };
-    expect(await make().check(snipe(), '24h')).toMatchObject({ ok: false, reason: 'expires-before-end' });
+    expect(await make().check(snipe({ id: 's-ms' }), '24h')).toMatchObject({ ok: false, reason: 'expires-before-end' });
+  });
+
+  it('a session expiring exactly at end + 5 min is ok; end + 4 min 59 s fails', async () => {
+    const fiveMin = 5 * 60_000;
+    const fourMin59s = 4 * 60_000 + 59_000;
+    session.stateValue = 'expiring';
+    session.token = { bearer: 'test-bearer', expiresAt: END + fiveMin, buyerId: '1' };
+    expect(await make().check(snipe({ id: 's-exact' }), '24h')).toEqual({ ok: true });
+
+    const secret = 'eyJhbGciOi-secret-bearer-T91';
+    session.token = { bearer: secret, expiresAt: END + fourMin59s, buyerId: '1' };
+    const early = failureOf(await make().check(snipe({ id: 's-4m59' }), '24h'));
+    expect(early.reason).toBe('expires-before-end');
+    expect(early.detail).toContain(SIGN_IN);
+    expect(early.detail).not.toContain(secret);
   });
 
   it('a usable session state with no token fails closed (no login saved)', async () => {
@@ -212,21 +227,36 @@ describe('T-91 auth-health: everything else is ok:true plus a warning (R2)', () 
     expect(notifier.sent[0]?.notification.message).toContain(SIGN_IN);
   });
 
-  it('Google disconnected warns with the reconnect fix action; an unconfigured Google never warns', async () => {
+  it('Google disconnected warns with the reconnect fix action only when the calendar is on; an unconfigured Google never warns', async () => {
+    settings.calendar.enabled = true;
     google = new FakeGoogleAuth({ connected: false, configured: true });
     await make().check(snipe(), '24h');
     await vi.waitFor(() => {
       expect(notifier.sent).toHaveLength(1);
     });
     expect(notifier.sent[0]?.notification.message).toContain('Reconnect Google');
+    expect(notifier.sent[0]?.notification.message).not.toContain('test-bearer');
 
     notifier.sent.length = 0;
     google = new FakeGoogleAuth({ connected: false, configured: false });
-    await make().check(snipe(), '24h');
+    await make().check(snipe({ id: 's-unconfigured' }), '24h');
     expect(notifier.sent).toHaveLength(0);
   });
 
-  it('Google needing interaction warns with the reconnect fix action', async () => {
+  it('a disconnected or interaction-needed Google does not warn when the calendar is off', async () => {
+    settings.calendar.enabled = false;
+    google = new FakeGoogleAuth({ connected: false, configured: true });
+    expect(await make().check(snipe(), '24h')).toEqual({ ok: true });
+    expect(notifier.sent).toHaveLength(0);
+
+    google = new FakeGoogleAuth({ connected: true, configured: true });
+    google.needsInteraction = true;
+    expect(await make().check(snipe({ id: 's-interact' }), '1h')).toEqual({ ok: true });
+    expect(notifier.sent).toHaveLength(0);
+  });
+
+  it('Google needing interaction warns with the reconnect fix action when the calendar is on', async () => {
+    settings.calendar.enabled = true;
     google = new FakeGoogleAuth({ connected: true });
     google.needsInteraction = true;
     await make().check(snipe(), '24h');
@@ -246,15 +276,15 @@ describe('T-91 auth-health: everything else is ok:true plus a warning (R2)', () 
 
     notifier.sent.length = 0;
     healthLast = failingReport(NOW - 25 * HOUR);
-    await make().check(snipe(), '24h');
+    await make().check(snipe({ id: 's-stale-health' }), '24h');
     expect(notifier.sent).toHaveLength(0);
 
     healthLast = { ok: true, checkedAt: NOW - HOUR, configVersion: 'test', checks: [] };
-    await make().check(snipe(), '24h');
+    await make().check(snipe({ id: 's-healthy-report' }), '24h');
     expect(notifier.sent).toHaveLength(0);
   });
 
-  it('keep-awake warnings follow the tier: T1 needs the power and background permissions', async () => {
+  it('keep-awake warnings follow the runner: T1 warns only when the power permission is missing', async () => {
     settings.snipe.tier = 'T1';
     permissions = new FakePermissions({ permissions: ['background'] }); // power missing
     await make().check(snipe(), '24h');
@@ -263,9 +293,17 @@ describe('T-91 auth-health: everything else is ok:true plus a warning (R2)', () 
     });
     expect(notifier.sent[0]?.notification.message).toContain('Turn on Keep awake');
 
+    // Power is granted and background is not. The runner treats that as keep-awake
+    // available, so this check must not warn.
     notifier.sent.length = 0;
+    audit = new FakeAuditLog(clock);
+    permissions = new FakePermissions({ permissions: ['power'] });
+    await make().check(snipe({ id: 's-power-only' }), '24h');
+    expect(notifier.sent).toHaveLength(0);
+
+    audit = new FakeAuditLog(clock);
     permissions = new FakePermissions({ permissions: ['power', 'background'] });
-    await make().check(snipe(), '24h');
+    await make().check(snipe({ id: 's-both' }), '24h');
     expect(notifier.sent).toHaveLength(0);
   });
 
@@ -312,7 +350,14 @@ describe('T-91 auth-health: everything else is ok:true plus a warning (R2)', () 
     await vi.waitFor(() => {
       expect(notifier.sent).toHaveLength(2);
     });
-    expect(audit.kinds.filter((k) => k === AUTH_WARN_KIND)).toHaveLength(2);
+    // A second snipe is not swallowed by the first snipe's dedupe.
+    await make().check(snipe({ id: 's2' }), '24h');
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(3);
+    });
+    await make().check(snipe({ id: 's2' }), '24h');
+    expect(notifier.sent).toHaveLength(3);
+    expect(audit.kinds.filter((k) => k === AUTH_WARN_KIND)).toHaveLength(3);
     expect(notifier.sent[0]?.notification).toMatchObject({
       id: 'sbw:snipe:s1:auth-warn-24h',
       priority: 2,
@@ -334,6 +379,10 @@ describe('T-91 auth-health: quiet hours (R4)', () => {
     expect(authWarnDeferUntil(NOW, end, quiet, 'America/New_York')).toBeNull();
     expect(authWarnDeferUntil(NIGHT, end, undefined, 'America/New_York')).toBeNull();
     expect(authWarnDeferUntil(NIGHT, end, { from: '07:00', to: '07:00' }, 'America/New_York')).toBeNull();
+    // Quiet hours end at 11:00 UTC. Exactly 1 h later is not "more than 1 h", so send now.
+    const quietEnd = Date.UTC(2026, 9, 16, 11, 0, 0);
+    expect(authWarnDeferUntil(NIGHT, quietEnd + HOUR, quiet, 'America/New_York')).toBeNull();
+    expect(authWarnDeferUntil(NIGHT, quietEnd + HOUR + 1, quiet, 'America/New_York')).toBe(quietEnd);
   });
 
   it('the 24 h warning inside quiet hours waits for a deferral alarm, then notifies once at the quiet end', async () => {
@@ -411,19 +460,35 @@ describe('T-91 auth-health: alarm names and the register() seam', () => {
     session.token = { bearer: 'test-bearer', expiresAt: END + 2 * HOUR, buyerId: '1' };
     const s = snipe();
     await repo.set(STORAGE_KEYS.snipes, { [s.id]: s });
-    const ctx = {
-      clock,
-      session,
-      google,
-      health: { last: () => Promise.resolve(healthLast) },
-      keepAwake: { get available() { return keepAwakeAvailable; } },
-      permissions,
-      switches: { settings: () => settings },
-      audit,
-      notifier,
-      alarms,
-      repo,
-    } as unknown as BackgroundContext;
+    const touched: string[] = [];
+    const ctx = new Proxy(
+      {
+        clock,
+        session,
+        google,
+        health: { last: () => Promise.resolve(healthLast) },
+        keepAwake: { get available() { return keepAwakeAvailable; } },
+        permissions,
+        switches: { settings: () => settings },
+        audit,
+        notifier,
+        alarms,
+        repo,
+        api: sgw,
+        http: {},
+        scheduler: {},
+        calendarApi: {},
+        sgwClock: {},
+      } as unknown as BackgroundContext,
+      {
+        get(target, prop, receiver) {
+          if (prop === 'api' || prop === 'http' || prop === 'scheduler' || prop === 'calendarApi' || prop === 'sgwClock') {
+            touched.push(String(prop));
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      },
+    );
 
     const impl = register(ctx);
     expect(typeof impl.check).toBe('function');
@@ -433,20 +498,81 @@ describe('T-91 auth-health: alarm names and the register() seam', () => {
       expect(notifier.sent).toHaveLength(1);
     });
     expect(notifier.sent[0]?.notification.message).toContain('Turn on Keep awake');
-    // R3 / I-39: the fake SGW API saw no call during the checks.
-    expect(sgw.calls).toHaveLength(0);
+    // R3 / I-39: the check never touches the SGW API, HTTP, or the scheduler.
+    expect(sgw.calls).toEqual([]);
+    expect(touched).toEqual([]);
   });
 
-  it('checks make zero SGW requests (I-39) across every condition', async () => {
-    const impl = make();
+  it('checks make zero SGW requests (I-39) across every condition, and the text has no token', async () => {
+    const SECRET = 'eyJhbGciOi-secret-bearer-T91';
+    const network: string[] = [];
+    const watch = <T extends object>(obj: T, blocked: readonly string[]): T =>
+      new Proxy(obj, {
+        get(target, prop, receiver) {
+          const value: unknown = Reflect.get(target, prop, receiver);
+          if (typeof prop === 'string' && blocked.includes(prop) && typeof value === 'function') {
+            return (...args: unknown[]) => {
+              network.push(prop);
+              return (value as (...a: unknown[]) => unknown).apply(target, args);
+            };
+          }
+          return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+    session.token = { bearer: SECRET, expiresAt: END + 2 * HOUR, buyerId: '1' };
     session.stateValue = 'expiring';
-    session.token = { bearer: 'test-bearer', expiresAt: END + 2 * HOUR, buyerId: '1' };
-    google = new FakeGoogleAuth({ connected: false, configured: true });
-    healthLast = failingReport(NOW - HOUR);
-    await impl.check(snipe(), '24h');
-    session.stateValue = 'logged-out';
-    await impl.check(snipe(), '1h');
-    expect(sgw.calls).toHaveLength(0);
-    expect(isoMs(snipe().endTime)).toBe(END);
+    settings.calendar.enabled = true;
+    google = watch(
+      new FakeGoogleAuth({ connected: false, configured: true, account: SECRET }),
+      ['getAccessToken', 'connect', 'disconnect'],
+    );
+    healthLast = {
+      ok: false,
+      checkedAt: NOW - HOUR,
+      configVersion: 'test',
+      checks: [{ name: 'detail-schema', ok: false, detail: SECRET }],
+    };
+    let healthRuns = 0;
+    const fetches: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = ((input: unknown) => {
+      fetches.push(String(input));
+      return Promise.reject(new Error('SGW fetch'));
+    }) as typeof fetch;
+    const health = {
+      last: () => Promise.resolve(healthLast),
+      run: () => {
+        healthRuns += 1;
+        network.push('health.run');
+        return Promise.resolve(healthLast);
+      },
+    };
+    try {
+      const impl = createAuthHealth({
+        ...deps(),
+        session: watch(session, ['refresh', 'observe', 'clear', 'reportRejected']),
+        google,
+        health,
+      });
+      await impl.check(snipe({ title: 'Vintage Pyrex bowl' }), '24h');
+      session.stateValue = 'logged-out';
+      session.token = null;
+      await impl.check(snipe({ id: 's-out' }), '1h');
+      await vi.waitFor(() => {
+        expect(notifier.sent.length).toBeGreaterThan(0);
+      });
+      const text = notifier.sent.map((n) => `${n.notification.title}\n${n.notification.message}`).join('\n');
+      expect(text).not.toContain(SECRET);
+      expect(text).toContain(SIGN_IN);
+      expect(text).toContain('Reconnect Google');
+      expect(JSON.stringify(audit.entries)).not.toContain(SECRET);
+      expect(sgw.calls).toEqual([]);
+      expect(network).toEqual([]);
+      expect(healthRuns).toBe(0);
+      expect(fetches).toEqual([]);
+      expect(google.calls.every((c) => c.method === 'status')).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 });
