@@ -536,3 +536,19 @@ A dry-run snipe has to ask "would live bidding be allowed?" without the dry-run 
 `verdictNow(feature, { ignoreDryRun: true })` skips only that one condition. Kill, storage repair, health (including T-30b sticky scoping and a pending flagged failure) and the session check are unchanged. `writesAllowed` and `view` never pass the option, so a dry run still blocks a real write. The runner uses this verdict for a dry-run snipe's `writesAllowed` and for its window anomaly check, and no longer mirrors `healthFailing`.
 
 **Tests.** `test/integration/background-main.test.ts` ("verdictNow ignoreDryRun") and `test/integration/snipe-runner.test.ts` (a pending `placeBid` failure does not audit "would have placed"; a favorites-only pending failure still does).
+
+## T-90 contract change: optional storage key `sbw:dryRunCounted`
+
+Source: controller ruling on T-90 concern 4.
+
+The dry-run counter keeps the snipe ids it has already counted in `sbw:dryRunCounted`, so a replayed completion event does not increment `settings.snipe.completedDryRuns` twice. The key was module-private. It is now a storage record, the same kind of optional bookkeeping as `sbw:snipeRunner` and `sbw:ntfy`.
+
+`STORAGE_KEYS.dryRunCounted = 'sbw:dryRunCounted'` (area `local`). The schema is module-private (an exported `*Schema` would join the locked example list): `{ version: 1, counted: Record<SnipeId, EpochMs> }`. `counted` maps a snipe id to when it was counted.
+
+Optional and additive. A profile with no record has counted nothing. No migration, and `sbw:meta.schemaVersion` stays 1.
+
+Invalid data parses to the empty record `{ version: 1, counted: {} }` through `parseDryRunCounted` (missing or unreadable). A typed `repo.find` quarantines an invalid record and returns undefined, which is that empty record. The counter does not read the key through `find`. It reads the raw bytes and, when a record is present but invalid, refuses the increment and leaves the bytes in place. Adopting the empty parse would drop the idempotency set, and a replay could count again. Over-counting is the direction that opens the live-bidding gate early.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, the sample, invalid parses to empty) and `test/unit/background/dry-run-counter.test.ts` (refuse on a corrupt record; `repo.find` quarantines).
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.

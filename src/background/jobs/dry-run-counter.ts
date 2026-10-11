@@ -9,39 +9,35 @@
 // kill, and an abort never have that outcome, and `noteDryRunComplete` ignores
 // them even if the seam were to deliver one.
 //
-// Storage. The counted snipe ids live at the module-private key
-// `sbw:dryRunCounted` (storage.local), written through the raw Storage port —
-// not a Repo key, like T-67's `sbw:calendarSync` ("bookkeeping the frozen
-// schema has no room for"). The record is validated with a module-private
-// schema (fail closed) and capped. The settings increment itself goes through
-// the Repo.
+// Storage. The counted snipe ids live at `sbw:dryRunCounted` (storage.local),
+// an optional record (T-90). The counter reads it raw: a typed `repo.find`
+// would quarantine an invalid record, and the next read would look empty.
+// Invalid data parses to empty (`parseDryRunCounted`), but a present invalid
+// record is refused instead of adopted, so the idempotency set cannot reset
+// and a replay cannot count again. The record is capped. The settings
+// increment goes through the Repo.
 //
 // Crash order. The id is recorded BEFORE the settings increment: a crash in
 // between loses the count (under-count), never adds it twice (over-count).
 // An unreadable record refuses to count at all, for the same reason.
-import { z } from 'zod';
-
 import type { Settings } from '../../domain/settings/schema';
 import type { Snipe } from '../../domain/snipe/types';
 import type { Repo } from '../../domain/storage/repo';
-import { STORAGE_KEYS } from '../../domain/storage/schema';
+import {
+  checkedDryRunCounted,
+  readDryRunCounted,
+  STORAGE_KEYS,
+  type DryRunCountedRecord,
+} from '../../domain/storage/schema';
 import type { Clock } from '../../ports/clock';
 import type { Storage } from '../../ports/storage';
 import type { BackgroundContext } from '../context';
 import { snipeSeams } from './snipe-runner';
 
-/** Module-private: not in STORAGE_KEYS, so the Repo neither validates nor quarantines it. */
-export const DRY_RUN_COUNTED_KEY = 'sbw:dryRunCounted';
+/** `sbw:dryRunCounted`. The counter reads it raw so a bad record is not quarantined. */
+export const DRY_RUN_COUNTED_KEY = STORAGE_KEYS.dryRunCounted;
 /** How many counted ids the record keeps (oldest go first); the record stays tiny. */
 export const DRY_RUN_COUNTED_CAP = 4000;
-
-/** Module-private on purpose: an exported `*Schema` would join the locked example list. */
-const CountedRecordSchema = z.object({
-  version: z.literal(1),
-  /** snipe id -> when it was counted (local epoch ms, for the cap's oldest-first pruning). */
-  counted: z.record(z.string().min(1), z.number()),
-});
-type CountedRecord = z.infer<typeof CountedRecordSchema>;
 
 export type CountResult = 'counted' | 'already' | 'refused';
 /** `ignored`: not a completed dry run (live, killed, or aborted). Nothing is stored. */
@@ -54,7 +50,7 @@ export type NoteResult = CountResult | 'ignored';
  * (`killed`), and an abort (skipped, ended, cap-blocked, …) do not.
  */
 export function countsAsCompletedDryRun(snipe: Snipe): boolean {
-  return snipe.dryRun === true && snipe.state === 'resolved' && snipe.outcome === 'dry-run';
+  return snipe.dryRun && snipe.state === 'resolved' && snipe.outcome === 'dry-run';
 }
 
 export interface DryRunCounterDeps {
@@ -67,22 +63,19 @@ export interface DryRunCounterDeps {
   log?: (message: string, error?: unknown) => void;
 }
 
-const emptyRecord = (): CountedRecord => ({ version: 1, counted: {} });
-
-async function readRecord(deps: DryRunCounterDeps): Promise<CountedRecord | 'unreadable'> {
+async function readRecord(deps: DryRunCounterDeps): Promise<DryRunCountedRecord | 'unreadable'> {
   const raw = await deps.storage.get<unknown>(DRY_RUN_COUNTED_KEY);
-  if (raw === undefined) return emptyRecord();
-  const parsed = CountedRecordSchema.safeParse(raw);
-  return parsed.success ? parsed.data : 'unreadable';
+  const read = readDryRunCounted(raw);
+  return read === 'invalid' ? 'unreadable' : read;
 }
 
 /** Appends `id` and prunes the oldest entries beyond the cap. */
-async function writeRecord(deps: DryRunCounterDeps, record: CountedRecord, id: string): Promise<void> {
+async function writeRecord(deps: DryRunCounterDeps, record: DryRunCountedRecord, id: string): Promise<void> {
   const counted = { ...record.counted, [id]: deps.clock.now() };
   const entries = Object.entries(counted).sort((a, b) => a[1] - b[1]);
-  const kept: CountedRecord['counted'] = {};
+  const kept: DryRunCountedRecord['counted'] = {};
   for (const [k, at] of entries.slice(-DRY_RUN_COUNTED_CAP)) kept[k] = at;
-  await deps.storage.set({ [DRY_RUN_COUNTED_KEY]: CountedRecordSchema.parse({ version: 1, counted: kept }) });
+  await deps.storage.set({ [DRY_RUN_COUNTED_KEY]: checkedDryRunCounted({ version: 1, counted: kept }) });
 }
 
 /**
@@ -133,9 +126,8 @@ export function register(ctx: BackgroundContext): void {
     },
   };
   snipeSeams(ctx).onDryRunComplete((snipe) => {
-    // Return the promise: the runner awaits the listener, so the increment
-    // is stored before the worker moves on. A thrown count is logged here.
-    return noteDryRunComplete(deps, snipe).catch((e: unknown) => {
+    // The seam's callback type is void, so the promise is not returned into it.
+    void noteDryRunComplete(deps, snipe).catch((e: unknown) => {
       deps.log?.(`dry-run counter: counting the completed dry run ${snipe.id} failed`, e);
     });
   });

@@ -9,7 +9,7 @@ import { defaultSettings } from '../../../src/domain/settings/defaults';
 import type { Settings } from '../../../src/domain/settings/schema';
 import type { Snipe, SnipeOutcome } from '../../../src/domain/snipe/types';
 import { Repo } from '../../../src/domain/storage/repo';
-import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
+import { parseDryRunCounted, STORAGE_KEYS } from '../../../src/domain/storage/schema';
 import { FakeClock } from '../../fakes/ports/fake-clock';
 import { FakeStorageAreas } from '../../fakes/ports/fake-storage';
 
@@ -110,8 +110,20 @@ describe('countDryRun (R1)', () => {
 
   it('an unreadable counted record refuses to count (fail closed: never over-count)', async () => {
     await storage.local.set({ [DRY_RUN_COUNTED_KEY]: { version: 2, nope: true } });
+    // The public parse is empty, but the counter must not adopt it: that would
+    // drop the idempotency set and let a replay count again.
+    expect(parseDryRunCounted({ version: 2, nope: true })).toEqual({ version: 1, counted: {} });
     expect(await countDryRun(deps, 's1')).toBe('refused');
     expect(await completed()).toBe(0);
+    expect(await storage.local.get(DRY_RUN_COUNTED_KEY)).toMatchObject({ version: 2, nope: true });
+  });
+
+  it('a typed repo read quarantines an invalid record, which then parses as empty', async () => {
+    await storage.local.set({ [STORAGE_KEYS.dryRunCounted]: { junk: true } });
+    expect(await repo.find(STORAGE_KEYS.dryRunCounted)).toBeUndefined();
+    expect(parseDryRunCounted(undefined)).toEqual({ version: 1, counted: {} });
+    const quarantined = await storage.local.get<unknown>(`sbw:quarantine:${STORAGE_KEYS.dryRunCounted}`);
+    expect(quarantined).toMatchObject({ value: { junk: true } });
   });
 
   it('caps the counted record, dropping the oldest ids', async () => {

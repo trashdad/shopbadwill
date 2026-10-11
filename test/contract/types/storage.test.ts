@@ -13,6 +13,7 @@ import {
   REQUEST_SCHEDULER_STATE_VERSION,
   RequestBudgetSchema,
   RequestSchedulerStateSchema,
+  parseDryRunCounted,
   STORAGE_KEYS,
   STORAGE_LIMITS,
   STORAGE_RECORDS,
@@ -51,6 +52,7 @@ const LOCAL_KEYS = [
   'sbw:healthReport',
   'sbw:healthProbe',
   'sbw:snipeRunner',
+  'sbw:dryRunCounted',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -87,6 +89,7 @@ const SAMPLE_VALUES: Record<string, unknown> = {
     sticky: [{ endpoint: 'favorites', at: 1791400000000, detail: 'bad rows' }],
   },
   'sbw:snipeRunner': example('SnipeRunnerRecord'),
+  'sbw:dryRunCounted': { version: 1, counted: { 'snp-1': 1791400000000 } },
 };
 
 describe('storage schema v1', () => {
@@ -159,6 +162,24 @@ describe('storage schema v1', () => {
     const credentials = { ...(example('GoogleCredentials') as object), calendarId: 'example@group.calendar.google.com' };
     expect(GoogleCredentialsSchema.parse(credentials)).not.toHaveProperty('calendarId');
     expect(CalendarStateSchema.parse(example('CalendarState'))).toHaveProperty('calendarId');
+  });
+
+  it('registers the optional dry-run counted record; invalid data parses to empty (T-90)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.dryRunCounted];
+    expect(spec.area).toBe('local');
+    expect(spec.schema.safeParse({ version: 1, counted: {} }).success).toBe(true);
+    expect(spec.schema.safeParse({ version: 1, counted: { 'snp-1': 1791400000000 } }).success).toBe(true);
+    // The strict schema still rejects, so a typed repo read can quarantine.
+    expect(spec.schema.safeParse({ version: 2, counted: {} }).success).toBe(false);
+    expect(spec.schema.safeParse({ version: 1, counted: { 'snp-1': -1 } }).success).toBe(false);
+    // Missing or invalid parses to the empty record. No migration; schemaVersion stays 1.
+    expect(parseDryRunCounted(undefined)).toEqual({ version: 1, counted: {} });
+    expect(parseDryRunCounted({ version: 2, nope: true })).toEqual({ version: 1, counted: {} });
+    expect(parseDryRunCounted({ junk: true })).toEqual({ version: 1, counted: {} });
+    expect(parseDryRunCounted({ version: 1, counted: { 'snp-1': 1791400000000 } })).toEqual({
+      version: 1,
+      counted: { 'snp-1': 1791400000000 },
+    });
   });
 
   it('registers the optional snipe-runner record and rejects one that cannot be replayed (T-84)', () => {
