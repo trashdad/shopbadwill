@@ -61,7 +61,7 @@ function Rows(props: { snipes: readonly Snipe[] }): VNode {
     .map((s) => ({ snipe: s, m: timingMeasurements(s) }));
   if (rows.length === 0) return <p class="sbw-muted">No snipes have run yet.</p>;
   return (
-    <table>
+    <table aria-label="Per-snipe timing">
       <thead>
         <tr>
           <th scope="col">Snipe</th>

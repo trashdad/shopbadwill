@@ -171,6 +171,24 @@ describe('timing section', () => {
     expect(current.snipe.caps.perItemMax).toBe(2500);
   });
 
+  it('the per-snipe table has an accessible name and header cells', async () => {
+    const m = settingsClient(defaultSettings());
+    mount(m);
+    const table = await screen.findByRole('table', { name: 'Per-snipe timing' });
+    expect(table).toBeTruthy();
+    expect(screen.getAllByRole('columnheader').map((c) => c.textContent)).toEqual([
+      'Snipe',
+      'Kind',
+      'Offset',
+      'RTT',
+      'Fire error',
+      'Alarm delay',
+      'Latency',
+      'On time',
+    ]);
+    expect(screen.getAllByRole('rowheader')).toHaveLength(5);
+  });
+
   it('no recommendation or one equal to the current default leaves the button off (no write possible)', async () => {
     // Recommendation equals the current default.
     const s = defaultSettings();
