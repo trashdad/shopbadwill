@@ -13,6 +13,7 @@ import {
   REQUEST_SCHEDULER_STATE_VERSION,
   RequestBudgetSchema,
   RequestSchedulerStateSchema,
+  parseCompanionWakes,
   parseDryRunCounted,
   STORAGE_KEYS,
   STORAGE_LIMITS,
@@ -56,6 +57,7 @@ const LOCAL_KEYS = [
   'sbw:healthProbe',
   'sbw:snipeRunner',
   'sbw:dryRunCounted',
+  'sbw:companionWakes',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -109,6 +111,8 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   },
   'sbw:snipeRunner': example('SnipeRunnerRecord'),
   'sbw:dryRunCounted': { version: 1, counted: { 'snp-1': 1791400000000 } },
+  // T-111: the wakes the T2 companion may hold (snipe id -> wake), kept 15 days for the awake history.
+  'sbw:companionWakes': { version: 1, wakes: { 'snp-1': { wakeAt: 1791400000000, state: 'confirmed', triedAt: 1791390000000 } } },
 };
 
 describe('storage schema v1', () => {
@@ -199,6 +203,21 @@ describe('storage schema v1', () => {
       version: 1,
       counted: { 'snp-1': 1791400000000 },
     });
+  });
+
+  it('registers the optional companion wake record; invalid data parses to empty (T-111)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.companionWakes];
+    expect(STORAGE_KEYS.companionWakes).toBe('sbw:companionWakes');
+    expect(spec.area).toBe('local');
+    const entry = { wakeAt: 1791400000000, state: 'asked', triedAt: 1791390000000, cancelTriedAt: 1791395000000 };
+    expect(spec.schema.safeParse({ version: 1, wakes: { 'snp-1': entry } }).success).toBe(true);
+    expect(spec.schema.safeParse({ version: 2, wakes: {} }).success).toBe(false);
+    expect(spec.schema.safeParse({ version: 1, wakes: { 'snp-1': { ...entry, state: 'maybe' } } }).success).toBe(false);
+    expect(spec.schema.safeParse({ version: 1, wakes: { 'snp-1': { wakeAt: 1791400000000 } } }).success).toBe(false);
+    // Missing or invalid parses to the empty record. No migration; schemaVersion stays 1.
+    expect(parseCompanionWakes(undefined)).toEqual({ version: 1, wakes: {} });
+    expect(parseCompanionWakes({ version: 1, wakes: 'x' })).toEqual({ version: 1, wakes: {} });
+    expect(parseCompanionWakes({ version: 1, wakes: { 'snp-1': entry } })).toEqual({ version: 1, wakes: { 'snp-1': entry } });
   });
 
   it('registers the optional quote salt: 64 lowercase hex, nothing else (T-57 final check)', () => {

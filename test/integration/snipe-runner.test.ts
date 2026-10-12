@@ -29,6 +29,7 @@ import {
 } from '../../src/adapters/browser/snipe-host';
 import type { BackgroundContext, BackgroundModule, RuntimePort } from '../../src/background/context';
 import { HANDLER_MODULES } from '../../src/background/handlers/index';
+import { COMPANION_WAKE_MARGIN_MS } from '../../src/background/jobs/companion-sync';
 import { JOB_MODULES } from '../../src/background/jobs/index';
 import {
   getSnipeRunner,
@@ -1574,6 +1575,104 @@ describe('lanes, preflight and health alarms', () => {
     const { w } = await boot(shared);
     await arm(w);
     await runTo(shared, END + 2 * MIN);
+    expect(shared.keepAwake.holds).toEqual([]);
+  });
+
+  // T-111b: the companion is not under test here (companion.test.ts covers it); without a profile its
+  // preflight hook would fail the snipe as keep-awake before the wake.
+  const noCompanion = (): Record<string, BackgroundModule> => ({ './companion-sync.ts': { register: () => undefined } });
+
+  /** T-111's companion wake: the runner's T-5 min wake minus the margin (about T-8 min). */
+  const companionWake = (): number => wakeAt() - COMPANION_WAKE_MARGIN_MS;
+
+  it('KeepAwake under tier T2 (power granted) is held from the companion wake (T-8 min) to the end; the preflight sees it not required', async () => {
+    const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T2' }) });
+    await shared.permissions.request({ permissions: ['power'] });
+    // The stored state each time the runner takes the hold.
+    const heldIn: string[] = [];
+    const hold = shared.keepAwake.hold.bind(shared.keepAwake);
+    vi.spyOn(shared.keepAwake, 'hold').mockImplementation((reason) => {
+      heldIn.push(stored(shared).state);
+      return hold(reason);
+    });
+    const { w } = await boot(shared, { jobModules: noCompanion() });
+    await arm(w);
+    await flush();
+    // Not at arm: a hold from arm would keep the computer from sleeping at all.
+    expect(shared.keepAwake.holds).toEqual([]);
+    // Nor through the T-15 min preflight (it passes, keep-awake not required), up to the companion wake.
+    await runTo(shared, companionWake() - 5 * SEC);
+    expect(stored(shared).state).toBe('armed');
+    expect(kinds(shared)).toContain('snipe.preflight');
+    expect(kinds(shared)).not.toContain('snipe.preflight-failed');
+    expect(shared.keepAwake.holds).toEqual([]);
+    // The companion wake takes it, the snipe still armed (this browser kept running: its alarm drives the step).
+    await runTo(shared, companionWake() + ALARM_DELAY + 5 * SEC);
+    expect(stored(shared).state).toBe('armed');
+    expect(shared.keepAwake.isHeld).toBe(true);
+    expect(heldIn).toEqual(['armed']);
+    // Still held at the T-5 min wake ...
+    await runTo(shared, wakeAt() + ALARM_DELAY + SEC);
+    expect(stored(shared).state).toBe('waking');
+    expect(shared.keepAwake.isHeld).toBe(true);
+    // ... and at the fire.
+    await runTo(shared, FIRE_LOCAL + 2 * SEC);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(shared.keepAwake.isHeld).toBe(true);
+    expect(shared.keepAwake.releases).toBe(0);
+    // The resolve releases it.
+    await runTo(shared, END + 2 * MIN);
+    const s = stored(shared);
+    expect(s.state).toBe('resolved');
+    expect(transitions(s)).toEqual(['draft>armed', 'armed>waking', 'waking>verified', 'verified>firing', 'firing>sent', 'sent>sent', 'sent>resolved']);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(shared.keepAwake.holds).toEqual(['snipe s1']);
+    expect(shared.keepAwake.isHeld).toBe(false);
+    expect(shared.keepAwake.releases).toBe(1);
+  });
+
+  it('KeepAwake under tier T2: the browser the companion starts at T-8 min holds before the late preflight, which sees it held', async () => {
+    const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T2' }) });
+    await shared.permissions.request({ permissions: ['power'] });
+    const first = await boot(shared, { jobModules: noCompanion() });
+    await arm(first.w);
+    // The computer sleeps before the T-15 min preflight: no worker until the companion wakes it.
+    await runTo(shared, END - 20 * MIN);
+    first.w.kill();
+    await runTo(shared, companionWake());
+    expect(shared.keepAwake.holds).toEqual([]);
+    expect(kinds(shared)).not.toContain('snipe.preflight');
+    // The companion's browser start: the new worker holds, then runs the missed preflight, which passes.
+    await boot(shared, { jobModules: noCompanion() });
+    await runTo(shared, companionWake() + 5 * SEC);
+    expect(stored(shared).state).toBe('armed');
+    expect(shared.keepAwake.isHeld).toBe(true);
+    expect(kinds(shared)).toContain('snipe.preflight');
+    expect(kinds(shared)).not.toContain('snipe.preflight-failed');
+    await runTo(shared, END + 2 * MIN);
+    const s = stored(shared);
+    expect(s.state).toBe('resolved');
+    expect(transitions(s)).toContain('armed>waking');
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(shared.keepAwake.holds).toEqual(['snipe s1']);
+    expect(shared.keepAwake.isHeld).toBe(false);
+    expect(shared.keepAwake.releases).toBe(1);
+  });
+
+  it.each([
+    ['without `power`', { power: false, available: true }],
+    ['without the power API (Firefox)', { power: true, available: false }],
+  ])('KeepAwake under tier T2 %s is never held, and the snipe still fires', async (_name, opts) => {
+    const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T2' }) });
+    shared.keepAwake = new FakeKeepAwake({ available: opts.available });
+    if (opts.power) await shared.permissions.request({ permissions: ['power'] });
+    const { w } = await boot(shared, { jobModules: noCompanion() });
+    await arm(w);
+    await runTo(shared, END + 2 * MIN);
+    const s = stored(shared);
+    expect(transitions(s)).toContain('armed>waking');
+    expect(s.state).toBe('resolved');
+    expect(shared.sgw.placeBids).toHaveLength(1);
     expect(shared.keepAwake.holds).toEqual([]);
   });
 });
