@@ -277,13 +277,27 @@ async function anchorClock(page: Page, at = ANCHOR_MS): Promise<void> {
   expect(value.now).toBe(at);
 }
 
-/** One fake-time step plus one tick alarm, waiting until the run moved and the tick settled. */
-async function stepTick(page: Page, before: JobRun | null): Promise<JobRun> {
-  const adv = await callHook(page, 'sbw:test:advance', { ms: TICK_STEP_MS });
+/** Moves the fake clock by `ms` (firing due alarms and Clock timers); returns the new now and the pending Clock timer deadlines. */
+async function advance(page: Page, ms: number): Promise<{ now: number; timers: number[] }> {
+  const adv = await callHook(page, 'sbw:test:advance', { ms });
   expect(adv.ok, adv.error ?? 'sbw:test:advance failed').toBe(true);
+  return adv.value as { now: number; timers: number[] };
+}
+
+async function fireTick(page: Page): Promise<void> {
   const fire = await callHook(page, 'sbw:test:fireAlarm', { name: 'sbw:tick' });
   expect(fire.ok, fire.error ?? 'sbw:test:fireAlarm failed').toBe(true);
+}
 
+/** One fake-time step plus one tick alarm, waiting until the run moved and the tick settled. */
+async function stepTick(page: Page, before: JobRun | null): Promise<JobRun> {
+  await advance(page, TICK_STEP_MS);
+  await fireTick(page);
+  return awaitTick(page, before);
+}
+
+/** Waits until the tick moved the run on and settled. */
+async function awaitTick(page: Page, before: JobRun | null): Promise<JobRun> {
   // The tick plans the run (first tick) and/or executes exactly one step.
   await expect
     .poll(
@@ -426,13 +440,50 @@ test('pacing: one SGW request per tick, at least 120 s of fake time apart', asyn
 
     let run: JobRun | null = null;
     let seen = 0;
-    await test.step('each tick runs one step and sends at most one request', async () => {
-      for (let i = 0; i < 3; i++) {
-        run = await stepTick(options, run);
-        const entries = await backgroundLog();
-        expect(entries.length - seen, `tick ${String(i)} sent more than one request`).toBeLessThanOrEqual(1);
-        seen = entries.length;
-      }
+    const atMostOneRequest = async (tick: string): Promise<void> => {
+      const entries = await backgroundLog();
+      expect(entries.length - seen, `tick ${tick} sent more than one request`).toBeLessThanOrEqual(1);
+      seen = entries.length;
+    };
+
+    await test.step('the first tick searches page 1', async () => {
+      run = await stepTick(options, run);
+      await atMostOneRequest('1');
+      expect(seen).toBe(1);
+    });
+
+    await test.step('a tick only 30 s later waits out the 120 s gap before page 2', async () => {
+      // The spacing below must come from the RequestScheduler, not from the
+      // harness's step size: fire this tick early, wait until the scheduler
+      // holds page 2 on its gap timer (or, if pacing broke, already sent it),
+      // then fast-forward past the gap.
+      const [first] = await backgroundLog();
+      const sentAt = first?.fakeNowMs ?? 0;
+      const firedAt = (await advance(options, 30_000)).now;
+      expect(firedAt - sentAt).toBeLessThan(120_000);
+      await fireTick(options);
+      await expect
+        .poll(
+          async () => {
+            if ((await backgroundLog()).length > 1) return 'sent';
+            const { timers } = await advance(options, 0);
+            return timers.some((t) => t >= sentAt + 120_000 && t <= sentAt + TICK_STEP_MS + 60_000) ? 'held' : 'pending';
+          },
+          { message: 'page 2 was neither held on a gap timer nor sent', timeout: 15_000 },
+        )
+        .not.toBe('pending');
+      await advance(options, TICK_STEP_MS);
+      run = await awaitTick(options, run);
+      await atMostOneRequest('2');
+      const entries = await backgroundLog();
+      expect(entries).toHaveLength(2);
+      expect(entries[1]?.fakeNowMs ?? 0, 'page 2 went out when the early tick fired').toBeGreaterThan(firedAt);
+      expectFakeSpacing(entries);
+    });
+
+    await test.step('the last tick reads the favorites list (no session: no request)', async () => {
+      run = await stepTick(options, run);
+      await atMostOneRequest('3');
     });
 
     await test.step('the run searched both pages and then read the favorites list', () => {

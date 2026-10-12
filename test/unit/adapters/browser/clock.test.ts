@@ -4,7 +4,13 @@
 // existing test-hooks tests do.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { advanceTestClock, BrowserClock, setTestClockTo } from '../../../../src/adapters/browser/clock';
+import {
+  advanceTestClock,
+  BrowserClock,
+  fireDueTestTimers,
+  pendingTestTimers,
+  setTestClockTo,
+} from '../../../../src/adapters/browser/clock';
 
 const T = 1_800_000_000_000;
 const MIN = 60_000;
@@ -59,5 +65,44 @@ describe('BrowserClock time travel (SBW_TEST)', () => {
     expect(() => advanceTestClock(Number.NaN)).toThrow(/non-negative/);
     expect(() => setTestClockTo(Number.POSITIVE_INFINITY)).toThrow(/finite/);
     expect(new BrowserClock().now()).toBe(T);
+  });
+
+  it('fast-forwards Clock timers: one whose fake deadline passed fires on advance, once', () => {
+    vi.stubEnv('SBW_TEST', '1');
+    pinWallClock();
+    setTestClockTo(T);
+    const c = new BrowserClock();
+    const due = vi.fn();
+    const later = vi.fn();
+    c.setTimeout(due, 2 * MIN);
+    const laterId = c.setTimeout(later, 10 * MIN);
+    expect(pendingTestTimers()).toEqual([T + 2 * MIN, T + 10 * MIN]);
+    expect(fireDueTestTimers(advanceTestClock(1 * MIN))).toBe(0);
+    expect(due).not.toHaveBeenCalled();
+    expect(fireDueTestTimers(advanceTestClock(2 * MIN))).toBe(1);
+    expect(due).toHaveBeenCalledTimes(1);
+    expect(fireDueTestTimers(advanceTestClock(1 * MIN))).toBe(0);
+    expect(due).toHaveBeenCalledTimes(1);
+    expect(pendingTestTimers()).toEqual([T + 10 * MIN]);
+    c.clearTimeout(laterId);
+    expect(pendingTestTimers()).toEqual([]);
+    expect(fireDueTestTimers(advanceTestClock(60 * MIN))).toBe(0);
+    expect(later).not.toHaveBeenCalled();
+  });
+
+  it('a fast-forwarded timer still fires on real time when nobody advances', async () => {
+    vi.stubEnv('SBW_TEST', '1');
+    const c = new BrowserClock();
+    await new Promise<void>((resolve) => c.setTimeout(resolve, 1));
+    expect(pendingTestTimers()).toEqual([]);
+  });
+
+  it('production builds track no timers', () => {
+    vi.stubEnv('SBW_TEST', '');
+    const c = new BrowserClock();
+    const id = c.setTimeout(() => undefined, 10 * MIN);
+    expect(pendingTestTimers()).toEqual([]);
+    expect(fireDueTestTimers(Number.MAX_SAFE_INTEGER)).toBe(0);
+    c.clearTimeout(id);
   });
 });

@@ -4,8 +4,10 @@
 // registry in src/adapters/browser/alarms.ts). Payload: `{ ms }` to advance
 // by that many milliseconds and/or `{ to }` to set the fake now to an
 // absolute instant (a restart loses the offset; the harness re-anchors with
-// `to` instead of re-adding). The reply is `{ now, fired }` (the new fake
-// now, and the alarm names fired, in order).
+// `to` instead of re-adding). It also fires the Clock timers whose fake
+// deadline passed (e.g. a RequestScheduler gap wait). The reply is
+// `{ now, fired, timers }`: the new fake now, the alarm names fired (in
+// order), and the fake deadlines of the Clock timers still pending.
 //
 // It also stamps every background fetch with `x-sbw-fake-now` (the fake now
 // at send time): the fake SGW server records the header in `/__log`, which is
@@ -14,7 +16,13 @@
 // contains none of this (`pnpm check:prod-bundle`).
 import { z } from 'zod';
 
-import { advanceTestClock, setTestClockTo, testClockNow } from '../adapters/browser/clock';
+import {
+  advanceTestClock,
+  fireDueTestTimers,
+  pendingTestTimers,
+  setTestClockTo,
+  testClockNow,
+} from '../adapters/browser/clock';
 import { fireDueTestAlarms } from '../adapters/browser/alarms';
 import type { TestHookContext } from './index';
 
@@ -64,6 +72,7 @@ export function install(ctx: TestHookContext): void {
     }
     const now = parsed.data.to !== undefined ? setTestClockTo(parsed.data.to) : advanceTestClock(parsed.data.ms ?? 0);
     const fired = fireDueTestAlarms(now).map((a) => a.name);
-    return { now, fired };
+    fireDueTestTimers(now);
+    return { now, fired, timers: pendingTestTimers() };
   });
 }

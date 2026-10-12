@@ -38,7 +38,7 @@ describe('sbw:test:advance', () => {
     const browserStub = installAdvance();
     const port = browserStub.connect('sbw:test:advance');
     port.post({ payload: { ms: 5 * MIN } });
-    expect(await port.nextReply()).toEqual({ ok: true, value: { now: T + 5 * MIN, fired: [] } });
+    expect(await port.nextReply()).toEqual({ ok: true, value: { now: T + 5 * MIN, fired: [], timers: [] } });
     expect(new BrowserClock().now()).toBe(T + 5 * MIN);
   });
 
@@ -49,7 +49,7 @@ describe('sbw:test:advance', () => {
     const browserStub = installAdvance();
     const port = browserStub.connect('sbw:test:advance');
     port.post({ payload: { to: T - 3 * MIN } });
-    expect(await port.nextReply()).toEqual({ ok: true, value: { now: T - 3 * MIN, fired: [] } });
+    expect(await port.nextReply()).toEqual({ ok: true, value: { now: T - 3 * MIN, fired: [], timers: [] } });
     expect(new BrowserClock().now()).toBe(T - 3 * MIN);
   });
 
@@ -64,8 +64,28 @@ describe('sbw:test:advance', () => {
     const browserStub = installAdvance();
     const port = browserStub.connect('sbw:test:advance');
     port.post({ payload: { ms: 2.5 * MIN } });
-    expect(await port.nextReply()).toEqual({ ok: true, value: { now: T + 2.5 * MIN, fired: ['sbw:tick'] } });
+    expect(await port.nextReply()).toEqual({ ok: true, value: { now: T + 2.5 * MIN, fired: ['sbw:tick'], timers: [] } });
     expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires the Clock timers that become due and lists the pending deadlines', async () => {
+    vi.stubEnv('SBW_TEST', '1');
+    pinWallClock();
+    setTestClockTo(T);
+    const c = new BrowserClock();
+    const gap = vi.fn();
+    const later = c.setTimeout(() => undefined, 30 * MIN);
+    c.setTimeout(gap, 2 * MIN);
+    const browserStub = installAdvance();
+    const peek = browserStub.connect('sbw:test:advance');
+    peek.post({ payload: { ms: 0 } });
+    // (`fired` lists alarms; an earlier test's periodic alarm may still be registered.)
+    expect(await peek.nextReply()).toMatchObject({ ok: true, value: { now: T, timers: [T + 2 * MIN, T + 30 * MIN] } });
+    const port = browserStub.connect('sbw:test:advance');
+    port.post({ payload: { ms: 3 * MIN } });
+    expect(await port.nextReply()).toMatchObject({ ok: true, value: { now: T + 3 * MIN, timers: [T + 30 * MIN] } });
+    expect(gap).toHaveBeenCalledTimes(1);
+    c.clearTimeout(later);
   });
 
   it('refuses a payload with neither ms nor to', async () => {
