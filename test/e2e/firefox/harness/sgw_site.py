@@ -11,6 +11,13 @@ real shopgoodwill.com, or any other internet host, during a test. Firefox does
 not proxy loopback, so the fake SGW buyerapi (``pnpm fake:sgw`` on 127.0.0.1)
 stays directly reachable.
 
+Routes (T-40): :meth:`SgwSite.route` makes the proxy answer an SGW host (the
+fixture host or one of its subdomains, such as ``buyerapi.shopgoodwill.com``)
+and/or a path prefix from a local fake server instead of the fixture files. The
+upstream is always ``127.0.0.1`` (a route takes a port, never a host), so a
+routed request is relayed to a process on this machine and never beyond it;
+every host without a route is still refused.
+
 The extension's manifest is exactly the production one plus the test build's
 ``http://127.0.0.1/*`` host: the content script matches the real hostname.
 """
@@ -18,6 +25,7 @@ The extension's manifest is exactly the production one plus the test build's
 from __future__ import annotations
 
 import datetime
+import http.client
 import mimetypes
 import ssl
 import tempfile
@@ -40,6 +48,13 @@ SOCKET_TIMEOUT_S = 30
 # In the body of every 403 the proxy sends, so the sandbox canary can tell the
 # proxy's refusal from a page served by anything else.
 REFUSAL_MARKER = "sbw-e2e-proxy-refused"
+# The only address a route relays to.
+LOOPBACK = "127.0.0.1"
+# Not relayed in either direction (RFC 9110 §7.6.1); the body is re-framed with Content-Length.
+_HOP_BY_HOP = frozenset(
+    ("connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization",
+     "te", "trailer", "transfer-encoding", "upgrade", "content-length")
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +65,15 @@ class SiteRequest:
     host: str
     path: str
     status: int
+
+
+@dataclass(frozen=True)
+class Route:
+    """``https://{host}{path_prefix}*`` is answered by the fake server on ``127.0.0.1:{port}``."""
+
+    host: str
+    path_prefix: str
+    port: int
 
 
 def _tls_context(hostname: str) -> ssl.SSLContext:
@@ -105,8 +129,39 @@ class SgwSite:
         self.requests: list[SiteRequest] = []
         self.refused: list[str] = []
         self._lock = threading.Lock()
-        self._tls = _tls_context(host)
+        self._tls = {host: _tls_context(host)}
+        self._routes: list[Route] = []
         self._server: ThreadingHTTPServer | None = None
+
+    def route(self, host: str, port: int, path_prefix: str = "/") -> Route:
+        """Answers ``https://{host}{path_prefix}*`` from the fake server on 127.0.0.1:``port``.
+
+        ``host`` must be the fixture host or one of its subdomains. The longest
+        matching prefix wins; other paths of the fixture host stay static files.
+        """
+        if host != self.host and not host.endswith(f".{self.host}"):
+            raise ValueError(f"a route serves only {self.host} and its subdomains, not {host!r}")
+        if not path_prefix.startswith("/"):
+            raise ValueError(f"a route's path prefix starts with '/', not {path_prefix!r}")
+        if not isinstance(port, int) or not 0 < port < 65536:
+            raise ValueError(f"not a port: {port!r}")
+        route = Route(host, path_prefix, port)
+        with self._lock:
+            if host not in self._tls:
+                self._tls[host] = _tls_context(host)
+            self._routes.append(route)
+        return route
+
+    def _tls_for(self, host: str) -> ssl.SSLContext | None:
+        """The TLS context for a host this proxy serves (the fixture host or a routed one), else None."""
+        with self._lock:
+            return self._tls.get(host)
+
+    def _route_for(self, host: str, path: str) -> Route | None:
+        url_path = urlsplit(path).path
+        with self._lock:
+            matches = [r for r in self._routes if r.host == host and url_path.startswith(r.path_prefix)]
+        return max(matches, key=lambda r: len(r.path_prefix), default=None)
 
     @property
     def proxy_port(self) -> int:
@@ -155,17 +210,18 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     def do_CONNECT(self) -> None:  # noqa: N802 (http.server naming)
         host, _, port = self.path.partition(":")
-        if host != self.site.host or port not in ("", "443"):
+        context = self.site._tls_for(host)
+        if context is None or port not in ("", "443"):
             self._forbid(self.path)
             return
         self.send_response(200, "Connection Established")
         self.end_headers()
         self.close_connection = True
         try:
-            tls = self.site._tls.wrap_socket(self.connection, server_side=True)
+            tls = context.wrap_socket(self.connection, server_side=True)
         except (ssl.SSLError, OSError):
             return  # the browser gave up on the handshake
-        _FixtureHandler(tls, self.client_address, self.server, self.site)
+        _FixtureHandler(tls, self.client_address, self.server, self.site, host)
 
     def _refuse_plain(self) -> None:
         self._forbid(f"{self.command} {self.path}")
@@ -185,19 +241,63 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
-    """The site side, inside the TLS tunnel: static files from the fixture root."""
+    """The site side, inside the TLS tunnel: a route's fake server, else static files from the fixture root."""
 
     protocol_version = "HTTP/1.1"
 
-    def __init__(self, request: socket, client_address: Any, server: Any, site: SgwSite) -> None:
+    def __init__(self, request: socket, client_address: Any, server: Any, site: SgwSite, host: str) -> None:
         self.site = site
+        self.host = host
         super().__init__(request, client_address, server)
 
-    def do_GET(self) -> None:  # noqa: N802
-        self._serve(send_body=True)
+    def _dispatch(self) -> None:
+        route = self.site._route_for(self.host, self.path)
+        if route is not None:
+            self._relay(route)
+        elif self.host == self.site.host and self.command in ("GET", "HEAD"):
+            self._serve(send_body=self.command == "GET")
+        else:
+            self._reply(404 if self.command in ("GET", "HEAD") else 405, b"Not served by the fixture SGW site\n")
 
-    def do_HEAD(self) -> None:  # noqa: N802
-        self._serve(send_body=False)
+    do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _dispatch
+
+    def _relay(self, route: Route) -> None:
+        """Relays this request to the route's fake server on loopback and its reply back."""
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            self.close_connection = True  # the unread chunked body would desync the connection
+            self._reply(501, b"The E2E relay takes request bodies with a Content-Length only\n")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP_BY_HOP}
+        upstream = http.client.HTTPConnection(LOOPBACK, route.port, timeout=SOCKET_TIMEOUT_S)
+        try:
+            upstream.request(self.command, self.path, body=body, headers=headers)
+            response = upstream.getresponse()
+            data = response.read()
+        except (OSError, http.client.HTTPException) as error:
+            self._reply(502, f"The fake server for {route.host}{route.path_prefix} did not answer: {error}\n".encode())
+            return
+        finally:
+            upstream.close()
+        self.site._record(SiteRequest(self.command, self.host, urlsplit(self.path).path, response.status))
+        self.send_response(response.status, response.reason)
+        for name, value in response.getheaders():
+            if name.lower() not in _HOP_BY_HOP:
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _reply(self, status: int, body: bytes) -> None:
+        self.site._record(SiteRequest(self.command, self.host, urlsplit(self.path).path, status))
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _serve(self, send_body: bool) -> None:
         file = _resolve(self.site.root, self.path)

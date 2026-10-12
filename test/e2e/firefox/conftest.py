@@ -4,7 +4,11 @@
 * ``firefox``: a WebDriver with the test build installed (one fresh profile per spec file).
   Each new browser first passes the sandbox canary (harness/firefox.py:check_sandbox);
   if it fails, the whole run stops with exit code 3.
-* ``extension``: the installed build: ``url(path)``, ``call_hook(name, payload)``.
+* ``extension``: the installed build: ``url(path)``, ``call_hook(name, payload)``,
+  ``send_message(type, payload)``, ``storage_set(items)``.
+* ``fake_sgw`` / ``fake_site``: the fake buyerapi and the fake search page
+  (harness/fake_servers.py) on free loopback ports, started only for the specs
+  that ask for them (one each per run).
 
 On failure, a screenshot and the page source go to ``test-results/firefox/``.
 """
@@ -20,6 +24,7 @@ from selenium.webdriver.firefox.webdriver import WebDriver
 
 from harness import firefox as firefox_launcher
 from harness.extension import REPO_ROOT, Extension, extension_dir
+from harness.fake_servers import FAKE_SGW, FAKE_SITE, FakeServer
 from harness.sgw_site import SgwSite
 
 RESULTS_DIR = REPO_ROOT / "test-results" / "firefox"
@@ -45,6 +50,18 @@ def sgw_site() -> Iterator[SgwSite]:
     site.start()
     yield site
     site.stop()
+
+
+@pytest.fixture(scope="session")
+def fake_sgw() -> Iterator[FakeServer]:
+    with FakeServer(FAKE_SGW) as server:
+        yield server
+
+
+@pytest.fixture(scope="session")
+def fake_site() -> Iterator[FakeServer]:
+    with FakeServer(FAKE_SITE) as server:
+        yield server
 
 
 @pytest.fixture(scope="module")

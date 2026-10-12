@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -47,10 +48,38 @@ return new Promise((resolve) => {
 """
 
 
+# Sends one router message (src/messaging/protocol.ts envelope) from an
+# extension page and resolves with the router's { ok, reply | error } response.
+_SEND_MESSAGE_JS = """
+const [message, timeoutMs] = arguments;
+const timeout = new Promise((resolve) => {
+  setTimeout(() => resolve({ ok: false, error: `no reply on ${message.type} within ${timeoutMs} ms` }), timeoutMs);
+});
+const sent = browser.runtime
+  .sendMessage({ ...message, reqId: crypto.randomUUID() })
+  .catch((e) => ({ ok: false, error: String(e && e.message ? e.message : e) }));
+return Promise.race([sent, timeout]);
+"""
+
+
 class TestHookError(AssertionError):
     """A test hook answered ``{ ok: false }``, or nothing answered."""
 
     __test__ = False  # not a pytest test class
+
+
+class MessageError(AssertionError):
+    """The background's router answered ``{ ok: false }``, or nothing answered."""
+
+
+@cache
+def msg_version() -> int:
+    """The router's message envelope version, read from the source so it cannot drift."""
+    source = (REPO_ROOT / "src" / "messaging" / "protocol.ts").read_text(encoding="utf-8")
+    match = re.search(r"^export const MSG_VERSION = (\d+);", source, re.MULTILINE)
+    if match is None:
+        raise AssertionError("src/messaging/protocol.ts no longer exports `MSG_VERSION = <n>;`")
+    return int(match.group(1))
 
 
 def extension_dir() -> Path:
@@ -100,6 +129,31 @@ class Extension:
 
         The current tab is left as it was, so a test can call hooks while a page is open.
         """
+        reply = self.run_in_extension_page(_CALL_HOOK_JS, name, payload, int(timeout_s * 1000))
+        if not isinstance(reply, dict) or not reply.get("ok"):
+            error = reply.get("error") if isinstance(reply, dict) else reply
+            raise TestHookError(f"test hook {name} failed: {error}")
+        return reply.get("value")
+
+    def send_message(self, type_: str, payload: Any = None, timeout_s: float = 10) -> Any:
+        """Sends a background message through the real router (as the options page does) and returns its reply."""
+        message: dict[str, Any] = {"v": msg_version(), "type": type_}
+        if payload is not None:
+            message["payload"] = payload
+        reply = self.run_in_extension_page(_SEND_MESSAGE_JS, message, int(timeout_s * 1000))
+        if not isinstance(reply, dict) or not reply.get("ok"):
+            raise MessageError(f"message {type_} failed: {reply}")
+        return reply.get("reply")
+
+    def storage_set(self, items: dict[str, Any]) -> None:
+        """``browser.storage.local.set(items)`` from the extension page (the Chromium specs seed from the worker)."""
+        self.run_in_extension_page("return browser.storage.local.set(arguments[0]).then(() => null);", items)
+
+    def run_in_extension_page(self, script: str, *args: Any) -> Any:
+        """Runs ``script`` (a WebDriver script body; a returned Promise is awaited) in the extension page's tab.
+
+        The current tab is left as it was, so a test can do this while a page is open.
+        """
         driver = self.driver
         previous = driver.current_window_handle
         if self._hook_window not in driver.window_handles:
@@ -109,10 +163,6 @@ class Extension:
         else:
             driver.switch_to.window(self._hook_window)
         try:
-            reply = driver.execute_script(_CALL_HOOK_JS, name, payload, int(timeout_s * 1000))
+            return driver.execute_script(script, *args)
         finally:
             driver.switch_to.window(previous)
-        if not isinstance(reply, dict) or not reply.get("ok"):
-            error = reply.get("error") if isinstance(reply, dict) else reply
-            raise TestHookError(f"test hook {name} failed: {error}")
-        return reply.get("value")
