@@ -47,6 +47,9 @@ export class BrowserHttp implements Http {
         headers,
         credentials: req.credentials,
         signal: controller.signal,
+        // GET item reads must not be replayed. A cached ItemDetail with
+        // numBids 0 would let the snipe strategy send a second bid.
+        cache: 'no-store',
       };
       if (req.body !== undefined) init.body = req.body;
       const res = await this.fetchFn(url, init);

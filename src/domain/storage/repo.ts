@@ -37,6 +37,7 @@ const DEFAULTS = {
   [STORAGE_KEYS.listingCache]: () => ({}),
   [STORAGE_KEYS.detailCache]: () => ({}),
   [STORAGE_KEYS.shippingCache]: () => ({}),
+  [STORAGE_KEYS.quoteCache]: () => ({}),
   [STORAGE_KEYS.favoritesCache]: () => ({ fetchedAt: 0, items: [] }),
   [STORAGE_KEYS.jobRuns]: () => [],
   [STORAGE_KEYS.calendar]: () => ({ links: {} }),
