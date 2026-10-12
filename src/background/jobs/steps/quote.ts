@@ -91,7 +91,7 @@ export async function executeQuoteStep(step: JobStep, deps: StepDeps): Promise<S
   const now = repo.now();
   const cached = await readCachedQuote(repo, step.itemId, zipHash, now);
   if (cached !== undefined) {
-    return { kind: 'quote', quote: { shipping: cached.shipping, handling: cached.handling } };
+    return { kind: 'quote', quote: cached === null ? null : { shipping: cached.shipping, handling: cached.handling } };
   }
 
   // Again, immediately before the send: settings and the kill switch can move
@@ -113,12 +113,13 @@ export async function executeQuoteStep(step: JobStep, deps: StepDeps): Promise<S
   } catch (e) {
     scrubZip(e, zip);
   }
+  // SGW answered (a failure rethrew above), so a null is its "no quote" (T-57b): remember it too.
+  try {
+    await writeCachedQuote(repo, step.itemId, zipHash, quote, now);
+  } catch {
+    // A failed cache write must not lose the quote already computed.
+  }
   if (quote !== null) {
-    try {
-      await writeCachedQuote(repo, step.itemId, zipHash, quote, now);
-    } catch {
-      // A failed cache write must not lose the quote already computed.
-    }
     try {
       await deps.audit.append({ actor: 'daily-job', kind: 'quote.fetched', itemId: step.itemId, details: {} });
     } catch {

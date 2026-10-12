@@ -174,10 +174,27 @@ describe('landedCost.get handler', () => {
     expect(quoteCalls()).toEqual([]);
   });
 
-  it('answers a null quote with null and caches nothing', async () => {
+  it('remembers the SGW "no quote" answer for 24 h (T-57b): null, and no request again until it expires', async () => {
     expect(await get([1])).toEqual({ 1: null });
     expect(quoteCalls()).toHaveLength(1);
+    const stored = await cache();
+    expect(stored[1]).toEqual({ shipping: 0, handling: 0, none: true, 'zip-hash': await storedZipHash(ZIP), fetchedAt: T0 });
+
+    clock.advance(23 * HOUR);
+    expect(await get([1])).toEqual({ 1: null });
+    expect(quoteCalls()).toHaveLength(1); // negative cache hit
+
+    clock.advance(HOUR); // 24 h: stale, asked again
+    expect(await get([1])).toEqual({ 1: null });
+    expect(quoteCalls()).toHaveLength(2);
+  });
+
+  it('never caches a failed request as "no quote": the next page view asks again', async () => {
+    api.failNext('shippingQuote', 'network');
+    expect(await get([1])).toEqual({ 1: null });
     expect(await cache()).toEqual({});
+    expect(await get([1])).toEqual({ 1: null });
+    expect(quoteCalls()).toHaveLength(2);
   });
 
   it('caches the quote under a ZIP hash (never the ZIP) and never re-fetches within 24 h', async () => {
@@ -479,6 +496,24 @@ describe('ZIP hash privacy: a per-install salt (sbw:quoteSalt)', () => {
     expect(quoteCalls()).toHaveLength(2);
   });
 
+  it('the quote step shares the negative cache (T-57b): a "no quote" stored by the handler sends nothing', async () => {
+    expect(await contentGet([1], tabSender(1))).toEqual({ 1: null }); // SGW answers no quote; remembered
+    const deps = {
+      api,
+      repo,
+      audit: createAuditLog(repo),
+      switches: new FakeSwitches(),
+      lane: 'background' as Lane,
+      run: stepRun('run-n'),
+      ctx: {} as unknown as BackgroundContext,
+    };
+    expect(await executeQuoteStep({ kind: 'quote', itemId: 1 }, deps)).toEqual({ kind: 'quote', quote: null });
+    expect(quoteCalls()).toHaveLength(1);
+    expect(await executeQuoteStep({ kind: 'quote', itemId: 2 }, deps)).toEqual({ kind: 'quote', quote: null });
+    expect(quoteCalls()).toHaveLength(2);
+    expect((await cache())[2]?.none).toBe(true); // the step remembers its own "no quote" too
+  });
+
   it('an invalid stored salt is replaced by a fresh one; the old entries miss and a real quote is fetched', async () => {
     seedQuote(1);
     await contentGet([1]);
@@ -758,11 +793,19 @@ describe('quote step executor', () => {
     expect(quoteCalls()).toHaveLength(2);
   });
 
-  it('a null quote is not cached and not audited', async () => {
+  it('a null quote is remembered as "no quote" (T-57b), not audited, and not asked again within 24 h', async () => {
     expect(await executeQuoteStep(step, deps())).toEqual({ kind: 'quote', quote: null });
     expect(quoteCalls()).toHaveLength(1);
-    expect(await cache()).toEqual({});
+    expect(Object.values(await cache())).toMatchObject([{ none: true }]);
     expect(await audit.list({ limit: 5 })).toEqual([]);
+    expect(await executeQuoteStep(step, deps())).toEqual({ kind: 'quote', quote: null });
+    expect(quoteCalls()).toHaveLength(1);
+  });
+
+  it('a failed quote is never remembered as "no quote"', async () => {
+    api.failNext('shippingQuote', 'network');
+    await expect(executeQuoteStep(step, deps())).rejects.toMatchObject({ kind: 'network' });
+    expect(await cache()).toEqual({});
   });
 
   it('propagates SgwApiError so the runner can map it', async () => {
