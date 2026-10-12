@@ -31,6 +31,7 @@ import { browser } from 'wxt/browser';
 
 import type { AuthStatus } from '../../domain/calendar/types';
 import type { AuditLog } from '../../domain/audit/types';
+import type { Repo } from '../../domain/storage/repo';
 import { defaultSettings } from '../../domain/settings/defaults';
 import type { Settings } from '../../domain/settings/schema';
 import { isoMs, SESSION_MARGIN_AFTER_END_MS } from '../../domain/snipe/preflight';
@@ -48,6 +49,7 @@ import type { SgwHealth } from '../../ports/sgw-health';
 import type { SgwSession } from '../../ports/sgw-session';
 import type { BackgroundContext } from '../context';
 import { HEALTH_WINDOW_MS } from '../switches';
+import { deferAlarm } from './deferred-alarms';
 import { itemUrl, quietHoursEnd, truncateTitle } from './notify';
 import { snipeSeams, type AuthHealth, type AuthHealthCheck, type AuthHealthResult } from './snipe-runner';
 
@@ -233,6 +235,8 @@ export interface AuthHealthDeps {
   openOptions(): void | Promise<void>;
   /** The stored snipe, for the deferred re-check. */
   getSnipe(id: string): Promise<Snipe | undefined>;
+  /** T-118 (L6): records the deferral alarm in `sbw:deferredAlarms`. */
+  repo?: Pick<Repo, 'update'>;
   log?(message: string, error?: unknown): void;
 }
 
@@ -349,7 +353,9 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
     if (warnings.length > 0 && !(await alreadyWarned(snipe.id, which))) {
       const until = authWarnDeferUntil(snap.now, isoMs(snipe.endTime), snap.quiet, snap.timeZone);
       if (until !== null) {
-        await deps.alarms.create(authWarnAlarmName(snipe.id, which), { when: until });
+        // T-118 (L6): recorded (when the repo is wired) so a dropped alarm is re-created at startup.
+        if (deps.repo === undefined) await deps.alarms.create(authWarnAlarmName(snipe.id, which), { when: until });
+        else await deferAlarm({ repo: deps.repo, alarms: deps.alarms }, authWarnAlarmName(snipe.id, which), until);
       } else {
         await sendWarning(snipe, which, warnings);
       }
@@ -426,6 +432,7 @@ export function register(ctx: BackgroundContext): AuthHealth {
         () => undefined,
       ),
     getSnipe: async (id) => (await ctx.repo.get(STORAGE_KEYS.snipes))[id],
+    repo: ctx.repo,
   });
   snipeSeams(ctx).setAuthHealth(impl);
   return impl;

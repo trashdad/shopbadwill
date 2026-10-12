@@ -669,3 +669,12 @@ Source: T-111 (extension side of T2). Requirement 5 of the card's brief authoris
 - `test/integration/companion.test.ts`: the "contract additions" block, and `timing.awake` end to end.
 
 **Follow-up for the next PLAN edit.** Add `sbw:companionWakes` to PLAN §2.3 and `Settings.companion` to §3.10 and contracts.md. PLAN §2.5 names the permission button "Install companion". The options page says "Connect the companion", because the button grants the permission and does not install anything.
+
+## T-118 contract change: the optional storage key `sbw:deferredAlarms`
+
+**`sbw:deferredAlarms`** (storage.local, optional). `STORAGE_KEYS.deferredAlarms`, a Repo key with a default of `{}`. The schema is module-private: `Record<alarmName, EpochMs>`. It records the deferred one-shot alarms, because the browser may drop them: an extension update clears alarms, Firefox does not persist them, and Chrome before 150 may lose them on a restart. The alarms are:
+- `sbw:notify:digest:<run>`, the quiet-hours digest;
+- `sbw:notify:outcome:<item>`, the outcome notice;
+- `sbw:authhealth:<id>:<which>`, the auth-health warning.
+
+The owners create these alarms through `deferAlarm` (`src/background/jobs/deferred-alarms.ts`), which records the alarm and then creates it. That job module runs at every background start. It re-creates any recorded alarm the browser no longer holds; a past `when` fires at once. When an alarm fires, its record is removed, unless the owner deferred it again to a later time. The owners' handlers are idempotent: each re-checks its audit marker or the snipe state. A re-created alarm therefore never sends a notice twice. The change is additive, and `schemaVersion` stays 1. `test/contract/types/storage.test.ts` lists the key.

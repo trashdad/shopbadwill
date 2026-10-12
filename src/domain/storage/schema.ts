@@ -88,6 +88,13 @@ export const STORAGE_KEYS = {
    * none. No migration; `schemaVersion` stays 1. Invalid data parses to empty.
    */
   companionWakes: 'sbw:companionWakes',
+  /**
+   * Optional (T-118, L6): the deferred one-shot alarms (quiet-hours digest and
+   * outcome notices, auth-health warnings), alarm name -> when. Re-created by
+   * the startup reconcile if the browser dropped them; removed when they fire.
+   * Absent means none. No migration; `schemaVersion` stays 1.
+   */
+  deferredAlarms: 'sbw:deferredAlarms',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -389,6 +396,9 @@ export function parseCompanionWakes(raw: unknown): CompanionWakesRecord {
   return parsed.success ? parsed.data : { version: 1, wakes: {} };
 }
 
+/** `sbw:deferredAlarms` (T-118, L6). Optional. Module-private schema. Alarm name -> its `when`. */
+const DeferredAlarmsSchema = z.record(z.string().min(1), EpochMsSchema);
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -466,6 +476,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.snipeRunner]: { area: 'local', schema: SnipeRunnerRecordSchema },
   [STORAGE_KEYS.dryRunCounted]: { area: 'local', schema: DryRunCountedRecordSchema },
   [STORAGE_KEYS.companionWakes]: { area: 'local', schema: CompanionWakesRecordSchema },
+  [STORAGE_KEYS.deferredAlarms]: { area: 'local', schema: DeferredAlarmsSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

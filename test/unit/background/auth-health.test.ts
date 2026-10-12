@@ -138,6 +138,7 @@ const deps = (): AuthHealthDeps => ({
   optionsUrl: () => 'https://example.invalid/options.html#section-snipe',
   openOptions: () => undefined,
   getSnipe: async (id: string) => (await repo.get(STORAGE_KEYS.snipes))[id],
+  repo,
 });
 
 const make = (): AuthHealth => createAuthHealth(deps());
@@ -418,6 +419,8 @@ describe('T-91 auth-health: quiet hours (R4)', () => {
     expect(notifier.sent).toHaveLength(0);
     const alarm = (await alarms.getAll()).find((a) => a.name === authWarnAlarmName(s.id, '24h'));
     expect(alarm?.scheduledTime).toBe(Date.UTC(2026, 9, 16, 11, 0, 0)); // 07:00 NY
+    // T-118 (L6): recorded, so a startup reconcile re-creates it if the browser drops it.
+    expect(await repo.get(STORAGE_KEYS.deferredAlarms)).toEqual({ [authWarnAlarmName(s.id, '24h')]: Date.UTC(2026, 9, 16, 11, 0, 0) });
 
     alarms.advance(Date.UTC(2026, 9, 16, 11, 0, 0) - NIGHT);
     await vi.waitFor(() => {
