@@ -1,0 +1,84 @@
+/* T-102: the popup's live-bidding section. Reuses the shell's tokens and
+   badge styles; the meter bar is the same one T-85's ExposureMeter renders
+   (class names only, styled once here for the popup). */
+.exposure {
+  display: grid;
+  gap: 6px;
+}
+.exposure [role='progressbar'] {
+  height: 0.5rem;
+  background: var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.exposure .sbw-bar {
+  height: 100%;
+  background: var(--accent);
+}
+.exposure .sbw-muted {
+  color: var(--muted);
+}
+.exposure .sbw-error {
+  color: var(--danger);
+}
+.exposure-state {
+  display: flex;
+  gap: 6px;
+}
+.exposure-go {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+}
+.exposure-go:hover {
+  border-color: var(--accent);
+}
+.exposure-confirm {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: var(--danger-bg);
+}
+.exposure-confirm a {
+  color: var(--accent);
+}
+.exposure-field {
+  display: grid;
+  gap: 4px;
+  font-weight: 600;
+}
+.exposure-field input {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.exposure-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.exposure-actions button {
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  font-weight: 700;
+}
+.exposure-actions button:hover {
+  border-color: var(--accent);
+}
+.exposure-actions button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+.exposure-error {
+  color: var(--danger);
+  font-weight: 600;
+}

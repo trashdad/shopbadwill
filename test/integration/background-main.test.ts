@@ -406,7 +406,9 @@ describe('T-36 brief', () => {
     };
     const h = boot({
       seed: { [STORAGE_KEYS.settings]: defaultSettings() },
-      handlerModules: { ...HANDLER_MODULES, './zz-live-gate.ts': gate },
+      // './aa-' sorts ahead of the real T-102 live gate (./live-gate.ts), so this
+      // test's own interceptor — and its expected message — vetoes first.
+      handlerModules: { ...HANDLER_MODULES, './aa-live-gate.ts': gate },
     });
     await h.handle.ready;
     const before = h.areas.local.dump()[STORAGE_KEYS.settings];
