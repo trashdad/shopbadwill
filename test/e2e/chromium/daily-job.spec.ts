@@ -35,6 +35,7 @@ import type { Rule } from '../../../src/domain/rules/schema';
 import type { SgwSessionRecord, TrackedItem } from '../../../src/domain/types';
 import type { JobRun, Watch } from '../../../src/domain/watches/schema';
 import { seed, testExtensionDir } from './fixtures';
+import { backgroundLog, clearFakeLog, mintSession as mintSessionAt, setScenario, type FakeLogEntry } from './helpers/fake-sgw';
 import {
   advance,
   anchorClock as anchorClockAt,
@@ -49,7 +50,6 @@ import {
   verifyBaseUrl,
 } from './helpers/harness';
 import { DAY, HOUR, TICK_STEP_MS } from './helpers/time';
-import { FAKE_BUYERAPI } from './network';
 
 // ── The fixed clock ──────────────────────────────────────────────────────────
 
@@ -63,44 +63,10 @@ const PYREX_1 = 280000000; // "Pyrex lot #1 vintage"
 const PYREX_13 = 280000012; // "Pyrex lot #13"
 const PYREX_25 = 280000024; // "Pyrex lot #25"
 
-// ── Wire types ───────────────────────────────────────────────────────────────
-
-interface FakeLogEntry {
-  seq: number;
-  method: string;
-  path: string;
-  query: string;
-  endpoint: string;
-  status: number;
-  receivedAtMs: number;
-  fakeNowMs: number | null;
-  requestTimeMs: number;
-  hasBearer: boolean;
-  body: string;
-}
-
-// ── The fake-server side (Node) ──────────────────────────────────────────────
+// ── The fake-server side (Node; helpers/fake-sgw.ts) ─────────────────────────
 
 async function pinFakeClock(): Promise<void> {
-  const res = await fetch(`${FAKE_BUYERAPI}/__scenario`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ reset: true, serverNowMs: pacificNaiveToEpoch(SERVER_PIN_PACIFIC) }),
-  });
-  expect(res.status).toBe(200);
-}
-
-async function clearFakeLog(): Promise<void> {
-  const res = await fetch(`${FAKE_BUYERAPI}/__log`, { method: 'DELETE' });
-  expect(res.status).toBe(200);
-}
-
-/** The log entries the background produced: the ones carrying `x-sbw-fake-now` (every background request does). */
-async function backgroundLog(): Promise<FakeLogEntry[]> {
-  const res = await fetch(`${FAKE_BUYERAPI}/__log`);
-  expect(res.status).toBe(200);
-  const body = (await res.json()) as { entries: FakeLogEntry[] };
-  return body.entries.filter((e) => e.fakeNowMs !== null);
+  await setScenario({ reset: true, serverNowMs: pacificNaiveToEpoch(SERVER_PIN_PACIFIC) });
 }
 
 /** R4: consecutive background requests are at least the background lane's 120 s apart in fake time. */
@@ -117,14 +83,7 @@ function expectFakeSpacing(entries: FakeLogEntry[]): void {
 }
 
 async function mintSession(): Promise<SgwSessionRecord> {
-  const res = await fetch(`${FAKE_BUYERAPI}/__token`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({}),
-  });
-  expect(res.status).toBe(200);
-  const token = (await res.json()) as { accessToken: string; expiresAtMs: number };
-  return { bearer: token.accessToken, capturedAt: ANCHOR_MS, expiresAt: token.expiresAtMs, buyerId: '1234567', source: 'tap' };
+  return mintSessionAt(ANCHOR_MS);
 }
 
 // ── The browser side ─────────────────────────────────────────────────────────
