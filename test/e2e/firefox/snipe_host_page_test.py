@@ -10,7 +10,12 @@ through the same factory the snipe runner uses on a Firefox build:
 * a second ``acquire`` for the same snipe is a no-op;
 * ``release`` closes the window;
 * a window the user closes early is audited (``snipe.host-window-closed`` in
-  the audit log) and re-acquired once, never twice.
+  the audit log) and re-acquired once, never twice;
+* after a worker that died mid-window (simulated by the hook's ``restart``),
+  the new host adopts the still-open page instead of opening a second window,
+  and the page reconnects its port to it (``runtime.getContexts`` and the
+  page's reconnect, in the real browser);
+* the startup reap closes a left-over page whose snipe no longer needs it.
 
 Window focus cannot be asserted headless (S-7: the popup reported focused
 despite ``focused:false``); the unfocused contract is asserted through the
@@ -81,6 +86,15 @@ def _popup_handles(driver: WebDriver, before: set[str]) -> list[str]:
 
 def _popup_handle(driver: WebDriver, before: set[str], what: str = "the snipe-host window to open") -> str:
     return _wait_until(lambda: _popup_handles(driver, before)[0] if _popup_handles(driver, before) else None, what=what)
+
+
+def _stable_handle(driver: WebDriver) -> str:
+    """A window that is not a runner page (never closed by the host), for hook calls that close popups."""
+    for handle in driver.window_handles:
+        driver.switch_to.window(handle)
+        if PAGE_URL_NEEDLE not in driver.current_url:
+            return handle
+    raise AssertionError("no window other than runner pages is open")
 
 
 def _audit_entries(extension: Extension) -> list[dict[str, Any]]:
@@ -191,3 +205,54 @@ def test_an_early_user_close_is_audited_and_the_window_is_reacquired_once(
     )
     assert [a["details"]["reacquired"] for a in audits[:2]] == [True, False]
     assert _popup_handles(firefox, before) == []
+
+
+def test_a_restarted_worker_adopts_the_open_window_instead_of_opening_a_second(
+    firefox: WebDriver, extension: Extension
+) -> None:
+    snipe = "e2e-restart"
+    before = set(firefox.window_handles)
+
+    first = _host(extension, "acquire", snipe)
+    handle = _popup_handle(firefox, before)
+    _wait_until(
+        lambda: (s := _snipe(extension, snipe)) is not None and s["portConnected"],
+        what="the page port to reach the first host",
+    )
+
+    # The worker dies with the window open; the restarted one acquires the snipe again.
+    firefox.switch_to.window(_stable_handle(firefox))
+    second = extension.call_hook(HOOK, {"action": "restart", "snipeId": snipe, "acquire": True})
+
+    assert second["windowId"] == first["windowId"]  # the same window, adopted
+    assert second["createOptions"] is None  # nothing was created
+    status = _snipe(extension, snipe)
+    assert status is not None and status["adopted"] is True
+    assert _popup_handles(firefox, before) == [handle]  # no second window
+    # The page's port dropped with the old worker; it reconnects to the new host.
+    _wait_until(
+        lambda: (s := _snipe(extension, snipe)) is not None and s["portConnected"],
+        what="the page to reconnect its port to the restarted host",
+    )
+
+    firefox.switch_to.window(_stable_handle(firefox))
+    _host(extension, "release", snipe)
+    _wait_until(lambda: handle not in firefox.window_handles, what="release to close the adopted window")
+
+
+def test_the_startup_reap_closes_a_left_over_page_whose_snipe_is_gone(
+    firefox: WebDriver, extension: Extension
+) -> None:
+    snipe = "e2e-orphan"
+    before = set(firefox.window_handles)
+
+    reply = _host(extension, "acquire", snipe)
+    handle = _popup_handle(firefox, before)
+
+    # The worker dies with the window open; no snipe "e2e-orphan" exists in storage.
+    firefox.switch_to.window(_stable_handle(firefox))
+    extension.call_hook(HOOK, {"action": "restart"})
+    reaped = extension.call_hook(HOOK, {"action": "reap"})
+
+    assert reply["windowId"] in reaped["closed"]
+    _wait_until(lambda: handle not in firefox.window_handles, what="the reap to close the left-over window")
