@@ -20,6 +20,7 @@ import { PORT_NAMES, type MsgPayload } from '../../src/messaging/protocol';
 import { itemIdFromSearch, SnipesSection } from '../../src/ui/dashboard/sections/snipes';
 import { ExposureMeter, measureExposure } from '../../src/ui/exposure';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
+import { FakePermissions } from '../fakes/ports/fake-permissions';
 
 /** The exact dry-run sentence. A renamed constant in the form must not keep this green. */
 const DRY_RUN = 'DRY RUN — no bid will be placed';
@@ -98,6 +99,8 @@ interface SetupOptions {
   snipes?: Snipe[];
   prepare?: (itemId: number) => { detail: ItemDetail; estAllIn: number | null; caps: { ok: boolean; violations: string[] } };
   arm?: (payload: MsgPayload<'snipe.arm'>) => Snipe;
+  /** Defaults to notifications allowed. */
+  permissions?: FakePermissions;
 }
 
 function setup(opts: SetupOptions = {}) {
@@ -118,8 +121,9 @@ function setup(opts: SetupOptions = {}) {
     });
   });
   m.handle('snipe.disarm', () => undefined);
-  render(h(SnipesSection, { client: m, userTz: TZ, openOptions: () => undefined }));
-  return { m };
+  const permissions = opts.permissions ?? new FakePermissions({ permissions: ['notifications'] });
+  render(h(SnipesSection, { client: m, userTz: TZ, openOptions: () => undefined, permissions }));
+  return { m, permissions };
 }
 
 const armSent = (m: FakeMessaging): Array<{ type: string; payload: unknown }> =>
@@ -757,3 +761,56 @@ describe('the card Snipe… badge (deep link, R1)', () => {
   });
 });
 
+
+describe('T-118 F4: the arm flow warns when notifications are off', () => {
+  const WARN = /Notifications are off: you will not be told if this snipe is at risk/;
+
+  it('warns, offers Allow, and still arms', async () => {
+    const { m } = setup({ permissions: new FakePermissions(), s: settings({ snipe: { ...settings().snipe, caps: generousCaps } }) });
+    expect(await screen.findByText(WARN)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Allow notifications' })).toBeTruthy();
+    await prepare(m);
+    fireEvent.input(amountInput(/^max bid \(\$\)/i), { target: { value: '20.00' } });
+    fireEvent.click(screen.getByRole('button', { name: /^review and arm$/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /^arm snipe$/i }));
+    await waitFor(() => {
+      expect(armSent(m)).toHaveLength(1);
+    });
+  });
+
+  it('Allow asks for the permission inside the click, then the warning goes away', async () => {
+    const permissions = new FakePermissions();
+    let syncCalls = 0;
+    const orig = permissions.request.bind(permissions);
+    permissions.request = (p) => {
+      syncCalls += 1;
+      return orig(p);
+    };
+    setup({ permissions });
+    const allow = await screen.findByRole('button', { name: 'Allow notifications' });
+    fireEvent.click(allow);
+    expect(syncCalls).toBe(1);
+    expect(permissions.requested).toEqual([{ permissions: ['notifications'] }]);
+    await waitFor(() => {
+      expect(screen.queryByText(WARN)).toBeNull();
+    });
+  });
+
+  it('says so when the browser refuses', async () => {
+    const permissions = new FakePermissions();
+    permissions.grantRequests = false;
+    setup({ permissions });
+    fireEvent.click(await screen.findByRole('button', { name: 'Allow notifications' }));
+    expect(await screen.findByText(/did not allow notifications/)).toBeTruthy();
+    expect(screen.getByText(WARN)).toBeTruthy();
+  });
+
+  it('shows no warning when notifications are allowed', async () => {
+    setup();
+    await screen.findByText(/No armed snipes/);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(WARN)).toBeNull();
+  });
+});

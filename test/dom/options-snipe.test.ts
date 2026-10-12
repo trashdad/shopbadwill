@@ -432,3 +432,26 @@ describe('SnipeSection', () => {
     );
   });
 });
+
+describe('T-118 F4: the snipe settings warn when notifications are off', () => {
+  const WARN = /Notifications are off: you will not be told if this snipe is at risk/;
+
+  it('warns and offers a one-click Allow that asks inside the click', async () => {
+    const { permissions } = app();
+    expect(await screen.findByText(WARN)).toBeTruthy();
+    expect(permissions.requested).toEqual([]);
+    fireEvent.click(screen.getByRole('button', { name: 'Allow notifications' }));
+    expect(permissions.requested).toEqual([{ permissions: ['notifications'] }]);
+    await waitFor(() => {
+      expect(screen.queryByText(WARN)).toBeNull();
+    });
+  });
+
+  it('shows no warning when notifications are allowed', async () => {
+    app({ permissions: new FakePermissions({ permissions: ['notifications'] }) });
+    await screen.findByRole('button', { name: 'Turn on Keep awake' });
+    await waitFor(() => {
+      expect(screen.queryByText(WARN)).toBeNull();
+    });
+  });
+});

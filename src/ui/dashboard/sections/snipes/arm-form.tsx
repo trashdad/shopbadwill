@@ -23,8 +23,10 @@ import type { Settings } from '../../../../domain/settings/schema';
 import type { Cents, ItemId } from '../../../../domain/types';
 import type { MsgReply } from '../../../../messaging/protocol';
 import type { MessagingClient } from '../../../../ports/messaging';
+import type { Permissions } from '../../../../ports/permissions';
 import { describeError } from '../../../components/describeError';
 import { Field } from '../../../components/Field';
+import { NotificationsOffWarning } from '../../../components/NotificationsOffWarning';
 import { Status } from '../../../components/Status';
 import { Money } from '../../../money';
 import { PacificTime } from '../../../time';
@@ -66,6 +68,8 @@ export interface ArmFormProps {
   openItem: ItemId | null;
   /** Called after a successful arm so the section reloads its list. */
   onArmed: () => void;
+  /** T-118 (F4): checks and requests the optional `notifications` permission. */
+  permissions: Pick<Permissions, 'contains' | 'request'>;
 }
 
 const isKnownShipping = (d: PrepareReply['detail']): d is PrepareReply['detail'] & { shippingPrice: Cents } =>
@@ -357,6 +361,7 @@ export function ArmForm(props: ArmFormProps): VNode {
       {settings?.snipe.enabled === false ? (
         <p class="sbw-warn">Sniping is turned off in the snipe settings; arming will be refused until it is on.</p>
       ) : null}
+      <NotificationsOffWarning api={props.permissions} />
       <form
         onSubmit={(e) => {
           e.preventDefault();

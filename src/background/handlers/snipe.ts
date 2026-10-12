@@ -8,6 +8,33 @@
 import { getSnipeRunner, KILL_ARM_REFUSAL, type SnipeRunner } from '../jobs/snipe-runner';
 import type { BackgroundContext } from '../context';
 
+/**
+ * T-118 (F4): the `notifications` permission is optional. Without it every snipe
+ * alert (at risk, soon, unconfirmed) is dropped, so an arm without it is
+ * audited. Never blocks the arm: it runs after, and a failing check or append
+ * is swallowed. A check that throws counts as "not allowed".
+ */
+async function auditIfNotifyOff(ctx: BackgroundContext, id: string, itemId: number): Promise<void> {
+  try {
+    let allowed = false;
+    try {
+      allowed = await ctx.permissions.contains({ permissions: ['notifications'] });
+    } catch {
+      allowed = false;
+    }
+    if (allowed) return;
+    await ctx.audit.append({
+      actor: 'user',
+      kind: 'snipe.notify-off',
+      itemId,
+      ref: id,
+      details: { permission: 'notifications', note: 'Notifications are off: no alert will be shown if this snipe is at risk.' },
+    });
+  } catch {
+    // The warning is best effort; the snipe is already armed.
+  }
+}
+
 /** T-36 self-registration (I-01). The runner registers with the jobs, after the handlers; it is looked up per message. */
 export function register(ctx: BackgroundContext): void {
   const runner = (): SnipeRunner => {
@@ -16,12 +43,12 @@ export function register(ctx: BackgroundContext): void {
     return r;
   };
   ctx.router.register('snipe.prepare', ({ itemId }) => runner().prepare(itemId));
-  ctx.router.register('snipe.arm', ({ snipe, typedConfirmation }) => {
+  ctx.router.register('snipe.arm', async ({ snipe, typedConfirmation }) => {
     // T-84c: refuse cleanly while the kill switch is on. The arm does not
     // happen and then get stopped by the kill disarm-all; nothing is stored.
     // The runner checks again under its lock (a kill that lands while the item is read).
     if (ctx.switches.view().killSwitch) throw new Error(KILL_ARM_REFUSAL);
-    return runner().arm(
+    const armed = await runner().arm(
       {
         id: snipe.id,
         itemId: snipe.itemId,
@@ -37,6 +64,8 @@ export function register(ctx: BackgroundContext): void {
       },
       typedConfirmation,
     );
+    await auditIfNotifyOff(ctx, armed.id, armed.itemId);
+    return armed;
   });
   ctx.router.register('snipe.disarm', async ({ id }) => {
     await runner().disarm(id);

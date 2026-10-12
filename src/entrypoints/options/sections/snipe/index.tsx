@@ -24,6 +24,7 @@ import type { Settings } from '../../../../domain/settings/schema';
 import type { Permissions } from '../../../../ports/permissions';
 import { Card, Field } from '../../../../ui/components/Field';
 import { describeError } from '../../../../ui/components/describeError';
+import { NotificationsOffWarning } from '../../../../ui/components/NotificationsOffWarning';
 import { Status } from '../../../../ui/components/Status';
 import { Switch } from '../../../../ui/components/Switch';
 import { hasPermissions, requestPermissions } from '../../../../ui/permissions';
@@ -258,6 +259,7 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
             live bidding on — the bidding switch and the dry-run counter are managed elsewhere.
           </p>
         ) : null}
+        <NotificationsOffWarning api={api} />
       </Card>
 
       <Card>

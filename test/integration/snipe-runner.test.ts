@@ -3299,3 +3299,33 @@ describe('T-84b final check: a failed not-sent write', () => {
     }
   });
 });
+
+describe('T-118 F4: arming without the notifications permission warns and audits, never blocks', () => {
+  it('a snipe armed while notifications are not allowed arms and records snipe.notify-off', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    const armed = await arm(w);
+    expect(armed.state).toBe('armed');
+    const off = audits(shared).filter((a) => a.kind === 'snipe.notify-off');
+    expect(off).toHaveLength(1);
+    expect(off[0]?.ref).toBe('s1');
+    expect(off[0]?.itemId).toBe(ITEM);
+  });
+
+  it('with notifications allowed, nothing extra is audited', async () => {
+    const shared = makeShared();
+    await shared.permissions.request({ permissions: ['notifications'] });
+    const { w } = await boot(shared);
+    await arm(w);
+    expect(kinds(shared)).not.toContain('snipe.notify-off');
+  });
+
+  it('a permissions check that throws still arms (fail open on the warning, never on the arm)', async () => {
+    const shared = makeShared();
+    shared.permissions.contains = () => Promise.reject(new Error('no API'));
+    const { w } = await boot(shared);
+    const armed = await arm(w);
+    expect(armed.state).toBe('armed');
+    expect(kinds(shared)).toContain('snipe.notify-off');
+  });
+});
