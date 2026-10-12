@@ -654,14 +654,26 @@ export class SnipeRunner {
   }
 
   /**
-   * Feeds one event to the reducer for `id` (CAS against `expectVersion` when
-   * given) and runs its effects. The way in for other modules (T-86's
-   * disarm-all, tests); the runner itself uses the same path. Attempt events
-   * (`sent`, `result`, `ambiguous`, `post-read`, `post-read-failed`, `not-sent`)
-   * are refused here: only the runner's own send path feeds them.
+   * The public way in for other modules: only `disarm` (T-86's disarm-all, the
+   * user) and `arm` (already exposed) may be sent from outside. Every other
+   * event is refused with a typed `invalid-event` before it reaches the
+   * reducer (T-84c). The runner feeds its own events through `feed`.
    */
   async dispatch(id: string, event: SnipeEvent, expectVersion?: number): Promise<CommitResult> {
     const r = await this.commit(id, event, { external: true, ...(expectVersion === undefined ? {} : { expectVersion }) });
+    if (r.kind === 'accepted') void this.drive(id);
+    return r;
+  }
+
+  /**
+   * The internal path for events only the runner's own logic feeds: the runner
+   * itself, T-103's ended-early path (post-end) and the integration tests (the
+   * CAS race, the R4 property actions). Unlike `dispatch` there is no
+   * allow-list here: this is the private commit, and a caller outside the
+   * runner uses it only for effects the runner owns (T-84c).
+   */
+  async feed(id: string, event: SnipeEvent, expectVersion?: number): Promise<CommitResult> {
+    const r = await this.commit(id, event, { ...(expectVersion === undefined ? {} : { expectVersion }) });
     if (r.kind === 'accepted') void this.drive(id);
     return r;
   }

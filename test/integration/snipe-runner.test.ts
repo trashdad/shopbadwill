@@ -39,6 +39,7 @@ import {
   snipeAlarmName,
   snipeSeams,
   type SendStrategy,
+  type SnipeRunner,
 } from '../../src/background/jobs/snipe-runner';
 import { SWITCHES_LOAD_TIMEOUT_MS } from '../../src/background/switches';
 import { startBackground, type BackgroundBrowser } from '../../src/background/main';
@@ -848,7 +849,7 @@ function crashOn(state: Snipe['state']): CrashPredicate {
 }
 
 interface RunnerRecordView {
-  entries: Record<string, { outbox: Array<{ kind: string }> } | undefined>;
+  entries: Record<string, { outbox: Array<{ kind: string }>; atRisk?: string } | undefined>;
 }
 
 function runnerRecord(shared: Shared): RunnerRecordView {
@@ -903,7 +904,8 @@ describe('money safety carries', () => {
     if (runner === undefined) throw new Error('no runner');
     const v = stored(shared).history.length;
     const now = shared.clock.now();
-    const [a, b] = await Promise.all([runner.dispatch('s1', { type: 'wake', now }, v), runner.dispatch('s1', { type: 'wake', now }, v)]);
+    // The internal path (T-84c): outside dispatch refuses everything but disarm.
+    const [a, b] = await Promise.all([runner.feed('s1', { type: 'wake', now }, v), runner.feed('s1', { type: 'wake', now }, v)]);
     expect([a.kind, b.kind].sort()).toEqual(['accepted', 'rejected']);
     const lost = a.kind === 'rejected' ? a : b;
     expect(lost.kind === 'rejected' ? lost.rejection.reason : '').toBe('step-passed');
@@ -1668,6 +1670,14 @@ describe('snipe handlers', () => {
     expect(ok.maxBid).toBe(4000);
   });
 
+  it('snipe.arm while the kill switch is on is refused cleanly: nothing is armed and then stopped', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await w.ok('kill.set', { on: true });
+    await expect(arm(w)).rejects.toThrow(/kill switch is on/);
+    expect(shared.areas.local.dump()[STORAGE_KEYS.snipes]).toBeUndefined();
+  });
+
   it('snipe.arm refuses one cent over the per-item cap and over the daily cap still remaining', async () => {
     const withCaps = (caps: Partial<Settings['snipe']['caps']>): Settings => {
       const s = settingsWith({ live: true });
@@ -2119,7 +2129,14 @@ async function propRun(start: { dryRun: boolean; fallback: Snipe['fallback']; ma
         if (runner === undefined || cur === undefined) break;
         const e = stalEvent(world, act.type, shared.clock.now() + act.shift);
         const version = act.stale ? Math.max(0, cur.history.length - 1) : cur.history.length;
-        const runs = act.twice ? [runner.dispatch('s1', e, version), runner.dispatch('s1', e, version)] : [runner.dispatch('s1', e, version)];
+        // T-84c: `disarm` still exercises the outside path, and the attempt
+        // events stay on it too (they were, and are, refused there). The other
+        // events are fed through the internal path, as the runner's own logic
+        // would feed them.
+        const outsideAttempt = act.type === 'sent' || act.type === 'result' || act.type === 'ambiguous' || act.type === 'post-read';
+        const send = async (): Promise<ReturnType<SnipeRunner['feed']>> =>
+          act.type === 'disarm' || outsideAttempt ? runner.dispatch('s1', e, version) : runner.feed('s1', e, version);
+        const runs = act.twice ? [send(), send()] : [send()];
         const results = await Promise.race([Promise.all(runs), world.w.died.then(() => [])]);
         for (const r of results) bump(world, `dispatch:${r.kind}`);
         await flush();
@@ -2593,6 +2610,138 @@ describe('T-84b: dispatch refuses attempt events from outside', () => {
     expect(shared.sgw.placeBids).toHaveLength(0);
     expect(shared.sgw.modals).toHaveLength(0);
     expect(shared.http.requests.filter((req) => req.url.startsWith(PLACE_URL))).toHaveLength(0);
+  });
+});
+
+// ── T-84c: dispatch allow-list (brief item 1) ────────────────────────────────
+
+describe('T-84c: dispatch allow-list', () => {
+  it('an outside wake, verified, verify-failed, fire, preflight-failed or apply-fallback is refused, and the state is unchanged', async () => {
+    const shared = makeShared();
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 30 * SEC); // the verify read is done: 'verified'
+    expect(stored(shared).state).toBe('verified');
+    const runner = getSnipeRunner(ctx);
+    if (runner === undefined) throw new Error('no runner');
+    const before = stored(shared);
+    const now = shared.clock.now();
+    const detail = normalizeItemDetail(shared.sgw.raw(), { observedAt: now, authenticated: true });
+    const outside: SnipeEvent[] = [
+      { type: 'wake', now },
+      { type: 'verified', now, detail, offsetMs: SKEW, rttMs: LATENCY },
+      { type: 'verify-failed', now, reason: 'network' },
+      { type: 'fire', now },
+      { type: 'preflight-failed', now, reason: 'clock' },
+      { type: 'apply-fallback', now, mode: 'skip' },
+    ];
+    for (const e of outside) {
+      const r = await runner.dispatch('s1', e);
+      expect(r.kind).toBe('rejected');
+      if (r.kind === 'rejected') expect(r.rejection.reason).toBe('invalid-event');
+    }
+    expect(stored(shared)).toEqual(before);
+    // The runner's own path still fires and sends exactly one bid.
+    await runTo(shared, END + 2 * MIN);
+    expect(stored(shared).state).toBe('resolved');
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+});
+
+// ── T-84c: at-risk notifications (brief items 3 and 4) ───────────────────────
+
+/** A snipe ending at Oct 12 03:00Z: the 24 h check runs at Oct 11 03:00Z, the 1 h check at Oct 12 02:00Z. */
+const LONG_END = Date.UTC(2026, 9, 12, 3, 0, 0);
+/** A snipe ending at Oct 11 03:00Z: the 1 h check runs at Oct 11 02:00Z (inside quiet hours). */
+const SHORT_END = Date.UTC(2026, 9, 11, 3, 0, 0);
+const QUIET_24_CHECK = Date.UTC(2026, 9, 11, 3, 0, 0);
+const QUIET_END = Date.UTC(2026, 9, 11, 7, 0, 0);
+const LONG_1H_CHECK = Date.UTC(2026, 9, 12, 2, 0, 0);
+
+const AUTH_FAIL = { ok: false as const, reason: 'logged-out', detail: 'You are not signed in to ShopGoodwill. Sign in to ShopGoodwill in this browser.' };
+const AUTH_OK = { ok: true as const };
+
+function quietSettings(): Settings {
+  const s = settingsWith({ live: true });
+  s.locale.timeZone = 'UTC';
+  s.notifications.quietHours = { from: '22:00', to: '07:00' };
+  return s;
+}
+
+describe('T-84c: at-risk notifications and quiet hours', () => {
+  it('a 24 h failure at 3 AM inside quiet hours is delivered at the quiet-hours end', async () => {
+    const shared = makeShared({ settings: quietSettings() });
+    const { w } = await boot(shared, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setAuthHealth({ check: () => Promise.resolve(AUTH_FAIL) });
+      }),
+    });
+    const sentAt: number[] = [];
+    const realNotify = shared.notifier.notify.bind(shared.notifier);
+    shared.notifier.notify = (n) => {
+      sentAt.push(shared.clock.now());
+      return realNotify(n);
+    };
+    shared.sgw.item.endMs = LONG_END;
+    await arm(w);
+    await runTo(shared, QUIET_24_CHECK + ALARM_DELAY + SEC);
+    // Inside quiet hours: the failure is audited, the alert waits for 07:00.
+    expect(kinds(shared)).toContain('snipe.at-risk');
+    expect(shared.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe at risk'))).toHaveLength(0);
+    const deferred = (await snipeAlarms(shared)).find((a) => a.name === snipeAlarmName('s1', 'atrisk-defer'));
+    expect(deferred?.scheduledTime).toBe(QUIET_END);
+    await runTo(shared, QUIET_END + ALARM_DELAY + SEC);
+    const alerts = shared.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe at risk'));
+    expect(alerts).toHaveLength(1);
+    expect(sentAt[0]).toBeGreaterThanOrEqual(QUIET_END);
+  });
+
+  it('a 1 h failure inside quiet hours is delivered at once', async () => {
+    const shared = makeShared({ settings: quietSettings() });
+    const { w } = await boot(shared, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setAuthHealth({ check: () => Promise.resolve(AUTH_FAIL) });
+      }),
+    });
+    shared.sgw.item.endMs = SHORT_END;
+    await arm(w);
+    await runTo(shared, SHORT_END - HOUR + ALARM_DELAY + SEC); // Oct 11 02:00:45Z, inside quiet hours
+    const alerts = shared.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe at risk'));
+    expect(alerts).toHaveLength(1);
+    expect((await snipeAlarms(shared)).some((a) => a.name === snipeAlarmName('s1', 'atrisk-defer'))).toBe(false);
+  });
+
+  it('fail at 24 h, pass at 1 h: atRisk is cleared', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setAuthHealth({ check: (_s, which) => Promise.resolve(which === '24h' ? AUTH_FAIL : AUTH_OK) });
+      }),
+    });
+    shared.sgw.item.endMs = LONG_END;
+    await arm(w);
+    await runTo(shared, QUIET_24_CHECK + ALARM_DELAY + SEC);
+    expect(runnerRecord(shared).entries.s1?.atRisk).toBe('health24:logged-out');
+    expect(shared.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe at risk'))).toHaveLength(1);
+    await runTo(shared, LONG_1H_CHECK + ALARM_DELAY + SEC);
+    expect(runnerRecord(shared).entries.s1?.atRisk).toBeUndefined();
+    expect(shared.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe at risk'))).toHaveLength(1);
+  });
+
+  it('fail at 24 h, fail again at 1 h: notified twice, once per check', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).setAuthHealth({ check: () => Promise.resolve(AUTH_FAIL) });
+      }),
+    });
+    shared.sgw.item.endMs = LONG_END;
+    await arm(w);
+    await runTo(shared, QUIET_24_CHECK + ALARM_DELAY + SEC);
+    await runTo(shared, LONG_1H_CHECK + ALARM_DELAY + SEC);
+    const alerts = shared.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe at risk'));
+    expect(alerts).toHaveLength(2);
+    expect(kinds(shared).filter((k) => k === 'snipe.at-risk')).toHaveLength(2);
   });
 });
 

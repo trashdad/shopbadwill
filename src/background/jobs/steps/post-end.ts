@@ -331,7 +331,7 @@ export async function executePostEnd(step: JobStep, deps: PostEndDeps): Promise<
     for (const s of preFire) {
       const event = endedEvent(s, now);
       if (event === undefined) continue;
-      const r = await runner?.dispatch(s.id, event);
+      const r = await runner?.feed(s.id, event);
       if (r !== undefined && r.kind === 'accepted') moved += 1;
     }
     if (runner === undefined) {
