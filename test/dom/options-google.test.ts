@@ -1,4 +1,5 @@
 // T-70: the Google and Health options sections, driven through FakeMessaging.
+import { onSettingsSaved } from '../../src/entrypoints/options/settings-events';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -261,6 +262,38 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
 
   const toggle = async (): Promise<HTMLInputElement> =>
     screen.findByRole<HTMLInputElement>('switch', { name: 'Add auction ends to Google Calendar' });
+
+  it('T-70c: a reminders save made while the toggle save is in flight keeps both changes, and each save is announced', async () => {
+    let release!: () => void;
+    const holdSet = new Promise<void>((r) => {
+      release = r;
+    });
+    const { fake } = toggleApp({ enabled: false, holdSet });
+    let announced = 0;
+    const off = onSettingsSaved(() => {
+      announced++;
+    });
+    const t = await toggle();
+    await waitFor(() => {
+      expect(t.disabled).toBe(false);
+    });
+    fireEvent.click(t); // calendar on: its settings.set is held
+    const reminder = screen.getAllByLabelText<HTMLInputElement>(/^Reminder \d \(minutes\)$/)[0];
+    if (reminder === undefined) throw new Error('no reminder input');
+    fireEvent.input(reminder, { target: { value: '30' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save reminders' }));
+    release();
+    await waitFor(() => {
+      expect(sent(fake, 'settings.set')).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(announced).toBe(2);
+    });
+    off();
+    const last = sent(fake, 'settings.set')[1]?.payload as Partial<Settings>;
+    expect(last.calendar?.enabled).toBe(true);
+    expect(last.calendar?.reminders[0]).toBe(30);
+  });
 
   it('keeps the toggle disabled with "Connect Google first" while Google is not connected', async () => {
     toggleApp({ auth: status({ connected: false }) });

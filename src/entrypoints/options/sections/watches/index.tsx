@@ -1,4 +1,5 @@
 import type { VNode } from 'preact';
+import { onSettingsSaved } from '../../settings-events';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { browser } from 'wxt/browser';
 
@@ -137,7 +138,15 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
     };
     client.send('settings.get', undefined).then(setSettings, failed);
     client.send('calendar.status', undefined).then(setAuth, failed);
-    return client.onBroadcast('rules.changed', loadRules);
+    // T-70c: another section saved settings (the calendar toggle): re-read them.
+    const offSettings = onSettingsSaved(() => {
+      client.send('settings.get', undefined).then(setSettings, failed);
+    });
+    const offRules = client.onBroadcast('rules.changed', loadRules);
+    return () => {
+      offSettings();
+      offRules();
+    };
   }, [client, loadWatches, loadRules]);
 
   const openDraft = (d: WatchDraft, base?: Watch): void => {
