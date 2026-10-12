@@ -44,7 +44,8 @@ const MSG_DIR = path.join(import.meta.dirname, 'examples', 'Msg');
 
 // §3.12, grouped by its comments. §2.4 rule 3: content scripts may send only
 // the `content` group (page.*, ui.openSnipe, rules.evaluate, rules.disable,
-// landedCost.get, quick.*). `rules.disable` is the T-32 contract change
+// landedCost.get, relist.lookup, quick.*). `rules.disable` is the T-32 contract change;
+// `relist.lookup` is the T-113 one
 // (docs/CONTRACT-DECISIONS.md); extension pages may send content types too.
 const EXPECTED = {
   content: [
@@ -56,6 +57,7 @@ const EXPECTED = {
     'rules.evaluate',
     'rules.disable',
     'landedCost.get',
+    'relist.lookup',
     'quick.hideSeller',
     'quick.hideKeyword',
     'quick.favorite',
@@ -100,6 +102,7 @@ const EXPECTED = {
 const WITH_REPLY = [
   'rules.evaluate',
   'landedCost.get',
+  'relist.lookup',
   'settings.get',
   'rules.list',
   'rules.preview',
@@ -201,6 +204,8 @@ describe('replies', () => {
     expectTypeOf<MsgReply<'rules.evaluate'>>().toEqualTypeOf<MatchResult[]>();
     // T-57 contract change (R1): the reply value now carries shipping, handling and pickup.
     expectTypeOf<MsgReply<'landedCost.get'>>().toEqualTypeOf<Record<ItemId, LandedCostQuote | null>>();
+    // T-113 contract change: the earlier listing per item, or null.
+    expectTypeOf<MsgReply<'relist.lookup'>>().toEqualTypeOf<Record<ItemId, { itemId: ItemId; price: Cents; seenAt: EpochMs } | null>>();
     expectTypeOf<MsgReply<'settings.get'>>().toEqualTypeOf<Settings>();
     expectTypeOf<MsgReply<'rules.list'>>().toEqualTypeOf<Rule[]>();
     expectTypeOf<MsgReply<'rules.preview'>>().toEqualTypeOf<{ matched: number; total: number; ids: ItemId[] }>();
@@ -244,12 +249,23 @@ describe('replies', () => {
     ).toBe(true);
     expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': 1299 }).success).toBe(false);
     expect(MsgReplySchemas['landedCost.get'].safeParse({ '279250057': { shipping: 499, handling: 100 } }).success).toBe(false);
+    // T-113: entries are { itemId, price, seenAt } or null.
+    expect(
+      MsgReplySchemas['relist.lookup'].safeParse({ '279250057': { itemId: 279250001, price: 1299, seenAt: 1791400000000 }, '279250058': null })
+        .success,
+    ).toBe(true);
+    expect(MsgReplySchemas['relist.lookup'].safeParse({ '279250057': { itemId: 279250001, price: -1, seenAt: 1 } }).success).toBe(false);
     expect(MsgReplySchemas['job.status'].safeParse(null).success).toBe(true);
     // timing.awake is the persisted sbw:awake history (epoch ms), or an empty array.
     expect(MsgReplySchemas['timing.awake'].safeParse([]).success).toBe(true);
     expect(MsgReplySchemas['timing.awake'].safeParse([1_791_400_000_000]).success).toBe(true);
     expect(MsgReplySchemas['timing.awake'].safeParse([-1]).success).toBe(false);
     expect(MsgReplySchemas['timing.awake'].safeParse({ beats: [] }).success).toBe(false);
+  });
+
+  it('rejects relist.lookup when itemIds is longer than 40 (T-113)', () => {
+    const ids = Array.from({ length: 41 }, (_, i) => i + 1);
+    expect(MsgEnvelopeSchema.safeParse({ v: 1, reqId: 'r-cap', type: 'relist.lookup', payload: { itemIds: ids } }).success).toBe(false);
   });
 
   it('rejects landedCost.get when itemIds is longer than 40 (R5)', () => {
@@ -273,6 +289,7 @@ type SpecMsg =
   | { type: 'rules.evaluate'; payload: { listings: Listing[] } }
   | { type: 'rules.disable'; payload: { ruleId: string } }
   | { type: 'landedCost.get'; payload: { itemIds: ItemId[] } }
+  | { type: 'relist.lookup'; payload: { itemIds: ItemId[] } }
   | { type: 'quick.hideSeller'; payload: { sellerId: number; sellerName: string } }
   | { type: 'quick.hideKeyword'; payload: { term: string } }
   | { type: 'quick.favorite'; payload: { itemId: ItemId } }
