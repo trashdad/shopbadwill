@@ -42,12 +42,8 @@ export const ON_TIME_RATE_MIN = 0.95;
  * T-90) is judged as this floor, so the gate never opens on fewer.
  */
 export const REQUIRED_DRY_RUNS_FLOOR = 5;
-/**
- * The "first live snipe" checklist link (R5): `docs/ACCEPTANCE.md#a-5` once
- * T-105 writes it; until then the docs folder.
- * TODO(T-105): point this at docs/ACCEPTANCE.md#a-5.
- */
-export const FIRST_LIVE_CHECKLIST_URL = 'https://github.com/trashdad/shopbadwill/tree/main/docs';
+/** The "first live snipe" checklist link (R5): `docs/ACCEPTANCE.md` A-5 (T-105). */
+export const FIRST_LIVE_CHECKLIST_URL = 'https://github.com/trashdad/shopbadwill/blob/main/docs/ACCEPTANCE.md#a-5-first-real-snipe-phase-5';
 /** Audit kind for a `dryRun.bidding` → off transition (both the confirmed override and the clean switch). */
 export const AUDIT_KIND_BIDDING_OFF = 'dryrun.bidding.off';
 
