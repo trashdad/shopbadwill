@@ -1,7 +1,11 @@
-// `sbw:test:baseUrl` (T-39): the test-only override of the two remote origins
-// the background can talk to. E2E runs set them to the fake servers on
-// 127.0.0.1 (buyerapi on 8787, Google on 8788), so no background request can
-// leave the machine. An override is accepted only when the parsed host is
+// `sbw:test:baseUrl` (T-39): the test-only override of the remote origins the
+// background can talk to. E2E runs set them to the fake servers on 127.0.0.1
+// (buyerapi on 8787, Google on 8788), so no background request can leave the
+// machine. The `google` key covers every Google host (T-72, the T-39 carry):
+// the Calendar API, the OAuth token and revoke endpoints, and the consent page
+// (which the background never fetches; the google-auth-stub hook uses the
+// rewrite to point the stand-in consent window at the fake). The fake Google
+// server serves all of them on one origin, under the production paths. An override is accepted only when the parsed host is
 // loopback or a `.test` name. Test builds only; see ./index.ts for how hooks
 // are loaded and called. The port gate there refuses content scripts and web
 // pages, so only an extension page (the test harness) can set this.
@@ -20,13 +24,19 @@ import type { TestHookContext } from './index';
 
 export const BASE_URL_HOOK = 'sbw:test:baseUrl';
 
-/** The production origins this hook may rewrite. Keep them in sync with the adapter configs. */
+/** The production origins each override rewrites. Keep them in sync with the adapter configs. */
 export const PROD_ORIGINS = {
   /** src/adapters/sgw/config.ts: SGW_API_BASE. */
-  sgw: 'https://buyerapi.shopgoodwill.com',
-  /** src/adapters/google/calendar-api.ts: CALENDAR_BASE_URL. */
-  google: 'https://www.googleapis.com',
-} as const;
+  sgw: ['https://buyerapi.shopgoodwill.com'],
+  google: [
+    /** src/adapters/google/calendar-api.ts: CALENDAR_BASE_URL. */
+    'https://www.googleapis.com',
+    /** src/adapters/google/auth-pkce.ts: GOOGLE_OAUTH_ENDPOINTS.token and .revoke. */
+    'https://oauth2.googleapis.com',
+    /** src/adapters/google/auth-pkce.ts: GOOGLE_OAUTH_ENDPOINTS.authorize (the consent page). */
+    'https://accounts.google.com',
+  ],
+} as const satisfies Record<string, readonly string[]>;
 
 export type OverrideKey = keyof typeof PROD_ORIGINS;
 export interface BaseUrlPatch {
@@ -125,9 +135,10 @@ export function applyOverrides(next: BaseUrlOverrides): BaseUrlPatch {
 export function rewriteUrl(raw: string, p: BaseUrlPatch = patch): string {
   for (const key of Object.keys(PROD_ORIGINS) as OverrideKey[]) {
     const to = p[key];
-    const from = PROD_ORIGINS[key];
     if (to === null) continue;
-    if (raw === from || raw.startsWith(`${from}/`)) return `${to}${raw.slice(from.length)}`;
+    for (const from of PROD_ORIGINS[key]) {
+      if (raw === from || raw.startsWith(`${from}/`)) return `${to}${raw.slice(from.length)}`;
+    }
   }
   return raw;
 }
