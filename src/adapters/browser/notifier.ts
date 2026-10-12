@@ -19,6 +19,30 @@ interface Entry {
 }
 type EntryMap = Record<string, Entry>;
 
+/**
+ * T-118 (L7): the stored map is validated on read. A record that is not an
+ * object reads as empty, and an entry that is not `{ at: number, url?: string,
+ * buttons?: string[] }` is dropped, so bad data can never become a URL to open.
+ */
+function validEntries(raw: unknown): EntryMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {};
+  const out: EntryMap = {};
+  for (const [id, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== 'object' || v === null) continue;
+    const e = v as Record<string, unknown>;
+    if (typeof e['at'] !== 'number' || !Number.isFinite(e['at'])) continue;
+    if (e['url'] !== undefined && typeof e['url'] !== 'string') continue;
+    const buttons = e['buttons'];
+    if (buttons !== undefined && !(Array.isArray(buttons) && buttons.every((b) => typeof b === 'string'))) continue;
+    out[id] = {
+      at: e['at'],
+      ...(typeof e['url'] === 'string' ? { url: e['url'] } : {}),
+      ...(buttons === undefined ? {} : { buttons }),
+    };
+  }
+  return out;
+}
+
 /** Firefox supports only `basic` notifications without buttons. */
 export class BrowserNotifier implements Notifier {
   readonly supportsActions: boolean;
@@ -32,7 +56,7 @@ export class BrowserNotifier implements Notifier {
 
   private async read(): Promise<EntryMap> {
     const got = await browser.storage.session.get(NOTIFIER_MAP_KEY);
-    return (got[NOTIFIER_MAP_KEY] as EntryMap | undefined) ?? {};
+    return validEntries(got[NOTIFIER_MAP_KEY]);
   }
 
   private update<T>(fn: (map: EntryMap) => T): Promise<T> {

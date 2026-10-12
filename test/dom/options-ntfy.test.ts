@@ -479,3 +479,38 @@ describe('T-70c: live settings', () => {
     });
   });
 });
+
+describe('T-118 L1: the calendar dry run also stops phone push', () => {
+  const DRY = /while .Dry run: calendar. is on, no phone pushes are sent/i;
+
+  it('says plainly that no phone pushes are sent while "Dry run: calendar" is on', async () => {
+    const on = ntfyOn();
+    app({ settings: { ...on, dryRun: { ...on.dryRun, calendar: true } } });
+    const note = (await screen.findByText(DRY)).textContent;
+    expect(note).toMatch(/Settings section/);
+  });
+
+  it('says nothing about it when the calendar dry run is off, or phone push is off', async () => {
+    const on = ntfyOn();
+    app({ settings: { ...on, dryRun: { ...on.dryRun, calendar: false } } });
+    await screen.findByText('Auction titles and end times are sent to ntfy.sh.');
+    expect(screen.queryByText(DRY)).toBeNull();
+    cleanup();
+
+    const off = defaultSettings();
+    app({ settings: { ...off, dryRun: { ...off.dryRun, calendar: true } } });
+    await screen.findByText('Auction titles and end times are sent to ntfy.sh.');
+    expect(screen.queryByText(DRY)).toBeNull();
+  });
+
+  it('the note follows the Settings switch on the same page', async () => {
+    const on = ntfyOn();
+    const { replySettings } = app({ settings: { ...on, dryRun: { ...on.dryRun, calendar: true } } });
+    await screen.findByText(DRY);
+    replySettings({ ...on, dryRun: { ...on.dryRun, calendar: false } });
+    announceSettingsSaved();
+    await waitFor(() => {
+      expect(screen.queryByText(DRY)).toBeNull();
+    });
+  });
+});

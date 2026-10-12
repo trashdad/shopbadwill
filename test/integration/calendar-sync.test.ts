@@ -762,6 +762,11 @@ describe('late add, reminder sinks, undo, handlers', () => {
     const late = r.notifier.sent.filter((n) => n.id === `sbw:notify:late:${String(id)}`);
     expect(late).toHaveLength(1);
     expect(late[0]?.notification.title).toMatch(/^Ends in \d+ min: Last minute vase/);
+    // T-118 (L3): one tab per click. The shared T-56 id routes a body click to the
+    // dashboard (handleNotificationAction), so the notice must not also open the item
+    // itself; the item is the same 'Open item' button T-56's notice offers.
+    expect(late[0]?.notification.openUrlOnClick).toBeUndefined();
+    expect(late[0]?.notification.actions?.map((a) => a.id)).toEqual(['open-item', 'dashboard']);
     await r.setTracked(id, { endTime: new Date(Date.now() + 40 * MIN).toISOString() });
     await r.sync.syncNow('two');
     expect(r.notifier.sent.filter((n) => n.id === `sbw:notify:late:${String(id)}`)).toHaveLength(1);

@@ -157,6 +157,20 @@ export function fingerprintOf(e: DesiredEvent): string {
   return `${e.startUtc}|${String(e.generation)}|${minutes}`;
 }
 
+/**
+ * T-118 (L4): which topic a stored item's entries were published on, without
+ * storing the topic (R3): 32-bit FNV-1a, hex. A record written by a publish
+ * that raced a topic rotation then no longer reads as "already scheduled".
+ */
+export function topicTag(topic: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < topic.length; i++) {
+    h ^= topic.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
 /** R4: only the title, the lead and the end time in the user's zone; the link travels as X-Click. */
 export function buildMessage(e: DesiredEvent, leadMin: number, timeZone: string): Omit<NtfyMessage, 'seq' | 'fireAt'> {
   const endMs = new Date(e.startUtc).getTime();
@@ -360,7 +374,10 @@ export class NtfySink {
       }
       const now = this.deps.clock.now();
       const state = await this.deps.store.load();
-      const prev = state.items[event.itemId];
+      const tag = topicTag(prep.topic);
+      const stored = state.items[event.itemId];
+      // T-118 (L4): entries stored for another topic are not scheduled on this one.
+      const prev = stored !== undefined && (stored.topicTag ?? tag) === tag ? stored : undefined;
       const fingerprint = fingerprintOf(event);
 
       let entries: NtfyEntry[] = [];
@@ -374,7 +391,7 @@ export class NtfySink {
         if (remaining.some((entry) => entry.status === 'scheduled')) {
           await this.deps.store.update((s) => ({
             ...(s.status === undefined ? {} : { status: s.status }),
-            items: { ...s.items, [event.itemId]: { fingerprint: prev.fingerprint, entries: remaining } },
+            items: { ...s.items, [event.itemId]: { fingerprint: prev.fingerprint, topicTag: tag, entries: remaining } },
           }));
           return;
         }
@@ -384,6 +401,7 @@ export class NtfySink {
       }
 
       const byLead = new Map(entries.map((x) => [x.leadMin, x]));
+      const published: NtfyEntry[] = [];
       for (const lead of this.leads(event, now)) {
         if (lead === null) continue; // past: skip entirely (R5)
         const cur = byLead.get(lead.leadMin);
@@ -401,7 +419,9 @@ export class NtfySink {
         if (cur !== undefined && cur.status === 'scheduled' && cur.seq === lead.seq && cur.fireAt === lead.fireAt) continue;
         const result = await this.publish(event.itemId, prep.topic, prep.timeZone, event, lead);
         if (result === 'ok') {
-          byLead.set(lead.leadMin, { seq: lead.seq, leadMin: lead.leadMin, fireAt: lead.fireAt, status: 'scheduled' });
+          const entry: NtfyEntry = { seq: lead.seq, leadMin: lead.leadMin, fireAt: lead.fireAt, status: 'scheduled' };
+          byLead.set(lead.leadMin, entry);
+          published.push(entry);
         } else {
           // failed / rate-limited: the lead stays unpublished; the next upsert retries it.
           byLead.delete(lead.leadMin);
@@ -409,11 +429,20 @@ export class NtfySink {
         }
       }
 
+      // T-118 (L4): the options page may have rotated the topic, or turned phone
+      // push off, while this pass published (it clears `sbw:ntfy` outside this
+      // sink's queue). Take this pass's pushes back off the old topic and record
+      // nothing: the next upsert publishes on the new topic.
+      if (published.length > 0 && (await this.topicMoved(prep.topic))) {
+        await this.cancelEntries(event.itemId, prep.topic, published);
+        return;
+      }
+
       const next = [...byLead.values()];
       const unchanged =
         prev !== undefined && prev.fingerprint === fingerprint && JSON.stringify(prev.entries) === JSON.stringify(next);
       if (unchanged && state.status === undefined) return; // nothing owed: no write either
-      await this.deps.store.update((s) => ({ items: { ...s.items, [event.itemId]: { fingerprint, entries: next } } }));
+      await this.deps.store.update((s) => ({ items: { ...s.items, [event.itemId]: { fingerprint, topicTag: tag, entries: next } } }));
       if (state.status !== undefined) await this.audit({ kind: 'ntfy.status', details: { status: 'ok' } });
     } catch (e) {
       // R8: a failure never throws into calendar sync; audit without the topic.
@@ -431,6 +460,14 @@ export class NtfySink {
       const state = await this.deps.store.load();
       const item = state.items[itemId];
       if (item === undefined) return;
+      if (item.topicTag !== undefined && item.topicTag !== topicTag(prep.topic)) {
+        // T-118 (L4): published on another topic; nothing of it is on this one to cancel.
+        await this.deps.store.update((s) => ({
+          ...(s.status === undefined ? {} : { status: s.status }),
+          items: Object.fromEntries(Object.entries(s.items).filter(([key]) => key !== String(itemId))),
+        }));
+        return;
+      }
       const live = item.entries.filter((x) => x.status === 'scheduled');
       const kept: NtfyEntry[] = [];
       for (let i = 0; i < live.length; i++) {
@@ -449,7 +486,12 @@ export class NtfySink {
           const items = Object.fromEntries(Object.entries(s.items).filter(([key]) => key !== String(itemId)));
           return { items };
         }
-        return { items: { ...s.items, [itemId]: { fingerprint: item.fingerprint, entries: kept } } };
+        return {
+          items: {
+            ...s.items,
+            [itemId]: { fingerprint: item.fingerprint, ...(item.topicTag === undefined ? {} : { topicTag: item.topicTag }), entries: kept },
+          },
+        };
       });
     } catch (e) {
       await this.audit({ kind: 'ntfy.failed', itemId, details: { error: this.errorLabel(e) } });
@@ -457,6 +499,16 @@ export class NtfySink {
   }
 
   // ── internals ─────────────────────────────────────────────────────────────
+
+  /** T-118 (L4): phone push is now off, or on another topic, than when this pass started. */
+  private async topicMoved(topic: string): Promise<boolean> {
+    try {
+      const n = (await this.deps.settings()).ntfy;
+      return n === undefined || !n.enabled || n.topic !== topic;
+    } catch {
+      return false;
+    }
+  }
 
   /** The leads to consider now: deferred beyond the window, skipped within 10 s, else scheduled. */
   private leads(event: DesiredEvent, now: EpochMs): Array<Lead | null> {

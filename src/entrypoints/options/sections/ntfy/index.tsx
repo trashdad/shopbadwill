@@ -255,6 +255,12 @@ export function NtfySection(props: NtfySectionProps): VNode {
             tone="error"
           />
         ) : null}
+        {ntfy.enabled && settings.dryRun.calendar ? (
+          <p class="sbw-warn">
+            While “Dry run: calendar” is on, no phone pushes are sent: phone push follows calendar sync, which only
+            practises in dry run. Turn it off in the Settings section.
+          </p>
+        ) : null}
         {unsupportedServer ? (
           <Status
             message="This version supports only https://ntfy.sh; the saved server cannot be used yet."

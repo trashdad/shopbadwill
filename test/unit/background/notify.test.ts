@@ -276,6 +276,8 @@ describe('deliverDigest', () => {
     expect(all[0]?.name).toBe(`${DIGEST_ALARM_PREFIX}run-1`);
     expect(all[0]?.scheduledTime).toBe(Date.UTC(2026, 9, 11, 11, 0, 0));
     expect(audit.kinds).toEqual(['notify.deferred']);
+    // T-118 (L6): recorded, so a startup reconcile re-creates it if the browser drops it.
+    expect(await repo.get(STORAGE_KEYS.deferredAlarms)).toEqual({ [`${DIGEST_ALARM_PREFIX}run-1`]: Date.UTC(2026, 9, 11, 11, 0, 0) });
 
     // The alarm fires at the end of quiet hours.
     clock.set(Date.UTC(2026, 9, 11, 11, 0, 5));

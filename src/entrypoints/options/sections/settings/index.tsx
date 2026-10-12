@@ -9,6 +9,7 @@ import { Status } from '../../../../ui/components/Status';
 import { Switch } from '../../../../ui/components/Switch';
 import { Money } from '../../../../ui/money';
 import type { SectionDef, SectionProps } from '../../registry';
+import { announceSettingsSaved } from '../../settings-events';
 
 const ZIP = /^\d{5}$/;
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -61,6 +62,8 @@ export function SettingsSection(props: SectionProps): VNode {
       (next) => {
         if (gen === latest.current) setSettings(next);
         setStatus({ message: `Saved: ${what}.`, tone: 'ok' });
+        // T-118 (L1): other sections (ntfy reads dryRun.calendar) re-read settings.
+        announceSettingsSaved();
       },
       (e: unknown) => {
         setSettings((cur) => (cur === null ? cur : { ...cur, ...pick(previous, shown) }));

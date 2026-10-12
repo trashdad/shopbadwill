@@ -39,6 +39,7 @@ import type { Notification } from '../../../ports/notifier';
 import type { SgwApi } from '../../../ports/sgw-api';
 import type { BackgroundContext } from '../../context';
 import { syncFor } from '../calendar-sync';
+import { deferAlarm } from '../deferred-alarms';
 import { itemUrl, plainText, quietHoursEnd, truncateTitle } from '../notify';
 import { getSnipeRunner } from '../snipe-runner';
 
@@ -208,7 +209,7 @@ export async function notifyOutcome(
   if (t === undefined) return 'skipped';
   const until = quietHoursEnd(clock.now(), settings.notifications.quietHours, settings.locale.timeZone);
   if (until !== null) {
-    await alarms.create(OUTCOME_NOTIFY_PREFIX + String(itemId), { when: until });
+    await deferAlarm({ repo, alarms }, OUTCOME_NOTIFY_PREFIX + String(itemId), until); // T-118 (L6): survives a dropped alarm
     return 'deferred';
   }
   const overMax = outcome === 'lost' ? await lossBasis(ctx, itemId) : undefined;

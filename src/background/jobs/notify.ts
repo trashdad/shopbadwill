@@ -30,6 +30,7 @@ import type { Alarms } from '../../ports/alarms';
 import type { Notification, Notifier } from '../../ports/notifier';
 import type { Permissions } from '../../ports/permissions';
 import type { BackgroundContext } from '../context';
+import { deferAlarm } from './deferred-alarms';
 import { FAVORITE_SKIP_PREFIX } from './steps/favorite';
 
 export const DIGEST_ALARM_PREFIX = 'sbw:notify:digest:';
@@ -283,7 +284,7 @@ export async function deliverDigest(deps: NotifyDeps, run: DigestRun): Promise<D
   const now = repo.now();
   const until = quietHoursEnd(now, settings.notifications.quietHours, settings.locale.timeZone);
   if (until !== null) {
-    await deps.alarms.create(DIGEST_ALARM_PREFIX + run.id, { when: until });
+    await deferAlarm(deps, DIGEST_ALARM_PREFIX + run.id, until); // T-118 (L6): survives a dropped alarm
     if (!deferred.has(run.id)) {
       await deps.audit.append({
         actor: 'daily-job',

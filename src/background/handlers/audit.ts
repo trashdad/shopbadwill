@@ -34,7 +34,12 @@ export interface AuditHandlerDeps {
   executors: Partial<Record<UndoKind, UndoExecutor>>;
 }
 
-export function createUndoExecutors(deps: { api: Pick<SgwApi, 'removeFavorite'>; repo: Repo }): Partial<Record<UndoKind, UndoExecutor>> {
+export function createUndoExecutors(deps: {
+  api: Pick<SgwApi, 'removeFavorite'>;
+  repo: Repo;
+  /** T-118 (L9): tells open pages the rules changed (an options Rules section would otherwise stay stale). */
+  rulesChanged?: () => Promise<void>;
+}): Partial<Record<UndoKind, UndoExecutor>> {
   return {
     // favoriteState stays 'favorited' on purpose (T-53): handled, the user owns it now.
     // A worker restart mid-undo (after the write, before the `undo` audit append) leaves the
@@ -60,6 +65,8 @@ export function createUndoExecutors(deps: { api: Pick<SgwApi, 'removeFavorite'>;
         }),
       );
       if (hits.length === 0) throw new Error('That rule no longer exists.');
+      // The rule is already back on: a failed broadcast must not fail the undo.
+      if (deps.rulesChanged !== undefined) await deps.rulesChanged().catch(() => undefined);
     },
   };
 }
@@ -138,7 +145,10 @@ export function createAuditHandlers(deps: AuditHandlerDeps): {
  * UNDOABLE_KINDS is pinned to these keys by a unit test.
  */
 export function wiredUndoExecutors(ctx: BackgroundContext): Partial<Record<UndoKind, UndoExecutor>> {
-  return { ...createUndoExecutors({ api: ctx.api, repo: ctx.repo }), ...createCalendarUndoExecutors(ctx) };
+  return {
+    ...createUndoExecutors({ api: ctx.api, repo: ctx.repo, rulesChanged: () => ctx.broadcast('rules.changed') }),
+    ...createCalendarUndoExecutors(ctx),
+  };
 }
 
 /** T-36 self-registration (I-01): main.ts's handler registry calls this once. */

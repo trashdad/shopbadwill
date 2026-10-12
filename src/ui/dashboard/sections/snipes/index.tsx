@@ -15,10 +15,12 @@
 import type { VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
+import { BrowserPermissions } from '../../../../adapters/browser/permissions';
 import { formatMoney } from '../../../../domain/money';
 import type { Snipe, SnipeState } from '../../../../domain/snipe/types';
 import type { ItemId } from '../../../../domain/types';
 import { PORT_NAMES, type SnipeCountdownTick } from '../../../../messaging/protocol';
+import type { Permissions } from '../../../../ports/permissions';
 import { describeError } from '../../../components/describeError';
 import { ExposureMeter, measureExposure } from '../../../exposure';
 import { Money } from '../../../money';
@@ -127,8 +129,14 @@ function OutcomeRow(props: { snipe: Snipe; tz: string }): VNode {
   );
 }
 
-export function SnipesSection(props: SectionProps): VNode {
+export interface SnipesSectionProps extends SectionProps {
+  /** Injectable for tests (T-118 F4: the notifications-off warning). */
+  permissions?: Pick<Permissions, 'contains' | 'request'>;
+}
+
+export function SnipesSection(props: SnipesSectionProps): VNode {
   const { client } = props;
+  const [permissions] = useState(() => props.permissions ?? new BrowserPermissions());
   const [settings, reloadSettings] = useLoad(() => client.send('settings.get', undefined), [client]);
   const [snipes, reloadSnipes] = useLoad(() => client.send('snipe.list', undefined), [client]);
   const [ticks, setTicks] = useState<ReadonlyMap<string, SnipeCountdownTick>>(new Map());
@@ -227,6 +235,7 @@ export function SnipesSection(props: SectionProps): VNode {
         snipes={list}
         openItem={openItem}
         onArmed={reloadSnipes}
+        permissions={permissions}
       />
 
       <h3>Armed snipes</h3>

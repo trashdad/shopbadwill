@@ -58,6 +58,7 @@ const LOCAL_KEYS = [
   'sbw:snipeRunner',
   'sbw:dryRunCounted',
   'sbw:companionWakes',
+  'sbw:deferredAlarms',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -113,6 +114,8 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:dryRunCounted': { version: 1, counted: { 'snp-1': 1791400000000 } },
   // T-111: the wakes the T2 companion may hold (snipe id -> wake), kept 15 days for the awake history.
   'sbw:companionWakes': { version: 1, wakes: { 'snp-1': { wakeAt: 1791400000000, state: 'confirmed', triedAt: 1791390000000 } } },
+  // T-118 (L6): deferred one-shot alarms (name -> when), re-created at startup if the browser dropped them.
+  'sbw:deferredAlarms': { 'sbw:notify:digest:run-1': 1791400000000 },
 };
 
 describe('storage schema v1', () => {
@@ -218,6 +221,16 @@ describe('storage schema v1', () => {
     expect(parseCompanionWakes(undefined)).toEqual({ version: 1, wakes: {} });
     expect(parseCompanionWakes({ version: 1, wakes: 'x' })).toEqual({ version: 1, wakes: {} });
     expect(parseCompanionWakes({ version: 1, wakes: { 'snp-1': entry } })).toEqual({ version: 1, wakes: { 'snp-1': entry } });
+  });
+
+  it('registers the optional deferred-alarm record: alarm name -> when (T-118 L6)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.deferredAlarms];
+    expect(STORAGE_KEYS.deferredAlarms).toBe('sbw:deferredAlarms');
+    expect(spec.area).toBe('local');
+    expect(spec.schema.safeParse({}).success).toBe(true);
+    expect(spec.schema.safeParse({ 'sbw:notify:outcome:28': 1791400000000 }).success).toBe(true);
+    expect(spec.schema.safeParse({ 'sbw:notify:outcome:28': -1 }).success).toBe(false);
+    expect(spec.schema.safeParse({ '': 1791400000000 }).success).toBe(false);
   });
 
   it('registers the optional quote salt: 64 lowercase hex, nothing else (T-57 final check)', () => {

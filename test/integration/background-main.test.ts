@@ -40,6 +40,7 @@ import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import type { SgwEndpointKey } from '../../src/adapters/sgw/config';
 import type { HealthReport, Listing, SgwSessionRecord } from '../../src/domain/types';
 import type { AuditEntry } from '../../src/domain/audit/types';
+import type { Watch } from '../../src/domain/watches/schema';
 import { loadFixture } from '../contract/sgw/fixtures';
 import { FakeAlarms } from '../fakes/ports/fake-alarms';
 import { FakeClock } from '../fakes/ports/fake-clock';
@@ -1648,5 +1649,58 @@ describe('verdictNow ignoreDryRun (T-84)', () => {
     expect(bid.switches.verdictNow('bidding', { ignoreDryRun: true })).toEqual({ ok: false, why: 'health check failed' });
     expect(bid.switches.verdictNow('favorites', { ignoreDryRun: true })).toEqual({ ok: true });
     expect(bid.switches.verdictNow('calendar', { ignoreDryRun: true })).toEqual({ ok: true });
+  });
+});
+
+describe('T-118 L5: a new daily run time takes effect at its next occurrence', () => {
+  // T0 is 2026-10-10 15:00 UTC; the zone is UTC so the slots are easy to read.
+  const at = (day: number, hour: number): number => Date.UTC(2026, 9, day, hour, 0, 0);
+  const sevenAm = (): Settings => {
+    const s = liveSettings();
+    return { ...s, locale: { ...s.locale, timeZone: 'UTC' }, dailyRun: { ...s.dailyRun, localTime: '07:00' } };
+  };
+  const watch = (id: string, nextRunAt: number, enabled = true): Watch => ({
+    id,
+    name: id,
+    enabled,
+    query: { searchText: id, categoryIds: [], sellerIds: [], page: 1 },
+    ruleIds: [],
+    maxPages: 1,
+    favoriteMode: 'sgw',
+    calendar: false,
+    notify: false,
+    nextRunAt,
+    seenItemIds: [],
+  });
+
+  async function bootWith(watches: Watch[], dailyRunOn = true) {
+    const base = sevenAm();
+    const s = { ...base, dailyRun: { ...base.dailyRun, enabled: dailyRunOn } };
+    const h = boot({ seed: { [STORAGE_KEYS.settings]: s, [STORAGE_KEYS.watches]: watches } });
+    await h.handle.ready;
+    const stored = (): Record<string, number> =>
+      Object.fromEntries((h.areas.local.dump()[STORAGE_KEYS.watches] as Watch[]).map((w) => [w.id, w.nextRunAt]));
+    return { h, s, stored };
+  }
+
+  it('moved later: the same day, while that time is still ahead', async () => {
+    const { h, s, stored } = await bootWith([watch('a', at(11, 7)), watch('off', at(11, 7), false)]);
+    await h.ok('settings.set', { dailyRun: { ...s.dailyRun, localTime: '20:00' } });
+    expect(stored()).toEqual({ a: at(10, 20), off: at(10, 20) });
+  });
+
+  it('moved earlier than now: the next day at the new time, not the old slot', async () => {
+    const { h, s, stored } = await bootWith([watch('a', at(11, 7))]);
+    await h.ok('settings.set', { dailyRun: { ...s.dailyRun, localTime: '03:00' } });
+    expect(stored()).toEqual({ a: at(11, 3) });
+  });
+
+  it('an overdue watch keeps its slot (catch-up decides), and other settings changes move nothing', async () => {
+    // Daily runs off, so the startup reconcile leaves the overdue slot as seeded.
+    const { h, s, stored } = await bootWith([watch('late', at(10, 7)), watch('a', at(11, 7))], false);
+    await h.ok('settings.set', { considerateMode: 'tight' });
+    expect(stored().a).toBe(at(11, 7));
+    await h.ok('settings.set', { dailyRun: { ...s.dailyRun, localTime: '20:00' } });
+    expect(stored()).toEqual({ late: at(10, 7), a: at(10, 20) });
   });
 });

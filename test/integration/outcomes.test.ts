@@ -632,6 +632,8 @@ describe('post-end outcome detection', () => {
     const alarm = (await r.alarms.getAll()).find((a) => a.name === `${OUTCOME_NOTIFY_ALARM_PREFIX}28`);
     expect(alarm).toBeDefined();
     expect(alarm?.scheduledTime).toBeGreaterThan(r.clock.now());
+    // T-118 (L6): recorded, so a startup reconcile re-creates it if the browser drops it.
+    expect(await r.repo.get(STORAGE_KEYS.deferredAlarms)).toEqual({ [`${OUTCOME_NOTIFY_ALARM_PREFIX}28`]: alarm?.scheduledTime });
 
     // Quiet hours end at 06:00 EDT = 10:00 UTC.
     r.clock.advance(6 * 60 * MIN + 10 * MIN);

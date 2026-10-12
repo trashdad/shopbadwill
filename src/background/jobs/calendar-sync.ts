@@ -149,7 +149,7 @@ export interface CalendarSyncDeps {
   api: CalendarApi;
   switches: GlobalSwitches;
   google: Pick<GoogleAuthProvider, 'status'>;
-  notifier: Pick<Notifier, 'notify'>;
+  notifier: Pick<Notifier, 'notify'> & Partial<Pick<Notifier, 'supportsActions'>>;
   permissions: Pick<Permissions, 'contains'>;
   /** The badge owner (T-86 subscribes to the flag). */
   badge: { set(on: boolean): void };
@@ -319,7 +319,17 @@ export class CalendarSync {
       title: `Ends in ${String(minutes)} min: ${truncateTitle(e.title, 50)}`,
       message: `Added to your calendar. ${itemUrl(e.itemId)}`,
       priority: 1,
-      openUrlOnClick: itemUrl(e.itemId),
+      // T-118 (L3): no openUrlOnClick. The id is T-56's, so a body click already
+      // opens the dashboard there (handleNotificationAction); opening the item too
+      // made two tabs. The item is T-56's 'Open item' button (the URL is in the text on Firefox).
+      ...(this.deps.notifier.supportsActions === true
+        ? {
+            actions: [
+              { id: 'open-item', title: 'Open item' },
+              { id: 'dashboard', title: 'Open dashboard' },
+            ],
+          }
+        : {}),
     });
     await audit.append({ actor: 'calendar', kind: 'notify.late-add', itemId: e.itemId, details: { minutes } });
   }

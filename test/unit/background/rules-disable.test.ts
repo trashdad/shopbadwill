@@ -4,7 +4,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { BackgroundContext } from '../../../src/background/context';
-import { createUndoExecutors } from '../../../src/background/handlers/audit';
+import { createUndoExecutors, wiredUndoExecutors } from '../../../src/background/handlers/audit';
 import { register } from '../../../src/background/handlers/rules';
 import { createRouter, type Router, type RouterSender } from '../../../src/background/router';
 import type { Rule } from '../../../src/domain/rules/schema';
@@ -80,6 +80,19 @@ describe('rules.disable', () => {
     if (entry?.undo === undefined) throw new Error('no undoable entry');
     await undo(entry.undo.ref, entry);
     expect((await rules()).find((x) => x.id === 'a')?.enabled).toBe(true);
+  });
+
+  it('the wired undo broadcasts rules.changed, so an open options Rules section reloads (T-118 L9)', async () => {
+    await router.handle(env('rules.disable', { ruleId: 'a' }), CONTENT);
+    broadcast.mockClear();
+    const ctx = { api: new FakeSgwApi({ clock, switches: new FakeSwitches() }), repo, broadcast } as unknown as BackgroundContext;
+    const undo = wiredUndoExecutors(ctx).disableRule;
+    if (undo === undefined) throw new Error('no disableRule executor');
+    const entry = audit.entries[0];
+    if (entry?.undo === undefined) throw new Error('no undoable entry');
+    await undo(entry.undo.ref, entry);
+    expect((await rules()).find((x) => x.id === 'a')?.enabled).toBe(true);
+    expect(broadcast).toHaveBeenCalledWith('rules.changed');
   });
 
   it('an already disabled rule is a no-op (no broadcast, no audit)', async () => {
