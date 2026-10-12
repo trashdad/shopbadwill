@@ -196,6 +196,30 @@ describe('BrowserNotifier', () => {
     });
   });
 
+  it('validates the stored map (T-118 L7): a bad record or entry reads as absent, never as a url to open', async () => {
+    const tabs = vi.spyOn(browser.tabs, 'create').mockResolvedValue({} as never);
+    await browser.storage.session.set({ [NOTIFIER_MAP_KEY]: 'junk' });
+    const n = new BrowserNotifier({ supportsActions: true });
+    const cb = vi.fn();
+    n.onAction(cb);
+    // A junk record does not break a new notification.
+    const id = await n.notify({ title: 't', message: 'm', openUrlOnClick: 'https://example.test/ok' });
+    expect(Object.keys((await browser.storage.session.get(NOTIFIER_MAP_KEY))[NOTIFIER_MAP_KEY] as object)).toEqual([id]);
+
+    await browser.storage.session.set({
+      [NOTIFIER_MAP_KEY]: { bad: { at: 'yesterday', url: 42 }, worse: null, ok: { at: Date.now(), url: 'https://example.test/ok' } },
+    });
+    await fakeBrowser.notifications.onClicked.trigger('bad');
+    await vi.waitFor(() => {
+      expect(cb).toHaveBeenLastCalledWith('bad', 'click');
+    });
+    expect(tabs).not.toHaveBeenCalled();
+    await fakeBrowser.notifications.onClicked.trigger('ok');
+    await vi.waitFor(() => {
+      expect(tabs).toHaveBeenCalledWith({ url: 'https://example.test/ok' });
+    });
+  });
+
   it('drops mappings on close and caps stored entries', async () => {
     const n = new BrowserNotifier({ supportsActions: true });
     n.onAction(vi.fn());

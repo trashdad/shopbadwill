@@ -678,3 +678,11 @@ Source: T-111 (extension side of T2). Requirement 5 of the card's brief authoris
 - `sbw:authhealth:<id>:<which>`, the auth-health warning.
 
 The owners create these alarms through `deferAlarm` (`src/background/jobs/deferred-alarms.ts`), which records the alarm and then creates it. That job module runs at every background start. It re-creates any recorded alarm the browser no longer holds; a past `when` fires at once. When an alarm fires, its record is removed, unless the owner deferred it again to a later time. The owners' handlers are idempotent: each re-checks its audit marker or the snipe state. A re-created alarm therefore never sends a notice twice. The change is additive, and `schemaVersion` stays 1. `test/contract/types/storage.test.ts` lists the key.
+
+## T-118: two internal storage keys, documented (no contract change)
+
+Neither key is a Repo record, so neither is in `STORAGE_KEYS`. Each is private to one module, and losing it costs nothing that matters.
+
+**`sbw:notifier:map`** (storage.session). `NOTIFIER_MAP_KEY` in `src/adapters/browser/notifier.ts`. It maps a notification id to `{ at: EpochMs, url?: string, buttons?: string[] }`, so that a click or a button press can be resolved after a service-worker restart. Entries are kept for at most 24 h, and at most 50 of them. A body click consumes its entry, and so does a close. The map is validated on read: a record that is not an object reads as empty, and an invalid entry is dropped. Bad data can therefore never become a URL to open. It lives in session storage, so a browser restart clears it. The only cost is that a click on a notification left over from before the restart opens nothing.
+
+**`sbw:cacheOrder:<cacheKey>`** (storage.local, one per cache: `sbw:listingCache`, `sbw:detailCache`, `sbw:shippingCache`). `CACHE_ORDER_PREFIX` in `src/domain/storage/repo.ts`. It holds the recency list (oldest first) that the Repo uses to evict entries past `CACHE_MAX_ENTRIES`. A separate list is needed because a JS object orders integer-like keys numerically, not by insertion. It is validated as `string[]`; missing or invalid data reads as empty, and entries with no recency record are then evicted first. It is written only inside the cache's own lock.
