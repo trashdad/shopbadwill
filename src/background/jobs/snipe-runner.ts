@@ -77,6 +77,7 @@ import type { Clock } from '../../ports/clock';
 import { SgwApiError } from '../../ports/errors';
 import type { SgwApi } from '../../ports/sgw-api';
 import { errorText, type BackgroundContext, type RuntimePort } from '../context';
+import { quietHoursEnd } from './notify';
 import { WHY, type Verdict } from '../switches';
 
 // ── Policy ──────────────────────────────────────────────────────────────────
@@ -87,7 +88,7 @@ const HOUR = 60 * MIN;
 
 /** Alarm names: `sbw:snipe:<id>:<kind>` (PLAN §1.3). */
 export const SNIPE_ALARM_PREFIX = 'sbw:snipe:';
-export const SNIPE_ALARM_KINDS = ['health24', 'health1', 'preflight', 'wake', 'recover', 'postread'] as const;
+export const SNIPE_ALARM_KINDS = ['health24', 'health1', 'preflight', 'wake', 'recover', 'postread', 'atrisk-defer'] as const;
 export type SnipeAlarmKind = (typeof SNIPE_ALARM_KINDS)[number];
 
 /** `sbw:snipeRunner`: per snipe, the effects outbox and the runner's bookkeeping. */
@@ -369,19 +370,15 @@ export type CommitResult =
   | { kind: 'missing' };
 
 /**
- * The events of a send attempt: only the runner, which owns the send, feeds
- * them (its internal commits). `dispatch` refuses them from outside, always:
- * a made-up `result` could suppress a bid, and a made-up `post-read` could
- * settle one while its PlaceBid is in flight (T-84b, brief item 4).
+ * The only events an outside caller may send (`dispatch`): `disarm` (T-86's
+ * kill disarm-all, the user) and `arm` (already exposed through `dispatch`;
+ * the proper arm is `arm()`). Every other event is refused before it reaches
+ * the reducer (T-84c): a made-up `fire` could trigger a send, a made-up
+ * `verify-failed` or `preflight-failed` could suppress one, and a made-up
+ * `verified` could move the fire to a wrong time. The runner feeds those
+ * itself, through its internal commits (`feed`, the private `commit`).
  */
-const ATTEMPT_EVENTS: ReadonlySet<SnipeEvent['type']> = new Set([
-  'sent',
-  'result',
-  'ambiguous',
-  'post-read',
-  'post-read-failed',
-  'not-sent',
-]);
+const EXTERNAL_EVENTS: ReadonlySet<SnipeEvent['type']> = new Set(['disarm', 'arm']);
 
 interface CommitOptions {
   /** Outbox effects this event completes; removed in the same write (even when the event is refused). */
@@ -390,7 +387,7 @@ interface CommitOptions {
   detail?: ItemDetail;
   /** The history.length the caller reduced from (compare-and-set). */
   expectVersion?: number;
-  /** From outside the runner's own send path (`dispatch`): attempt events are always refused. */
+  /** From outside the runner (`dispatch`): only `disarm` and `arm` are allowed; everything else is refused. */
   external?: boolean;
 }
 
@@ -688,16 +685,16 @@ export class SnipeRunner {
       const rec = await this.readRunner();
       const s = all[id];
       if (s === undefined) return { kind: 'missing' };
-      // T-84b: outside attempt events are refused outright, never reduced. A
-      // made-up reply or read must not settle (or suppress) a send the runner owns.
-      if (opts.external === true && ATTEMPT_EVENTS.has(e.type)) {
+      // T-84c: the dispatch allow-list. Anything but `disarm` (and `arm`) from
+      // outside is refused outright, never reduced: a made-up reply, read,
+      // wake or fire must not settle (or trigger) a send the runner owns.
+      if (opts.external === true && !EXTERNAL_EVENTS.has(e.type)) {
         return {
           kind: 'rejected',
           snipe: s,
           rejection: {
             reason: 'invalid-event',
-            detail:
-              'Attempt events (sent, result, ambiguous, post-read, post-read-failed, not-sent) are fed only by the runner; an outside dispatch is refused.',
+            detail: 'Only disarm (and arm) may be dispatched from outside the runner; every other event is fed by the runner itself.',
           },
         };
       }
@@ -1386,11 +1383,12 @@ export class SnipeRunner {
 
   // ── Health checks (AuthHealth port, 0 SGW requests) ───────────────────
 
-  private async healthCheck(id: string, which: 'health24' | 'health1'): Promise<void> {
+  private async healthCheck(id: string, which: 'health24' | 'health1', forceNotify = false): Promise<void> {
     const { snipe: s, entry } = await this.load(id);
     if (s === undefined || isTerminal(s)) return;
+    const now = this.ctx.clock.now();
     // From T-15 min on, the preflight decides.
-    if (this.ctx.clock.now() >= this.endLocal(s) - PREFLIGHT_LEAD_MS) return;
+    if (now >= this.endLocal(s) - PREFLIGHT_LEAD_MS) return;
     let r: AuthHealthResult;
     try {
       r = await this.seams.authHealth.check(s, which === 'health24' ? '24h' : '1h');
@@ -1398,23 +1396,47 @@ export class SnipeRunner {
       this.log(`snipe ${id}: the auth-health check threw`, e);
       return;
     }
-    if (r.ok) return;
+    if (r.ok) {
+      // T-84c: a later check passed: the risk is gone. A repeat failure (even
+      // with the same reason at a later check) then alerts again.
+      if (entry.atRisk !== undefined) await this.updateEntry(id, { atRisk: undefined });
+      return;
+    }
     // At risk: alert the user while there is time to fix it. Never a disarm here.
-    await this.updateEntry(id, { atRisk: r.reason });
+    // The `atRisk` value carries the check too (`health24:reason`), so the same
+    // reason at the 1 h check is a NEW risk and is notified again (T-84c).
+    const key = `${which}:${r.reason}`;
+    await this.updateEntry(id, { atRisk: key });
     await this.safely('audit', () =>
       this.ctx.audit.append({ actor: 'snipe', kind: 'snipe.at-risk', itemId: s.itemId, ref: id, details: { check: which, reason: r.reason, detail: r.detail }, dryRun: s.dryRun }),
     );
-    if (entry.atRisk !== r.reason) {
-      await this.safely('notify', () =>
-        this.ctx.notifier.notify({
-          id: `sbw:snipe:${id}:at-risk`,
-          title: `Snipe at risk: ${s.title}`,
-          message: `${r.detail} Fix it before the auction ends: the check 15 minutes before the end decides whether the snipe runs.`,
-          priority: 2,
-          openUrlOnClick: `${ITEM_URL}${String(s.itemId)}`,
-        }),
-      );
+    // This check already alerted for this reason (a restart, a duplicate alarm):
+    // nothing to say again. The deferred delivery below forces its notification.
+    if (!forceNotify && entry.atRisk === key) return;
+    // The 24 h alert respects the user's quiet hours (T-56's helper) as long as
+    // its delivery still lands more than 1 h before the end; the 1 h alert
+    // never waits (T-84c). The delivery re-runs this check at the quiet end.
+    if (!forceNotify && which === 'health24') {
+      const settings = await this.settings();
+      const until = quietHoursEnd(now, settings.notifications.quietHours, settings.locale.timeZone);
+      if (until !== null && until + HOUR < this.endLocal(s)) {
+        await this.ctx.alarms.create(snipeAlarmName(id, 'atrisk-defer'), { when: until });
+        return;
+      }
     }
+    await this.notifyAtRisk(s, r);
+  }
+
+  private async notifyAtRisk(s: Snipe, r: Extract<AuthHealthResult, { ok: false }>): Promise<void> {
+    await this.safely('notify', () =>
+      this.ctx.notifier.notify({
+        id: `sbw:snipe:${s.id}:at-risk`,
+        title: `Snipe at risk: ${s.title}`,
+        message: `${r.detail} Fix it before the auction ends: the check 15 minutes before the end decides whether the snipe runs.`,
+        priority: 2,
+        openUrlOnClick: `${ITEM_URL}${String(s.itemId)}`,
+      }),
+    );
   }
 
   // ── Anomalies (auto-kill) ─────────────────────────────────────────────
@@ -1583,6 +1605,13 @@ export class SnipeRunner {
     if (p.kind === 'health24' || p.kind === 'health1') {
       void this.healthCheck(p.id, p.kind).catch((e: unknown) => {
         this.log(`snipe ${p.id}: the health check failed`, e);
+      });
+      return;
+    }
+    if (p.kind === 'atrisk-defer') {
+      // The deferred 24 h at-risk delivery: re-check the state as it is now.
+      void this.healthCheck(p.id, 'health24', true).catch((e: unknown) => {
+        this.log(`snipe ${p.id}: the deferred at-risk delivery failed`, e);
       });
       return;
     }

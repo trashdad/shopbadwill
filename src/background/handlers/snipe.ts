@@ -16,8 +16,11 @@ export function register(ctx: BackgroundContext): void {
     return r;
   };
   ctx.router.register('snipe.prepare', ({ itemId }) => runner().prepare(itemId));
-  ctx.router.register('snipe.arm', ({ snipe, typedConfirmation }) =>
-    runner().arm(
+  ctx.router.register('snipe.arm', ({ snipe, typedConfirmation }) => {
+    // T-84c: refuse cleanly while the kill switch is on. The arm does not
+    // happen and then get stopped by the kill disarm-all; nothing is stored.
+    if (ctx.switches.view().killSwitch) throw new Error('The kill switch is on. Turn it off before arming.');
+    return runner().arm(
       {
         id: snipe.id,
         itemId: snipe.itemId,
@@ -32,8 +35,8 @@ export function register(ctx: BackgroundContext): void {
         ...(snipe.groupId === undefined ? {} : { groupId: snipe.groupId }),
       },
       typedConfirmation,
-    ),
-  );
+    );
+  });
   ctx.router.register('snipe.disarm', async ({ id }) => {
     await runner().disarm(id);
     return undefined;
