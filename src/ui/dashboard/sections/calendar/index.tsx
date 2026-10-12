@@ -138,7 +138,9 @@ export function CalendarSection(props: SectionProps): VNode {
               <span>{titleOf(t)}</span>
               <div class="sbw-meta">
                 Ends <PacificTime ms={new Date(t.endTime).getTime()} userTz={props.userTz} />{' '}
-                <button type="button" disabled={busy} aria-label={`Stop tracking ${titleOf(t)}`} onClick={() => setConfirming(t)}>
+                <button type="button" disabled={busy} aria-label={`Stop tracking ${titleOf(t)}`} onClick={() => {
+                  setConfirming(t);
+                }}>
                   Stop tracking
                 </button>
               </div>
@@ -152,7 +154,9 @@ export function CalendarSection(props: SectionProps): VNode {
                   <button type="button" disabled={busy} onClick={() => void stopTracking(t)}>
                     Yes, stop tracking
                   </button>{' '}
-                  <button type="button" onClick={() => setConfirming(null)}>
+                  <button type="button" onClick={() => {
+                    setConfirming(null);
+                  }}>
                     Cancel
                   </button>
                 </div>

@@ -38,7 +38,7 @@ import path from 'node:path';
 import { expect, test, type BrowserContext, type Page, type Worker } from '@playwright/test';
 
 import { CALENDAR_SCOPE } from '../../../src/adapters/google/auth-pkce';
-import { CALENDAR_MARKER, CALENDAR_SUMMARY } from '../../../src/adapters/google/calendar-sink';
+import { CALENDAR_DESCRIPTION, CALENDAR_MARKER, CALENDAR_SUMMARY } from '../../../src/adapters/google/calendar-sink';
 import type { AuditEntry } from '../../../src/domain/audit/types';
 import type { Settings } from '../../../src/domain/settings/schema';
 import type { CalendarState } from '../../../src/domain/storage/schema';
@@ -82,6 +82,7 @@ const ITEM_C = 290000103; // calendar off: never on Google
 const ITEM_D = 290000104; // added while the token is lost
 const ITEM_E = 290000105; // dry-run test
 const ITEM_F = 290000106; // dry-run test
+const ITEM_G = 290000107; // adoption tests
 
 const eventId = (itemId: number, generation = 0): string => `sbv${String(itemId)}g${String(generation)}`;
 
@@ -156,6 +157,16 @@ const RESET_SCENARIO = {
   clientSecret: CLIENT_SECRET,
 };
 
+/**
+ * The adoption tests list calendars, so they start with the fake holding only
+ * the primary calendar: earlier tests' calendars (all marked) would otherwise
+ * be adopted first.
+ */
+async function resetCalendars(): Promise<void> {
+  const res = await fetch(`${FAKE_GOOGLE}/__admin/reset-calendars`, { method: 'POST' });
+  expect(res.status, 'the fake Google server has no reset-calendars route (a stale server on 8788?)').toBe(200);
+}
+
 /** The request-log position now: later assertions read only what came after it. */
 async function mark(): Promise<number> {
   return (await googleState()).requests.length;
@@ -190,6 +201,39 @@ async function fakeCalendar(id: string): Promise<FakeCalendar> {
  * fake). The extension must never write it.
  */
 async function addForeignEvent(calendarId: string): Promise<string> {
+  const accessToken = await byHandToken();
+  const res = await fetch(`${FAKE_GOOGLE}/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      summary: 'Dentist (added by hand)',
+      start: { dateTime: new Date(ANCHOR_MS + 4 * DAY).toISOString() },
+      end: { dateTime: new Date(ANCHOR_MS + 4 * DAY + HOUR).toISOString() },
+    }),
+  });
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { id: string }).id;
+}
+
+/**
+ * A calendar that already exists on the account before this profile connects
+ * (an earlier install, or another app), made through the API with a separate
+ * grant, so the fake marks it app-created and the extension's narrow scope
+ * can list it. `description` carries our private marker, or not.
+ */
+async function addExistingCalendar(description?: string): Promise<string> {
+  const accessToken = await byHandToken();
+  const res = await fetch(`${FAKE_GOOGLE}/calendar/v3/calendars`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ summary: CALENDAR_SUMMARY, timeZone: 'UTC', ...(description === undefined ? {} : { description }) }),
+  });
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { id: string }).id;
+}
+
+/** An access token from a separate grant on the fake (the user by hand, not the extension). */
+async function byHandToken(): Promise<string> {
   const verifier = randomBytes(32).toString('base64url');
   const authorize = new URL(`${FAKE_GOOGLE}/o/oauth2/v2/auth`);
   authorize.search = new URLSearchParams({
@@ -214,18 +258,8 @@ async function addForeignEvent(calendarId: string): Promise<string> {
       code_verifier: verifier,
     }),
   });
-  const { access_token: accessToken } = (await token.json()) as { access_token: string };
-  const res = await fetch(`${FAKE_GOOGLE}/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      summary: 'Dentist (added by hand)',
-      start: { dateTime: new Date(ANCHOR_MS + 4 * DAY).toISOString() },
-      end: { dateTime: new Date(ANCHOR_MS + 4 * DAY + HOUR).toISOString() },
-    }),
-  });
-  expect(res.status).toBe(200);
-  return ((await res.json()) as { id: string }).id;
+  expect(token.status).toBe(200);
+  return ((await token.json()) as { access_token: string }).access_token;
 }
 
 // ── The browser side ─────────────────────────────────────────────────────────
@@ -732,4 +766,94 @@ test('calendar dry-run: audit entries only, the Google server receives zero writ
     await s?.context.close();
     removeProfile(profile);
   }
+});
+
+// ── T-117: adopting an existing dedicated calendar ───────────────────────────
+//
+// Here calendarList.list is allowed, so a fresh profile looks for a calendar
+// of ours before creating one. Only a calendar whose description carries our
+// private marker qualifies; the name alone never does (calendar-sink.ts
+// findDedicated). Both existing calendars are app-created on the fake, so the
+// extension's narrow scope does list them: the marker is the only difference.
+
+/**
+ * Fresh profile, one tracked auction, live calendar writes against the fake:
+ * connect, turn calendar events on, wait for the event. Returns the requests
+ * that step made and the calendar the extension settled on.
+ */
+async function connectAndSync(s: Session): Promise<{ reqs: GoogleRequest[]; calId: string }> {
+  await seed(s.worker, { 'sbw:tracked': { [ITEM_G]: trackedItem(ITEM_G, 'Fenton hobnail milk glass vase', ANCHOR_MS + 2 * DAY) } });
+  await setDryRun(s, false);
+  await connectFromOptions(s);
+  const from = await mark();
+  await s.options.locator('#section-google').getByRole('button', { name: 'Turn on calendar events now?' }).click();
+  await expect.poll(async () => (await calendarState(s.options)).links[ITEM_G]?.status).toBe('synced');
+  await settle(s);
+  const calId = (await calendarState(s.options)).calendarId ?? '';
+  return { reqs: await requestsSince(from), calId };
+}
+
+async function adoptionTest(body: (s: Session) => Promise<void>): Promise<void> {
+  const guard = createRouteGuard();
+  const profile = mkdtempSync(path.join(os.tmpdir(), 'sbw-e2e-calendar-'));
+  let s: Session | undefined;
+  try {
+    await googleScenario({ ...RESET_SCENARIO, forbidCalendarList: false });
+    await resetCalendars();
+    s = await start(testExtensionDir(), profile, guard, ANCHOR_MS);
+    await body(s);
+    expect(guard.unexpected, `unexpected hosts: ${guard.unexpected.join(', ')}`).toEqual([]);
+  } finally {
+    await s?.context.close();
+    await googleScenario(RESET_SCENARIO);
+    removeProfile(profile);
+  }
+}
+
+const namedLikeOurs = async (): Promise<FakeCalendar[]> => (await googleState()).calendars.filter((c) => c.summary === CALENDAR_SUMMARY);
+
+test('calendar adoption: an existing calendar carrying our private marker is adopted; no second calendar', async () => {
+  test.setTimeout(120_000);
+  await adoptionTest(async (s) => {
+    // A same-named decoy first (listed before ours), then the marked one.
+    const decoy = await addExistingCalendar('My own auction notes');
+    const marked = await addExistingCalendar(CALENDAR_DESCRIPTION);
+    const { reqs, calId } = await connectAndSync(s);
+
+    expect(calId, 'the extension adopted the marked calendar').toBe(marked);
+    // One list, no calendar insert, the one event insert into the adopted calendar.
+    expect(show(reqs, marked)).toEqual(['GET /calendar/v3/users/me/calendarList 200', 'POST /calendar/v3/calendars/<cal>/events 200']);
+    expect((await namedLikeOurs()).map((c) => c.id)).toEqual([decoy, marked]);
+    expect((await fakeCalendar(marked)).events.map((e) => [e.id, e.status])).toEqual([[eventId(ITEM_G), 'confirmed']]);
+    expect((await fakeCalendar(decoy)).events).toEqual([]);
+    const audits = calendarAudits(await auditEntries(s.options));
+    expect(audits.filter((e) => e.kind === 'calendar.adopted').map((e) => e.ref)).toEqual([marked]);
+    expect(audits.filter((e) => e.kind === 'calendar.create')).toEqual([]);
+  });
+});
+
+test('calendar adoption: a same-named calendar WITHOUT our marker is never adopted', async () => {
+  test.setTimeout(120_000);
+  await adoptionTest(async (s) => {
+    const decoy = await addExistingCalendar();
+    const { reqs, calId } = await connectAndSync(s);
+
+    expect(calId).not.toBe(decoy);
+    expect(calId).toMatch(/^[0-9a-f]+@group\.calendar\.google\.com$/);
+    // The list found nothing of ours, so the extension created its own calendar.
+    expect(show(reqs, calId)).toEqual([
+      'GET /calendar/v3/users/me/calendarList 200',
+      'POST /calendar/v3/calendars 200',
+      'POST /calendar/v3/calendars/<cal>/events 200',
+    ]);
+    expect((await namedLikeOurs()).map((c) => c.id)).toEqual([decoy, calId]);
+    expect((await fakeCalendar(calId)).description).toContain(CALENDAR_MARKER);
+    expect((await fakeCalendar(calId)).events.map((e) => e.id)).toEqual([eventId(ITEM_G)]);
+    // The decoy was never touched.
+    expect((await fakeCalendar(decoy)).events).toEqual([]);
+    expect(reqs.filter((r) => r.path.includes(decoy))).toEqual([]);
+    const audits = calendarAudits(await auditEntries(s.options));
+    expect(audits.filter((e) => e.kind === 'calendar.adopted')).toEqual([]);
+    expect(audits.filter((e) => e.kind === 'calendar.create').map((e) => e.ref)).toEqual([calId]);
+  });
 });

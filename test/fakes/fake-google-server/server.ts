@@ -494,6 +494,12 @@ export async function startFakeGoogle(opts: { port?: number; host?: string; scen
       clockOffset += ms;
       send(res, 200, { now: now() }); return;
     }
+    // E2E isolation (T-117): the CLI fake outlives a test, so a spec that lists
+    // calendars starts from the primary calendar alone.
+    if (req.method === 'POST' && url.pathname === '/__admin/reset-calendars') {
+      for (const id of [...calendars.keys()]) if (id !== 'primary') calendars.delete(id);
+      send(res, 200, { calendars: [...calendars.keys()] }); return;
+    }
     if (req.method === 'GET' && url.pathname === '/__admin/state') {
       send(res, 200, {
         now: now(), scenario, revokedCount: state.revokedCount, requests: state.requests,
