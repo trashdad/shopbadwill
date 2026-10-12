@@ -2,7 +2,22 @@
 
 Manual checks against the real site and your real browser. One checklist per
 phase; run each on a personal-use install (see `docs/SETUP-CHROME.md` /
-`docs/SETUP-FIREFOX.md`). T-73 consolidates these into the release checklist.
+`docs/SETUP-FIREFOX.md`). Google Calendar setup is in `docs/SETUP-GOOGLE.md`.
+
+| Checklist | Phase | Needs |
+|---|---|---|
+| A-1 Overlay | 1 | a build, a real search page |
+| A-2 Daily job | 2 | A-1, a ShopGoodwill sign-in |
+| A-3 Calendar | 3 | your own Google project (`docs/SETUP-GOOGLE.md`) |
+| A-4 Dry-run snipes | 4 | A-1 to A-3, Chrome **and** Firefox |
+| A-5 First real snipe | 5 | A-4, your signed approval |
+| A-6 Companion | 6 | A-4, the companion (`docs/COMPANION.md`) |
+
+Provisional, as of this file:
+- **Firefox Google sign-in is not yet verified.** The S-4 Firefox test is
+  deferred, so A-3 on Firefox may fail for reasons outside your setup.
+- **The SGW bid-reply catalogue waits on P5.** Until it is captured, A-5 may end
+  "Unconfirmed" even when the bid worked; check the item on ShopGoodwill.
 
 Never paste tokens, passwords or cookies into anything you share. Paste back
 only the results asked for (counts, texts, outcomes).
@@ -213,6 +228,71 @@ the same event), that Undo removed the event, that the app left the
 connections page after Disconnect, and the result of step 13 if you ran it.
 Never paste the client secret, tokens or account details.
 
+---
+
+## A-4 Dry-run snipes (Phase 4)
+
+Purpose: on **both** Chrome and Firefox, dry-run snipes fire on time over
+several evenings, a failed preflight applies the fallback and says so, and the
+kill switch works from the keyboard. No bid is placed: every snipe here carries
+the **DRY RUN — no bid will be placed** label.
+
+Never paste tokens, cookies or bid amounts you want private. The timing export
+holds timing data and snipe ids only.
+
+**Setup** (each browser)
+
+1. Install a non-test build: Chrome per `docs/SETUP-CHROME.md`, Firefox
+   per `docs/SETUP-FIREFOX.md` (use the signed install, Option B, so it
+   survives a restart).
+2. Sign in to shopgoodwill.com in that browser profile.
+3. Options → **Settings** → **Dry run (practice mode)**: **Dry run: bidding**
+   is ON. Options → **Sniping**: switch **Sniping** on and pick a
+   **Reliability tier** (T0 if you will be at the machine).
+4. Allow notifications (Options → **Notifications** → **Allow
+   notifications**).
+
+**Checks**
+
+5. **Five dry runs over three evenings, per browser.** Dashboard → **Snipes**
+   → **Snipe an item**: enter an item id → **Prepare** → enter a max →
+   **Review and arm**. The review shows the end time in your zone and Pacific,
+   and **DRY RUN — no bid will be placed**. Click **Arm snipe**. Do at least 5
+   on Chrome and 5 on Firefox, spread over at least 3 evenings. Keep the
+   computer awake and the browser open through each end.
+6. **Preflight notification at T−15.** For each snipe, about 15 minutes
+   before the end, a notification titled **Dry-run snipe soon:** followed by the item title
+   arrives ("Dry run, no bid will be placed: would bid up to …"), and
+   Options → **Activity** shows a `snipe.preflight` entry.
+7. **A failed preflight.** Arm one more dry run. More than 15 minutes before
+   its end, sign out of shopgoodwill.com in that browser. At about T−15 a
+   notification titled **Snipe skipped:** followed by the item title says you are not signed in,
+   and Activity shows `snipe.preflight` (not ok) and `snipe.fallback`. No bid
+   and no early proxy bid is placed. Sign in again afterwards.
+8. **On time.** Dashboard → **Timing** → **Soak summary (dry runs)**: the
+   on-time rate is **95 % or more** for each browser, and **Completed dry
+   runs** counts them. Click **Export JSON** and keep the file.
+9. **Awake history.** Dashboard → **Timing** → **Awake history** shows the
+   hours this computer was awake. Check it matches when you were here.
+10. **Kill switch from the keyboard.** With a dry run armed, press
+    **Alt+Shift+K** (on a normal web page, so the shortcut reaches the
+    browser). The popup shows **STOPPED: all automated writes are off**.
+    Check the snipe's state in Dashboard → **Snipes**. Resume from the popup (**Resume
+    automation…**).
+11. **Alarm floor on a packed build (Chrome).** Chrome limits alarms to one
+    every 30 s only for a packed (.crx) install; **Load unpacked** lifts the
+    limit. The snipe's only alarm is set at least 5 minutes ahead, so the floor
+    should not matter. If you can run a packed build, check that one dry run
+    still fires on time; otherwise record "not run". Firefox has no alarm floor
+    (spike S-7); the signed install from step 1 is its packed build.
+
+**Record**
+
+Paste back, per browser: the number of dry runs and evenings, the on-time rate
+and p95 from **Timing**, the failed-preflight notification text, whether
+Alt+Shift+K stopped automation, and the step 11 result. You may attach the
+Timing export (no bid amounts in it).
+
 ## A-5 First real snipe (Phase 5)
 
 This is the first time the extension places a real bid with real money. Do it once, on a cheap item you would be happy to win. Each later live snipe needs your own decision too.
@@ -261,3 +341,43 @@ Signed: ______________   Date: ______________
 ```
 
 If anything looks wrong, turn on the kill switch (Alt+Shift+K, or the popup), keep the timing export, and report what you saw.
+
+---
+
+## A-6 Companion (Phase 6)
+
+Purpose: with the Windows companion (tier T2), a sleeping PC wakes before a
+dry-run snipe, the browser starts, the snipe fires on time, and the log shows
+the whole chain. No bid is placed.
+
+The power-plan guidance this relies on is provisional until the S-8 wake test
+(`docs/USER-STEPS/S-8.md`) passes.
+
+**Setup**
+
+1. A-4 passed on this browser.
+2. The companion is installed and tested: `docs/COMPANION.md`, USER STEP 1.
+   **Test the companion** says "The companion answered: …".
+3. Options → **Sniping** → **Reliability tier**: **T2**. **Browser profile for
+   the companion** is the profile you gave install.ps1.
+4. The laptop is **plugged in**. Wake timers are off on battery.
+
+**Checks**
+
+5. Arm a dry-run snipe on an item ending in more than 40 minutes. In
+   PowerShell, `Get-ScheduledTask -TaskName "ShopBadwill-*"` lists one task.
+   Its wake time is about 8 minutes before the end.
+6. Close the browser. **20 minutes before the fire time**, put the PC to sleep
+   (Start → Power → **Sleep**).
+7. Leave it alone. About 8 minutes before the end the PC wakes and the browser
+   starts with your profile.
+8. After the end, Options → **Activity** shows the chain in order:
+   `companion.schedule` → `snipe.wake` → `snipe.verified` → `bid.dry-run`.
+   Dashboard → **Timing** shows the fire as on time.
+9. The scheduled task is gone within about 10 minutes of firing.
+
+**Record**
+
+Paste back: the task name, the time you slept the PC and the time it woke, the
+Activity chain you saw, and the on-time result. Never paste anything from the
+browser profile folders, tokens or passwords.
