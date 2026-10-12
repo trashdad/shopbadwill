@@ -112,27 +112,9 @@ jobs:
       - name: Test-vs-prod build (test build carries the fake-server hook and host)
         run: |
           node -e "const fs=require('fs');const m=JSON.parse(fs.readFileSync('.output/chrome-mv3-test/manifest.json','utf8'));if(!(m.host_permissions||[]).includes('http://127.0.0.1/*')){console.error('test build: missing http://127.0.0.1/* host permission');process.exit(1)};const bg=fs.readFileSync('.output/chrome-mv3-test/'+m.background.service_worker,'utf8');if(!bg.includes('sbw:test:baseUrl')){console.error('test build: missing the sbw:test:baseUrl hook');process.exit(1)};console.log('test-vs-prod: test build carries the fake-server host permission and the baseUrl hook; the prod build is covered by check-prod-bundle')"
-      - name: Start the fake servers and wait for them
-        run: |
-          pnpm fake:sgw > fake-sgw.log 2>&1 &
-          pnpm fake:google > fake-google.log 2>&1 &
-          pnpm exec tsx scripts/serve-fake-site.ts > fake-site.log 2>&1 &
-          for port in 8787 8788 8789; do
-            for i in $(seq 1 60); do
-              if curl -s -o /dev/null "http://127.0.0.1:${port}/"; then
-                echo "port ${port} is up"
-                break
-              fi
-              if [ "$i" -eq 60 ]; then
-                echo "fake server on ${port} did not start" >&2
-                cat fake-sgw.log fake-google.log fake-site.log >&2
-                exit 1
-              fi
-              sleep 1
-            done
-          done
       # The overlay specs (T-32, T-39) run against the test build; the
-      # `chromium` channel runs headless (no display on the runner).
+      # `chromium` channel runs headless (no display on the runner). Playwright
+      # starts the fake servers itself, on free ports per run (T-39b).
       - run: pnpm test:e2e:chromium
       - name: Upload Playwright report
         if: ${{ !cancelled() }}
@@ -142,9 +124,6 @@ jobs:
           path: |
             playwright-report/
             test-results/
-            fake-sgw.log
-            fake-google.log
-            fake-site.log
           if-no-files-found: ignore
           retention-days: 7
 
@@ -184,26 +163,6 @@ jobs:
         run: |
           firefox --version
           "${GECKOWEBDRIVER}/geckodriver" --version
-      # The harness serves its own fixture page (https://shopgoodwill.com/ via a
-      # local proxy). The fake servers are for specs that call buyerapi/Google.
-      - name: Start the fake servers and wait for them
-        run: |
-          pnpm fake:sgw > fake-sgw.log 2>&1 &
-          pnpm fake:google > fake-google.log 2>&1 &
-          for port in 8787 8788; do
-            for i in $(seq 1 60); do
-              if curl -s -o /dev/null "http://127.0.0.1:${port}/"; then
-                echo "port ${port} is up"
-                break
-              fi
-              if [ "$i" -eq 60 ]; then
-                echo "fake server on ${port} did not start" >&2
-                cat fake-sgw.log fake-google.log >&2
-                exit 1
-              fi
-              sleep 1
-            done
-          done
       # Builds the Firefox test extension (.output/firefox-mv3-test), then runs
       # pytest in test/e2e/firefox: temporary install via Selenium/geckodriver,
       # headless Firefox.
@@ -216,7 +175,5 @@ jobs:
           name: firefox-e2e
           path: |
             test-results/firefox/
-            fake-sgw.log
-            fake-google.log
           if-no-files-found: ignore
           retention-days: 7

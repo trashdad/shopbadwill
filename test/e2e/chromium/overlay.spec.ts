@@ -9,7 +9,7 @@
 //     → Why?
 //     → undo (the bar's Show)
 //     → an SPA page change (the fake site's paginator: pushState + the same
-//       search XHR to the fake buyerapi on 127.0.0.1:8787, through the route)
+//       search XHR to the fake buyerapi (FAKE_BUYERAPI), through the route)
 //       after which everything is still correct
 //     → the kill switch (the popup's one kill control: one click turns it on),
 //       which clears the decorations.
