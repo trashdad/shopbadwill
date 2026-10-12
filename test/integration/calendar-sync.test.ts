@@ -639,6 +639,33 @@ describe('dry run', () => {
     expect(r.audit.entries.filter((e) => e.kind === 'calendar.insert')).toHaveLength(1);
   });
 
+  it('a kill switch pressed mid-run stops the next write: the gate is asked before each one (integration review)', async () => {
+    const r = await rig();
+    await r.track();
+    await r.track();
+    await r.track();
+    let inserts = 0;
+    r.restart((api) => ({
+      calendarsInsert: (s, tz, description) => api.calendarsInsert(s, tz, description),
+      calendarListGet: (c) => api.calendarListGet(c),
+      calendarListList: () => api.calendarListList(),
+      eventsGet: (c, e) => api.eventsGet(c, e),
+      eventsPatch: (c, e, p) => api.eventsPatch(c, e, p),
+      eventsDelete: (c, e) => api.eventsDelete(c, e),
+      eventsListByPrivateProp: (c, k, v) => api.eventsListByPrivateProp(c, k, v),
+      eventsInsert: async (c, b) => {
+        inserts += 1;
+        const out = await api.eventsInsert(c, b);
+        r.switches.killAll('kill switch'); // pressed while the first insert was on its way
+        return out;
+      },
+    }));
+    const report = await r.sync.syncNow('test');
+    expect(report.status).toBe('blocked');
+    expect(inserts).toBe(1);
+    expect(r.events()).toHaveLength(1);
+  });
+
   it('the kill switch (or health) blocks writes without auditing a dry run', async () => {
     const r = await rig();
     r.switches.killAll('kill switch');
