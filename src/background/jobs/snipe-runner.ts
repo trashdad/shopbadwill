@@ -412,6 +412,8 @@ interface CommitOptions {
    * Everything else is refused before the reducer.
    */
   external?: 'dispatch' | 'ended-early';
+  /** T-87e: a preflight hook's failure detail, for the reducer's copy (ReduceContext.preflightDetail). */
+  preflightDetail?: string;
 }
 
 type StepResult = 'continue' | 'wait';
@@ -753,7 +755,7 @@ export class SnipeRunner {
         timeZone: settings.locale.timeZone,
         ...(detail === undefined ? {} : { detail }),
       });
-      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable));
+      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable, opts.preflightDetail));
       if (red.rejection !== null) {
         if (outbox !== entry.outbox) {
           rec.entries[id] = { ...entry, outbox };
@@ -781,12 +783,13 @@ export class SnipeRunner {
     return r;
   }
 
-  private reduceContext(s: Snipe, settings: Settings, sessionUsable: boolean): ReduceContext {
+  private reduceContext(s: Snipe, settings: Settings, sessionUsable: boolean, preflightDetail?: string): ReduceContext {
     return {
       timeZone: settings.locale.timeZone,
       sessionUsable,
       // C4: a dry run asks with the dry-run condition ignored (it still never sends).
       writesAllowed: this.biddingVerdict(s).ok,
+      ...(preflightDetail === undefined ? {} : { preflightDetail }),
     };
   }
 
@@ -1414,7 +1417,7 @@ export class SnipeRunner {
         await this.safely('audit', () =>
           this.ctx.audit.append({ actor: 'snipe', kind: 'snipe.preflight', itemId: fresh.itemId, ref: fresh.id, details: { ok: false, hook: f.reason, why: f.detail }, dryRun: fresh.dryRun }),
         );
-        await this.commit(fresh.id, { type: 'preflight-failed', now, reason: f.reason }, withDetail);
+        await this.commit(fresh.id, { type: 'preflight-failed', now, reason: f.reason }, { ...withDetail, preflightDetail: f.detail });
         return;
       }
     }

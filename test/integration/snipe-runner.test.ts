@@ -2041,6 +2041,26 @@ describe('seams (I-12)', () => {
     expect(shared.sgw.placeBids).toHaveLength(1);
   });
 
+  it("T-87e: a preflight hook's failure detail is what the user is told, not the generic keep-awake copy", async () => {
+    const shared = makeShared();
+    const detail = 'T2: the wake companion did not answer (is it installed and running?), so nothing will wake this computer before the auction ends.';
+    const { w } = await boot(shared, {
+      jobModules: probe((ctx) => {
+        snipeSeams(ctx).addArmHooks({ preflight: () => ({ reason: 'keep-awake', detail }) });
+      }),
+    });
+    await arm(w, { fallback: 'skip' });
+    await runTo(shared, END + 2 * MIN);
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    const told = shared.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe skipped'));
+    expect(told).toHaveLength(1);
+    expect(told[0]?.notification.message).toContain(detail);
+    expect(told[0]?.notification.message).not.toMatch(/Keep-awake is not held/);
+    expect(s.outcomeDetail).toContain(detail);
+  });
+
   it('the SnipeHost factory is keyed by the S-7 verdict and loads registered implementations', () => {
     const deps = { clock: new FakeClock(T0), log: () => undefined };
     expect(S7_HOST_VERDICT).toEqual({ chrome: 'background', firefox: 'runner-page' });

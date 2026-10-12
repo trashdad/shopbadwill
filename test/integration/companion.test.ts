@@ -734,6 +734,11 @@ describe('T-111 brief', () => {
         expect(pre?.details.hook).toBe('keep-awake');
         expect(String(pre?.details.why)).toMatch(c.why);
         expect(String(pre?.details.why)).toMatch(/T2/);
+        // T-87e: the user is told the same reason, not the generic "Keep-awake is not held".
+        const told = world.notifier.sent.filter((n) => n.notification.title.startsWith('Snipe skipped'));
+        expect(told).toHaveLength(1);
+        expect(told[0]?.notification.message).toContain(String(pre?.details.why));
+        expect(told[0]?.notification.message).not.toMatch(/Keep-awake is not held/);
       });
     }
   });
