@@ -13,6 +13,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/pr
 import { h } from 'preact';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import type { CompanionPort, CompanionReply, CompanionTask } from '../../src/adapters/browser/companion';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { loadSections } from '../../src/entrypoints/options/registry';
@@ -22,7 +23,9 @@ import { FakePermissions } from '../fakes/ports/fake-permissions';
 
 afterEach(cleanup);
 
-function app(opts: { settings?: Settings; firefox?: boolean; permissions?: FakePermissions } = {}) {
+function app(
+  opts: { settings?: Settings; firefox?: boolean; permissions?: FakePermissions; companion?: Pick<CompanionPort, 'list'> } = {},
+) {
   const fake = new FakeMessaging();
   const saved: Array<Record<string, unknown>> = [];
   fake.handle('settings.get', () => opts.settings ?? defaultSettings());
@@ -31,7 +34,7 @@ function app(opts: { settings?: Settings; firefox?: boolean; permissions?: FakeP
     return undefined;
   });
   const permissions = opts.permissions ?? new FakePermissions();
-  render(h(SnipeSection, { client: fake, permissions, firefox: opts.firefox }));
+  render(h(SnipeSection, { client: fake, permissions, firefox: opts.firefox, companion: opts.companion }));
   return { saved, permissions };
 }
 
@@ -335,6 +338,87 @@ describe('SnipeSection', () => {
     app({ settings: defaultSettings() });
     const link = await screen.findByRole('link', { name: /OS power guidance/ });
     expect(link.getAttribute('href')).toBe('https://github.com/trashdad/shopbadwill/blob/dev/docs/COMPANION.md');
+  });
+
+  describe('T2: the wake companion (T-111)', () => {
+    it('asks for nativeMessaging only from the Connect the companion click, synchronously (I-21)', async () => {
+      const permissions = new FakePermissions();
+      const orig = permissions.request.bind(permissions);
+      let duringClick = false;
+      permissions.request = (p) => {
+        expect(duringClick).toBe(true);
+        return orig(p);
+      };
+      app({ permissions });
+      const button = await screen.findByRole('button', { name: 'Connect the companion' });
+      expect(permissions.requested).toEqual([]);
+      duringClick = true;
+      fireEvent.click(button);
+      duringClick = false;
+      expect(permissions.requested).toEqual([{ permissions: ['nativeMessaging'] }]);
+      await screen.findByText('The companion permission is on.');
+      expect(screen.queryByRole('button', { name: 'Connect the companion' })).toBeNull();
+    });
+
+    it('is offered on Firefox too (T2 is the only unattended option there)', async () => {
+      const { permissions } = app({ firefox: true });
+      fireEvent.click(await screen.findByRole('button', { name: 'Connect the companion' }));
+      await waitFor(() => {
+        expect(permissions.requested).toEqual([{ permissions: ['nativeMessaging'] }]);
+      });
+    });
+
+    it('says so when the browser declines', async () => {
+      const permissions = new FakePermissions();
+      permissions.grantRequests = false;
+      app({ permissions });
+      fireEvent.click(await screen.findByRole('button', { name: 'Connect the companion' }));
+      await screen.findByText(/did not allow/);
+      expect(screen.queryByRole('button', { name: 'Connect the companion' })).not.toBeNull();
+    });
+
+    it('loads and saves the profile as settings.companion, refusing one the host would refuse', async () => {
+      const s = defaultSettings();
+      s.companion = { profile: 'Default' };
+      const { saved } = app({ settings: s });
+      const input = await screen.findByLabelText('Browser profile for the companion');
+      await waitFor(() => {
+        expect((input as HTMLInputElement).value).toBe('Default');
+      });
+      fireEvent.input(input, { target: { value: 'Default & calc' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save profile' }));
+      await screen.findByText(/Enter the profile name or folder/);
+      expect(saved).toEqual([]);
+      fireEvent.input(input, { target: { value: '  Profile 2 ' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save profile' }));
+      await waitFor(() => {
+        expect(saved).toEqual([{ companion: { profile: 'Profile 2' } }]);
+      });
+      await screen.findByText('Saved: companion profile Profile 2.');
+    });
+
+    it('Test the companion reports what it answered', async () => {
+      const replies: Array<CompanionReply<{ tasks: CompanionTask[] }>> = [
+        { status: 'ok', value: { tasks: [] } },
+        { status: 'unreachable', detail: 'Specified native messaging host not found.' },
+      ];
+      const companion = { list: () => Promise.resolve(replies.shift() ?? { status: 'ok' as const, value: { tasks: [] } }) };
+      app({ permissions: new FakePermissions({ permissions: ['nativeMessaging'] }), companion });
+      const test = await screen.findByRole('button', { name: 'Test the companion' });
+      await waitFor(() => {
+        expect((test as HTMLButtonElement).disabled).toBe(false);
+      });
+      fireEvent.click(test);
+      await screen.findByText('The companion answered: 0 wake tasks scheduled.');
+      fireEvent.click(test);
+      await screen.findByText('The companion did not answer: Specified native messaging host not found.');
+    });
+
+    it('Test the companion is disabled until the permission is on', async () => {
+      app();
+      const test = await screen.findByRole('button', { name: 'Test the companion' });
+      expect((test as HTMLButtonElement).disabled).toBe(true);
+    });
   });
 
   it('builds the section from text, with no HTML sink', () => {

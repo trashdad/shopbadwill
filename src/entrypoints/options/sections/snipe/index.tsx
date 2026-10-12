@@ -5,13 +5,18 @@
 // link (docs/COMPANION.md). The `background` and `power` permissions are
 // requested ONLY inside the "Turn on Keep awake" click handler, through T-56's
 // src/ui/permissions.ts (I-21) — never on load, never from a save. Firefox
-// hides the T1 controls. This section never touches the bidding dry-run
+// hides the T1 controls. T-111: the T2 card asks for the optional
+// `nativeMessaging` permission the same way (only in the "Connect the
+// companion" click), saves the companion's browser profile
+// (`settings.companion.profile`, checked against the host's rules first) and
+// can ping the companion (`list`). This section never touches the bidding dry-run
 // switch or the required/completed dry-run counters (live gating is T-102):
 // turning sniping on while bidding is in dry-run keeps snipes dry-run, and it
 // says so plainly (R6). Text only, no innerHTML (R7).
 import type { VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
+import { BrowserCompanion, validCompanionProfile, type CompanionPort } from '../../../../adapters/browser/companion';
 import { BrowserPermissions } from '../../../../adapters/browser/permissions';
 import { isFirefox } from '../../../../adapters/browser/env';
 import { formatCents, parseCents } from '../../../../domain/money';
@@ -28,6 +33,8 @@ export interface SnipeSectionProps extends SectionProps {
   /** Injectable for tests. */
   permissions?: Pick<Permissions, 'contains' | 'request'>;
   firefox?: boolean;
+  /** Injectable for tests: the T2 companion (only `list` is used here). */
+  companion?: Pick<CompanionPort, 'list'>;
 }
 
 /** The OS power guidance (docs/COMPANION.md, the S-8 note). */
@@ -50,7 +57,7 @@ const TIERS: ReadonlyArray<{ value: Settings['snipe']['tier']; label: string; hi
   {
     value: 'T2',
     label: 'T2 · Wake the computer',
-    hint: 'A Windows companion wakes the computer before the end (coming in a later update).',
+    hint: 'A Windows companion wakes the computer and starts the browser before the end (set it up below).',
   },
 ];
 
@@ -70,6 +77,12 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loadError, setLoadError] = useState('');
   const [granted, setGranted] = useState<Granted>('unknown');
+  const [nativeGranted, setNativeGranted] = useState<Granted>('unknown');
+  const [companion] = useState<Pick<CompanionPort, 'list'>>(
+    () => props.companion ?? new BrowserCompanion({ granted: () => hasPermissions(api, ['nativeMessaging']) }),
+  );
+  const [profileText, setProfileText] = useState('');
+  const [profileError, setProfileError] = useState<string | undefined>(undefined);
   const [status, setStatus] = useState<Msg>({ message: '', tone: 'ok' });
   const [leadText, setLeadText] = useState('8');
   const [capsText, setCapsText] = useState<CapsText>({ perItem: '50.00', perDay: '100.00', exposure: '200.00' });
@@ -86,6 +99,7 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
           perDay: formatCents(s.snipe.caps.perDayMax),
           exposure: formatCents(s.snipe.caps.openExposureMax),
         });
+        setProfileText(s.companion?.profile ?? '');
       },
       (e: unknown) => {
         setLoadError(`Could not load your settings. ${describeError(e)}`);
@@ -93,6 +107,9 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
     );
     void hasPermissions(api, ['power', 'background']).then((ok) => {
       setGranted(ok ? 'yes' : 'no');
+    });
+    void hasPermissions(api, ['nativeMessaging']).then((ok) => {
+      setNativeGranted(ok ? 'yes' : 'no');
     });
   }, [client, api]);
 
@@ -137,6 +154,57 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
         setStatus({ message: 'The browser did not allow it. Nothing was changed.', tone: 'error' });
       } else {
         setStatus({ message: `Could not ask for the permissions. ${r.message}`, tone: 'error' });
+      }
+    });
+  };
+
+  // T2 (I-21): the nativeMessaging prompt is the first thing in the click.
+  const allowCompanion = (): void => {
+    void requestPermissions(api, ['nativeMessaging']).then((r) => {
+      if (r.kind === 'granted') {
+        setNativeGranted('yes');
+        setStatus({ message: 'The companion permission is on: the extension may talk to the Windows companion.', tone: 'ok' });
+      } else if (r.kind === 'denied') {
+        setNativeGranted('no');
+        setStatus({ message: 'The browser did not allow it. Nothing was changed.', tone: 'error' });
+      } else {
+        setStatus({ message: `Could not ask for the permission. ${r.message}`, tone: 'error' });
+      }
+    });
+  };
+
+  const saveProfile = (): void => {
+    const profile = profileText.trim();
+    if (!validCompanionProfile(profile)) {
+      setProfileError(
+        'Enter the profile name or folder you gave install.ps1 (no quotes, & | < > ^ % ! or backticks, no "..", not starting with -).',
+      );
+      return;
+    }
+    setProfileError(undefined);
+    setProfileText(profile);
+    client.send('settings.set', { companion: { profile } }).then(
+      () => {
+        setSettings({ ...settings, companion: { profile } });
+        setStatus({ message: `Saved: companion profile ${profile}.`, tone: 'ok' });
+      },
+      (e: unknown) => {
+        setStatus({ message: `Could not save the companion profile. ${describeError(e)}`, tone: 'error' });
+      },
+    );
+  };
+
+  const testCompanion = (): void => {
+    setStatus({ message: 'Asking the companion...', tone: 'ok' });
+    const sentence = (text: string): string => `${text.replace(/[.\s]+$/, '')}.`;
+    void companion.list().then((r) => {
+      if (r.status === 'ok') {
+        const n = r.value.tasks.length;
+        setStatus({ message: `The companion answered: ${String(n)} wake task${n === 1 ? '' : 's'} scheduled.`, tone: 'ok' });
+      } else if (r.status === 'refused') {
+        setStatus({ message: `The companion answered with an error: ${sentence(r.detail)}`, tone: 'error' });
+      } else {
+        setStatus({ message: `The companion did not answer: ${sentence(r.detail)}`, tone: 'error' });
       }
     });
   };
@@ -337,6 +405,50 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
           )}
         </Card>
       ) : null}
+
+      <Card>
+        <h3>Wake the computer (T2)</h3>
+        <p class="sbw-hint">
+          T2 needs the Windows companion installed (docs/COMPANION.md, USER STEP 1). For each armed snipe it asks the
+          companion to wake the computer and start this browser a few minutes before the end. Only the snipe id, the wake
+          time, the browser and the profile below are sent: never the item, the bid or your account.
+        </p>
+        {nativeGranted === 'yes' ? (
+          <p>The companion permission is on.</p>
+        ) : (
+          <>
+            <p>
+              T2 needs the <code>nativeMessaging</code> permission, which your browser asks for separately.
+            </p>
+            <button type="button" onClick={allowCompanion}>
+              Connect the companion
+            </button>
+          </>
+        )}
+        <Field
+          id="snipe-companion-profile"
+          label="Browser profile for the companion"
+          hint="The profile you gave install.ps1: a name (Chrome: Default, Firefox: default-release) or a profile folder."
+          error={profileError}
+        >
+          {(c) => (
+            <input
+              {...c}
+              type="text"
+              value={profileText}
+              onInput={(e) => {
+                setProfileText(e.currentTarget.value);
+              }}
+            />
+          )}
+        </Field>
+        <button type="button" onClick={saveProfile}>
+          Save profile
+        </button>{' '}
+        <button type="button" class="sbw-secondary" disabled={nativeGranted !== 'yes'} onClick={testCompanion}>
+          Test the companion
+        </button>
+      </Card>
 
       <Card>
         <h3>Power guidance</h3>
