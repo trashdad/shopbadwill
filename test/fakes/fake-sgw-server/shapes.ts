@@ -135,6 +135,8 @@ export const LogEntrySchema = z.object({
   /** The time to treat as the request time: fakeNowMs when declared, else receivedAtMs. */
   requestTimeMs: z.number(),
   hasBearer: z.boolean(),
+  /** The Cookie header exactly as received, else null (T-104). */
+  cookie: z.string().nullable(),
   body: z.string(),
 });
 export const LogResponseSchema = z.object({ entries: z.array(LogEntrySchema) });

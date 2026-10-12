@@ -23,6 +23,8 @@ export interface FakeLogEntry {
   fakeNowMs: number | null;
   requestTimeMs: number;
   hasBearer: boolean;
+  /** The Cookie header exactly as the fake received it, else null (T-104). */
+  cookie: string | null;
   body: string;
 }
 

@@ -55,6 +55,8 @@ interface LogEntry {
   fakeNowMs: number | null;
   requestTimeMs: number;
   hasBearer: boolean;
+  /** The Cookie header exactly as received (T-104), else null: proves what rode on the wire. */
+  cookie: string | null;
   body: string;
 }
 
@@ -585,6 +587,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
           fakeNowMs,
           requestTimeMs: fakeNowMs ?? receivedAtMs,
           hasBearer: bearer !== null,
+          cookie: req.headers.cookie ?? null,
           body,
         });
       };
@@ -639,6 +642,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
           fakeNowMs: null,
           requestTimeMs: started,
           hasBearer: false,
+          cookie: req.headers.cookie ?? null,
           body: '',
         });
       }
