@@ -640,3 +640,32 @@ Source: the controller, from the T-57 final check (considerate use).
 **Why.** Items with no quote (often pickup-only) were re-requested on every page view and in every job run.
 
 **Tests.** `test/unit/background/landed-cost.test.ts`: the handler's and the quote step's negative cache, the 24 h expiry, and no caching of failures.
+
+## T-111 contract change: `settings.companion` and the optional storage key `sbw:companionWakes`
+
+Source: T-111 (extension side of T2). Requirement 5 of the card's brief authorises additive contract changes recorded here. Both changes are additive and optional: `sbw:meta.schemaVersion` stays 1 and there is no migration.
+
+**No manifest change.** `nativeMessaging` was already an optional permission on both browsers (T-10, PLAN §2.5), and both permission snapshots already list it. T-111 only requests it, from the options snipe section's "Connect the companion" click through `src/ui/permissions.ts` (I-21).
+
+**`Settings.companion?: { profile: string }`** (`src/domain/settings/schema.ts`; `profile` is 1-260 chars). The browser profile name or folder given to `companion/windows/install.ps1`. It is sent to the host with each `schedule`, which is how the brief's "profile: from settings" is met. It is a top-level group, so `settings.set` writes it alone (`{ companion: { profile } }`) and no `snipe`-group writer can drop it. The host's character rules (ruling R2: no `"` `&` `|` `<` `>` `^` `%` `!`, backticks, `$(`/`${`, `..` segments, newlines or a leading `-`) are not in the settings schema, so a later rule change can never quarantine the whole settings record. The adapter (`validCompanionProfile`) checks them before anything is sent, and the options page checks them before saving. Absent means "not set": a T2 arm then notifies the user, and the preflight fails as `keep-awake` with "the browser profile for the wake companion is not set". `test/contract/types/spec-shapes.test.ts` mirrors the field.
+
+**`sbw:companionWakes`** (storage.local, optional). `STORAGE_KEYS.companionWakes`. The schema is module-private, so the locked example list is unchanged: `{ version: 1, wakes: Record<SnipeId, { wakeAt: EpochMs, state: 'confirmed' | 'asked' | 'none', triedAt: EpochMs, cancelTriedAt?: EpochMs }> }`.
+
+- `wakeAt` is the wake the companion was asked for. The entry is written BEFORE a `schedule` request leaves, because a request that timed out may still have made the task.
+- `state`:
+  - `confirmed`: the host made the task.
+  - `asked`: no usable answer came back, so the task may exist.
+  - `none`: nothing was made (the request was not sent, or the host refused it).
+- A clean refusal restores the previous entry. A confirmed `cancel` removes it.
+- `triedAt` / `cancelTriedAt` space out retries after a worker restart (`COMPANION_RETRY_MS`, 10 min).
+- Entries are kept 15 days after `wakeAt` (`AWAKE_RETENTION_MS`), capped at 500. The awake history uses `confirmed` and `asked` entries.
+- Missing or invalid data parses to the empty record (`parseCompanionWakes`). Losing it costs at most a retry or an awake-history filter, never money.
+
+**`timing.awake` behaviour (no shape change).** The reply is still `EpochMs[]`. It now leaves out the heartbeat runs that a companion wake caused (`withoutCompanionWakes` in `src/background/jobs/companion-sync.ts`). A wake at W caused a run when there is no heartbeat in the 30 min before W. The run starts at the first heartbeat within 70 min after W. It ends at the first gap of 30 min or more, and at most 8 h after W. The stored `sbw:awake` is never changed. This is the card's "awake-history ignores companion-caused wakes for advice". `awakeAdvice` (T-83, `src/domain/snipe/**`) is unchanged; a future arm-time advice caller should pass it the same filtered history.
+
+**Tests.**
+- `test/contract/types/storage.test.ts`: the key, its area, a sample, and that invalid data parses to empty.
+- `test/contract/types/spec-shapes.test.ts`: the settings field.
+- `test/integration/companion.test.ts`: the "contract additions" block, and `timing.awake` end to end.
+
+**Follow-up for the next PLAN edit.** Add `sbw:companionWakes` to PLAN §2.3 and `Settings.companion` to §3.10 and contracts.md. PLAN §2.5 names the permission button "Install companion". The options page says "Connect the companion", because the button grants the permission and does not install anything.

@@ -7,12 +7,20 @@
 // heartbeat job, which quarantines it under its own lock. A Repo `get` here
 // would quarantine outside that lock, and its remove could delete a history
 // the heartbeat had just written.
-import { STORAGE_KEYS, STORAGE_RECORDS } from '../../domain/storage/schema';
+//
+// T-111: the chart is the awake-history advice, so it leaves out the runs a T2
+// companion wake caused (`withoutCompanionWakes` over `sbw:companionWakes`,
+// read raw the same way; an invalid record counts as no wakes). The stored
+// history itself is never changed.
+import { parseCompanionWakes, STORAGE_KEYS, STORAGE_RECORDS } from '../../domain/storage/schema';
 import type { BackgroundContext } from '../context';
+import { companionWakeTimes, withoutCompanionWakes } from '../jobs/companion-sync';
 
 export function register(ctx: BackgroundContext): void {
   ctx.router.register('timing.awake', async () => {
     const parsed = STORAGE_RECORDS[STORAGE_KEYS.awake].schema.safeParse(await ctx.repo.getRaw(STORAGE_KEYS.awake));
-    return parsed.success ? parsed.data : [];
+    if (!parsed.success) return [];
+    const wakes = companionWakeTimes(parseCompanionWakes(await ctx.repo.getRaw(STORAGE_KEYS.companionWakes)));
+    return withoutCompanionWakes(parsed.data, wakes, ctx.repo.now());
   });
 }

@@ -52,6 +52,14 @@ export const SettingsSchema = z.object({
     completedDryRuns: z.number().int().nonnegative(),
     tier: z.enum(['T0', 'T1', 'T2']),
   }),
+  /**
+   * T-111 (additive, optional): the T2 wake companion. `profile` is the
+   * browser profile name or folder given to companion/windows/install.ps1; it
+   * is sent to the host with each `schedule`. Absent until the user sets it.
+   * The host's character rules (ruling R2) are checked by the adapter before
+   * anything is sent, not here, so a rule change can never quarantine settings.
+   */
+  companion: z.object({ profile: z.string().min(1).max(260) }).optional(),
   killSwitch: z.boolean(),
 });
 export type Settings = z.infer<typeof SettingsSchema>;
