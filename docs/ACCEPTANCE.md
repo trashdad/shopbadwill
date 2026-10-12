@@ -212,3 +212,52 @@ on the event, whether the phone popups arrived with the PC off (and which of
 the same event), that Undo removed the event, that the app left the
 connections page after Disconnect, and the result of step 13 if you ran it.
 Never paste the client secret, tokens or account details.
+
+## A-5 First real snipe (Phase 5)
+
+This is the first time the extension places a real bid with real money. Do it once, on a cheap item you would be happy to win. Each later live snipe needs your own decision too.
+
+**Before you start, make sure all of these are true:**
+- The A-1 to A-3 checklists passed on this browser profile.
+- You have done at least 5 dry-run snipes. The extension counts them, and the live gate refuses until it has 5. The Timing page shows an on-time rate. If that rate is under 95 %, the extension will ask you to type a confirmation.
+- You are signed in to shopgoodwill.com in this browser profile. Never paste your password, cookies or tokens anywhere else.
+- Your computer will be awake at the auction's end: you are at the machine, or keep-awake (T1) or the Windows companion (T2) is set up per `docs/COMPANION.md`.
+
+### Steps
+1. **Pick the item.** Choose one cheap auction ending in more than 2 hours, with a current price well under $10. Write down its item number and end time, then check the end time on the item page. Be ready to win it and pay for it, shipping included.
+2. **Set the caps to this one item.** Go to Options → Snipe:
+   - per-item cap = your max for this item, e.g. $8.00;
+   - daily cap = the same amount;
+   - open exposure cap = the same amount.
+   
+   No other snipe can then spend anything today.
+3. **Arm it as a dry run first.** On the dashboard's Snipes page, prepare the item. Then:
+   - Check the confirmation. It must show your max, the estimated total with shipping and handling, and the end date and time in both your time zone and ShopGoodwill's Pacific time.
+   - Arm it with "DRY RUN" still showing.
+4. **Turn live bidding on, for this snipe only.**
+   - In the popup's Live bidding section, read the warning and type the confirmation.
+   - Disarm the dry-run snipe, then arm it again. The confirmation must NOT say "DRY RUN" this time.
+   - The exposure meter must show your max against the daily cap.
+5. **Leave it alone.** Do not bid on this item yourself on the site, since that would compete with the snipe. Leave the browser open, or rely on T1/T2.
+6. **After the end:**
+   - The notification says Won, Lost or Unconfirmed. An Unconfirmed result means the outcome could not be read. Check the item on ShopGoodwill; never re-bid blindly.
+   - On the dashboard's Timing page, save the JSON export. It contains timing data only, with no bid amounts.
+   - On your dedicated ShopGoodwill calendar, check the event title: it should read `WON $x` or `LOST`.
+   - In Activity, the audit log should show exactly one `bid` entry for this snipe, or two if the safe retry ran. A second entry always has the same amount.
+7. **Turn live bidding back off** (one click in the popup) until you decide on the next live snipe.
+
+### Sign-off
+Copy this text, fill it in, and keep it with your own notes. Never paste it anywhere public.
+
+```
+A-5 first real snipe — I approved this specific bid.
+Item: ______________   End (Pacific): ______________
+My max: $______   Caps set to: per-item $____ / daily $____ / exposure $____
+Result: Won / Lost / Unconfirmed   Final price: $______
+Calendar stamp correct: yes / no   Timing export saved: yes / no
+Audit shows one bid (or one proven-safe retry with the same amount): yes / no
+Live bidding turned back off afterwards: yes / no
+Signed: ______________   Date: ______________
+```
+
+If anything looks wrong, turn on the kill switch (Alt+Shift+K, or the popup), keep the timing export, and report what you saw.
