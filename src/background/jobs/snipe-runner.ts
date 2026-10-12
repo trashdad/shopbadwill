@@ -1071,6 +1071,8 @@ export class SnipeRunner {
   }
 
   private async wakingStep(s: Snipe): Promise<StepResult> {
+    // T1 holds it from arm already; T2 takes it here, at the wake (T-111b).
+    await this.holdAwake(s);
     await this.openWindow(s);
     if (await this.checkAnomaly(s)) return 'continue';
     const sess = this.windowSession(s);
@@ -1668,10 +1670,18 @@ export class SnipeRunner {
     await this.ctx.alarms.clear(snipeAlarmName(id, 'recover'));
   }
 
-  // ── KeepAwake (tier T1, Chrome with `power`) ──────────────────────────
+  // ── KeepAwake (tiers T1 and T2, Chrome with `power`) ──────────────────
 
-  private async keepAwakeRequired(settings: Settings): Promise<boolean> {
-    if (settings.snipe.tier !== 'T1' || !this.ctx.keepAwake.available) return false;
+  /**
+   * T1 holds from arm to the end. T2 (T-111b) holds only from the T-5 min wake
+   * to the end: the companion woke the computer and Windows would put it back
+   * to sleep after about 2 min unattended, while a hold from arm would keep it
+   * from sleeping at all. So an armed T2 snipe, the preflight included, needs none.
+   */
+  private async keepAwakeRequired(s: Snipe, settings: Settings): Promise<boolean> {
+    const tier = settings.snipe.tier;
+    const due = tier === 'T1' || (tier === 'T2' && s.state !== 'armed');
+    if (!due || !this.ctx.keepAwake.available) return false;
     try {
       return await this.ctx.permissions.contains({ permissions: ['power'] });
     } catch {
@@ -1680,13 +1690,13 @@ export class SnipeRunner {
   }
 
   private async keepAwakeState(s: Snipe, settings: Settings): Promise<PreflightContext['keepAwake']> {
-    if (!(await this.keepAwakeRequired(settings))) return 'not-required';
+    if (!(await this.keepAwakeRequired(s, settings))) return 'not-required';
     return this.awake.has(s.id) ? 'held' : 'not-held';
   }
 
   private async holdAwake(s: Snipe): Promise<void> {
     if (this.awake.has(s.id) || isTerminal(s)) return;
-    if (!(await this.keepAwakeRequired(await this.settings()))) return;
+    if (!(await this.keepAwakeRequired(s, await this.settings()))) return;
     try {
       await this.ctx.keepAwake.hold(`snipe ${s.id}`);
       this.awake.add(s.id);
