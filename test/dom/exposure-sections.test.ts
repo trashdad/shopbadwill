@@ -3,7 +3,7 @@
 // the same T-85 meter. Both mount `src/ui/exposure/**` (R4), never a fork.
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
@@ -272,7 +272,9 @@ const armedLive = (id: string, maxBid: number, estShipping?: number): Snipe => (
 });
 
 describe("review fixes (Opus): the meter is the caps module's number, and unknown is not zero", () => {
-  const LIVE_ARMED = [...AT_100, armedLive('x', 3000, 500), armedLive('y', 2000)];
+  /** A live snipe won earlier today: today's spend, which the meter adds to the open exposure. */
+  const wonToday: Snipe = { ...fired('w'), dryRun: false, state: 'resolved', outcome: 'won', maxBid: 1500, estShipping: 200 };
+  const LIVE_ARMED = [...AT_100, armedLive('x', 3000, 500), armedLive('y', 2000), wonToday];
 
   function popupWith(snipeList: () => Snipe[]) {
     const m = new FakeMessaging();
@@ -289,7 +291,9 @@ describe("review fixes (Opus): the meter is the caps module's number, and unknow
   }
 
   const expectCapsNumber = async (): Promise<void> => {
-    const want = exposure(LIVE_ARMED).total + spentToday(LIVE_ARMED, NOW, defaultSettings().locale.timeZone);
+    const spent = spentToday(LIVE_ARMED, NOW, defaultSettings().locale.timeZone);
+    expect(spent).toBe(1700); // the fixture really has spend today, so a meter that drops it fails
+    const want = exposure(LIVE_ARMED).total + spent;
     const bar = await screen.findByRole('progressbar', { name: 'Exposure against the daily cap' });
     expect(bar.getAttribute('aria-valuenow')).toBe(String(want));
     expect(screen.getByText(`Exposure ${formatMoney(want)} of`, { exact: false })).toBeTruthy();
@@ -301,8 +305,15 @@ describe("review fixes (Opus): the meter is the caps module's number, and unknow
   });
 
   it('dashboard: the meter shows open exposure plus spent today exactly as the caps module counts it', async () => {
-    dashboardWith(() => structuredClone(LIVE_ARMED));
-    await expectCapsNumber();
+    // The dashboard's "today" is the wall clock: pin it (Date only, so the queries' timers still run).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
+    try {
+      dashboardWith(() => structuredClone(LIVE_ARMED));
+      await expectCapsNumber();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('popup: says when some shipping is unknown and counts as zero, like the Snipes section', async () => {
