@@ -6,6 +6,7 @@
 // Leading, Unconfirmed, ambiguous, an unreadable item and a contradicting read
 // never confirm. Plus: ends at least 2 min apart (arm time), the edit freeze
 // from T-2 min before the next end, one mode per group, and the cancel targets.
+import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -31,9 +32,10 @@ import {
   nextResult,
   type WinJudgement,
 } from '../../../../src/domain/snipe/groups';
-import type { Snipe } from '../../../../src/domain/snipe/types';
+import { classifyOutcome } from '../../../../src/domain/snipe/outcome';
+import { SnipeOutcomeSchema, type Snipe } from '../../../../src/domain/snipe/types';
 import type { SnipeGroup, SnipeGroupResult } from '../../../../src/domain/storage/schema';
-import type { BidResult, ItemDetail } from '../../../../src/domain/types';
+import { BidResultKindSchema, type BidResult, type ItemDetail } from '../../../../src/domain/types';
 
 const SEC = 1000;
 const MIN = 60 * SEC;
@@ -489,5 +491,130 @@ describe('groupView', () => {
     const v = groupView(group({ results: { a: result('confirmed', { dryRun: true }) } }), [firedDryRun()], END_MS + MIN, TZ);
     expect(v.mode).toBe('dry-run');
     expect(v.items[0]?.status).toMatch(/Would have won \(dry run/);
+  });
+});
+
+// ── Properties: cancel only on proof ────────────────────────────────────────
+
+const PROP_RUNS = Number(process.env.SBW_PROP_RUNS ?? (process.env.SBW_LONG_PROPS !== undefined && process.env.SBW_LONG_PROPS !== '' ? 20_000 : 2_000));
+
+/** Any finished-or-not member, any send evidence, any stored outcome. */
+const memberArb = fc
+  .record({
+    state: fc.constantFrom<Snipe['state']>('resolved', 'resolved', 'resolved', 'killed', 'sent', 'armed', 'firing'),
+    dryRun: fc.boolean(),
+    outcome: fc.option(fc.constantFrom(...SnipeOutcomeSchema.options), { nil: undefined }),
+    sent: fc.boolean(),
+    ambiguous: fc.boolean(),
+    notSent: fc.boolean(),
+    reply: fc.option(fc.record({ kind: fc.constantFrom(...BidResultKindSchema.options), high: fc.constantFrom(true, false, null) }), { nil: undefined }),
+    maxBid: fc.integer({ min: 100, max: 5000 }),
+  })
+  .map(
+    (m): Snipe =>
+      wonLive({
+        state: m.state,
+        dryRun: m.dryRun,
+        outcome: m.outcome,
+        maxBid: m.maxBid,
+        attempt: {
+          ...(m.sent ? { sentAt: END_MS - 8000, idempotencyKey: 'a:k' } : {}),
+          ...(m.ambiguous ? { ambiguous: true } : {}),
+          ...(m.notSent ? { notSent: true } : {}),
+          ...(m.reply === undefined ? {} : { reply: bid(m.reply.kind, { isHighBidder: m.reply.high }) }),
+        },
+      }),
+  );
+
+/** Any read after the end: open or closed, extended or not, any price, any high-bidder flag, or none at all. */
+const postArb = fc.option(
+  fc
+    .record({
+      closed: fc.boolean(),
+      serverShift: fc.constantFrom(-60_000, -1000, 0, 6000, 600_000),
+      endShift: fc.constantFrom(0, 0, 0, 120_000, 600_000),
+      price: fc.integer({ min: 0, max: 6000 }),
+      high: fc.constantFrom(true, false, null),
+      otherItem: fc.constantFrom(false, false, false, false, true),
+    })
+    .map((p) =>
+      post({
+        itemId: p.otherItem ? 999 : 101,
+        isClosed: p.closed,
+        serverTime: iso(END_MS + p.serverShift),
+        endTime: iso(END_MS + p.endShift),
+        currentPrice: p.price,
+        minimumBid: p.price + 100,
+        isHighBidder: p.high,
+      }),
+    ),
+  { nil: null },
+);
+
+const closedRead = (d: ItemDetail): boolean => d.isClosed || Date.parse(d.serverTime) >= Date.parse(d.endTime);
+
+describe('property: a confirmed verdict (the only thing that cancels) always has its proof', () => {
+  it('live: the reducer stored `won`, a bid may be out, T-87 says won AND final on this read, at or below the max; dry run: closed below the max', () => {
+    fc.assert(
+      fc.property(memberArb, postArb, (s, d) => {
+        const j = judgeWin(s, d, TZ);
+        if (j.verdict !== 'confirmed') return;
+        expect(s.state).toBe('resolved');
+        expect(d).not.toBeNull();
+        const read = d as ItemDetail;
+        expect(read.itemId).toBe(s.itemId);
+        if (s.dryRun) {
+          expect(s.outcome).toBe('dry-run');
+          expect(closedRead(read)).toBe(true);
+          expect(s.maxBid).toBeGreaterThan(read.currentPrice);
+          return;
+        }
+        expect(s.outcome).toBe('won');
+        expect(s.attempt.notSent).not.toBe(true);
+        const reply = s.attempt.ambiguous === true ? null : (s.attempt.reply ?? null);
+        const c = classifyOutcome(s, reply, read, { userTz: TZ });
+        expect(c.outcome).toBe('won');
+        expect(c.final).toBe(true);
+        expect(read.currentPrice).toBeLessThanOrEqual(s.maxBid);
+      }),
+      { numRuns: PROP_RUNS },
+    );
+  });
+
+  it('an open auction, a failed read, or a stored Unconfirmed / Leading never confirms', () => {
+    fc.assert(
+      fc.property(memberArb, postArb, (s, d) => {
+        const j = judgeWin(s, d, TZ);
+        const leading = d !== null && !s.dryRun && !classifyOutcome(s, s.attempt.ambiguous === true ? null : (s.attempt.reply ?? null), d, { userTz: TZ }).final;
+        if (d === null || !closedRead(d) || s.outcome === 'network' || s.outcome === 'extended' || leading) {
+          expect(j.verdict).not.toBe('confirmed');
+        }
+      }),
+      { numRuns: PROP_RUNS },
+    );
+  });
+
+  it('cancelTargets is empty unless N wins of that mode are confirmed, and only ever names open members', () => {
+    const resultArb = fc.record({
+      verdict: fc.constantFrom<SnipeGroupResult['verdict']>('checking', 'confirmed', 'unconfirmed', 'not-won'),
+      dryRun: fc.boolean(),
+    });
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 1, max: 3 }),
+        fc.array(resultArb, { maxLength: 5 }),
+        fc.array(fc.record({ state: fc.constantFrom<Snipe['state']>('armed', 'waking', 'sent', 'resolved', 'killed'), dryRun: fc.boolean() }), { maxLength: 5 }),
+        (maxWins, results, ms) => {
+          const g = group({ maxWins, results: Object.fromEntries(results.map((r, i) => [`r${String(i)}`, result(r.verdict, { dryRun: r.dryRun })])) });
+          const members = ms.map((m, i) => open(String.fromCharCode(98 + i), END_MS + (i + 1) * 5 * MIN, { state: m.state, dryRun: m.dryRun }));
+          for (const t of cancelTargets(g, members)) {
+            expect(['resolved', 'killed']).not.toContain(t.state);
+            const wins = results.filter((r) => r.verdict === 'confirmed' && r.dryRun === t.dryRun).length;
+            expect(wins).toBeGreaterThanOrEqual(maxWins);
+          }
+        },
+      ),
+      { numRuns: PROP_RUNS },
+    );
   });
 });
