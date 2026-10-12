@@ -159,6 +159,12 @@ describe('judgeWin: only a confirmed win (T-87: won AND final) counts', () => {
     expect(j).toMatchObject({ verdict: 'unconfirmed', retry: true });
   });
 
+  it('a stored win whose read shows the auction extended and open is not a win yet (retried)', () => {
+    const later = END_MS + 10 * MIN;
+    const j = judgeWin(wonLive(), post({ isClosed: false, endTime: iso(later), serverTime: iso(END_MS + 6 * SEC) }), TZ);
+    expect(j).toEqual({ verdict: 'unconfirmed', why: 'the auction was extended and is still open', retry: true });
+  });
+
   it('an unreadable item never confirms (and is retried)', () => {
     expect(judgeWin(wonLive(), null, TZ)).toMatchObject({ verdict: 'unconfirmed', retry: true });
   });

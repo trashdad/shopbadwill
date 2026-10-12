@@ -214,11 +214,13 @@ export function judgeWin(s: Snipe, post: ItemDetail | null, userTz?: string): Wi
     // The reducer stored a win; this read says otherwise. Never a guess either way.
     return { verdict: 'unconfirmed', why: `the reads disagree (this one says ${c.outcome}): check the item`, retry: false };
   }
-  return {
-    verdict: 'unconfirmed',
-    why: c.outcome === 'won' ? 'the auction was still open when read' : 'it could not be told whether you lead',
-    retry: true,
-  };
+  const why =
+    c.outcome === 'won'
+      ? 'the auction was still open when read'
+      : c.outcome === 'extended'
+        ? 'the auction was extended and is still open'
+        : 'it could not be told whether you lead';
+  return { verdict: 'unconfirmed', why, retry: true };
 }
 
 /** The member's result after one confirming attempt (`prev` is `checking`; `prev.at` is the first attempt). */
