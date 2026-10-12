@@ -259,6 +259,12 @@ describe('chrome-only manifest keys', () => {
     expect(manifestOf('chrome').browser_specific_settings).toBeUndefined();
     expect(manifestOf('chrome').sidebar_action).toBeUndefined();
   });
+
+  // T-119: the snipe runner page is Firefox-only (Chrome always uses the
+  // background host), so the Chrome builds must not ship it.
+  it.each(['production', 'test'] as const)('does not ship the Firefox snipe-runner page (%s build)', async (kind) => {
+    await expect(access(path.join(outDirOf('chrome', kind), 'snipe-runner.html'))).rejects.toThrow();
+  });
 });
 
 describe('firefox-only manifest keys', () => {
@@ -288,6 +294,10 @@ describe('firefox-only manifest keys', () => {
       open_at_install: false,
     });
     await expect(access(path.join(outDirOf('firefox'), 'sidebar.html'))).resolves.toBeUndefined();
+  });
+
+  it.each(['production', 'test'] as const)('ships the snipe-runner page (%s build)', async (kind) => {
+    await expect(access(path.join(outDirOf('firefox', kind), 'snipe-runner.html'))).resolves.toBeUndefined();
   });
 
   it('has no Chrome-only keys', () => {

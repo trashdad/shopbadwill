@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <title>ShopBadwill snipe</title>
+    <!-- Firefox only (T-119): Chrome always uses the background snipe host, so the
+         Chrome build does not ship this page. -->
+    <meta name="manifest.include" content="['firefox']" />
     <style>
       html,
       body {
