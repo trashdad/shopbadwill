@@ -37,6 +37,12 @@ export const CONFIRM_TTL_MS = 2 * 60_000;
 /** The on-time rate below which turning live needs the typed confirmation (R2: "below 95%"). */
 export const ON_TIME_RATE_MIN = 0.95;
 /**
+ * The fewest completed dry runs live bidding ever needs: the schema default of
+ * `requiredDryRuns` (R3). A stored value below it (corrupt, or from before
+ * T-90) is judged as this floor, so the gate never opens on fewer.
+ */
+export const REQUIRED_DRY_RUNS_FLOOR = 5;
+/**
  * The "first live snipe" checklist link (R5): `docs/ACCEPTANCE.md#a-5` once
  * T-105 writes it; until then the docs folder.
  * TODO(T-105): point this at docs/ACCEPTANCE.md#a-5.
@@ -90,7 +96,7 @@ export function liveGateVerdict(
     return {
       ok: false,
       veto:
-        `The required dry-run count cannot be lowered: it starts at 5 and only the dry-run soak raises it. ` +
+        `The required dry-run count can be raised, never lowered: it starts at ${String(REQUIRED_DRY_RUNS_FLOOR)}. ` +
         `${String(current.snipe.requiredDryRuns)} stays in place.`,
     };
   }
@@ -98,9 +104,10 @@ export function liveGateVerdict(
   const biddingOff = current.dryRun.bidding && !next.dryRun.bidding;
   if (!biddingOff) return { ok: true, audit: null }; // turning ON, a no-op, or another group: always allowed (R2)
 
-  // R3: judge the KEPT count in `next` (T-90's merge), never a patch value.
+  // R3: judge the KEPT count in `next` (T-90's merge), never a patch value,
+  // against at least the schema default.
   const completed = next.snipe.completedDryRuns;
-  const required = next.snipe.requiredDryRuns;
+  const required = Math.max(REQUIRED_DRY_RUNS_FLOOR, next.snipe.requiredDryRuns);
   if (completed < required) {
     const left = required - completed;
     return {
@@ -135,14 +142,18 @@ export function liveGateVerdict(
       `Live bids are real money: at most ${formatMoney(audit.maxBid)} for one item and ${formatMoney(audit.perDayMax)} per day. ` +
       `ShopGoodwill's terms may forbid automated bidding. Your dry-run snipes fired on time ${String(percent(soak.onTimeRate))}% ` +
       `of the time (below ${String(percent(ON_TIME_RATE_MIN))}%), so going live needs a typed confirmation. ` +
-      `Read the first live snipe checklist (${FIRST_LIVE_CHECKLIST_URL}) first, then type ${GO_LIVE_CONFIRMATION} to confirm.`,
+      `Read the first live snipe checklist (${FIRST_LIVE_CHECKLIST_URL}) first, then type ${GO_LIVE_CONFIRMATION} in the popup's Live bidding section to confirm.`,
   };
 }
 
-/** A sender whose url is a web page (as opposed to an extension page). */
-function fromWebPage(url: string | undefined): boolean {
-  if (url === undefined) return false;
-  return url.startsWith('http://') || url.startsWith('https://');
+/**
+ * A sender that is one of the extension's own pages (runtime.onConnect only
+ * carries this extension's pages and content scripts). An allowlist: a
+ * content script (a web page, about:blank, file:, data:) or a sender with no
+ * url is not one.
+ */
+function fromExtensionPage(url: string | undefined): boolean {
+  return url !== undefined && /^(chrome|moz)-extension:\/\/[^/]+\//.test(url);
 }
 
 /** The one gate of a background. Holds the pending confirmation and the interceptor. */
@@ -158,12 +169,12 @@ export class LiveGate {
   /**
    * Serves LIVE_GATE_PORT: one message per port, `{ confirmation }`, answered
    * `{ ok: true }` only for the exact phrase (R6), then the port closes. A
-   * sender from a web page is disconnected unheard. Accepting a message never
+   * sender that is not an extension page is disconnected unheard. Accepting a message never
    * writes anything: it only arms a short-lived confirmation that the
    * settings.set interceptor — and nothing else — can consume.
    */
   servePort(port: RuntimePort): void {
-    if (fromWebPage(port.sender?.url)) {
+    if (!fromExtensionPage(port.sender?.url)) {
       port.disconnect();
       return;
     }

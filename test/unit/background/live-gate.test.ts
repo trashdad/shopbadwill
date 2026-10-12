@@ -16,16 +16,22 @@ import {
   register,
   type BiddingOffAudit,
 } from '../../../src/background/handlers/live-gate';
+import { register as registerSettings } from '../../../src/background/handlers/settings';
+import { createRouter, type MessageResponse, type Router } from '../../../src/background/router';
 import { defaultSettings } from '../../../src/domain/settings/defaults';
 import type { Settings } from '../../../src/domain/settings/schema';
 import type { Snipe } from '../../../src/domain/snipe/types';
 import { Repo } from '../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
+import { MSG_VERSION } from '../../../src/messaging/protocol';
 import { FakeClock } from '../../fakes/ports/fake-clock';
 import { FakeStorageAreas } from '../../fakes/ports/fake-storage';
 
 const NOW = Date.UTC(2026, 9, 10, 15, 0, 0);
 const END = NOW + 3_600_000;
+/** The extension's own page prefix in these tests (what runtime.getURL('') returns). */
+const EXT = 'chrome-extension://sbwtestid/';
+const POPUP_URL = `${EXT}popup.html`;
 
 interface CtxHarness {
   ctx: BackgroundContext;
@@ -33,9 +39,10 @@ interface CtxHarness {
   auditEntries: Array<{ actor: string; kind: string; details: Record<string, unknown> }>;
   connections: Channel<[RuntimePort]>;
   interceptors: SettingsSetInterceptors;
+  router: Router;
 }
 
-/** A minimal background context with only what register() touches. */
+/** A minimal background context with only what register() (and the settings handler) touch. */
 function makeCtx(): CtxHarness {
   const clock = new FakeClock(NOW);
   const storage = new FakeStorageAreas();
@@ -46,6 +53,12 @@ function makeCtx(): CtxHarness {
   const connections = new Channel<[RuntimePort]>(gate);
   const ports = createPortRegistry(connections);
   const interceptors = new SettingsSetInterceptors();
+  const router = createRouter({
+    runtimeId: 'sbwtestid',
+    getURL: (p) => `${EXT}${p.replace(/^\//, '')}`,
+    isQuickFavoriteEnabled: () => false,
+    log: () => undefined,
+  });
   const ctx = {
     clock,
     repo,
@@ -56,10 +69,28 @@ function makeCtx(): CtxHarness {
       },
     },
     ports,
+    router,
+    switches: { noteSettings: () => undefined },
     interceptors: { settingsSet: interceptors },
   } as unknown as BackgroundContext;
-  return { ctx, repo, auditEntries, connections, interceptors };
+  return { ctx, repo, auditEntries, connections, interceptors, router };
 }
+
+/**
+ * The real background stack a page talks to: the router, T-36/T-90's
+ * settings handler and this gate. `send` is a message from the popup.
+ */
+function makeStack(): CtxHarness & { send: (type: string, payload?: unknown) => Promise<MessageResponse> } {
+  const h = makeCtx();
+  registerSettings(h.ctx);
+  register(h.ctx);
+  const send = (type: string, payload?: unknown): Promise<MessageResponse> =>
+    h.router.handle({ v: MSG_VERSION, reqId: 'r1', type, ...(payload === undefined ? {} : { payload }) }, { id: 'sbwtestid', url: POPUP_URL });
+  return { ...h, send };
+}
+
+/** The stored settings, read through the repo. */
+const readSettings = (repo: Repo): Promise<Settings> => repo.get(STORAGE_KEYS.settings);
 
 /** A dry-run snipe that fired: on-time unless `offByMs` says otherwise. */
 const fired = (id: string, offByMs = 0): Snipe => ({
@@ -109,21 +140,30 @@ const on = (current: Settings): SettingsSetChange => {
   return change(current, next, { dryRun: { ...current.dryRun, bidding: true } });
 };
 
-/** The gate's port reply: ok only for the exact phrase. */
-function portProbe(ctx: { connections: Channel<[RuntimePort]> }, senderUrl?: string): { posts: unknown[]; send: (m: unknown) => void } {
+/**
+ * The gate's port reply: ok only for the exact phrase. The sender is the
+ * popup unless `senderUrl` says otherwise (`null`: a sender with no url).
+ */
+function portProbe(
+  ctx: { connections: Channel<[RuntimePort]> },
+  senderUrl: string | null = POPUP_URL,
+): { posts: unknown[]; send: (m: unknown) => void; disconnected: () => boolean } {
   const posts: unknown[] = [];
   const listeners: Array<(m: unknown) => void> = [];
+  let disconnected = false;
   ctx.connections.emit({
     name: LIVE_GATE_PORT,
-    sender: senderUrl === undefined ? { id: 'sbw' } : { id: 'sbw', url: senderUrl },
+    sender: senderUrl === null ? { id: 'sbwtestid' } : { id: 'sbwtestid', url: senderUrl },
     postMessage: (m: unknown) => {
       posts.push(m);
     },
-    disconnect: () => undefined,
+    disconnect: () => {
+      disconnected = true;
+    },
     onMessage: { addListener: (l) => listeners.push(l), removeListener: () => undefined },
     onDisconnect: { addListener: () => undefined, removeListener: () => undefined },
   });
-  return { posts, send: (m) => listeners[0]?.(m) };
+  return { posts, send: (m) => listeners[0]?.(m), disconnected: () => disconnected };
 }
 
 describe('liveGateVerdict (pure)', () => {
@@ -205,7 +245,7 @@ describe('liveGateVerdict (pure)', () => {
     next.snipe.requiredDryRuns = 4;
     const verdict = liveGateVerdict(change(current, next, { snipe: { ...current.snipe, requiredDryRuns: 4 } }), [], null, NOW);
     expect(verdict.ok).toBe(false);
-    if (!verdict.ok) expect(verdict.veto).toContain('cannot be lowered');
+    if (!verdict.ok) expect(verdict.veto).toContain('never lowered');
   });
 
   it('a requiredDryRuns decrease below the schema default of 5 is refused too', () => {
@@ -365,5 +405,136 @@ describe('register (background wiring: port + interceptor + audit)', () => {
     expect(() => {
       ctx.ports.serve(LIVE_GATE_PORT, () => undefined);
     }).toThrow(/already served/);
+  });
+});
+
+/** Five dry-run fires as stored snipes: all on time (100%), or one 2 s late (80%). */
+const ON_TIME_RECORD = { a: fired('a'), b: fired('b'), c: fired('c'), d: fired('d'), e: fired('e') };
+const BELOW_95_RECORD = { a: fired('a'), b: fired('b'), c: fired('c'), d: fired('d'), e: fired('e', 2000) };
+
+describe('review fixes (Opus)', () => {
+  it('a stored requiredDryRuns below the schema default of 5 still needs 5 completed dry runs (the floor)', () => {
+    const snipes = Object.values(ON_TIME_RECORD);
+    const v = liveGateVerdict(off(settingsWith(4, 0)), snipes, null, NOW);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.veto).toBe('Complete 1 dry-run snipe before bidding live.');
+    expect(liveGateVerdict(off(settingsWith(5, 0)), snipes, null, NOW).ok).toBe(true);
+  });
+
+  it('the below-95% veto says where the confirmation is typed (the popup): the options switch has no field for it', () => {
+    const v = liveGateVerdict(off(settingsWith(5, 5)), Object.values(BELOW_95_RECORD), null, NOW);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.veto).toContain(`type ${GO_LIVE_CONFIRMATION} in the popup's Live bidding section`);
+  });
+
+  it('the decrease veto is honest: the count can be raised, never lowered (nothing raises it by itself)', () => {
+    const current = settingsWith(5, 5);
+    const next = structuredClone(current);
+    next.snipe.requiredDryRuns = 4;
+    const v = liveGateVerdict(change(current, next, { snipe: next.snipe }), [], null, NOW);
+    expect(v.ok).toBe(false);
+    if (!v.ok) {
+      expect(v.veto).not.toMatch(/soak raises/);
+      expect(v.veto).toContain('can be raised, never lowered');
+    }
+  });
+
+  it('only an extension page can arm the confirmation: no url, about:blank, file:, data: and web pages are disconnected unheard', async () => {
+    const { ctx, interceptors, connections, repo } = makeCtx();
+    register(ctx);
+    await repo.set(STORAGE_KEYS.snipes, BELOW_95_RECORD);
+    for (const url of [null, 'about:blank', 'file:///C:/x.html', 'data:text/html,x', 'https://shopgoodwill.com/']) {
+      const probe = portProbe({ connections }, url);
+      probe.send({ confirmation: GO_LIVE_CONFIRMATION });
+      expect(probe.posts).toEqual([]);
+      expect(probe.disconnected()).toBe(true);
+      await expect(interceptors.check(off(settingsWith(5, 5)))).rejects.toThrow(SettingsVetoError);
+    }
+    // Firefox's extension pages are moz-extension://.
+    const firefox = portProbe({ connections }, 'moz-extension://0d1c2b3a/popup.html');
+    firefox.send({ confirmation: GO_LIVE_CONFIRMATION });
+    expect(firefox.posts).toEqual([{ ok: true }]);
+  });
+});
+
+describe('the real background stack: router -> settings handler (T-36/T-90) -> this gate', () => {
+  it('settings.set sent directly cannot turn bidding live below requiredDryRuns; a claimed completedDryRuns never lands and never opens the gate', async () => {
+    const h = makeStack();
+    await h.repo.set(STORAGE_KEYS.settings, settingsWith(3, 5));
+    await h.repo.set(STORAGE_KEYS.snipes, ON_TIME_RECORD);
+    const before = await readSettings(h.repo);
+
+    const claim = await h.send('settings.set', { dryRun: { ...before.dryRun, bidding: false }, snipe: { ...before.snipe, completedDryRuns: 99 } });
+    expect(claim).toMatchObject({ ok: false, error: { message: 'Complete 2 dry-run snipes before bidding live.' } });
+    expect(await readSettings(h.repo)).toEqual(before);
+
+    // The claim on its own is written without the count (T-90 keeps the stored one): it is no back door.
+    expect(await h.send('settings.set', { snipe: { ...before.snipe, completedDryRuns: 99 } })).toMatchObject({ ok: true });
+    expect((await readSettings(h.repo)).snipe.completedDryRuns).toBe(3);
+    expect((await h.send('settings.set', { dryRun: { ...before.dryRun, bidding: false } })).ok).toBe(false);
+    expect((await readSettings(h.repo)).dryRun.bidding).toBe(true);
+    expect(h.auditEntries).toHaveLength(0);
+  });
+
+  it('a full settings replace cannot flip bidding live, raise the count or lower requiredDryRuns', async () => {
+    const h = makeStack();
+    await h.repo.set(STORAGE_KEYS.settings, settingsWith(3, 5));
+    await h.repo.set(STORAGE_KEYS.snipes, ON_TIME_RECORD);
+    const before = await readSettings(h.repo);
+    const whole = structuredClone(before);
+    whole.dryRun = { favorites: false, calendar: false, bidding: false };
+    whole.snipe.completedDryRuns = 99;
+    expect((await h.send('settings.set', whole)).ok).toBe(false);
+    whole.snipe.requiredDryRuns = 0;
+    expect((await h.send('settings.set', whole)).ok).toBe(false);
+    expect(await readSettings(h.repo)).toEqual(before);
+  });
+
+  it('requiredDryRuns never drops through settings.set: 4 and 0 are refused, -1 is invalid, a raise sticks and cannot be undone', async () => {
+    const h = makeStack();
+    const s = await readSettings(h.repo);
+    expect(s.snipe.requiredDryRuns).toBe(5);
+    for (const n of [4, 0, -1]) {
+      expect((await h.send('settings.set', { snipe: { ...s.snipe, requiredDryRuns: n } })).ok).toBe(false);
+    }
+    expect((await readSettings(h.repo)).snipe.requiredDryRuns).toBe(5);
+    expect((await h.send('settings.set', { snipe: { ...s.snipe, requiredDryRuns: 7 } })).ok).toBe(true);
+    expect((await h.send('settings.set', { snipe: { ...s.snipe, requiredDryRuns: 5 } })).ok).toBe(false);
+    expect((await readSettings(h.repo)).snipe.requiredDryRuns).toBe(7);
+  });
+
+  it('below 95%: refused without the port confirmation, live with the exact phrase; the audit entry holds counts and limits only', async () => {
+    const h = makeStack();
+    await h.repo.set(STORAGE_KEYS.settings, settingsWith(5, 5));
+    await h.repo.set(STORAGE_KEYS.snipes, BELOW_95_RECORD);
+    const s = await readSettings(h.repo);
+    const refused = await h.send('settings.set', { dryRun: { ...s.dryRun, bidding: false } });
+    expect(refused).toMatchObject({ ok: false, error: { message: expect.stringContaining(GO_LIVE_CONFIRMATION) as unknown } });
+    expect(h.auditEntries).toHaveLength(0);
+
+    portProbe(h).send({ confirmation: GO_LIVE_CONFIRMATION });
+    expect((await h.send('settings.set', { dryRun: { ...s.dryRun, bidding: false } })).ok).toBe(true);
+    expect((await readSettings(h.repo)).dryRun.bidding).toBe(false);
+    expect(h.auditEntries).toHaveLength(1);
+    expect(Object.keys(h.auditEntries[0] ?? {}).sort()).toEqual(['actor', 'details', 'kind']);
+    expect(h.auditEntries[0]).toMatchObject({ actor: 'user', kind: 'dryrun.bidding.off' });
+    expect(h.auditEntries[0]?.details).toEqual({
+      confirmed: true,
+      completedDryRuns: 5,
+      requiredDryRuns: 5,
+      firesAttempted: 5,
+      onTimeRate: 0.8,
+      maxBid: 5000,
+      perDayMax: 10_000,
+    });
+  });
+
+  it('turning dry-run back on through settings.set is one message with no confirmation, whatever the counts', async () => {
+    const h = makeStack();
+    await h.repo.set(STORAGE_KEYS.settings, settingsWith(0, 5, false));
+    const s = await readSettings(h.repo);
+    expect((await h.send('settings.set', { dryRun: { ...s.dryRun, bidding: true } })).ok).toBe(true);
+    expect((await readSettings(h.repo)).dryRun.bidding).toBe(true);
+    expect(h.auditEntries).toHaveLength(0);
   });
 });

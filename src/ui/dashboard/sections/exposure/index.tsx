@@ -2,8 +2,9 @@
 // T-85's exposure meter (R4, never a fork) beside the live gate's status: the
 // dry-run progress, the soak's on-time rate, and the honest copy with the
 // "first live snipe" checklist link (R5). The go-live action with the typed
-// confirmation lives in the popup section and the options page; the background
-// gate (src/background/handlers/live-gate.ts) is the authority either way (R1).
+// confirmation lives in the popup section (the options page's bidding switch
+// has no field for it); the background gate
+// (src/background/handlers/live-gate.ts) is the authority either way (R1).
 import type { VNode } from 'preact';
 
 import { FIRST_LIVE_CHECKLIST_URL } from '../../../../background/handlers/live-gate';
