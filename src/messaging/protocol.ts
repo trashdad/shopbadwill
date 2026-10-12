@@ -73,6 +73,11 @@ export const MsgSchema = z.discriminatedUnion('type', [
   msg('rules.disable', z.object({ ruleId: z.string().min(1) })),
   /** R5: at most 40 item ids. The TypeScript payload type stays `ItemId[]`. */
   msg('landedCost.get', z.object({ itemIds: z.array(ItemIdSchema).max(40) })),
+  /**
+   * T-113 contract change: the relist badge asks whether the background has
+   * seen an earlier listing of each item. At most 40 ids; no SGW request.
+   */
+  msg('relist.lookup', z.object({ itemIds: z.array(ItemIdSchema).max(40) })),
   msg('quick.hideSeller', z.object({ sellerId: z.number().int(), sellerName: z.string() })),
   /** A non-empty term: an empty one would hide every listing. */
   msg('quick.hideKeyword', z.object({ term: z.string().min(1) })),
@@ -156,6 +161,7 @@ export const MSG_SENDER = Object.freeze({
   'rules.evaluate': 'content',
   'rules.disable': 'content',
   'landedCost.get': 'content',
+  'relist.lookup': 'content',
   'quick.hideSeller': 'content',
   'quick.hideKeyword': 'content',
   'quick.favorite': 'content',
@@ -215,6 +221,14 @@ const LandedCostQuoteSchema = z.object({
 });
 export type LandedCostQuote = z.infer<typeof LandedCostQuoteSchema>;
 
+/**
+ * T-113 contract change: one `relist.lookup` reply entry, the earlier listing
+ * of the item (its id, last seen current price, when it was last seen).
+ * Module-private schema, like LandedCostQuoteSchema.
+ */
+const RelistHitSchema = z.object({ itemId: ItemIdSchema, price: CentsSchema, seenAt: EpochMsSchema });
+export type RelistLookupHit = z.infer<typeof RelistHitSchema>;
+
 /** Reply schemas for the §3.12 types that declare a `reply`. */
 export const MsgReplySchemas = Object.freeze({
   'rules.evaluate': z.array(MatchResultSchema),
@@ -224,6 +238,8 @@ export const MsgReplySchemas = Object.freeze({
    * pickup-only, with shipping and handling 0.
    */
   'landedCost.get': z.record(ItemIdSchema, LandedCostQuoteSchema.nullable()),
+  /** T-113: per item, the earlier listing, or null (none known, or `features.relistDetector` off). */
+  'relist.lookup': z.record(ItemIdSchema, RelistHitSchema.nullable()),
   'settings.get': SettingsSchema,
   'rules.list': z.array(RuleSchema),
   'rules.preview': z.object({

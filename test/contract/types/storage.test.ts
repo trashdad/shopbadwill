@@ -14,6 +14,7 @@ import {
   RequestBudgetSchema,
   RequestSchedulerStateSchema,
   parseCompanionWakes,
+  parseRelistSeen,
   parseDryRunCounted,
   STORAGE_KEYS,
   STORAGE_LIMITS,
@@ -59,6 +60,7 @@ const LOCAL_KEYS = [
   'sbw:dryRunCounted',
   'sbw:companionWakes',
   'sbw:deferredAlarms',
+  'sbw:relistSeen',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -116,6 +118,8 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:companionWakes': { version: 1, wakes: { 'snp-1': { wakeAt: 1791400000000, state: 'confirmed', triedAt: 1791390000000 } } },
   // T-118 (L6): deferred one-shot alarms (name -> when), re-created at startup if the browser dropped them.
   'sbw:deferredAlarms': { 'sbw:notify:digest:run-1': 1791400000000 },
+  // T-113: the relist detector's history of public listings (item id -> fingerprint, last price, last seen).
+  'sbw:relistSeen': { version: 1, entries: { '279250057': { fp: '42|pyrex bowl|abc.jpg', price: 1299, seenAt: 1791400000000 } } },
 };
 
 describe('storage schema v1', () => {
@@ -231,6 +235,19 @@ describe('storage schema v1', () => {
     expect(spec.schema.safeParse({ 'sbw:notify:outcome:28': 1791400000000 }).success).toBe(true);
     expect(spec.schema.safeParse({ 'sbw:notify:outcome:28': -1 }).success).toBe(false);
     expect(spec.schema.safeParse({ '': 1791400000000 }).success).toBe(false);
+  });
+
+  it('registers the optional relist history: item id -> { fp, price, seenAt }, invalid parses empty (T-113)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.relistSeen];
+    expect(STORAGE_KEYS.relistSeen).toBe('sbw:relistSeen');
+    expect(spec.area).toBe('local');
+    const entry = { fp: '42|pyrex bowl|abc.jpg', price: 1299, seenAt: 1791400000000 };
+    expect(spec.schema.safeParse({ version: 1, entries: {} }).success).toBe(true);
+    expect(spec.schema.safeParse({ version: 1, entries: { '279250057': entry } }).success).toBe(true);
+    expect(spec.schema.safeParse({ version: 1, entries: { '279250057': { ...entry, price: -1 } } }).success).toBe(false);
+    expect(spec.schema.safeParse({ version: 1, entries: { '279250057': { ...entry, fp: '' } } }).success).toBe(false);
+    expect(parseRelistSeen({ version: 2 })).toEqual({ version: 1, entries: {} });
+    expect(parseRelistSeen(undefined)).toEqual({ version: 1, entries: {} });
   });
 
   it('registers the optional quote salt: 64 lowercase hex, nothing else (T-57 final check)', () => {
