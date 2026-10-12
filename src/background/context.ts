@@ -25,7 +25,7 @@ import type { Settings } from '../domain/settings/schema';
 import type { MigrateResult } from '../domain/storage/migrations';
 import type { Repo } from '../domain/storage/repo';
 import type { EpochMs, ItemDetail, ItemId, Listing } from '../domain/types';
-import type { MsgBroadcastType, MsgPayload } from '../messaging/protocol';
+import { PORT_NAMES, type MsgBroadcastType, type MsgPayload } from '../messaging/protocol';
 import type { Alarms } from '../ports/alarms';
 import type { CalendarApi } from '../ports/calendar';
 import type { Clock } from '../ports/clock';
@@ -235,11 +235,20 @@ export interface PortRegistry {
   serve(name: string, handler: PortHandler): () => void;
 }
 
+/** T-118 (L9): read-only UI streams, served only to the extension's own pages (never a content script). */
+const UI_ONLY_PORTS: ReadonlySet<string> = new Set([PORT_NAMES.snipeCountdown, PORT_NAMES.jobProgress]);
+
 /** Dispatches connected ports by name; a name nobody serves (e.g. a test hook's) is ignored, never disconnected. */
 export function createPortRegistry(connections: Channel<[RuntimePort]>): PortRegistry {
   const handlers = new Map<string, PortHandler>();
   connections.on((port) => {
-    handlers.get(port.name)?.(port);
+    const handler = handlers.get(port.name);
+    if (handler === undefined) return;
+    if (UI_ONLY_PORTS.has(port.name) && !/^(chrome|moz)-extension:\/\/[^/]+\//.test(port.sender?.url ?? '')) {
+      port.disconnect();
+      return;
+    }
+    handler(port);
   });
   return {
     serve(name, handler) {

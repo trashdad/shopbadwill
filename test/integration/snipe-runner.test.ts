@@ -2098,6 +2098,8 @@ describe('seams (I-12)', () => {
     const disconnect = fakeEvent<() => void>();
     const port: RuntimePort = {
       name: 'sbw:snipe-countdown',
+      // T-118 (L9): the countdown is served only to the extension's own pages.
+      sender: { id: 'sbwtestid', url: 'chrome-extension://sbwtestid/sidepanel.html' },
       postMessage: (m) => {
         got.push(m);
       },
