@@ -23,6 +23,8 @@ import {
 } from './shapes';
 
 export const FAKE_JWT_SECRET = 'sbw-fake-sgw-secret';
+/** Log status of a request the client abandoned during injected latency (nginx's "client closed request"). */
+export const CLIENT_CLOSED = 499;
 export const PAGE_SIZE = 40;
 export const MAX_TOTAL_RECORDS = 10000;
 
@@ -567,13 +569,37 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
       const endpoint = route?.name ?? url.pathname;
       const auth = req.headers.authorization;
       const bearer = auth?.startsWith('Bearer ') ? auth.slice(7).trim() : null;
+      const fakeNowMs = parseFakeNow([req.headers['x-sbw-fake-now']].flat()[0]);
+      // T-89: follow the client's fake clock (re-pinned at receipt; it ticks from there).
+      if (scenario.followFakeNow && fakeNowMs !== null) anchor = { fake: fakeNowMs, real: receivedAtMs };
+      const record = (status: number): void => {
+        logged = true;
+        log.push({
+          seq: ++seq,
+          method,
+          path: url.pathname,
+          query: url.search,
+          endpoint,
+          status,
+          receivedAtMs,
+          fakeNowMs,
+          requestTimeMs: fakeNowMs ?? receivedAtMs,
+          hasBearer: bearer !== null,
+          body,
+        });
+      };
 
       let result: Result;
       if (hit === null) result = bad(404, 'Not found');
       else if (hit === 'method') result = bad(405, 'Method not allowed');
       else {
         const lat = findSpec(scenario.latencyMs, endpoint);
-        if (lat && lat[1] > 0 && !(await sleep(lat[1], res))) return;
+        if (lat && lat[1] > 0 && !(await sleep(lat[1], res))) {
+          // The client gave up during the injected latency (T-89: a stalled read
+          // that timed out). Logged as 499, "client closed request", never answered.
+          record(CLIENT_CLOSED);
+          return;
+        }
         const err = findSpec<ErrorSpec>(scenario.errors, endpoint);
         let forced: ErrorSpec | null = null;
         if (err) {
@@ -596,21 +622,7 @@ export async function startFakeSgw(opts: FakeSgwOptions = {}): Promise<FakeSgw> 
         }
       }
 
-      const fakeNowMs = parseFakeNow([req.headers['x-sbw-fake-now']].flat()[0]);
-      logged = true;
-      log.push({
-        seq: ++seq,
-        method,
-        path: url.pathname,
-        query: url.search,
-        endpoint,
-        status: result.status,
-        receivedAtMs,
-        fakeNowMs,
-        requestTimeMs: fakeNowMs ?? receivedAtMs,
-        hasBearer: bearer !== null,
-        body,
-      });
+      record(result.status);
       if (result.delayMs !== undefined && result.delayMs > 0 && !(await sleep(result.delayMs, res))) return;
       send(res, result.status, result.body, result.headers);
     })().catch((e: unknown) => {

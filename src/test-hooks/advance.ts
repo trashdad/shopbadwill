@@ -4,7 +4,9 @@
 // registry in src/adapters/browser/alarms.ts). Payload: `{ ms }` to advance
 // by that many milliseconds and/or `{ to }` to set the fake now to an
 // absolute instant (a restart loses the offset; the harness re-anchors with
-// `to` instead of re-adding). It also fires the Clock timers whose fake
+// `to` instead of re-adding), or `{ until }` (T-89) to move it forward to an
+// instant and never back: the fake clock ticks with real time, so a target the
+// harness computed a moment ago may already have passed. It also fires the Clock timers whose fake
 // deadline passed (e.g. a RequestScheduler gap wait). The reply is
 // `{ now, fired, timers }`: the new fake now, the alarm names fired (in
 // order), and the fake deadlines of the Clock timers still pending.
@@ -35,9 +37,14 @@ const AdvanceSchema = z
     ms: z.number().nonnegative().optional(),
     /** Set the fake clock to this absolute instant. */
     to: z.number().optional(),
+    /** Move the fake clock forward to this instant; a no-op when it is already there or past it. */
+    until: z.number().optional(),
   })
-  .refine((v) => v.ms !== undefined || v.to !== undefined, {
-    message: 'send ms and/or to',
+  .refine((v) => v.ms !== undefined || v.to !== undefined || v.until !== undefined, {
+    message: 'send ms and/or to, or until',
+  })
+  .refine((v) => v.until === undefined || (v.ms === undefined && v.to === undefined), {
+    message: 'send only one of until / ms+to',
   });
 
 const WRAP_MARK = Symbol.for('sbw.testHooks.advance.fetch');
@@ -68,9 +75,16 @@ export function install(ctx: TestHookContext): void {
   ctx.serve(ADVANCE_HOOK, (payload) => {
     const parsed = AdvanceSchema.safeParse(payload);
     if (!parsed.success) {
-      throw new Error(`expected { ms?: number, to?: number } with at least one of them; got ${JSON.stringify(payload)}`);
+      const why = parsed.error.issues.some((i) => i.message.includes('only one of')) ? 'send only one of until / ms+to' : 'at least one of them';
+      throw new Error(`expected { ms?: number, to?: number } or { until: number }, ${why}; got ${JSON.stringify(payload)}`);
     }
-    const now = parsed.data.to !== undefined ? setTestClockTo(parsed.data.to) : advanceTestClock(parsed.data.ms ?? 0);
+    const { ms, to, until } = parsed.data;
+    const now =
+      until !== undefined
+        ? setTestClockTo(Math.max(until, testClockNow()))
+        : to !== undefined
+          ? setTestClockTo(to)
+          : advanceTestClock(ms ?? 0);
     const fired = fireDueTestAlarms(now).map((a) => a.name);
     fireDueTestTimers(now);
     return { now, fired, timers: pendingTestTimers() };

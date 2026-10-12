@@ -1,8 +1,14 @@
 import type { Http, HttpRequest, HttpResponse } from '../../ports/http';
 import { HttpNetworkError, HttpTimeoutError } from '../../ports/errors';
+import { testClockNow } from './clock';
 
 export interface BrowserHttpOptions {
   fetch?: typeof fetch;
+  /**
+   * `startedAt` / `endedAt`. Default: BrowserClock's time (T-89), which is
+   * Date.now() in production and carries T-59's time-travel offset in a test
+   * build, so clock samples and read round trips share the runner's timebase.
+   */
   now?: () => number;
   /** Defaults to `navigator.onLine`; undefined when unknown. */
   isOnline?: () => boolean | undefined;
@@ -16,7 +22,7 @@ export class BrowserHttp implements Http {
 
   constructor(opts: BrowserHttpOptions = {}) {
     this.fetchFn = opts.fetch ?? ((input, init) => fetch(input, init));
-    this.now = opts.now ?? (() => Date.now());
+    this.now = opts.now ?? testClockNow;
     this.isOnline = opts.isOnline ?? (() => (typeof navigator === 'undefined' ? undefined : navigator.onLine));
   }
 
