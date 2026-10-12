@@ -14,6 +14,7 @@ import { RulesSection, section as rulesSection } from '../../src/entrypoints/opt
 import { fromDraft, newCondition, newRuleDraft, toDraft, CONDITION_KINDS } from '../../src/entrypoints/options/sections/rules/draft';
 import { formatMinutes, summarizeRule } from '../../src/entrypoints/options/sections/rules/summary';
 import { SettingsSection, section as settingsSection } from '../../src/entrypoints/options/sections/settings';
+import { onSettingsSaved } from '../../src/entrypoints/options/settings-events';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
 
 afterEach(cleanup);
@@ -217,6 +218,21 @@ describe('rule list', () => {
 });
 
 describe('settings', () => {
+  it('announces each successful save so other sections re-read settings (T-118 L1)', async () => {
+    let heard = 0;
+    const off = onSettingsSaved(() => {
+      heard += 1;
+    });
+    try {
+      settingsApp();
+      fireEvent.click(await screen.findByRole('switch', { name: 'Dry run: calendar' }));
+      await screen.findByText('Saved: calendar dry run.');
+      expect(heard).toBe(1);
+    } finally {
+      off();
+    }
+  });
+
   it('persists a dry-run toggle through settings.set, sending the whole group', async () => {
     const fake = settingsApp();
     const toggle = await screen.findByRole('switch', { name: 'Dry run: bidding' });
