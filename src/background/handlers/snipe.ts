@@ -5,7 +5,7 @@
 // (attempt, fireAt, wakeAlarm, measured, outcome) and arms through the reducer;
 // `snipe.disarm` is a `disarm { by: 'user' }` the reducer may refuse (after
 // `sent`, a bid may already be out).
-import { getSnipeRunner, type SnipeRunner } from '../jobs/snipe-runner';
+import { getSnipeRunner, KILL_ARM_REFUSAL, type SnipeRunner } from '../jobs/snipe-runner';
 import type { BackgroundContext } from '../context';
 
 /** T-36 self-registration (I-01). The runner registers with the jobs, after the handlers; it is looked up per message. */
@@ -16,8 +16,12 @@ export function register(ctx: BackgroundContext): void {
     return r;
   };
   ctx.router.register('snipe.prepare', ({ itemId }) => runner().prepare(itemId));
-  ctx.router.register('snipe.arm', ({ snipe, typedConfirmation }) =>
-    runner().arm(
+  ctx.router.register('snipe.arm', ({ snipe, typedConfirmation }) => {
+    // T-84c: refuse cleanly while the kill switch is on. The arm does not
+    // happen and then get stopped by the kill disarm-all; nothing is stored.
+    // The runner checks again under its lock (a kill that lands while the item is read).
+    if (ctx.switches.view().killSwitch) throw new Error(KILL_ARM_REFUSAL);
+    return runner().arm(
       {
         id: snipe.id,
         itemId: snipe.itemId,
@@ -32,8 +36,8 @@ export function register(ctx: BackgroundContext): void {
         ...(snipe.groupId === undefined ? {} : { groupId: snipe.groupId }),
       },
       typedConfirmation,
-    ),
-  );
+    );
+  });
   ctx.router.register('snipe.disarm', async ({ id }) => {
     await runner().disarm(id);
     return undefined;
