@@ -501,12 +501,18 @@ const PROP_RUNS = Number(process.env.SBW_PROP_RUNS ?? (process.env.SBW_LONG_PROP
 /** Any finished-or-not member, any send evidence, any stored outcome. */
 const memberArb = fc
   .record({
-    state: fc.constantFrom<Snipe['state']>('resolved', 'resolved', 'resolved', 'killed', 'sent', 'armed', 'firing'),
-    dryRun: fc.boolean(),
-    outcome: fc.option(fc.constantFrom(...SnipeOutcomeSchema.options), { nil: undefined }),
-    sent: fc.boolean(),
-    ambiguous: fc.boolean(),
-    notSent: fc.boolean(),
+    // Weighted toward the region that matters: finished members the reducer called a win.
+    state: fc.constantFrom<Snipe['state']>('resolved', 'resolved', 'resolved', 'resolved', 'resolved', 'killed', 'sent', 'armed', 'firing'),
+    dryRun: fc.constantFrom(false, false, true),
+    outcome: fc.oneof(
+      { arbitrary: fc.constant<Snipe['outcome']>('won'), weight: 4 },
+      { arbitrary: fc.constant<Snipe['outcome']>('dry-run'), weight: 2 },
+      { arbitrary: fc.constantFrom<Snipe['outcome']>(...SnipeOutcomeSchema.options), weight: 2 },
+      { arbitrary: fc.constant<Snipe['outcome']>(undefined), weight: 1 },
+    ),
+    sent: fc.constantFrom(true, true, true, false),
+    ambiguous: fc.constantFrom(false, false, true),
+    notSent: fc.constantFrom(false, false, false, true),
     reply: fc.option(fc.record({ kind: fc.constantFrom(...BidResultKindSchema.options), high: fc.constantFrom(true, false, null) }), { nil: undefined }),
     maxBid: fc.integer({ min: 100, max: 5000 }),
   })
@@ -534,7 +540,7 @@ const postArb = fc.option(
       serverShift: fc.constantFrom(-60_000, -1000, 0, 6000, 600_000),
       endShift: fc.constantFrom(0, 0, 0, 120_000, 600_000),
       price: fc.integer({ min: 0, max: 6000 }),
-      high: fc.constantFrom(true, false, null),
+      high: fc.constantFrom(true, true, false, null),
       otherItem: fc.constantFrom(false, false, false, false, true),
     })
     .map((p) =>
