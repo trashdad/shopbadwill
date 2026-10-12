@@ -38,7 +38,7 @@
 // after the browser aborts, and it replays the context's cookie jar on every
 // request whatever the page's credentials mode). The browser is launched fail
 // closed like everywhere else, except that 127.0.0.1 resolves, and requests to
-// 127.0.0.1:8787 continue straight to the fake over a real socket: what the
+// FAKE_BUYERAPI continue straight to the fake over a real socket: what the
 // fake logs (including the new `cookie` field and the 499 of a request the
 // browser gave up on) is exactly what the browser sent. Every other request
 // goes through the shared fail-closed guard, and a request to any other host
@@ -149,7 +149,7 @@ function endpointOf(pathname: string): string {
 }
 
 /**
- * The context's one route. Requests to the fake SGW (127.0.0.1:8787, where
+ * The context's one route. Requests to the fake SGW (FAKE_BUYERAPI, where
  * sbw:test:baseUrl sends the background) are recorded as they leave, then
  * continue to the fake over a real socket; every other request goes through
  * the shared fail-closed guard (a fake fetch, or an abort that fails the spec).
@@ -566,10 +566,10 @@ interface WireExpect {
  */
 async function expectMoneyWire(r: Rig, x: WireExpect): Promise<FakeLogEntry[]> {
   const log = await fakeLog();
-  // Playwright reuses whatever already listens on 8787: an older fake (another checkout's run) has no `cookie` field.
+  // An older fake SGW (without the `cookie` log field) would show here; each run now starts its own (T-39b).
   expect(
     log.filter((e) => (e as Partial<FakeLogEntry>).cookie === undefined).map((e) => e.endpoint),
-    'the fake SGW on 8787 logs the Cookie header (is an older fake server from another checkout running?)',
+    'the fake SGW logs the Cookie header (is an older fake server running?)',
   ).toEqual([]);
   expect(
     log.filter((e) => e.cookie !== null).map((e) => `${e.endpoint}: ${String(e.cookie)}`),

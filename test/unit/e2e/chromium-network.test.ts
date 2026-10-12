@@ -3,7 +3,7 @@
 // file fails.
 import { describe, expect, it } from 'vitest';
 
-import { decideRequest, FAKE_BUYERAPI, FAKE_SITE } from '../../../test/e2e/chromium/network';
+import { decideRequest, DEFAULT_FAKE_PORTS, FAKE_BUYERAPI, FAKE_PORTS, FAKE_SITE, fakePort } from '../../../test/e2e/chromium/network';
 
 describe('chromium E2E network policy', () => {
   it('serves /categories/listing?st= and /shopgoodwill/* from the local fake site', () => {
@@ -37,9 +37,9 @@ describe('chromium E2E network policy', () => {
       unexpected: true,
     });
     // The rewritten request is fetched from the fake buyerapi.
-    expect(decideRequest('http://127.0.0.1:8787/__log', { serviceWorker: true })).toEqual({
+    expect(decideRequest(`${FAKE_BUYERAPI}/__log`, { serviceWorker: true })).toEqual({
       action: 'fetch',
-      url: 'http://127.0.0.1:8787/__log',
+      url: `${FAKE_BUYERAPI}/__log`,
       bucket: 'local',
     });
     // The page's own search XHR is not the background's: it still goes to the fake buyerapi.
@@ -52,7 +52,7 @@ describe('chromium E2E network policy', () => {
 
   it('fulfills the fake-server ports locally instead of continuing them', () => {
     // continue() would send the browser through the dead proxy (--proxy-server=127.0.0.1:9).
-    for (const port of ['8787', '8788', '8789']) {
+    for (const port of Object.values(FAKE_PORTS).map(String)) {
       const url = `http://127.0.0.1:${port}/__log`;
       expect(decideRequest(url), port).toEqual({ action: 'fetch', url, bucket: 'local' });
     }
@@ -78,5 +78,16 @@ describe('chromium E2E network policy', () => {
   it('lets extension pages and about: through', () => {
     expect(decideRequest('chrome-extension://abcdefghijklmnop/popup.html')).toEqual({ action: 'continue' });
     expect(decideRequest('about:blank')).toEqual({ action: 'continue' });
+  });
+
+  it('takes each fake port from its env var (T-39b), else the default, and refuses port 0 or junk', () => {
+    expect(fakePort('sgw', {})).toBe(DEFAULT_FAKE_PORTS.sgw);
+    expect(fakePort('google', { FAKE_GOOGLE_PORT: '' })).toBe(DEFAULT_FAKE_PORTS.google);
+    expect(fakePort('sgw', { SBW_FAKE_SGW_PORT: '51234' })).toBe(51234);
+    expect(fakePort('google', { FAKE_GOOGLE_PORT: '51235' })).toBe(51235);
+    expect(fakePort('site', { SBW_FAKE_SITE_PORT: '51236' })).toBe(51236);
+    for (const bad of ['0', '-1', '65536', '87.5', 'abc']) {
+      expect(() => fakePort('site', { SBW_FAKE_SITE_PORT: bad }), bad).toThrow(/SBW_FAKE_SITE_PORT/);
+    }
   });
 });

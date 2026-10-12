@@ -1,6 +1,6 @@
 // T-72: calendar sync end to end, in a real Chromium, on the TEST build
 // (.output/chrome-mv3-test: SBW_TEST=1), against the fake Google server
-// (test/fakes/fake-google-server, 127.0.0.1:8788). The arc per PLAN §6 T-72:
+// (test/fakes/fake-google-server, FAKE_GOOGLE: this run's port). The arc per PLAN §6 T-72:
 //
 //   connect (options page: paste the client, Connect; the harness approves the
 //   consent window through `sbw:test:googleAuth`) → turn calendar events on
@@ -164,7 +164,7 @@ const RESET_SCENARIO = {
  */
 async function resetCalendars(): Promise<void> {
   const res = await fetch(`${FAKE_GOOGLE}/__admin/reset-calendars`, { method: 'POST' });
-  expect(res.status, 'the fake Google server has no reset-calendars route (a stale server on 8788?)').toBe(200);
+  expect(res.status, 'the fake Google server has no reset-calendars route (a stale fake Google server?)').toBe(200);
 }
 
 /** The request-log position now: later assertions read only what came after it. */
