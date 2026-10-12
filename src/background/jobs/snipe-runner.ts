@@ -412,6 +412,8 @@ interface CommitOptions {
    * Everything else is refused before the reducer.
    */
   external?: 'dispatch' | 'ended-early';
+  /** T-87e: a preflight hook's failure detail, for the reducer's copy (ReduceContext.preflightDetail). */
+  preflightDetail?: string;
 }
 
 type StepResult = 'continue' | 'wait';
@@ -538,6 +540,8 @@ export class SnipeRunner {
       const s = all[p.id];
       if (s === undefined || (isTerminal(s) && rec.entries[p.id] === undefined)) await this.ctx.alarms.clear(a.name);
     }
+    // Before the drives, so none of them takes a hold this could undo.
+    await this.safely('leftover keep-awake release', () => this.releaseLeftoverAwake(Object.values(all)));
     for (const s of Object.values(all)) {
       if (!isTerminal(s) || rec.entries[s.id] !== undefined) void this.drive(s.id);
     }
@@ -751,7 +755,7 @@ export class SnipeRunner {
         timeZone: settings.locale.timeZone,
         ...(detail === undefined ? {} : { detail }),
       });
-      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable));
+      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable, opts.preflightDetail));
       if (red.rejection !== null) {
         if (outbox !== entry.outbox) {
           rec.entries[id] = { ...entry, outbox };
@@ -779,12 +783,13 @@ export class SnipeRunner {
     return r;
   }
 
-  private reduceContext(s: Snipe, settings: Settings, sessionUsable: boolean): ReduceContext {
+  private reduceContext(s: Snipe, settings: Settings, sessionUsable: boolean, preflightDetail?: string): ReduceContext {
     return {
       timeZone: settings.locale.timeZone,
       sessionUsable,
       // C4: a dry run asks with the dry-run condition ignored (it still never sends).
       writesAllowed: this.biddingVerdict(s).ok,
+      ...(preflightDetail === undefined ? {} : { preflightDetail }),
     };
   }
 
@@ -1412,7 +1417,7 @@ export class SnipeRunner {
         await this.safely('audit', () =>
           this.ctx.audit.append({ actor: 'snipe', kind: 'snipe.preflight', itemId: fresh.itemId, ref: fresh.id, details: { ok: false, hook: f.reason, why: f.detail }, dryRun: fresh.dryRun }),
         );
-        await this.commit(fresh.id, { type: 'preflight-failed', now, reason: f.reason }, withDetail);
+        await this.commit(fresh.id, { type: 'preflight-failed', now, reason: f.reason }, { ...withDetail, preflightDetail: f.detail });
         return;
       }
     }
@@ -1733,6 +1738,21 @@ export class SnipeRunner {
   private async releaseAwake(id: string): Promise<void> {
     if (!this.awake.delete(id) || this.awake.size > 0) return;
     await this.safely('keep-awake release', () => this.ctx.keepAwake.release());
+  }
+
+  /**
+   * T-111c: Chrome keeps the request per extension, not per worker, so one a
+   * dead worker held outlives it (and the computer never sleeps). Released
+   * unless an open snipe still needs it (keepAwakeRequired: T1 from arm, T2
+   * from the companion wake) or this worker holds one.
+   */
+  private async releaseLeftoverAwake(snipes: readonly Snipe[]): Promise<void> {
+    const settings = await this.settings();
+    for (const s of snipes) {
+      if (!isTerminal(s) && (await this.keepAwakeRequired(s, settings))) return;
+    }
+    if (this.awake.size > 0) return;
+    await this.ctx.keepAwake.release();
   }
 
   // ── Alarms and timers ─────────────────────────────────────────────────

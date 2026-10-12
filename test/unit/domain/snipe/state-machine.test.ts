@@ -1326,6 +1326,48 @@ describe('verify failures and fallbacks (fallbackDecision, I-18)', () => {
     expect(reduce(inState('armed'), E.preflightFailed('gremlins'), CAPS_OK, CTX).rejection?.reason).toBe('invalid-event');
   });
 
+  describe("T-87e: a preflight hook's failure detail is the notification's cause", () => {
+    const HOOK =
+      'T2: the wake companion is not reachable (Specified native messaging host not found.), so nothing will wake this computer before the auction ends.';
+    const GENERIC = 'Keep-awake is not held, so this computer may sleep before the auction ends.';
+    const SKIP = 'Skipped, as your fallback setting says. No bid was placed.';
+    const skipper = (): Snipe => inState('armed', { fallback: 'skip' });
+
+    it('the hook detail replaces the generic keep-awake cause in the notification and the outcome detail', () => {
+      const r = reduce(skipper(), E.preflightFailed('keep-awake'), CAPS_OK, { ...CTX, preflightDetail: HOOK });
+      const n = ofKind(r.effects, 'notify');
+      expect(n).toHaveLength(1);
+      expect(n[0]?.title).toMatch(/^Snipe skipped: /);
+      expect(n[0]?.message).toBe(`${HOOK} ${SKIP}`);
+      expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped', outcomeDetail: `${HOOK} ${SKIP}` });
+      expect(money(r.effects)).toEqual([]);
+    });
+
+    it.each([
+      ['no detail', {}],
+      ['a blank detail', { preflightDetail: '  ' }],
+    ] as const)("%s keeps today's copy", (_name, extra) => {
+      const r = reduce(skipper(), E.preflightFailed('keep-awake'), CAPS_OK, { ...CTX, ...extra });
+      expect(ofKind(r.effects, 'notify')[0]?.message).toBe(`${GENERIC} ${SKIP}`);
+    });
+
+    it.each(['auth', 'clock'] as const)('a %s hook failure says its detail too', (reason) => {
+      const r = reduce(skipper(), E.preflightFailed(reason), CAPS_OK, { ...CTX, preflightDetail: HOOK });
+      expect(ofKind(r.effects, 'notify')[0]?.message).toContain(HOOK);
+    });
+
+    it.each(['auth', 'clock', 'keep-awake'] as const)('a %s detail changes only the copy, never the decision or the money', (reason) => {
+      for (const fallback of ['early-proxy', 'skip'] as const) {
+        const plain = reduce(inState('armed', { fallback }), E.preflightFailed(reason), CAPS_OK, CTX);
+        const told = reduce(inState('armed', { fallback }), E.preflightFailed(reason), CAPS_OK, { ...CTX, preflightDetail: HOOK });
+        expect(told.next.state).toBe(plain.next.state);
+        expect(told.next.outcome).toBe(plain.next.outcome);
+        expect(money(told.effects)).toEqual(money(plain.effects));
+        expect(audits(told.effects)).toEqual(audits(plain.effects));
+      }
+    });
+  });
+
   it("apply-fallback can only downgrade: mode 'early-proxy' never overrides the user's 'skip'", () => {
     const up = reduce(inState('armed', { fallback: 'skip' }), E.applyFallback('early-proxy'), CAPS_OK, CTX);
     expect(up.next).toMatchObject({ state: 'resolved', outcome: 'skipped', fallback: 'skip' });

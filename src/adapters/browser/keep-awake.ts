@@ -16,7 +16,11 @@ function powerApi(): PowerApi | undefined {
  * permission is not granted, hold/release are no-ops.
  */
 export class BrowserKeepAwake implements KeepAwake {
-  private held = false;
+  /**
+   * Whether a request of ours may stand. Chrome keeps it per extension, not
+   * per worker, so a new worker cannot know (T-111c): true until the first release.
+   */
+  private held = true;
 
   get available(): boolean {
     return powerApi() !== undefined;

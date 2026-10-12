@@ -272,6 +272,16 @@ describe('BrowserKeepAwake', () => {
     await k.release();
     expect(power.releaseKeepAwake).toHaveBeenCalledTimes(1);
   });
+
+  it('a new worker releases a request a dead worker may have left (Chrome keeps it per extension, T-111c)', async () => {
+    const power = { requestKeepAwake: vi.fn(), releaseKeepAwake: vi.fn() };
+    setPower(power);
+    const k = new BrowserKeepAwake();
+    await k.release();
+    await k.release();
+    expect(power.requestKeepAwake).not.toHaveBeenCalled();
+    expect(power.releaseKeepAwake).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('BrowserKeepAlive', () => {

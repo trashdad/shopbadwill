@@ -149,9 +149,15 @@ export interface ReduceContext {
    * would do (C4). Default false.
    */
   writesAllowed?: boolean;
+  /**
+   * T-87e: a preflight hook's own reason (`PreflightHookFailure.detail`, a
+   * sentence) for the `preflight-failed` it caused. The notification says it
+   * instead of the generic auth / clock / keep-awake cause. Copy only.
+   */
+  preflightDetail?: string;
 }
 
-const accept = (...to: SnipeState[]): TransitionCell => Object.freeze({ to: Object.freeze(to) });
+const accept =(...to: SnipeState[]): TransitionCell => Object.freeze({ to: Object.freeze(to) });
 const guarded = (to: SnipeState[], guards: RejectReason[]): TransitionCell =>
   Object.freeze({ to: Object.freeze(to), guards: Object.freeze(guards) });
 const reject = (reason: RejectReason): TransitionCell => Object.freeze({ reject: reason });
@@ -748,10 +754,16 @@ function onPreflightFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'preflight-f
     case 'auth':
     case 'clock':
     case 'keep-awake':
-      done = preFireFallback(s, e, reason, PREFLIGHT_CAUSE[reason], caps, ctx);
+      done = preFireFallback(s, e, reason, preflightCause(reason, ctx), caps, ctx);
       break;
   }
   return { ...done, details: { reason, ...done.details } };
+}
+
+/** T-87e: the hook's own reason when it gave one, else the generic cause. */
+function preflightCause(reason: keyof typeof PREFLIGHT_CAUSE, ctx: ReduceContext): string {
+  const told = ctx.preflightDetail?.trim() ?? '';
+  return told === '' ? PREFLIGHT_CAUSE[reason] : told;
 }
 
 function onApplyFallback(s: Snipe, e: Extract<SnipeEvent, { type: 'apply-fallback' }>, caps: CapsResult, ctx: ReduceContext): Handled {
