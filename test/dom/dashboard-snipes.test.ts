@@ -755,6 +755,22 @@ describe('the card Snipe… badge (deep link, R1)', () => {
     });
   });
 
+  it('is hidden on an auction that has already ended, and shown while it is open', () => {
+    const props = (endTime: string) => ({
+      itemId: 7,
+      listing: { endTime } as unknown as NonNullable<Parameters<typeof snipeLinkBadge.Component>[0]['listing']>,
+      settings: defaultSettings(),
+      client: new FakeMessaging(),
+      cardRoot: document.body,
+      now: NOW,
+    });
+    render(h(snipeLinkBadge.Component, props(new Date(NOW - 1000).toISOString())));
+    expect(screen.queryByRole('button', { name: /^snipe…$/i })).toBeNull();
+    cleanup();
+    render(h(snipeLinkBadge.Component, props(new Date(NOW + 60_000).toISOString())));
+    expect(screen.getByRole('button', { name: /^snipe…$/i })).toBeTruthy();
+  });
+
   it('registers as a card badge picked up by the registry glob', () => {
     expect(snipeLinkBadge.id).toBe('snipe-link');
     expect(snipeLinkBadge.Component).toBeTypeOf('function');

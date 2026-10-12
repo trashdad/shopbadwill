@@ -7,7 +7,9 @@ import type { VNode } from 'preact';
 
 import type { CardBadge, CardBadgeProps } from '../badge-registry';
 
-function SnipeLink({ itemId, client }: CardBadgeProps): VNode {
+function SnipeLink({ itemId, listing, client, now }: CardBadgeProps): VNode | null {
+  // Nothing to snipe once the auction is over (the page's own end time).
+  if (listing !== null && new Date(listing.endTime).getTime() <= now) return null;
   return (
     <button
       type="button"
