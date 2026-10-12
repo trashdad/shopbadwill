@@ -547,6 +547,24 @@ describe('acquire, release and an early close racing each other', () => {
     expect(windows.windows).toHaveLength(0);
   });
 
+  it('a release while the early-close audit is being written never re-opens the window', async () => {
+    const windows = installFakeWindows();
+    installFakeRuntime();
+    const written = deferred<undefined>();
+    setSnipeHostPageHooks({ stillAhead: () => true, auditClosed: () => written.promise });
+    const host = runnerPageHost();
+    await host.acquire('sn1');
+
+    windows.close(1);
+    await settle(); // the audit is being written...
+    await host.release('sn1'); // ...as the runner releases the snipe
+    written.resolve(undefined);
+    await settle();
+
+    expect(windows.createCalls).toHaveLength(1);
+    expect(windows.windows).toHaveLength(0);
+  });
+
   it('a release while the re-acquired window is opening closes that window', async () => {
     const windows = installFakeWindows();
     installFakeRuntime();
