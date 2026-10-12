@@ -198,8 +198,25 @@ export async function verifyBaseUrl(worker: Worker): Promise<void> {
   await verifyRewrite(worker, 'https://buyerapi.shopgoodwill.com/__log');
 }
 
-/** Anchors the background's Clock to `at` (absolute set: a restart's lost offset is re-anchored, not re-added). */
+/**
+ * Anchors the background's Clock to `at` (absolute set: a restart's lost
+ * offset is re-anchored, not re-added).
+ *
+ * It first waits for the startup reconcile to have created `sbw:tick`. The
+ * hook ports answer from the worker's first turn, before startup finishes, so
+ * an anchor could land first; the tick alarm was then created at `at + 2 min`
+ * in fake time, and the first `advance` fired it on top of the spec's own
+ * `fireTick` (T-72 found this as a ~1-in-30 failure of T-59's restart test:
+ * the run went one step too far). Created before the anchor, the alarm stays
+ * days ahead of the fake clock and only `fireTick` drives the scheduler.
+ */
 export async function anchorClock(page: Page, at: number): Promise<void> {
+  await expect
+    .poll(async () => (await testState(page)).alarms.some((a) => a.name === 'sbw:tick'), {
+      message: 'the background never created sbw:tick (its startup did not finish)',
+      timeout: 15_000,
+    })
+    .toBe(true);
   const reply = await callHook(page, 'sbw:test:advance', { to: at });
   expect(reply.ok, reply.error ?? 'sbw:test:advance failed').toBe(true);
   const value = reply.value as { now: number; fired: string[] };
