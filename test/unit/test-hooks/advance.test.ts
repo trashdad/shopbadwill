@@ -53,6 +53,26 @@ describe('sbw:test:advance', () => {
     expect(new BrowserClock().now()).toBe(T - 3 * MIN);
   });
 
+  it('moves the Clock port forward to until, never backwards (T-89)', async () => {
+    vi.stubEnv('SBW_TEST', '1');
+    pinWallClock();
+    setTestClockTo(T);
+    const browserStub = installAdvance();
+    const ahead = browserStub.connect('sbw:test:advance');
+    ahead.post({ payload: { until: T + 4 * MIN } });
+    expect(await ahead.nextReply()).toEqual({ ok: true, value: { now: T + 4 * MIN, fired: [], timers: [] } });
+    // Real time already carried the clock past the target: nothing moves.
+    const behind = browserStub.connect('sbw:test:advance');
+    behind.post({ payload: { until: T + 1 * MIN } });
+    expect(await behind.nextReply()).toEqual({ ok: true, value: { now: T + 4 * MIN, fired: [], timers: [] } });
+    expect(new BrowserClock().now()).toBe(T + 4 * MIN);
+    const both = browserStub.connect('sbw:test:advance');
+    both.post({ payload: { until: T + 9 * MIN, ms: 1 } });
+    const bothReply = await both.nextReply();
+    expect(bothReply.ok).toBe(false);
+    expect(bothReply.error).toMatch(/only one of/);
+  });
+
   it('fires the alarms that become due and names them', async () => {
     vi.stubEnv('SBW_TEST', '1');
     pinWallClock();
