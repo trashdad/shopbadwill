@@ -41,6 +41,7 @@ import type { SgwEndpointKey } from '../../src/adapters/sgw/config';
 import type { HealthReport, Listing, SgwSessionRecord } from '../../src/domain/types';
 import type { AuditEntry } from '../../src/domain/audit/types';
 import type { Watch } from '../../src/domain/watches/schema';
+import { normalizeItemDetail } from '../../src/adapters/sgw/normalize';
 import { loadFixture } from '../contract/sgw/fixtures';
 import { FakeAlarms } from '../fakes/ports/fake-alarms';
 import { FakeClock } from '../fakes/ports/fake-clock';
@@ -1065,6 +1066,22 @@ describe('wiring', () => {
       reasons: [{ kind: 'manual' }],
       favoriteState: 'none',
     });
+  });
+
+  it('T-120: an item page reports its own detail (page.detail); quick.track then uses it, with zero SGW requests', async () => {
+    const h = boot();
+    await h.handle.ready;
+    const ITEM_PAGE: RouterSender = { id: EXT_ID, url: 'https://shopgoodwill.com/item/694349278', tab: { id: 7 } };
+    const detail = normalizeItemDetail(loadFixture('item-detail-logged-in'), { observedAt: T0, authenticated: true });
+    await h.ok('page.detail', { detail }, ITEM_PAGE);
+    await h.ok('quick.track', { itemId: detail.itemId }, ITEM_PAGE);
+    expect((h.areas.local.dump()[STORAGE_KEYS.tracked] as Record<string, unknown>)[String(detail.itemId)]).toMatchObject({
+      itemId: detail.itemId,
+      title: detail.title,
+      reasons: [{ kind: 'manual' }],
+    });
+    // The background read nothing from SGW: the page had already loaded the detail.
+    expect(h.http.requests).toEqual([]);
   });
 
   it('quick.favorite in dry-run audits the intent and sends nothing', async () => {

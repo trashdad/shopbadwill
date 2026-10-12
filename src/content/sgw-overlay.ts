@@ -1,8 +1,9 @@
 // T-32: the content overlay (ISOLATED world).
 //
 // Data in: the MAIN-world api-tap relays (T-31) and the page DOM. Data out:
-// `page.token`, `page.listings`, `page.domHealth`, `rules.evaluate` and the
-// user's `quick.*` intents, all to the background. The overlay itself never
+// `page.token`, `page.listings`, `page.detail` (T-120: item pages), `page.domHealth`,
+// `rules.evaluate` and the user's `quick.*` and `ui.openSnipe` intents, all to
+// the background. The overlay itself never
 // talks to SGW: zero extra requests.
 //
 // Rules this file keeps:
@@ -36,9 +37,9 @@
 import { h, render } from 'preact';
 import { z } from 'zod';
 
-import { SGW_API_BASE, SGW_ENDPOINTS } from '../adapters/sgw/config';
+import { SGW_API_BASE, SGW_ENDPOINTS, SGW_PAGE_PATTERNS } from '../adapters/sgw/config';
 import { createDomAdapter, type AdapterCardHandle, type DiscoveryReport } from '../adapters/sgw/dom-adapter';
-import { normalizeSearch, type SearchNormalizeContext } from '../adapters/sgw/normalize';
+import { normalizeItemDetail, normalizeSearch, type SearchNormalizeContext } from '../adapters/sgw/normalize';
 import { searchQueryFromUrl } from '../adapters/sgw/query-url';
 import { RuleSchema, type MatchResult, type Rule } from '../domain/rules/schema';
 import { defaultSettings } from '../domain/settings/defaults';
@@ -73,6 +74,7 @@ export const OVERLAY_TIMING = Object.freeze({
 /** Tap listings kept in memory (oldest dropped). */
 const MAX_LISTINGS = 1000;
 const SEARCH_PATH = new URL(SGW_ENDPOINTS.search.path, SGW_API_BASE).pathname.toLowerCase();
+const ITEM_PAGE_RE = new RegExp(SGW_PAGE_PATTERNS.item);
 /** Elements we insert: our tags, and the markers the DomAdapter and we put on our own nodes. */
 const OUR_TAG = /^(sbw-|shopbadwill-)/i;
 const OUR_ATTRS = ['data-sbw-stub', 'data-sbw-label', 'data-sbw-tools', 'data-sbw-why'] as const;
@@ -195,6 +197,26 @@ function defaultMountPageUi(doc: Document): MountPageUi {
 function isSearchApi(url: string): boolean {
   try {
     return new URL(url).pathname.toLowerCase() === SEARCH_PATH;
+  } catch {
+    return false;
+  }
+}
+
+/** The item id of an item page URL (`/item/{id}`), else null. */
+function itemPageId(url: string): ItemId | null {
+  try {
+    const m = ITEM_PAGE_RE.exec(new URL(url).pathname);
+    return m?.[1] === undefined ? null : Number(m[1]);
+  } catch {
+    return null;
+  }
+}
+
+/** The API URL is the page item's own detail read (`ItemDetail/GetItemDetailModelByItemId/{itemId}`). */
+function isDetailApiFor(url: string, itemId: ItemId): boolean {
+  try {
+    const path = new URL(SGW_ENDPOINTS.itemDetail.path.replace('{itemId}', String(itemId)), SGW_API_BASE).pathname;
+    return new URL(url).pathname.toLowerCase() === path.toLowerCase();
   } catch {
     return false;
   }
@@ -353,7 +375,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     return p.lastSearchCount !== null || p.replyWaitOver;
   }
 
-  function send<K extends 'page.token' | 'page.listings' | 'page.domHealth'>(type: K, payload: MsgPayload<K>): void {
+  function send<K extends 'page.token' | 'page.listings' | 'page.detail' | 'page.domHealth' | 'ui.openSnipe'>(type: K, payload: MsgPayload<K>): void {
     try {
       void client.send(type, payload).catch(() => undefined);
     } catch {
@@ -666,7 +688,10 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     if (!settings.overlay.enabled) return { kind: 'off' };
     if (killed()) return { kind: 'idle', text: 'ShopBadwill paused (kill switch)' };
     if (settingsUnreadable) return { kind: 'idle', text: 'ShopBadwill paused (settings unreadable)' };
-    if (dom.pageKind(page.url) !== 'search') return { kind: 'idle', text: 'ShopBadwill ready' };
+    if (dom.pageKind(page.url) !== 'search') {
+      const itemId = itemPageId(page.url);
+      return itemId === null ? { kind: 'idle', text: 'ShopBadwill ready' } : { kind: 'item', text: 'ShopBadwill ready', itemId };
+    }
     if (zeroVerdict()) return { kind: 'banner' };
     let hidden = 0;
     let shown = 0;
@@ -690,6 +715,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
           view: view(),
           collapsed: pillCollapsed,
           onShowAll: showAll,
+          onSnipe: (itemId: ItemId) => {
+            send('ui.openSnipe', { itemId });
+          },
           onHideAgain: hideAgain,
           onCollapse: () => {
             pillCollapsed = true;
@@ -877,6 +905,17 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     else renderPage();
   }
 
+  /** T-120: the item page's own detail read (relayed by the tap), reported as `page.detail`. Never fetched by us. */
+  function ingestDetail(body: unknown, itemId: ItemId): void {
+    let detail;
+    try {
+      detail = normalizeItemDetail(body, { observedAt: now(), authenticated: tokenSeen });
+    } catch {
+      return; // not a detail reply we understand: ignore it
+    }
+    if (detail.itemId === itemId) send('page.detail', { detail });
+  }
+
   function onMessage(ev: MessageEvent): void {
     if (stopped || ev.source !== win) return;
     let msg;
@@ -891,7 +930,12 @@ export function startOverlay(deps: OverlayDeps): Overlay {
       send('page.token', { bearer: msg.bearer, capturedAt: now() });
       return;
     }
-    if (msg.status === 200 && isSearchApi(msg.url)) ingestSearch(msg.body);
+    if (msg.status !== 200) return;
+    if (isSearchApi(msg.url)) ingestSearch(msg.body);
+    else {
+      const itemId = itemPageId(getUrl());
+      if (itemId !== null && isDetailApiFor(msg.url, itemId)) ingestDetail(msg.body, itemId);
+    }
   }
 
   async function loadSettings(): Promise<void> {

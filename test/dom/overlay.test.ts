@@ -289,6 +289,8 @@ async function setup(opts: SetupOpts = {}) {
   m.handle('quick.hideSeller', ack('quick.hideSeller'));
   m.handle('quick.hideKeyword', ack('quick.hideKeyword'));
   m.handle('rules.disable', ack('rules.disable'));
+  m.handle('page.detail', ack('page.detail'));
+  m.handle('ui.openSnipe', ack('ui.openSnipe'));
   const overlay = startOverlay({
     win: window,
     messaging: m,
@@ -1505,5 +1507,82 @@ describe('Opus check (fix round 4)', () => {
     expect(norm(dialog?.querySelector('.pop-h')?.textContent)).toBe('Why this listing is highlighted');
     expect(Array.from(dialog?.querySelectorAll('.rule') ?? [], (p) => norm(p.textContent))).toEqual(['Highlight rule: Cheap glass']);
     expect(Array.from(dialog?.querySelectorAll('[data-action="disable-rule"]') ?? [], (b) => b.getAttribute('data-rule-id'))).toEqual(['r-hl']);
+  });
+});
+
+describe('T-120: item pages', () => {
+  const ITEM_ID = 694349278;
+  const DETAIL_API = `https://buyerapi.shopgoodwill.com/api/ItemDetail/GetItemDetailModelByItemId/${String(ITEM_ID)}`;
+  const DETAIL_JSON = JSON.parse(readFileSync(resolve(FIX, 'json/item-detail-logged-in.json'), 'utf8')) as Record<string, unknown>;
+  const OTHER_JSON = JSON.parse(readFileSync(resolve(FIX, 'json/item-detail-open.json'), 'utf8')) as Record<string, unknown>;
+  function tapDetail(o: Overlay, body: unknown, url = DETAIL_API, status = 200): void {
+    post({ source: TAP_SOURCE, nonce: o.nonce, kind: 'response', url, status, body });
+  }
+  const itemSetup = (opts: SetupOpts = {}) => setup({ fixture: 'item-page-logged-in', url: ITEM_URL, ...opts });
+  const snipeButton = (): HTMLButtonElement => button(pageRoot(), 'snipe');
+
+  it('reports the item detail the page itself loaded (page.detail), once per reply', async () => {
+    const s = await itemSetup();
+    tapDetail(s.overlay, DETAIL_JSON);
+    await tick();
+    const sent = sentOf(s.m, 'page.detail') as Array<{ detail: { itemId: number; source: string; observedAt: number } }>;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.detail).toMatchObject({ itemId: ITEM_ID, source: 'api', observedAt: NOW });
+    // Nothing is decorated or evaluated on an item page.
+    expect(sentOf(s.m, 'rules.evaluate')).toEqual([]);
+    expect(count('[data-sbw-stub], [data-sbw-label], [data-sbw-tools]')).toBe(0);
+  });
+
+  it('ignores a detail reply for another item, a failed reply, an unparseable body, and detail replies on a search page', async () => {
+    const s = await itemSetup();
+    tapDetail(s.overlay, OTHER_JSON, DETAIL_API.replace(String(ITEM_ID), String(OTHER_JSON['itemId'])));
+    tapDetail(s.overlay, DETAIL_JSON, DETAIL_API, 500);
+    tapDetail(s.overlay, { nope: true });
+    await tick();
+    expect(sentOf(s.m, 'page.detail')).toEqual([]);
+    s.loc.href = SEARCH_URL;
+    s.overlay.onLocationChange(SEARCH_URL);
+    tapDetail(s.overlay, DETAIL_JSON);
+    await tick();
+    expect(sentOf(s.m, 'page.detail')).toEqual([]);
+  });
+
+  it('shows the Snipe… deep link; a trusted click sends ONLY ui.openSnipe for the page item', async () => {
+    const s = await itemSetup();
+    expect(barText()).toBe('ShopBadwill ready');
+    const before = s.m.sent.length;
+    click(snipeButton(), false); // synthetic: nothing
+    await tick();
+    expect(s.m.sent.length).toBe(before);
+    click(snipeButton(), true);
+    await tick();
+    expect(s.m.sent.slice(before)).toEqual([{ type: 'ui.openSnipe', payload: { itemId: ITEM_ID } }]);
+  });
+
+  it('no Snipe… link on a search page, with the kill switch on, or with the overlay off', async () => {
+    await setup();
+    expect(pageRoot().querySelector('[data-action="snipe"]')).toBeNull();
+    current?.stop();
+    document.body.replaceChildren();
+    await itemSetup({ settings: { ...defaultSettings(), killSwitch: true } });
+    expect(pageRoot().querySelector('[data-action="snipe"]')).toBeNull();
+    current?.stop();
+    document.body.replaceChildren();
+    const off = defaultSettings();
+    await itemSetup({ settings: { ...off, overlay: { ...off.overlay, enabled: false } } });
+    expect(pageRoot().querySelector('[data-action="snipe"]')).toBeNull();
+  });
+
+  it('makes zero requests to SGW on an item page (no fetch, no XHR)', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const xhrSpy = vi.spyOn(XMLHttpRequest.prototype, 'open');
+    const s = await itemSetup({ badges: BADGES });
+    tapDetail(s.overlay, DETAIL_JSON);
+    await s.overlay.scan();
+    click(snipeButton(), true);
+    await tick();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(xhrSpy).not.toHaveBeenCalled();
+    expect(sentOf(s.m, 'page.detail')).toHaveLength(1);
   });
 });
