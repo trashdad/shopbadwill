@@ -202,11 +202,23 @@ describe.each(TARGETS)('%s production manifest', (target) => {
 });
 
 describe.each(TARGETS)('%s test build (SBW_TEST=1)', (target) => {
-  it('adds only http://127.0.0.1/* to the production permissions', () => {
+  it('adds http://127.0.0.1/* and pre-grants what "Connect Google" asks for (T-70d), nothing else', () => {
+    // E2E browsers cannot click a permission prompt, so the test build moves the
+    // Google hosts (and Chrome's identity) from optional to required.
+    const googleHosts = ['https://oauth2.googleapis.com/*', 'https://www.googleapis.com/*'];
     const production = permissionSurface(manifestOf(target));
-    expect(permissionSurface(manifestOf(target, 'test'))).toEqual({
+    const prodOptional = (production.optional_permissions as string[] | undefined) ?? [];
+    const movesIdentity = target === 'chrome';
+    const testSurface = permissionSurface(manifestOf(target, 'test'));
+    // WXT appends sidePanel after the configured list, so compare permissions as a set.
+    const sorted = (xs: unknown): string[] => [...(xs as string[])].sort();
+    expect(sorted(testSurface.permissions)).toEqual(sorted([...(production.permissions as string[]), ...(movesIdentity ? ['identity'] : [])]));
+    expect({ ...testSurface, permissions: null }).toEqual({
       ...production,
-      host_permissions: [...(production.host_permissions as string[]), TEST_HOST],
+      permissions: null,
+      host_permissions: [...(production.host_permissions as string[]), TEST_HOST, ...googleHosts],
+      optional_permissions: prodOptional.filter((p) => !(movesIdentity && p === 'identity')),
+      optional_host_permissions: (production.optional_host_permissions as string[]).filter((h) => !googleHosts.includes(h)),
     });
   });
 

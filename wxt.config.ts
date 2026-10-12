@@ -13,6 +13,7 @@ const CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.app.created';
 // the result; any change here must update that snapshot in review.
 const SGW_HOSTS = ['https://shopgoodwill.com/*', 'https://buyerapi.shopgoodwill.com/*'];
 const TEST_HOSTS = ['http://127.0.0.1/*']; // test builds only (fake servers)
+const GOOGLE_HOSTS = ['https://oauth2.googleapis.com/*', 'https://www.googleapis.com/*'];
 const OPTIONAL_HOSTS = [
   'https://oauth2.googleapis.com/*', // "Connect Google": token endpoint
   'https://www.googleapis.com/*', // "Connect Google": Calendar API
@@ -51,10 +52,17 @@ export default defineConfig({
 
     return {
       name: 'ShopBadwill',
-      permissions: isFirefox ? REQUIRED_PERMISSIONS.firefox : REQUIRED_PERMISSIONS.chrome,
-      host_permissions: [...SGW_HOSTS, ...(TEST_BUILD ? TEST_HOSTS : [])],
-      optional_permissions: isFirefox ? OPTIONAL_PERMISSIONS.firefox : OPTIONAL_PERMISSIONS.chrome,
-      optional_host_permissions: OPTIONAL_HOSTS,
+      // Test builds pre-grant what "Connect Google" asks for (T-70d): E2E browsers
+      // cannot click a permission prompt. Production manifests are unchanged.
+      permissions: [
+        ...(isFirefox ? REQUIRED_PERMISSIONS.firefox : REQUIRED_PERMISSIONS.chrome),
+        ...(TEST_BUILD && !isFirefox ? ['identity'] : []),
+      ],
+      host_permissions: [...SGW_HOSTS, ...(TEST_BUILD ? [...TEST_HOSTS, ...GOOGLE_HOSTS] : [])],
+      optional_permissions: (isFirefox ? OPTIONAL_PERMISSIONS.firefox : OPTIONAL_PERMISSIONS.chrome).filter(
+        (p) => !(TEST_BUILD && p === 'identity'),
+      ),
+      optional_host_permissions: OPTIONAL_HOSTS.filter((h) => !(TEST_BUILD && GOOGLE_HOSTS.includes(h))),
       commands: {
         'kill-switch': {
           // Not Ctrl+Shift+K: that is Firefox's Web Console. Controller ruling C.
