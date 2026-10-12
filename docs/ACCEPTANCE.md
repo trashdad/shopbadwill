@@ -90,17 +90,27 @@ and dry-run: the extension never favorites anything on your account there.
    **catch-up** in the audit log (`job.run.done`, trigger `catch-up`), run the
    watch once, and move its next run time to the next daily slot.
 8. Repeat the overnight check once more if convenient: the next day's run
-   should re-report the same already-seen items without duplicate favorites
-   (the watch's seen ring de-duplicates).
+   should not report already-seen items as new matches and should add no new
+   `favorite.add` entries for them (the watch's seen list de-duplicates).
 9. Local-only sanity: create a second watch with **favorites: track in
    ShopBadwill only** and run it: its matches appear in the audit as tracked
    items, with no `favorite.add` entries at all.
 
-10. **Opt-in live favorite.** Pick ONE item the dry-run just matched, and
-    confirm you want this exact step:
-    - Turn **dry-run for favorites OFF** in the options page.
-    - Press **Run now** (or wait for the scheduled run), then immediately turn
-      dry-run back ON.
+10. **Opt-in live favorite.** Only if you want this exact step. A live run
+    favorites EVERY new match of EVERY watch set to favorite on ShopGoodwill,
+    and items an earlier run already saw are not new, so first narrow it to
+    one item:
+    - Disable (or switch to "track in ShopBadwill only") every other watch
+      that favorites on ShopGoodwill.
+    - Create a fresh rule whose keyword matches only ONE open item you are
+      happy to favorite (for example its exact, unusual title), and a fresh
+      watch for a search that shows it, using that rule. Run it once in
+      dry-run first: the audit must show exactly one dry-run `favorite.add`.
+      If it shows more, narrow the rule and use another fresh watch.
+    - Delete that watch and create it again (so the item is new to it), then
+      turn **dry-run for favorites OFF** in the options page.
+    - Press **Run now** (or wait for the scheduled run); as soon as the run
+      finishes, turn dry-run back ON.
     - Check your ShopGoodwill favorites: that one item is there, and nothing
       else was added by the extension.
     - In the audit log, find the `favorite.add` entry for that item (no
