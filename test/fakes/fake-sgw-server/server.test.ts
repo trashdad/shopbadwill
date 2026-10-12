@@ -232,6 +232,44 @@ describe('scenario toggles', () => {
     expect(t.data).toBe('10/08/2026 12:18:00');
     expect((await post('/__scenario', { name: 'nope' })).status).toBe(400);
   });
+  it('followFakeNow: a stamped request re-pins the server clock to the client fake time, skew on top', async () => {
+    const fake = Date.parse('2026-11-20T18:00:00.000Z');
+    await post('/__scenario', { followFakeNow: true, skewMs: 1300 });
+    const stamped = await parse(
+      await get('/api/ItemDetail/GetItemDetailModelByItemId/279250057', { 'x-sbw-fake-now': String(fake) }),
+      ItemDetailResponseSchema,
+    );
+    const at = pacificNaiveToEpoch(stamped.serverTime);
+    expect(at - fake).toBeGreaterThanOrEqual(1300);
+    expect(at - fake).toBeLessThan(1300 + 1000);
+    // The clock stays pinned there (and ticks): an unstamped read follows it, not the old pin.
+    const t = await parse(await post('/api/Dashboard/GetCurrentTime'), GetCurrentTimeResponseSchema);
+    expect(t.data).toBe('11/20/2026 10:00:01');
+    // A later stamp moves it again, backwards too (a restarted client re-anchors).
+    const back = Date.parse('2026-11-20T17:00:00.000Z');
+    const again = await parse(
+      await get('/api/ItemDetail/GetItemDetailModelByItemId/279250057', { 'x-sbw-fake-now': String(back) }),
+      ItemDetailResponseSchema,
+    );
+    expect(pacificNaiveToEpoch(again.serverTime) - back).toBeLessThan(1300 + 1000);
+    // Off by default: a stamp leaves the pinned clock alone.
+    await post('/__scenario', { reset: true, serverNowMs: PIN });
+    await get('/api/ItemDetail/GetItemDetailModelByItemId/279250057', { 'x-sbw-fake-now': String(fake) });
+    const pinned = await parse(await post('/api/Dashboard/GetCurrentTime'), GetCurrentTimeResponseSchema);
+    expect(pinned.data).toBe('10/07/2026 17:00:00');
+  });
+  it('a request the client abandons during injected latency is logged as 499 and never answered', async () => {
+    await post('/__scenario', { latencyMs: { 'ItemDetail/GetItemDetailModelByItemId': 5000 } });
+    await expect(
+      fetch(`${sgw.url}/api/ItemDetail/GetItemDetailModelByItemId/279250057`, {
+        headers: { 'x-sbw-fake-now': String(PIN) },
+        signal: AbortSignal.timeout(100),
+      }),
+    ).rejects.toThrow();
+    await expect
+      .poll(async () => (await parse(await get('/__log'), LogResponseSchema)).entries.map((e) => [e.endpoint, e.status, e.fakeNowMs]))
+      .toEqual([['ItemDetail/GetItemDetailModelByItemId', 499, PIN]]);
+  });
   it('startFakeSgw accepts a named scenario', async () => {
     const other = await startFakeSgw({ port: 0, scenario: 'skew-minus-5s' });
     try {

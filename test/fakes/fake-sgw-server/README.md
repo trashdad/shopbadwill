@@ -30,9 +30,9 @@ Unknown path is 404, wrong method 405. CORS reflects the request origin.
 
 ## Control plane
 
-- `POST /__scenario` with a patch, `GET /__scenario` for the current state. Fields (all optional): `name` (preset, resets first), `reset`, `skewMs`, `serverNowMs`, `latencyMs`, `errors`, `tokenLifetimeMs`, `bidSetsCookie`. For `latencyMs` and `errors`, keys are endpoint names (`Search/ItemListing`, case-insensitive) or `*`; a `null` value removes a key.
+- `POST /__scenario` with a patch, `GET /__scenario` for the current state. Fields (all optional): `name` (preset, resets first), `reset`, `skewMs`, `serverNowMs`, `latencyMs`, `errors`, `tokenLifetimeMs`, `bidSetsCookie`, `followFakeNow`. For `latencyMs` and `errors`, keys are endpoint names (`Search/ItemListing`, case-insensitive) or `*`; a `null` value removes a key.
 - `POST /__token {expiresInMs?, buyerId?}` mints a valid bearer.
-- `GET /__log` returns `{entries}`; `DELETE /__log` clears. Each entry has `seq, method, path, query, endpoint, status, receivedAtMs, fakeNowMs, requestTimeMs, hasBearer, body`. `fakeNowMs` is parsed from the `x-sbw-fake-now` header (epoch ms or ISO) and `requestTimeMs` prefers it (T-59). Control routes are not logged.
+- `GET /__log` returns `{entries}`; `DELETE /__log` clears. Each entry has `seq, method, path, query, endpoint, status, receivedAtMs, fakeNowMs, requestTimeMs, hasBearer, body`. `fakeNowMs` is parsed from the `x-sbw-fake-now` header (epoch ms or ISO) and `requestTimeMs` prefers it (T-59). A request whose client gave up during the injected latency is logged with status `499` (client closed request) and never answered. Control routes are not logged.
 
 ## Scenario list
 
@@ -47,7 +47,7 @@ Unknown path is 404, wrong method 405. CORS reflects the request origin.
 | `short-token` | Tokens last 60 s. |
 | `bid-cookie` | PlaceBid sets `Bid=1`; sending it back gets 403. |
 
-Primitives: `skewMs`; `serverNowMs` (pin the server clock, it then ticks); `latencyMs: {"<endpoint>|*": ms}`; `errors: {"<endpoint>|*": {status, times?, retryAfterSec?}}` (`times` fails N requests, then recovers); `tokenLifetimeMs`; `bidSetsCookie`.
+Primitives: `skewMs`; `serverNowMs` (pin the server clock, it then ticks); `latencyMs: {"<endpoint>|*": ms}`; `errors: {"<endpoint>|*": {status, times?, retryAfterSec?}}` (`times` fails N requests, then recovers); `tokenLifetimeMs`; `bidSetsCookie`; `followFakeNow` (T-89: every request carrying `x-sbw-fake-now` re-pins the server clock to that instant, so a time-travelling test build sees SGW move with it, `skewMs` ahead; unstamped requests and the control routes read the clock as last pinned).
 
 ## Bidding (`bidding/`)
 

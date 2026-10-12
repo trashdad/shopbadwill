@@ -21,6 +21,14 @@ export const ScenarioSchema = z.object({
   tokenLifetimeMs: z.number().positive(),
   /** PlaceBid sets a `Bid` cookie; a client that sends it back gets 403 on the next ItemBid call. */
   bidSetsCookie: z.boolean(),
+  /**
+   * T-89: the server clock follows the client's fake clock. Every request that
+   * carries `x-sbw-fake-now` re-pins the server clock to that instant (it then
+   * ticks), so a test build that time-travels sees SGW move with it, `skewMs`
+   * ahead. Requests without the header (and the control routes) read the
+   * clock as last pinned.
+   */
+  followFakeNow: z.boolean(),
 });
 export type Scenario = z.infer<typeof ScenarioSchema>;
 
@@ -31,6 +39,7 @@ export const DEFAULT_SCENARIO: Scenario = {
   errors: {},
   tokenLifetimeMs: 30 * 24 * 3600 * 1000,
   bidSetsCookie: false,
+  followFakeNow: false,
 };
 
 export const NAMED_SCENARIOS: Record<string, Partial<Scenario>> = {
@@ -55,6 +64,7 @@ export const ScenarioPatchSchema = z.object({
   errors: z.record(z.string(), ErrorSpecSchema.nullable()).optional(),
   tokenLifetimeMs: z.number().positive().optional(),
   bidSetsCookie: z.boolean().optional(),
+  followFakeNow: z.boolean().optional(),
 });
 export type ScenarioPatch = z.infer<typeof ScenarioPatchSchema>;
 
@@ -81,5 +91,6 @@ export function applyPatch(current: Scenario, patch: ScenarioPatch): Scenario {
     errors: mergeRecord(s.errors, patch.errors),
     tokenLifetimeMs: patch.tokenLifetimeMs ?? s.tokenLifetimeMs,
     bidSetsCookie: patch.bidSetsCookie ?? s.bidSetsCookie,
+    followFakeNow: patch.followFakeNow ?? s.followFakeNow,
   };
 }
