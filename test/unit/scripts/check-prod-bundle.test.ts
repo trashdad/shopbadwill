@@ -159,6 +159,41 @@ describe('check-prod-bundle: Firefox OAuth loopback allowlist (T-62)', () => {
   });
 });
 
+// T-72: production must never carry the Google auth stub or a redirect of the
+// Google hosts. Both live in src/test-hooks; these prove the check would catch
+// either module (or its pieces) if a build ever bundled it.
+describe('check-prod-bundle: the Google auth stub and the Google-host redirects (T-72)', () => {
+  const tokensIn = (code: string): string[] => scanText('background.js', code).map((f) => f.token);
+
+  it.each([
+    ['the stub bundled without its hook endpoint (its marker)', 'const m=Symbol.for("sbw.testHooks.googleAuthStub");'],
+    ['the stub hook endpoint', 'serve("sbw:test:googleAuth",h)'],
+    ['a Google host rewritten to a fake on loopback', 'u.startsWith("https://oauth2.googleapis.com")&&(u="http://127.0.0.1:8788"+u.slice(29))'],
+    ['a Google host rewritten to localhost', 'const t="http://localhost:8788/token";'],
+  ])('flags %s', (_name, code) => {
+    expect(tokensIn(code).length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ['src/test-hooks/google-auth-stub.ts', ['sbw:test', 'sbw.test']],
+    ['src/test-hooks/base-url.ts', ['sbw:test', 'sbw.test']],
+  ])('flags the source of %s (string literals survive minification)', async (rel, tokens) => {
+    const source = await readFile(path.join(import.meta.dirname, '../../../', rel), 'utf8');
+    // Comments are stripped by the minifier: scan the code without them.
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+    const found = new Set(scanText(rel, code).map((f) => f.token));
+    for (const t of tokens) expect([...found], `${rel} must be caught by "${t}"`).toContain(t);
+  });
+
+  it('passes the production Google endpoints (they are not redirects)', () => {
+    expect(
+      tokensIn(
+        'const e={authorize:"https://accounts.google.com/o/oauth2/v2/auth",token:"https://oauth2.googleapis.com/token",revoke:"https://oauth2.googleapis.com/revoke"},c="https://www.googleapis.com/calendar/v3";',
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe('check-prod-bundle: Preact innerHTML allowlist', () => {
   it('fixture sanity: the real Preact runtime is recognised and has 3 innerHTML tokens', () => {
     expect(isPreactRuntime(preactSource)).toBe(true);
