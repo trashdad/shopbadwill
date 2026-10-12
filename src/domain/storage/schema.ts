@@ -95,6 +95,14 @@ export const STORAGE_KEYS = {
    * Absent means none. No migration; `schemaVersion` stays 1.
    */
   deferredAlarms: 'sbw:deferredAlarms',
+  /**
+   * Optional (T-113): the relist detector's history of public listings seen
+   * (item id -> fingerprint, last seen price, last seen time). At most 2,000
+   * entries and 60 days, oldest evicted first; written only while
+   * `features.relistDetector` is on. Absent means none. No migration;
+   * `schemaVersion` stays 1. Invalid data parses to empty.
+   */
+  relistSeen: 'sbw:relistSeen',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -399,6 +407,24 @@ export function parseCompanionWakes(raw: unknown): CompanionWakesRecord {
 /** `sbw:deferredAlarms` (T-118, L6). Optional. Module-private schema. Alarm name -> its `when`. */
 const DeferredAlarmsSchema = z.record(z.string().min(1), EpochMsSchema);
 
+/**
+ * `sbw:relistSeen` (T-113). Optional. Module-private schema. Item id -> the
+ * relist fingerprint (`src/domain/relist/fingerprint.ts`), the last seen
+ * current price and when it was seen. Public listing data only: never the
+ * user's bids.
+ */
+const RelistSeenRecordSchema = z.object({
+  version: z.literal(1),
+  entries: z.record(ItemIdSchema, z.object({ fp: z.string().min(1).max(400), price: CentsSchema, seenAt: EpochMsSchema })),
+});
+export type RelistSeenRecord = z.infer<typeof RelistSeenRecordSchema>;
+
+/** Missing or invalid `sbw:relistSeen` parses to the empty record. */
+export function parseRelistSeen(raw: unknown): RelistSeenRecord {
+  const parsed = RelistSeenRecordSchema.safeParse(raw);
+  return parsed.success ? parsed.data : { version: 1, entries: {} };
+}
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -477,6 +503,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.dryRunCounted]: { area: 'local', schema: DryRunCountedRecordSchema },
   [STORAGE_KEYS.companionWakes]: { area: 'local', schema: CompanionWakesRecordSchema },
   [STORAGE_KEYS.deferredAlarms]: { area: 'local', schema: DeferredAlarmsSchema },
+  [STORAGE_KEYS.relistSeen]: { area: 'local', schema: RelistSeenRecordSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

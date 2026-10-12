@@ -47,6 +47,7 @@ const DEFAULTS = {
   [STORAGE_KEYS.awake]: () => [],
   [STORAGE_KEYS.clock]: () => [],
   [STORAGE_KEYS.deferredAlarms]: () => ({}),
+  [STORAGE_KEYS.relistSeen]: () => ({ version: 1, entries: {} }),
 } as const satisfies Partial<{ [K in StorageKey]: () => StorageValue<K> }>;
 
 export type DefaultedKey = keyof typeof DEFAULTS;
