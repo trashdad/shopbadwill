@@ -712,3 +712,31 @@ Source: T-119 item 1, the options page's "Send a test event". Additive; `schemaV
 **Not a contract change, recorded for completeness (T-119 item 3).** `PkceRefreshProvider.markNeedsInteraction('permission-revoked')` is a new adapter method (not on the `GoogleAuthProvider` port). The new job `src/background/jobs/permission-watch.ts` calls it when `identity` or a Google host permission is removed; its audit entry is `google.needsInteraction` with `details: { reason: 'permission-revoked' }` (the invalid_grant one carries `details.error`). The same job sets `sbw:ntfy.status` to the existing `needs-permission` value when the ntfy host is removed while phone push is on.
 
 **Follow-up for the next PLAN edit.** Add `calendar.testEvent` to §3.12 and contracts.md.
+
+## T-112 contract change: bid groups (`sbw:snipeGroups`, `groups.list` / `groups.save` / `groups.delete`)
+
+Source: T-112 (bid groups, "win at most N of these items"). `Snipe.groupId` was already in the contract (T-02); it names the group a snipe joins at arm time (`snipe.arm`'s `snipe.groupId`). Everything below is additive and optional: `sbw:meta.schemaVersion` stays 1 and there is no migration.
+
+**`sbw:snipeGroups`** (storage.local, optional). `STORAGE_KEYS.snipeGroups`. The schema is module-private, so the locked example list is unchanged: `{ version: 1, groups: Record<GroupId, { id, name, maxWins, createdAt, updatedAt, results, cancels }> }`.
+
+- `id`: 1-64 of `A-Z a-z 0-9 _ -` (`SNIPE_GROUP_LIMITS.idPattern`). `name`: 1-80 chars. `maxWins` (N): an integer from 1 to 50. At most 100 groups.
+- `results`: per member snipe id, `{ verdict, dryRun, at, attempts, nextAt?, why, finalPrice?, warned? }`. `verdict` is `checking` (a confirming read is due at `nextAt`; `at` is the first attempt), `confirmed`, `unconfirmed` or `not-won`. `confirmed` means T-87's `classifyOutcome`, run on a read of the item made after the end, said `won` with `final: true`, the reducer had stored `won`, and the closing price was not above the max. For a dry run it means "would have won" on a read showing the auction closed. `warned`: the user was told the group keeps going without a confirmation.
+- `cancels`: per member snipe id, `{ at, ok, why }`: the members the group asked the runner to disarm once N wins were confirmed. `ok: false` when the runner refused (a bid already sent cannot be stopped); `why` is the refusal.
+- Missing or invalid data parses to the empty record (`parseSnipeGroups`). The job reads it through `Repo.find`, so an invalid record is quarantined (health panel) rather than silently replaced. Losing it loses the groups' N: a member whose group is gone is never cancelled (each snipe then bids on its own), and new arms into it are refused.
+
+**Messages** (UI only; `MSG_SENDER` 'ui'):
+
+- `groups.list` (no payload). Reply: the stored record, validated with the same schema as `sbw:snipeGroups`.
+- `groups.save { id, name, maxWins }`. Creates the group, or renames it / changes N. No reply. Refused from 2 minutes before the group's next end until that member is settled (edit freeze). Lowering N to the confirmed wins stops the remaining members (the confirmed wins are the proof).
+- `groups.delete { id }`. No reply. Refused while frozen, or while the group has open snipes.
+
+The handlers live in `src/background/jobs/snipe-groups.ts`, which registers itself (I-01). The job also registers `ArmHooks` on T-84's registry (I-12): `beforeArm` vetoes a member that ends less than 2 minutes from another, mixes dry run and live, joins a frozen group, joins a group that already won N, or names an unknown group. `snipe-runner.ts`, `handlers/snipe.ts`, `state-machine.ts` and `main.ts` are unchanged.
+
+**One more alarm name, not a storage key.** `sbw:groups:check` is the alarm for the soonest due confirming read. It is re-armed from `sbw:snipeGroups` at every start, so it needs no record of its own.
+
+**Tests.**
+- `test/contract/types/storage.test.ts`: the key, its area, a sample, the limits, and that invalid data parses to empty.
+- `test/contract/types/messages.test.ts` and `examples/Msg/groups.*.json`: the three messages, their sender group and the reply.
+- `test/unit/domain/snipe/groups.test.ts`, `test/integration/snipe-groups.test.ts`, `test/dom/groups-section.test.ts`, `test/e2e/chromium/groups.spec.ts`.
+
+**Follow-up for the next PLAN edit.** Add `sbw:snipeGroups` to PLAN §2.3, and the three messages to §3.12 and contracts.md.

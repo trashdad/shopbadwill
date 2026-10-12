@@ -11,6 +11,7 @@ import type { AuthStatus } from '../../../src/domain/calendar/types';
 import type { MatchResult, Rule } from '../../../src/domain/rules/schema';
 import type { Settings } from '../../../src/domain/settings/schema';
 import type { CapsResult, Snipe } from '../../../src/domain/snipe/types';
+import type { SnipeGroupsRecord } from '../../../src/domain/storage/schema';
 import type {
   Cents,
   EpochMs,
@@ -89,6 +90,10 @@ const EXPECTED = {
     'snipe.arm',
     'snipe.disarm',
     'snipe.list',
+    // T-112 contract change (docs/CONTRACT-DECISIONS.md): bid groups.
+    'groups.list',
+    'groups.save',
+    'groups.delete',
     'timing.awake',
     'kill.set',
     'health.get',
@@ -118,6 +123,7 @@ const WITH_REPLY = [
   'snipe.prepare',
   'snipe.arm',
   'snipe.list',
+  'groups.list',
   'timing.awake',
   'health.get',
   'audit.list',
@@ -228,6 +234,9 @@ describe('replies', () => {
     expectTypeOf<MsgReply<'snipe.arm'>>().toEqualTypeOf<Snipe>();
     expectTypeOf<MsgReply<'snipe.list'>>().toEqualTypeOf<Snipe[]>();
     expectTypeOf<MsgReply<'timing.awake'>>().toEqualTypeOf<EpochMs[]>();
+    // T-112: the stored `sbw:snipeGroups` record.
+    expectTypeOf<MsgReply<'groups.list'>>().toEqualTypeOf<SnipeGroupsRecord>();
+    expectTypeOf<MsgReply<'groups.save'>>().toEqualTypeOf<undefined>();
     expectTypeOf<MsgReply<'health.get'>>().toEqualTypeOf<{
       sgw: HealthReport | null;
       session: SgwSessionRecord['expiresAt'] | null;
@@ -265,6 +274,9 @@ describe('replies', () => {
     expect(MsgReplySchemas['timing.awake'].safeParse([1_791_400_000_000]).success).toBe(true);
     expect(MsgReplySchemas['timing.awake'].safeParse([-1]).success).toBe(false);
     expect(MsgReplySchemas['timing.awake'].safeParse({ beats: [] }).success).toBe(false);
+    // T-112: groups.list is the stored sbw:snipeGroups record.
+    expect(MsgReplySchemas['groups.list'].safeParse({ version: 1, groups: {} }).success).toBe(true);
+    expect(MsgReplySchemas['groups.list'].safeParse([]).success).toBe(false);
   });
 
   it('rejects relist.lookup when itemIds is longer than 40 (T-113)', () => {
@@ -323,6 +335,9 @@ type SpecMsg =
   | { type: 'snipe.arm'; payload: { snipe: Omit<Snipe, 'state' | 'history' | 'armedAt'>; typedConfirmation?: string } }
   | { type: 'snipe.disarm'; payload: { id: string } }
   | { type: 'snipe.list' }
+  | { type: 'groups.list' }
+  | { type: 'groups.save'; payload: { id: string; name: string; maxWins: number } }
+  | { type: 'groups.delete'; payload: { id: string } }
   | { type: 'timing.awake' }
   | { type: 'kill.set'; payload: { on: boolean } }
   | { type: 'health.get' }

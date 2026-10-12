@@ -203,13 +203,14 @@ describe('dashboard sections', () => {
     expect(order[0]).toBe('Extra');
   });
 
-  it('registers the built-in sections (T-67 adds calendar, T-85 adds snipes, T-90 adds timing, T-102 adds exposure) and rejects a malformed or duplicate one', () => {
+  it('registers the built-in sections (T-67 adds calendar, T-85 adds snipes, T-90 adds timing, T-102 adds exposure, T-112 adds groups) and rejects a malformed or duplicate one', () => {
     expect(loadSections(builtinModules).map((s) => s.id)).toEqual([
       'watches',
       'matches',
       'health',
       'exposure',
       'snipes',
+      'groups',
       'activity',
       'calendar',
       'timing',

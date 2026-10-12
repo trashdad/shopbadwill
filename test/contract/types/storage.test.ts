@@ -16,6 +16,8 @@ import {
   parseCompanionWakes,
   parseRelistSeen,
   parseDryRunCounted,
+  parseSnipeGroups,
+  SNIPE_GROUP_LIMITS,
   STORAGE_KEYS,
   STORAGE_LIMITS,
   STORAGE_RECORDS,
@@ -61,6 +63,7 @@ const LOCAL_KEYS = [
   'sbw:companionWakes',
   'sbw:deferredAlarms',
   'sbw:relistSeen',
+  'sbw:snipeGroups',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -120,6 +123,23 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:deferredAlarms': { 'sbw:notify:digest:run-1': 1791400000000 },
   // T-113: the relist detector's history of public listings (item id -> fingerprint, last price, last seen).
   'sbw:relistSeen': { version: 1, entries: { '279250057': { fp: '42|pyrex bowl|abc.jpg', price: 1299, seenAt: 1791400000000 } } },
+  // T-112: the bid groups, their per-member verdicts and their cancellations.
+  'sbw:snipeGroups': {
+    version: 1,
+    groups: {
+      'grp-1': {
+        id: 'grp-1',
+        name: 'Table lamps',
+        maxWins: 1,
+        createdAt: 1791390000000,
+        updatedAt: 1791390000000,
+        results: {
+          'snp-1': { verdict: 'confirmed', dryRun: false, at: 1791400005000, attempts: 1, why: 'won at the close', finalPrice: 1700 },
+        },
+        cancels: { 'snp-2': { at: 1791400006000, ok: true, why: 'disarmed' } },
+      },
+    },
+  },
 };
 
 describe('storage schema v1', () => {
@@ -225,6 +245,26 @@ describe('storage schema v1', () => {
     expect(parseCompanionWakes(undefined)).toEqual({ version: 1, wakes: {} });
     expect(parseCompanionWakes({ version: 1, wakes: 'x' })).toEqual({ version: 1, wakes: {} });
     expect(parseCompanionWakes({ version: 1, wakes: { 'snp-1': entry } })).toEqual({ version: 1, wakes: { 'snp-1': entry } });
+  });
+
+  it('registers the optional bid-group record; invalid data parses to empty (T-112)', () => {
+    const spec = STORAGE_RECORDS[STORAGE_KEYS.snipeGroups];
+    expect(STORAGE_KEYS.snipeGroups).toBe('sbw:snipeGroups');
+    expect(spec.area).toBe('local');
+    const group = (SAMPLE_VALUES['sbw:snipeGroups'] as { groups: Record<string, Record<string, unknown>> }).groups['grp-1'] ?? {};
+    const record = (g: Record<string, unknown>): unknown => ({ version: 1, groups: { 'grp-1': g } });
+    expect(spec.schema.safeParse(record(group)).success).toBe(true);
+    // N is at least 1 and at most the limit; a group that may win nothing would cancel every snipe.
+    expect(spec.schema.safeParse(record({ ...group, maxWins: 0 })).success).toBe(false);
+    expect(spec.schema.safeParse(record({ ...group, maxWins: SNIPE_GROUP_LIMITS.maxWinsMax + 1 })).success).toBe(false);
+    expect(spec.schema.safeParse(record({ ...group, name: '' })).success).toBe(false);
+    expect(spec.schema.safeParse(record({ ...group, results: { 'snp-1': { verdict: 'won', dryRun: false, at: 1, attempts: 0, why: '' } } })).success).toBe(false);
+    expect(spec.schema.safeParse({ version: 1, groups: { 'bad id': { ...group, id: 'bad id' } } }).success).toBe(false);
+    expect(spec.schema.safeParse({ version: 2, groups: {} }).success).toBe(false);
+    // Missing or invalid parses to the empty record. No migration; schemaVersion stays 1.
+    expect(parseSnipeGroups(undefined)).toEqual({ version: 1, groups: {} });
+    expect(parseSnipeGroups({ version: 1, groups: 'x' })).toEqual({ version: 1, groups: {} });
+    expect(parseSnipeGroups(record(group))).toEqual(record(group));
   });
 
   it('registers the optional deferred-alarm record: alarm name -> when (T-118 L6)', () => {

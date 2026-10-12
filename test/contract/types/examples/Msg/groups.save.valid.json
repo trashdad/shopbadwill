@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "reqId": "r-81",
+  "type": "groups.save",
+  "payload": {
+    "id": "grp-lamps-1",
+    "name": "Table lamps",
+    "maxWins": 1
+  }
+}
