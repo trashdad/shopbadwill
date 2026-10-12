@@ -117,6 +117,8 @@ test.afterEach(async () => {
   opened = {};
   await context?.close();
   if (profile !== undefined) rmSync(profile, { recursive: true, force: true });
+  // The fake SGW is shared by every spec (CI starts one): leave it as a reset finds it.
+  await setScenario({ reset: true });
 });
 
 /**
