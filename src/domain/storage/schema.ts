@@ -177,6 +177,11 @@ const NtfyStateSchema = z.object({
     z.object({
       /** Stable identity of the event the entries belong to: end time, generation, reminder minutes. */
       fingerprint: z.string().min(1),
+      /**
+       * T-118 (L4): a short non-reversible tag of the topic the entries were
+       * published on (never the topic itself). Absent on records written before it.
+       */
+      topicTag: z.string().min(1).optional(),
       entries: z.array(
         z.object({
           /** `sbw-<itemId>-<leadMin>-<gen>`; deterministic, so a re-publish overwrites. */

@@ -106,6 +106,8 @@ interface Rig {
   sink: NtfySink;
   /** Rebuilds the sink over the same store and clock (a worker restart). */
   restart(opts?: { enabled?: boolean }): NtfySink;
+  /** What settings.get answers from now on (the options page saved a change). */
+  current: { ntfy: { enabled: boolean; server: string; topic: string }; timeZone: string };
 }
 
 /** Installs MSW ntfy handlers that record every request and answer 200 by default. */
@@ -168,6 +170,7 @@ function rig(
     store,
     requests,
     sink: mk(),
+    current,
     restart: (o = {}) => {
       if (o.enabled !== undefined) current.ntfy.enabled = o.enabled;
       r.sink = mk();
@@ -1194,3 +1197,67 @@ function stubCalendarApi(): CalendarApi {
     eventsListByPrivateProp: never,
   };
 }
+
+// ── T-118 (L4): the options page rotates or disables while a publish runs ─────
+
+describe('T-118 L4: a topic change or disable racing a background publish', () => {
+  const NEW_TOPIC = 'sbw-zyxwvutsrqponmlkjihgfedcba';
+
+  /** The options page's click lands while this pass is publishing: it clears sbw:ntfy and saves `next`. */
+  function optionsChangeDuringPublish(r: Rig, next: { topic?: string; enabled?: boolean }): void {
+    let fired = false;
+    mswServer.use(
+      http.post(`${NTFY_SERVER}/:topic`, () => {
+        if (!fired) {
+          fired = true;
+          r.store.state = structuredClone(EMPTY_NTFY_STATE);
+          if (next.topic !== undefined) r.current.ntfy.topic = next.topic;
+          if (next.enabled !== undefined) r.current.ntfy.enabled = next.enabled;
+        }
+        return undefined; // fall through to the recording handler
+      }),
+    );
+  }
+
+  it('a rotation mid-publish: the new topic still gets every push', async () => {
+    const r = rig();
+    optionsChangeDuringPublish(r, { topic: NEW_TOPIC });
+    const e = desiredEvent(7, 2 * HOUR);
+    await r.sink.upsert(e);
+    await r.sink.upsert(e);
+    const onNew = r.requests.filter((x) => x.kind === 'post' && x.url.includes(NEW_TOPIC));
+    expect(onNew.map((x) => x.headers['x-sequence-id'])).toEqual([sequenceId(7, 60, 0), sequenceId(7, 15, 0), sequenceId(7, 5, 0)]);
+  });
+
+  it('a rotation mid-publish cancels what this pass put on the old topic', async () => {
+    const r = rig();
+    optionsChangeDuringPublish(r, { topic: NEW_TOPIC });
+    await r.sink.upsert(desiredEvent(7, 2 * HOUR));
+    const old = r.requests.filter((x) => x.url.includes(`/${TOPIC}`));
+    const posted = old.filter((x) => x.kind === 'post').map((x) => x.headers['x-sequence-id']);
+    const deleted = old.filter((x) => x.kind === 'delete').map((x) => x.url.split('/').at(-1));
+    expect(posted.length).toBeGreaterThan(0);
+    expect(deleted.sort()).toEqual([...posted].sort());
+  });
+
+  it('a disable mid-publish leaves nothing scheduled on the old topic, and nothing stored', async () => {
+    const r = rig();
+    optionsChangeDuringPublish(r, { enabled: false });
+    await r.sink.upsert(desiredEvent(7, 2 * HOUR));
+    const posted = r.requests.filter((x) => x.kind === 'post').map((x) => x.headers['x-sequence-id']);
+    const deleted = r.requests.filter((x) => x.kind === 'delete').map((x) => x.url.split('/').at(-1));
+    expect(deleted.sort()).toEqual([...posted].sort());
+    expect(r.store.state.items['7']).toBeUndefined();
+  });
+
+  it('a record written for another topic is not taken as already scheduled on this one', async () => {
+    const r = rig();
+    const e = desiredEvent(7, 2 * HOUR);
+    await r.sink.upsert(e);
+    r.current.ntfy.topic = NEW_TOPIC; // the record still names the old topic's pushes
+    await r.sink.upsert(e);
+    expect(r.requests.filter((x) => x.kind === 'post' && x.url.includes(NEW_TOPIC))).toHaveLength(3);
+    // and no DELETE is aimed at the new topic for seqs that were never there
+    expect(r.requests.filter((x) => x.kind === 'delete' && x.url.includes(NEW_TOPIC))).toHaveLength(0);
+  });
+});
