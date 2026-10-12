@@ -3,6 +3,7 @@
 * check_sandbox() aborts unless every canary was refused by the proxy itself.
 * proxy_prefs() leaves no route around the proxy except loopback.
 * The proxy refuses every host but the fixture site and marks its refusals.
+* A route (T-40) opens only an SGW subdomain, and only once it is routed.
 """
 
 from __future__ import annotations
@@ -155,3 +156,20 @@ def test_proxy_tunnels_only_the_fixture_host(proxy: SgwSite) -> None:
     response = proxy_request(proxy, f"CONNECT {SGW_HOST}:443 HTTP/1.1\r\nHost: {SGW_HOST}:443\r\n\r\n")
     assert response.startswith("HTTP/1.1 200")
     assert proxy.refused == []
+
+
+@pytest.mark.parametrize("host", ["example.invalid", f"{SGW_HOST}.example.invalid", f"not{SGW_HOST}"])
+def test_a_route_serves_only_the_fixture_host_and_its_subdomains(proxy: SgwSite, host: str) -> None:
+    with pytest.raises(ValueError, match="only shopgoodwill.com and its subdomains"):
+        proxy.route(host, 8787)
+    response = proxy_request(proxy, f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n")
+    assert response.startswith("HTTP/1.1 403")
+
+
+def test_proxy_tunnels_a_subdomain_only_once_it_is_routed(proxy: SgwSite) -> None:
+    host = f"buyerapi.{SGW_HOST}"
+    connect = f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n"
+    assert proxy_request(proxy, connect).startswith("HTTP/1.1 403")
+    proxy.route(host, 8787)  # relays to 127.0.0.1:8787 only; a route has no upstream host
+    assert proxy_request(proxy, connect).startswith("HTTP/1.1 200")
+    assert proxy.refused == [f"{host}:443"]
