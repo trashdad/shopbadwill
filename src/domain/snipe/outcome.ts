@@ -129,7 +129,7 @@ function isClosed(d: ItemDetail): boolean {
 }
 
 interface Verdict {
-  outcome: 'won' | 'outbid' | 'unconfirmed';
+  outcome: 'won' | 'outbid' | 'not-registered' | 'unconfirmed';
   how: string;
 }
 
@@ -140,6 +140,13 @@ function judgeAccepted(s: Snipe, bid: BidResult | null, post: ItemDetail | null)
   // An unrecognised reply's own flag is unverified: only the post-read may speak for it.
   const high = bid?.kind === 'rejected-unknown' ? (post?.isHighBidder ?? null) : (post?.isHighBidder ?? bid?.isHighBidder ?? null);
   if (high === true) return { outcome: 'won', how: 'reported by SGW' };
+  // T-87d: not leading at a price below the max. A registered max above the price
+  // would lead, so the bid is not on record: at the close (with no accepted reply)
+  // it never registered; otherwise nothing is proven either way.
+  if (high === false && post !== null && post.isHighBidder === false && post.currentPrice < s.maxBid) {
+    if (isClosed(post) && !accepted) return { outcome: 'not-registered', how: 'not the high bidder at a final price below your max' };
+    return { outcome: 'unconfirmed', how: 'not leading at a price below your max: the bid may not be on record' };
+  }
   if (high === false) return { outcome: 'outbid', how: 'reported by SGW' };
   // No high-bidder flag (anonymous read): proxy bidding lets the price settle it, except at a tie.
   const price = post?.currentPrice;
@@ -365,6 +372,14 @@ export function classifyOutcome(
       message = `${final ? 'Won' : unread ? 'Leading when the bid went in' : 'Leading (auction still open)'}${at} (your max ${max}).${via}`;
       detail = `Won; ${v.how}.${rawNote}`;
       stampAs = final ? 'won' : null;
+    } else if (v.outcome === 'not-registered') {
+      // Not a spend outcome (spentToday counts won/network only); the item was not won.
+      outcome = 'outbid';
+      // After an ambiguous send, never claim no bid was placed (T-80 I2): say what the read shows.
+      heading = 'Not won';
+      message = `Not won: your bid does not appear to have registered. The auction ended${at}, below your max ${max}, and you were not the high bidder.${via}`;
+      detail = `Not registered; ${v.how}.${rawNote}`;
+      stampAs = 'lost';
     } else if (v.outcome === 'outbid') {
       outcome = 'outbid';
       heading = final ? 'Lost' : 'Outbid';
