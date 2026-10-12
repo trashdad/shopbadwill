@@ -101,20 +101,27 @@ Do **2a** for Chrome, **2b** for Firefox, or both.
 
 ### 2a · Chrome: Web application client
 
-**6. Find your extension ID.**
+**6. Copy your redirect URI from the options page.**
 
-1. Open `chrome://extensions`.
-2. On the **ShopBadwill** card, copy the **ID**. It is 32 letters from a to p.
-3. Your redirect URI is that ID inside this pattern, **with** the trailing slash:
+1. Click the ShopBadwill toolbar button → **Open options** → **Google
+   Calendar** → card **Your Google client**.
+2. The first time, click **Show and copy redirect URI**. This needs the
+   browser's sign-in permission; if Chrome asks, click **Allow**. The page
+   then shows **Authorized redirect URI** and copies it.
+3. Later visits show the address at once. **Copy redirect URI** copies it
+   again.
 
-   ```
-   https://<your-extension-id>.chromiumapp.org/
-   ```
+It looks like this, **with** the trailing slash:
+
+```
+https://<your-extension-id>.chromiumapp.org/
+```
 
 The ID of an unpacked extension depends on the folder you loaded it from.
 Loading it from a different folder gives a new ID, and you must add the new
-redirect URI (step 7.5) again. The options page does not show this URI; use
-`chrome://extensions`.
+redirect URI (step 7.5) again. If you declined the permission, you can also
+build the address by hand: the ID is on the ShopBadwill card in
+`chrome://extensions` (32 letters from a to p).
 
 **7. Create the client.**
 
@@ -123,8 +130,8 @@ redirect URI (step 7.5) again. The options page does not show this URI; use
 2. Set **Application type** to **Web application**.
 3. Set **Name** to `ShopBadwill Chrome (Web)`.
 4. Leave **Authorized JavaScript origins** empty.
-5. Under **Authorized redirect URIs**, click **Add URI** and paste your URI
-   from step 6.
+5. Under **Authorized redirect URIs**, click **Add URI** and paste the URI
+   you copied in step 6.
 6. Click **Create**.
 7. The dialog shows the **Client ID** and **Client secret**. **The secret is
    shown only this once.** Copy it into your password manager. Never save it
@@ -148,7 +155,8 @@ the sign-in with "client_secret is missing." (S-4, tested twice).
 
 There is no redirect URI to enter. Firefox signs in through the loopback
 address `http://127.0.0.1/mozoauth2/<hash>`. The hash is fixed for this add-on.
-The options page does not show it.
+The options page shows it under **Authorized redirect URI**, for reference
+only; a Desktop app client needs nothing pasted.
 
 The options page asks for a client secret on Firefox too. Paste the Desktop
 client's secret.
@@ -205,6 +213,17 @@ are only logged until you turn this off:
 1. Options → **Settings** → card **Dry run (practice mode)**.
 2. Turn **Dry run: calendar** off when you want real events on Google.
 
+**13a. Send a test event.** In the card **Calendar**, click **Send a test
+event**. It works once Google is connected and calendar events are on.
+
+- With **Dry run: calendar** off, ShopBadwill adds one event, **ShopBadwill
+  test event — safe to delete**, an hour from now to **ShopGoodwill
+  Auctions**, and deletes it at once. The page says "A test event was added to
+  ShopGoodwill Auctions and deleted again. Google Calendar works." Your
+  client, the sign-in and the calendar are then all working.
+- With **Dry run: calendar** on, nothing is written. The page says so.
+- If the delete fails, the page says so: delete the test event by hand.
+
 **14. Reminders (optional).** The card **Calendar** → **Reminders (minutes
 before the auction ends)** starts at 60, 15 and 5. Google allows at most 5. Use
 **Reset to 60, 15, 5** to go back, and **Save reminders** to keep a change.
@@ -252,7 +271,8 @@ days." After step 16 that warning goes away.
 2. In the app: menu → **Settings** → **ShopGoodwill Auctions**. Make sure it is
    synced (shown in the calendar list) and its notifications are on.
 
-**18. Test it once.** ShopBadwill has no test-event button.
+**18. Test it once.** The **Send a test event** button (step 13a) deletes its
+event at once, so it cannot test a phone popup. Make one by hand:
 
 1. On <https://calendar.google.com>, create an event on **ShopGoodwill
    Auctions** about 5 minutes from now, with a notification 1 minute before.
@@ -284,10 +304,12 @@ The **Last error** line in the card **Connection** names the problem.
 | You see | Cause | Fix |
 |---|---|---|
 | Last error "Google no longer accepts your sign-in. Reconnect Google." (`invalid_grant`), about once a week | The app is still in **Testing** | Do Part 4, then reconnect |
-| Google error page `Error 400: redirect_uri_mismatch` | Chrome: the redirect URI in the Web client does not match your extension ID (a new folder gives a new ID) | Repeat step 6, add the exact URI with its trailing slash to the Web client, click **Save**, connect again |
+| Google error page `Error 400: redirect_uri_mismatch` | Chrome: the redirect URI in the Web client does not match your extension ID (a new folder gives a new ID) | Repeat step 6 (**Copy redirect URI**), add that exact URI with its trailing slash to the Web client, click **Save**, connect again |
 | "client_secret is missing." / Last error "Google refused the request. Check your client ID and secret, then reconnect." | The secret is missing or belongs to another client | Paste the secret of **this** client into **Client secret**, then connect |
 | Last error "Calendar access was not granted. Reconnect and allow it." | The calendar box was left unticked, or a broader permission was granted | Connect again and allow the calendar permission |
 | "That does not look like a Google client ID." | You pasted something else, such as the secret or the project number | Paste the value that ends `.apps.googleusercontent.com` |
 | **Connect to Google Calendar** is greyed out | The client ID or the secret is empty | Fill in both. A saved secret shows as `Saved: …` in the field |
 | "Google Calendar needs permission to sign in and add events. Nothing was changed." | You declined the browser's permission prompt | Click **Connect to Google Calendar** again and click **Allow** |
 | Toolbar badge **!** and "Google needs you to sign in again." | Access was removed at Google, or the token lapsed | Click **Reconnect Google** and approve |
+| The same, right after you removed a ShopBadwill permission in the browser's extension settings | The sign-in permission or a Google site permission was removed, so Google cannot be reached | Click **Reconnect Google**; the browser asks for the permissions again |
+| **Send a test event** is greyed out | Google is not connected, needs a reconnect, or calendar events are off | Connect, then switch on **Add auction ends to Google Calendar** |

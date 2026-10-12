@@ -45,7 +45,7 @@ const MSG_DIR = path.join(import.meta.dirname, 'examples', 'Msg');
 // §3.12, grouped by its comments. §2.4 rule 3: content scripts may send only
 // the `content` group (page.*, ui.openSnipe, rules.evaluate, rules.disable,
 // landedCost.get, relist.lookup, quick.*). `rules.disable` is the T-32 contract change;
-// `relist.lookup` is the T-113 one
+// `relist.lookup` is the T-113 one; `calendar.testEvent` (ui) the T-119 one
 // (docs/CONTRACT-DECISIONS.md); extension pages may send content types too.
 const EXPECTED = {
   content: [
@@ -84,6 +84,7 @@ const EXPECTED = {
     'calendar.status',
     'calendar.syncNow',
     'calendar.ics',
+    'calendar.testEvent',
     'snipe.prepare',
     'snipe.arm',
     'snipe.disarm',
@@ -113,6 +114,7 @@ const WITH_REPLY = [
   'calendar.connect',
   'calendar.status',
   'calendar.ics',
+  'calendar.testEvent',
   'snipe.prepare',
   'snipe.arm',
   'snipe.list',
@@ -216,6 +218,8 @@ describe('replies', () => {
     expectTypeOf<MsgReply<'calendar.connect'>>().toEqualTypeOf<AuthStatus>();
     expectTypeOf<MsgReply<'calendar.status'>>().toEqualTypeOf<AuthStatus>();
     expectTypeOf<MsgReply<'calendar.ics'>>().toEqualTypeOf<{ ics: string }>();
+    // T-119 contract change: one test event created then deleted, or nothing written in calendar dry run.
+    expectTypeOf<MsgReply<'calendar.testEvent'>>().toEqualTypeOf<{ result: 'created-and-deleted' | 'dry-run' }>();
     expectTypeOf<MsgReply<'snipe.prepare'>>().toEqualTypeOf<{
       detail: ItemDetail;
       estAllIn: Cents | null;
@@ -314,6 +318,7 @@ type SpecMsg =
   | { type: 'calendar.status' }
   | { type: 'calendar.syncNow' }
   | { type: 'calendar.ics'; payload: { itemIds: ItemId[] } }
+  | { type: 'calendar.testEvent' }
   | { type: 'snipe.prepare'; payload: { itemId: ItemId } }
   | { type: 'snipe.arm'; payload: { snipe: Omit<Snipe, 'state' | 'history' | 'armedAt'>; typedConfirmation?: string } }
   | { type: 'snipe.disarm'; payload: { id: string } }

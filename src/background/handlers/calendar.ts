@@ -5,6 +5,9 @@
 // starts a sync in the background (not awaited: the reply is the new status).
 // calendar.ics is the zero-auth fallback (I-10): it builds the .ics from tracked
 // items with T-68's buildIcs, and needs no Google at all.
+// calendar.testEvent (T-119) is the options page's "Send a test event": only
+// while connected with calendar events on; the sink writes one test event and
+// deletes it (or, in calendar dry run, writes nothing).
 //
 // Undo ref format (documented in docs/CONTRACT-DECISIONS.md): an audit entry
 // `calendar.insert` carries `undo: { kind: 'deleteEvent', ref: 'deleteEvent:<itemId>:<eventId>' }`.
@@ -27,6 +30,7 @@ type CalendarHandlers = {
   'calendar.status': Handler<'calendar.status'>;
   'calendar.syncNow': Handler<'calendar.syncNow'>;
   'calendar.ics': Handler<'calendar.ics'>;
+  'calendar.testEvent': Handler<'calendar.testEvent'>;
 };
 
 export function createCalendarHandlers(ctx: BackgroundContext): CalendarHandlers {
@@ -56,6 +60,16 @@ export function createCalendarHandlers(ctx: BackgroundContext): CalendarHandlers
       const now = ctx.repo.now();
       const events = buildDesired(tracked, calendar.links, settings, now, { withPrice: true, only: p.itemIds });
       return { ics: buildIcs(events, { nowUtc: new Date(now).toISOString() }) };
+    },
+    'calendar.testEvent': async () => {
+      const auth = await ctx.google.status();
+      if (!auth.connected) throw new Error('Google Calendar is not connected. Connect it first.');
+      if (auth.needsInteraction) throw new Error('Google needs you to sign in again. Reconnect Google first.');
+      const settings = await ctx.repo.get(STORAGE_KEYS.settings);
+      if (!settings.calendar.enabled) throw new Error('Calendar events are off. Turn on "Add auction ends to Google Calendar" first.');
+      const sink = syncFor(ctx).sink;
+      sink.setTimeZone(settings.locale.timeZone);
+      return { result: await sink.sendTestEvent() };
     },
   };
 }
@@ -104,4 +118,5 @@ export function register(ctx: BackgroundContext): void {
   ctx.router.register('calendar.status', h['calendar.status']);
   ctx.router.register('calendar.syncNow', h['calendar.syncNow']);
   ctx.router.register('calendar.ics', h['calendar.ics']);
+  ctx.router.register('calendar.testEvent', h['calendar.testEvent']);
 }

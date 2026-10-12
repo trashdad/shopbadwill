@@ -857,3 +857,69 @@ test('calendar adoption: a same-named calendar WITHOUT our marker is never adopt
     expect(audits.filter((e) => e.kind === 'calendar.create').map((e) => e.ref)).toEqual([calId]);
   });
 });
+
+// ── T-119: Google setup aids on the options page ─────────────────────────────
+
+test('setup aids: the exact redirect URI is shown; Send a test event creates one test event and deletes it (dry run writes nothing)', async () => {
+  test.setTimeout(120_000);
+  const guard = createRouteGuard();
+  const profile = mkdtempSync(path.join(os.tmpdir(), 'sbw-e2e-calendar-'));
+  let s: Session | undefined;
+  try {
+    await googleScenario(RESET_SCENARIO);
+    s = await start(testExtensionDir(), profile, guard, ANCHOR_MS);
+    const opened = s;
+    const section = opened.options.locator('#section-google');
+
+    await test.step('the redirect URI is the one the sign-in sends, read-only', async () => {
+      // Test builds hold `identity` already, so the address shows at once.
+      const field = section.getByLabel('Authorized redirect URI');
+      await expect(field).toHaveValue(`https://${opened.extId}.chromiumapp.org/`);
+      await expect(field).toHaveAttribute('readonly', '');
+      await expect(section.getByRole('button', { name: 'Copy redirect URI' })).toBeVisible();
+    });
+
+    const testButton = section.getByRole('button', { name: 'Send a test event' });
+    await test.step('disabled until connected with calendar events on', async () => {
+      await expect(testButton).toBeDisabled();
+      await setDryRun(opened, false);
+      await connectFromOptions(opened);
+      await expect(testButton).toBeDisabled();
+      await section.getByRole('button', { name: 'Turn on calendar events now?' }).click();
+      await expect(section.locator('#g-calendar-enabled')).toBeChecked();
+      await expect(testButton).toBeEnabled();
+      await settle(opened);
+    });
+
+    await test.step('live: one clearly-titled event 1 h ahead is inserted, then deleted', async () => {
+      const from = await mark();
+      await testButton.click();
+      await expect(section.getByText('A test event was added to ShopGoodwill Auctions and deleted again. Google Calendar works.')).toBeVisible();
+      const calId = (await calendarState(opened.options)).calendarId ?? '';
+      const reqs = (await requestsSince(from)).filter(isCalendarApi);
+      const shown = show(reqs, calId);
+      expect(shown.filter((r) => r.startsWith('POST /calendar/v3/calendars/<cal>/events'))).toHaveLength(1);
+      expect(shown.filter((r) => r.startsWith('DELETE /calendar/v3/calendars/<cal>/events/testevt'))).toHaveLength(1);
+      const tests = (await fakeCalendar(calId)).events.filter((e) => e.id.startsWith('testevt'));
+      expect(tests.map((e) => [e.summary, e.status])).toEqual([['ShopBadwill test event — safe to delete', 'cancelled']]);
+      expect(tests[0]?.extendedProperties?.private?.['sbwItemId']).toBe('');
+      const lead = Date.parse(tests[0]?.start.dateTime ?? '') - ANCHOR_MS;
+      expect(lead).toBeGreaterThan(50 * MIN);
+      expect(lead).toBeLessThan(2 * 60 * MIN);
+      const audits = calendarAudits(await auditEntries(opened.options)).filter((e) => e.kind === 'calendar.testEvent');
+      expect(audits.map((e) => [e.actor, e.details])).toEqual([['user', { deleted: true }]]);
+    });
+
+    await test.step('calendar dry run: says so, and Google receives nothing', async () => {
+      await setDryRun(opened, true);
+      const from = await mark();
+      await testButton.click();
+      await expect(section.getByText(/Dry run: nothing was written to Google/)).toBeVisible();
+      expect(show((await requestsSince(from)).filter(isCalendarApi))).toEqual([]);
+    });
+    expect(guard.unexpected, `unexpected hosts: ${guard.unexpected.join(', ')}`).toEqual([]);
+  } finally {
+    await s?.context.close();
+    removeProfile(profile);
+  }
+});

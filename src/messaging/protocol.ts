@@ -108,6 +108,8 @@ export const MsgSchema = z.discriminatedUnion('type', [
   signal('calendar.status'),
   signal('calendar.syncNow'),
   msg('calendar.ics', z.object({ itemIds: z.array(ItemIdSchema) })),
+  /** T-119: user click. One test event in the dedicated calendar, deleted at once (nothing written in calendar dry run). */
+  signal('calendar.testEvent'),
   msg('snipe.prepare', ItemIdPayload),
   /**
    * The handler (T-84) sets `state`, `history` and `armedAt` itself, and must
@@ -186,6 +188,7 @@ export const MSG_SENDER = Object.freeze({
   'calendar.status': 'ui',
   'calendar.syncNow': 'ui',
   'calendar.ics': 'ui',
+  'calendar.testEvent': 'ui',
   'snipe.prepare': 'ui',
   'snipe.arm': 'ui',
   'snipe.disarm': 'ui',
@@ -258,6 +261,7 @@ export const MsgReplySchemas = Object.freeze({
   'calendar.connect': AuthStatusSchema,
   'calendar.status': AuthStatusSchema,
   'calendar.ics': z.object({ ics: z.string() }),
+  'calendar.testEvent': z.object({ result: z.enum(['created-and-deleted', 'dry-run']) }),
   'snipe.prepare': z.object({ detail: ItemDetailSchema, estAllIn: CentsSchema.nullable(), caps: CapsResultSchema }),
   'snipe.arm': SnipeSchema,
   'snipe.list': z.array(SnipeSchema),
