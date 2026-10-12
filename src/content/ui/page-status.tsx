@@ -7,12 +7,16 @@
 // user can collapse it to a small dot.
 import type { VNode } from 'preact';
 
+import type { ItemId } from '../../domain/types';
+
 export const LAYOUT_CHANGED = 'SGW layout changed, filters paused';
 
 export type PageView =
   /** settings.overlay.enabled is off: nothing visible. */
   | { kind: 'off' }
   | { kind: 'idle'; text: string }
+  /** T-120: an item page: the status plus the "Snipe…" deep link (ui.openSnipe only, never arms). */
+  | { kind: 'item'; text: string; itemId: ItemId }
   | { kind: 'hidden'; count: number }
   | { kind: 'shown'; count: number }
   | { kind: 'banner' };
@@ -22,6 +26,8 @@ export interface PageStatusProps {
   collapsed: boolean;
   onShowAll: () => void;
   onHideAgain: () => void;
+  /** Trusted clicks only. */
+  onSnipe: (itemId: ItemId) => void;
   onCollapse: () => void;
   onExpand: () => void;
 }
@@ -29,6 +35,7 @@ export interface PageStatusProps {
 function summary(view: Exclude<PageView, { kind: 'off' }>): string {
   switch (view.kind) {
     case 'idle':
+    case 'item':
       return view.text;
     case 'hidden':
       return `ShopBadwill: ${String(view.count)} hidden`;
@@ -43,6 +50,23 @@ function body(view: Exclude<PageView, { kind: 'off' }>, p: PageStatusProps): VNo
   switch (view.kind) {
     case 'idle':
       return <div role="status">{view.text}</div>;
+    case 'item':
+      return (
+        <>
+          <div role="status">{view.text}</div>
+          <button
+            type="button"
+            data-action="snipe"
+            title="Open the dashboard to arm a snipe (never arms from here)"
+            onClick={(e) => {
+              if (!e.isTrusted) return;
+              p.onSnipe(view.itemId);
+            }}
+          >
+            Snipe…
+          </button>
+        </>
+      );
     case 'hidden':
       return (
         <div role="status">

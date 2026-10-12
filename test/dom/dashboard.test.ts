@@ -249,6 +249,68 @@ describe('dashboard matches and health', () => {
     });
   });
 
+  describe('T-120: Stop tracking without a calendar event', () => {
+    const base = { sellerId: 3, reasons: [{ kind: 'watch' as const, id: 'w1' }], addedAt: NOW, updatedAt: NOW, favoriteState: 'none' as const };
+    function mountTracked(m: FakeMessaging): void {
+      const items = [
+        { ...base, itemId: 7, title: 'Canon', endTime: '2026-10-08T02:00:00.000Z', calendar: false },
+        { ...base, itemId: 8, title: 'Nikon', endTime: '2026-10-09T02:00:00.000Z', calendar: true },
+      ];
+      const removed = (id: number): boolean =>
+        m.sent.some((s) => s.type === 'tracked.remove' && (s.payload as { itemId: number }).itemId === id);
+      m.handle('tracked.list', () => items.filter((t) => !removed(t.itemId)));
+      render(h(Dashboard, { client: m, sections: loadSections(builtinModules), userTz: 'UTC', openOptions: () => undefined }));
+    }
+    const matches = (): HTMLElement => screen.getByRole('list', { name: 'Matches' });
+    const region = (): HTMLElement => screen.getByRole('heading', { name: 'Matches and favorites' }).closest('section') as HTMLElement;
+
+    it('a non-calendar match: confirm (no calendar wording), then tracked.remove once, and the list reloads', async () => {
+      const m = new FakeMessaging();
+      m.handle('tracked.remove', () => undefined);
+      mountTracked(m);
+      await screen.findByRole('list', { name: 'Matches' });
+      fireEvent.click(within(matches()).getByRole('button', { name: 'Stop tracking Canon' }));
+      const confirm = within(matches()).getByText(/^Stop tracking Canon\?/);
+      expect(confirm.textContent).not.toMatch(/calendar/i);
+      expect(m.sent.filter((s) => s.type === 'tracked.remove')).toEqual([]);
+      fireEvent.click(within(matches()).getByRole('button', { name: 'Yes, stop tracking' }));
+      await waitFor(() => {
+        expect(within(region()).getByRole('status').textContent).toBe('Stopped tracking Canon.');
+      });
+      expect(within(region()).getByRole('status').textContent).not.toMatch(/calendar/i);
+      expect(m.sent.filter((s) => s.type === 'tracked.remove').map((s) => s.payload)).toEqual([{ itemId: 7 }]);
+      await waitFor(() => {
+        expect(within(matches()).queryByText('Canon')).toBeNull();
+      });
+      expect(within(region()).queryByRole('alert')).toBeNull();
+    });
+
+    it('a match that is on the calendar says its event leaves the dedicated calendar', async () => {
+      const m = new FakeMessaging();
+      mountTracked(m);
+      await screen.findByRole('list', { name: 'Matches' });
+      fireEvent.click(within(matches()).getByRole('button', { name: 'Stop tracking Nikon' }));
+      expect(within(matches()).getByText(/^Stop tracking Nikon\?/).textContent).toMatch(/"ShopGoodwill Auctions" calendar/);
+    });
+
+    it('cancel sends nothing; a failure is an alert and the item stays', async () => {
+      const m = new FakeMessaging();
+      m.handle('tracked.remove', () => {
+        throw new Error('storage full');
+      });
+      mountTracked(m);
+      await screen.findByRole('list', { name: 'Matches' });
+      fireEvent.click(within(matches()).getByRole('button', { name: 'Stop tracking Canon' }));
+      fireEvent.click(within(matches()).getByRole('button', { name: 'Cancel' }));
+      expect(within(matches()).queryByRole('button', { name: 'Yes, stop tracking' })).toBeNull();
+      expect(m.sent.some((s) => s.type === 'tracked.remove')).toBe(false);
+      fireEvent.click(within(matches()).getByRole('button', { name: 'Stop tracking Canon' }));
+      fireEvent.click(within(matches()).getByRole('button', { name: 'Yes, stop tracking' }));
+      expect((await within(region()).findByRole('alert')).textContent).toMatch(/Could not stop tracking Canon/);
+      expect(within(matches()).getByText('Canon')).toBeTruthy();
+    });
+  });
+
   it('summarizes health and links to Options', async () => {
     const m = new FakeMessaging();
     m.handle('health.get', () =>
