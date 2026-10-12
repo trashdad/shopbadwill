@@ -67,6 +67,11 @@ function deliverTestAlarm(info: AlarmInfo): void {
   for (const cb of [...testListeners]) cb(info);
 }
 
+/** Every test-build alarm, for the `sbw:test:state` hook (the browser alarm API holds none in a test build). */
+export function listTestAlarms(): AlarmInfo[] {
+  return [...testAlarms.values()].map(testToInfo);
+}
+
 /** Fires one alarm by name now, whatever its scheduledTime. Throws when it does not exist. */
 export function fireTestAlarm(name: string): AlarmInfo {
   const entry = testAlarms.get(name);
