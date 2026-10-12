@@ -416,4 +416,13 @@ describe('server plumbing', () => {
     const adv = await fetch(new URL('/__admin/advance-clock', f.url), { method: 'POST', body: JSON.stringify({ ms: 5000 }) });
     expect(adv.status).toBe(200);
   });
+
+  it('admin reset-calendars drops every calendar but primary (E2E isolation, T-117)', async () => {
+    const { f, call } = await setup();
+    expect((await call('POST', '/calendars', { summary: 'A', description: 'x' })).status).toBe(200);
+    expect([...f.state.calendars.keys()]).toHaveLength(3);
+    const res = await fetch(new URL('/__admin/reset-calendars', f.url), { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect([...f.state.calendars.keys()]).toEqual(['primary']);
+  });
 });

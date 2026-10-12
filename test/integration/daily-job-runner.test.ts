@@ -1342,6 +1342,12 @@ describe('job.status, tracked.* and the sbw:job-progress port', () => {
     expect(((await h.reply('tracked.list')) as TrackedItem[]).map((t) => t.itemId)).toEqual([2, 1]);
     await h.reply('tracked.remove', { itemId: 2 });
     expect(Object.keys(h.tracked())).toEqual(['1']);
+    // T-117: the user's stop is audited once; removing an item no longer tracked writes nothing.
+    await h.reply('tracked.remove', { itemId: 2 });
+    expect(h.audit().filter((e) => e.kind === 'tracked.remove')).toEqual([
+      expect.objectContaining({ actor: 'user', kind: 'tracked.remove', itemId: 2, details: { calendar: false } }),
+    ]);
+    expect(h.audit().find((e) => e.kind === 'tracked.remove')?.undo).toBeUndefined();
   });
 
   it('streams the run on connect and after every step; refuses content-script ports', async () => {
