@@ -111,7 +111,8 @@ afterEach(cleanup);
 describe('one kill control (the shell switch)', () => {
   it('registers a single kill section and renders no second toggle', async () => {
     const { sections } = setupPopup(false);
-    expect(sections.map((s) => s.id)).toEqual(['kill']);
+    // 'exposure' is T-102's live-bidding section; the kill control itself stays single.
+    expect(sections.map((s) => s.id)).toEqual(['kill', 'exposure']);
     const stop = await screen.findByRole('button', { name: /stop all automation/i });
     await waitFor(() => {
       expect(stop.getAttribute('aria-pressed')).toBe('false');
