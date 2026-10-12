@@ -566,6 +566,11 @@ interface WireExpect {
  */
 async function expectMoneyWire(r: Rig, x: WireExpect): Promise<FakeLogEntry[]> {
   const log = await fakeLog();
+  // Playwright reuses whatever already listens on 8787: an older fake (another checkout's run) has no `cookie` field.
+  expect(
+    log.filter((e) => (e as Partial<FakeLogEntry>).cookie === undefined).map((e) => e.endpoint),
+    'the fake SGW on 8787 logs the Cookie header (is an older fake server from another checkout running?)',
+  ).toEqual([]);
   expect(
     log.filter((e) => e.cookie !== null).map((e) => `${e.endpoint}: ${String(e.cookie)}`),
     'no request carries a Cookie header',
@@ -1231,6 +1236,13 @@ test('cookie: with a Bid cookie in the browser and SGW setting one, no request c
   expect(verified.state).toBe('verified');
   const firedAt = await fire(r, verified);
   const sent = await sendAnswered(r, r.snipe.id);
+  await test.step('the bid path: ShowBidModal and PlaceBid left with no Cookie header and were answered 200', async () => {
+    const writes = (await fakeLog()).filter((e) => e.endpoint === SHOW_BID_MODAL || e.endpoint === PLACE_BID);
+    expect(writes.map((e) => `${e.endpoint} ${String(e.status)} cookie=${String(e.cookie)}`)).toEqual([
+      `${SHOW_BID_MODAL} 200 cookie=null`,
+      `${PLACE_BID} 200 cookie=null`,
+    ]);
+  });
   expect(sent.attempt.reply).toMatchObject({ kind: 'rejected-unknown', rawStatus: null, rawResult: 0 });
   const done = await outcomeRead(r, sent);
 
