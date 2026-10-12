@@ -54,7 +54,8 @@ export function ExposureSection(props: ExposureSectionProps): JSX.Element {
   const connectPort = props.connectPort ?? defaultConnectPort;
   const now = props.now ?? Date.now;
   const [settings, setSettings] = useState<Settings | null | 'unavailable'>(null);
-  const [snipes, setSnipes] = useState<Snipe[]>([]);
+  // 'unavailable': snipe.list failed, so the exposure is unknown (never shown as $0).
+  const [snipes, setSnipes] = useState<Snipe[] | 'unavailable'>([]);
   const [confirming, setConfirming] = useState(false);
   const [confirmText, setConfirmText] = useState('');
   const [error, setError] = useState('');
@@ -66,7 +67,7 @@ export function ExposureSection(props: ExposureSectionProps): JSX.Element {
       messaging.send('snipe.list', undefined),
     ]);
     setSettings(s.status === 'fulfilled' ? s.value : 'unavailable');
-    setSnipes(list.status === 'fulfilled' ? list.value : []);
+    setSnipes(list.status === 'fulfilled' ? list.value : 'unavailable');
   }, [messaging]);
 
   useEffect(() => {
@@ -88,14 +89,20 @@ export function ExposureSection(props: ExposureSectionProps): JSX.Element {
     );
   }
   const s = settings;
-  const soak = soakSummary(snipes);
-  const meter = measureExposure(snipes, now(), s.locale.timeZone);
-  const detail = [
-    `${String(meter.open.count)} armed`,
-    meter.spentToday > 0 ? `${formatMoney(meter.spentToday)} spent or unconfirmed today` : '',
-  ]
-    .filter((t) => t !== '')
-    .join(' · ');
+  // Without the snipes the soak has no fires (rate 0), so going live asks for
+  // the typed confirmation: the safe side.
+  const soak = soakSummary(snipes === 'unavailable' ? [] : snipes);
+  const meter = snipes === 'unavailable' ? null : measureExposure(snipes, now(), s.locale.timeZone);
+  const detail =
+    meter === null
+      ? ''
+      : [
+          `${String(meter.open.count)} armed`,
+          meter.open.shippingUnknown ? 'some shipping is unknown and counts as zero' : '',
+          meter.spentToday > 0 ? `${formatMoney(meter.spentToday)} spent or unconfirmed today` : '',
+        ]
+          .filter((t) => t !== '')
+          .join(' · ');
   const left = Math.max(0, s.snipe.requiredDryRuns - s.snipe.completedDryRuns);
   const needsTyped = soak.onTimeRate < ON_TIME_RATE_MIN;
 
@@ -179,7 +186,11 @@ export function ExposureSection(props: ExposureSectionProps): JSX.Element {
 
   return (
     <section class="exposure" aria-label="Live bidding" data-testid="exposure-section">
-      <ExposureMeter used={meter.used} cap={s.snipe.caps.perDayMax} detail={detail === '' ? undefined : detail} />
+      {meter === null ? (
+        <p class="muted">Exposure is unavailable right now: the snipes could not be read.</p>
+      ) : (
+        <ExposureMeter used={meter.used} cap={s.snipe.caps.perDayMax} detail={detail === '' ? undefined : detail} />
+      )}
 
       <p class="exposure-state">
         <span class={s.dryRun.bidding ? 'badge dry' : 'badge live'} data-testid="bidding-state" data-state={s.dryRun.bidding ? 'dry' : 'live'}>

@@ -15,6 +15,8 @@ import {
   GO_LIVE_CONFIRMATION,
   LIVE_GATE_PORT,
 } from '../../src/background/handlers/live-gate';
+import { formatMoney } from '../../src/domain/money';
+import { exposure, spentToday } from '../../src/domain/snipe/caps';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
 
 const NOW = Date.UTC(2026, 9, 10, 15, 0, 0);
@@ -257,5 +259,78 @@ describe('dashboard exposure section', () => {
     const m = new FakeMessaging();
     render(h(DashboardExposureSection, { client: m, userTz: 'America/New_York', openOptions: () => undefined }));
     expect(await screen.findByText(/live bidding is unavailable/i)).toBeTruthy();
+  });
+});
+
+/** A live armed snipe: open exposure (the dry-run soak ignores it). */
+const armedLive = (id: string, maxBid: number, estShipping?: number): Snipe => ({
+  ...fired(id),
+  dryRun: false,
+  state: 'armed',
+  maxBid,
+  ...(estShipping === undefined ? {} : { estShipping }),
+});
+
+describe("review fixes (Opus): the meter is the caps module's number, and unknown is not zero", () => {
+  const LIVE_ARMED = [...AT_100, armedLive('x', 3000, 500), armedLive('y', 2000)];
+
+  function popupWith(snipeList: () => Snipe[]) {
+    const m = new FakeMessaging();
+    m.handle('settings.get', () => structuredClone(settingsWith(5, 5)));
+    m.handle('snipe.list', snipeList);
+    render(h(PopupExposureSection, { messaging: m, connectPort: fakeConnectPort().connectPort, now: () => NOW }));
+  }
+
+  function dashboardWith(snipeList: () => Snipe[]) {
+    const m = new FakeMessaging();
+    m.handle('settings.get', () => structuredClone(settingsWith(5, 5)));
+    m.handle('snipe.list', snipeList);
+    render(h(DashboardExposureSection, { client: m, userTz: 'America/New_York', openOptions: () => undefined }));
+  }
+
+  const expectCapsNumber = async (): Promise<void> => {
+    const want = exposure(LIVE_ARMED).total + spentToday(LIVE_ARMED, NOW, defaultSettings().locale.timeZone);
+    const bar = await screen.findByRole('progressbar', { name: 'Exposure against the daily cap' });
+    expect(bar.getAttribute('aria-valuenow')).toBe(String(want));
+    expect(screen.getByText(`Exposure ${formatMoney(want)} of`, { exact: false })).toBeTruthy();
+  };
+
+  it('popup: the meter shows open exposure plus spent today exactly as the caps module counts it', async () => {
+    popupWith(() => structuredClone(LIVE_ARMED));
+    await expectCapsNumber();
+  });
+
+  it('dashboard: the meter shows open exposure plus spent today exactly as the caps module counts it', async () => {
+    dashboardWith(() => structuredClone(LIVE_ARMED));
+    await expectCapsNumber();
+  });
+
+  it('popup: says when some shipping is unknown and counts as zero, like the Snipes section', async () => {
+    popupWith(() => structuredClone(LIVE_ARMED));
+    expect(await screen.findByText(/some shipping is unknown and counts as zero/i)).toBeTruthy();
+  });
+
+  it('dashboard: says when some shipping is unknown and counts as zero, like the Snipes section', async () => {
+    dashboardWith(() => structuredClone(LIVE_ARMED));
+    expect(await screen.findByText(/some shipping is unknown and counts as zero/i)).toBeTruthy();
+  });
+
+  it('popup: no $0 meter when the snipes could not be read: the exposure is unknown, not zero', async () => {
+    popupWith(() => {
+      throw new Error('storage failed');
+    });
+    expect(await screen.findByText(/exposure is unavailable right now/i)).toBeTruthy();
+    expect(screen.queryByRole('progressbar', { name: 'Exposure against the daily cap' })).toBeNull();
+  });
+
+  it('dashboard: no $0 meter when the snipes could not be read: the exposure is unknown, not zero', async () => {
+    dashboardWith(() => {
+      throw new Error('storage failed');
+    });
+    await screen.findByTestId('exposure-section');
+    await waitFor(() => {
+      expect(screen.queryByText(/could not load/i) ?? screen.queryByText(/snipes/i)).toBeTruthy();
+    });
+    expect(screen.queryByRole('progressbar', { name: 'Exposure against the daily cap' })).toBeNull();
   });
 });

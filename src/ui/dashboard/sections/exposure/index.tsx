@@ -30,20 +30,27 @@ export function ExposureSection(props: SectionProps): VNode {
   const s = settings.value;
   const list = snipes.kind === 'ok' ? snipes.value : [];
   const soak = soakSummary(list);
-  const meter = measureExposure(list, Date.now(), s.locale.timeZone);
-  const detail = [
-    `${String(meter.open.count)} armed`,
-    meter.spentToday > 0 ? `${formatMoney(meter.spentToday)} spent or unconfirmed today` : '',
-  ]
-    .filter((t) => t !== '')
-    .join(' · ');
+  // Until the snipes are read the exposure is unknown: no meter, never a $0 one.
+  const meter = snipes.kind === 'ok' ? measureExposure(list, Date.now(), s.locale.timeZone) : null;
+  const detail =
+    meter === null
+      ? ''
+      : [
+          `${String(meter.open.count)} armed`,
+          meter.open.shippingUnknown ? 'some shipping is unknown and counts as zero' : '',
+          meter.spentToday > 0 ? `${formatMoney(meter.spentToday)} spent or unconfirmed today` : '',
+        ]
+          .filter((t) => t !== '')
+          .join(' · ');
   const left = Math.max(0, s.snipe.requiredDryRuns - s.snipe.completedDryRuns);
 
   return (
     <div data-testid="exposure-section">
       {snipes.kind !== 'ok' ? <LoadNotice state={snipes} what="snipes" /> : null}
 
-      <ExposureMeter used={meter.used} cap={s.snipe.caps.perDayMax} detail={detail === '' ? undefined : detail} />
+      {meter === null ? null : (
+        <ExposureMeter used={meter.used} cap={s.snipe.caps.perDayMax} detail={detail === '' ? undefined : detail} />
+      )}
 
       <p>
         <span class="sbw-tag" data-testid="bidding-state" data-state={s.dryRun.bidding ? 'dry' : 'live'}>
