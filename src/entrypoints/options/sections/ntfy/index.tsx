@@ -4,6 +4,7 @@
 // straight from the click handler (I-21) through the Permissions port — there
 // is no background handler for it. One-line third-party privacy note (R4), the
 // Firefox `technicalAndInteraction` note (R9), and v1 supports only ntfy.sh.
+import { onSettingsSaved } from '../../settings-events';
 import type { VNode } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 
@@ -77,6 +78,17 @@ export function NtfySection(props: NtfySectionProps): VNode {
       },
     );
     let cancelled = false;
+    // T-70c: the calendar toggle elsewhere on the page changes what this section says.
+    const offSettings = onSettingsSaved(() => {
+      client.send('settings.get', undefined).then(
+        (s) => {
+          if (!cancelled) setSettings(s);
+        },
+        () => {
+          /* keep the settings already shown */
+        },
+      );
+    });
     api
       .contains({ origins: [NTFY_ORIGIN] })
       .then((ok) => {
@@ -87,6 +99,7 @@ export function NtfySection(props: NtfySectionProps): VNode {
       });
     return () => {
       cancelled = true;
+      offSettings();
     };
   }, [client, api]);
 

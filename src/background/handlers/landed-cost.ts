@@ -111,22 +111,28 @@ export interface CachedQuote {
   handling: Cents;
 }
 
-/** A fresh cache entry for the item and ZIP hash, or undefined (absent, other ZIP, expired). */
+/**
+ * A fresh cache entry for the item and ZIP hash: the quote, `null` when SGW
+ * answered "no quote" (T-57b negative cache), or undefined (absent, other ZIP,
+ * expired).
+ */
 export async function readCachedQuote(
   repo: Repo,
   itemId: ItemId,
   zipHash: string,
   now: EpochMs,
-): Promise<CachedQuote | undefined> {
+): Promise<CachedQuote | null | undefined> {
   const cache = await repo.get(STORAGE_KEYS.quoteCache);
   const entry = cache[itemId];
   if (entry === undefined || entry['zip-hash'] !== zipHash) return undefined;
   if (now < entry.fetchedAt || now - entry.fetchedAt >= QUOTE_CACHE_TTL_MS) return undefined;
+  if (entry.none === true) return null;
   return { shipping: entry.shipping, handling: entry.handling };
 }
 
 /**
- * Stores the quote under the ZIP hash. Drops expired entries, then evicts the
+ * Stores the quote under the ZIP hash; `null` stores SGW's "no quote" answer
+ * (never a failed request: callers write only what SGW answered). Drops expired entries, then evicts the
  * oldest beyond QUOTE_CACHE_MAX_ENTRIES; the entry just written is never
  * evicted. An invalid stored record already read as empty (Repo default).
  */
@@ -134,7 +140,7 @@ export async function writeCachedQuote(
   repo: Repo,
   itemId: ItemId,
   zipHash: string,
-  quote: CachedQuote,
+  quote: CachedQuote | null,
   now: EpochMs,
 ): Promise<void> {
   await repo.update(STORAGE_KEYS.quoteCache, (cache) => {
@@ -146,7 +152,10 @@ export async function writeCachedQuote(
     fresh.sort((a, b) => a[1].fetchedAt - b[1].fetchedAt);
     const kept: Record<ItemId, QuoteCacheEntry> = {};
     for (const [id, entry] of fresh.slice(-(QUOTE_CACHE_MAX_ENTRIES - 1))) kept[id] = entry;
-    kept[itemId] = { shipping: quote.shipping, handling: quote.handling, 'zip-hash': zipHash, fetchedAt: now };
+    kept[itemId] =
+      quote === null
+        ? { shipping: 0, handling: 0, none: true, 'zip-hash': zipHash, fetchedAt: now }
+        : { shipping: quote.shipping, handling: quote.handling, 'zip-hash': zipHash, fetchedAt: now };
     return kept;
   });
 }
@@ -282,7 +291,7 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
         }
         const cached = await readCachedQuote(repo, id, zipHash, now);
         if (cached !== undefined) {
-          reply[id] = { ...cached, pickup: false };
+          reply[id] = cached === null ? null : { ...cached, pickup: false };
           continue;
         }
         needed.push(id);
@@ -308,8 +317,10 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
             continue;
           }
           let quote: CachedQuote | null;
+          let answered = false;
           try {
             quote = await api.shippingQuote(id, g.zip, QUOTE_LANE);
+            answered = true;
           } catch (e) {
             // A refusal from the scheduler (paused/budget) or a failure must not
             // take the other badges down: the item reads as "no quote". A
@@ -326,6 +337,13 @@ export function createLandedCostHandlers(deps: LandedCostDeps): LandedCostHandle
           }
           if (quote === null) {
             reply[id] = null;
+            if (answered) {
+              try {
+                await writeCachedQuote(repo, id, zipHash, null, now);
+              } catch {
+                // A failed cache write only means the item is asked again next time.
+              }
+            }
             continue;
           }
           reply[id] = { ...quote, pickup: false };

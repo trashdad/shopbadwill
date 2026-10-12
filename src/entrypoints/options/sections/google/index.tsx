@@ -1,4 +1,5 @@
 import type { VNode } from 'preact';
+import { announceSettingsSaved } from '../../settings-events';
 import { useEffect, useRef, useState } from 'preact/hooks';
 
 import type { AuthStatus } from '../../../../domain/calendar/types';
@@ -151,16 +152,36 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
     }
   };
 
+  /**
+   * T-70c: settings.set replaces the whole calendar group, so calendar writes
+   * run one at a time, each on a fresh settings.get: a reminders save made
+   * while the toggle's save is in flight keeps both changes. Each successful
+   * save is announced so the other sections re-read settings.
+   */
+  const calendarChain = useRef<Promise<unknown>>(Promise.resolve());
+  const writeCalendar = (
+    change: (cal: Settings['calendar']) => Settings['calendar'],
+  ): Promise<{ base: Settings; next: Settings['calendar'] }> => {
+    const run = calendarChain.current.then(async () => {
+      const base = await client.send('settings.get', undefined);
+      const next = change(base.calendar);
+      await client.send('settings.set', { calendar: next });
+      announceSettingsSaved();
+      return { base, next };
+    });
+    calendarChain.current = run.catch(() => undefined);
+    return run;
+  };
+
   const saveCalendar = (patch: Partial<Settings['calendar']>, what: string): void => {
     if (settings === null) {
       setModeMsg({ message: `Could not save ${what}: your settings have not loaded.`, tone: 'error' });
       return;
     }
     // Only the dedicated calendar works with the narrow scope (T-62), so never store another mode.
-    const next = { ...settings.calendar, ...patch, mode: 'dedicated' as const };
-    client.send('settings.set', { calendar: next }).then(
-      () => {
-        setSettings({ ...settings, calendar: next });
+    writeCalendar((cal) => ({ ...cal, ...patch, mode: 'dedicated' as const })).then(
+      ({ base, next }) => {
+        setSettings({ ...base, calendar: next });
         setModeMsg({ message: `Saved: ${what}.`, tone: 'ok' });
       },
       (e: unknown) => {
@@ -195,10 +216,8 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
       return;
     }
     const gen = ++calendarWrite.current;
-    const base = settings;
-    const next = { ...base.calendar, enabled: on };
-    client.send('settings.set', { calendar: next }).then(
-      () => {
+    writeCalendar((cal) => ({ ...cal, enabled: on })).then(
+      ({ base, next }) => {
         if (gen !== calendarWrite.current) return;
         setSettings({ ...base, calendar: next });
         afterSaved?.();

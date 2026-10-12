@@ -1687,3 +1687,12 @@ Each is recorded with its reason in `docs/CONTRACT-DECISIONS.md`; the code is au
 | §3.3 fail-closed rule: calendar writes are not gated by the SGW session (still by SGW health, kill, dryRun.calendar); sticky schema failures block only the feature(s) their endpoint maps to | T-36, T-30b | Google writes don't depend on SGW login; a broken favorites endpoint must not stop snipes |
 | Messages `health.clearSticky {endpoint}` (ui only, audited) and `health.get` reply `sticky?` list | T-30b | write-endpoint sticky failures can't self-clear; the user resumes after checking |
 | `SgwDom` no longer marks `data-sbw-seen` (port comment stale) | T-27 | nothing read it; leave no site-DOM residue |
+| Message `rules.disable` (content+ui senders; audited undo `disableRule`, ref = rule id) | T-32 | "Disable rule" from the Why? dialog |
+| Optional storage `sbw:snipeRunner` (outbox + per-snipe bookkeeping; invalid → empty outbox, never a replay) | T-84 | the runner record must be atomic with `sbw:snipes` |
+| Snipe events `post-read-failed` and `not-sent`; `Snipe.attempt.notSent?` | T-80b | a sent snipe must always exit; a provably unsent bid is "No bid was sent" |
+| Invariant: at most 2 PlaceBid wire sends per snipe with T-101's strategy (2nd only after `BidNotSentError` or a no-change proof read with ≥ 2 s left; same max, same key); ≤ 1 with the default strategy | T-101 | the single proven-safe retry |
+| Optional storage `sbw:ntfy` (scheduled push seqs per item) | T-69 | cancel/update of phone pushes across restarts |
+| `landedCost.get` reply value `{ shipping, handling, pickup } \| null` (was `Cents \| null`); optional storage `sbw:quoteCache` (24 h; HMAC'd ZIP; `none: true` = SGW answered no quote) and `sbw:quoteSalt` | T-57, T-57b | pickup flag; ZIP privacy; no re-asking for no-quote items |
+| Message `timing.awake` (ui; read-only `sbw:awake` history); optional storage `sbw:dryRunCounted`; `settings.set` keeps the stored `completedDryRuns` | T-90 | the awake chart; dry runs counted once and never rolled back by a page |
+| Live gate on `settings.set`: `dryRun.bidding` off needs `completedDryRuns ≥ requiredDryRuns` (and a typed, audited override below 95 % on-time); `requiredDryRuns` never decreases | T-102 | going live is a deliberate, gated act |
+| Job step kind `postEnd`; calendar stamp label `ENDED EARLY` | T-103 | post-end outcome detection |

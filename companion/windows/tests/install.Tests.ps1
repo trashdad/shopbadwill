@@ -271,7 +271,7 @@ Describe 'companion install and uninstall' {
   }
 
   Context 'uninstall task-name allowlist' {
-    It 'only returns ShopBadwill-<snipeId> names from the state file' {
+    It 'only returns ShopBadwill-{snipeId} names from the state file' {
       $tmp = New-TestTempDir
       $statePath = Join-Path $tmp 'state.json'
       @{ version = 1; tasks = @(

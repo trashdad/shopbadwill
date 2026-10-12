@@ -229,6 +229,17 @@ describe('settings', () => {
     expect((screen.getByRole<HTMLInputElement>('switch', { name: 'Dry run: bidding' })).checked).toBe(false);
   });
 
+  it('the bidding dry-run switch states the live-bidding stakes before it can go live (T-102 R5)', async () => {
+    settingsApp();
+    const toggle = await screen.findByRole('switch', { name: 'Dry run: bidding' });
+    const hint = document.getElementById(toggle.getAttribute('aria-describedby') ?? '')?.textContent ?? '';
+    expect(hint).toContain('real money');
+    expect(hint).toContain('$50.00 for one item');
+    expect(hint).toContain('$100.00 per day');
+    expect(hint).toContain("ShopGoodwill's terms may forbid automated bidding");
+    expect(hint).toContain('popup');
+  });
+
   it('puts a toggle back and says so when the save fails', async () => {
     const fake = new FakeMessaging();
     fake.handle('settings.get', () => defaultSettings());

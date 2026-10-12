@@ -50,6 +50,18 @@ $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot\host\protocol.ps1"   # Test-SbwProfileValue (R2 rules)
 
+
+# -WhatIf without $PSCmdlet: a function called after the script was dot-sourced
+# (Pester 5) has no cmdlet to ask, but the script's [CmdletBinding()] still sets
+# $WhatIfPreference for -WhatIf. Returns $true when the change should be made.
+function Test-SbwShouldProcess([string]$Target, [string]$Action) {
+  if ($WhatIfPreference) {
+    Write-Host "What if: $Action ($Target)"
+    return $false
+  }
+  return $true
+}
+
 function Get-SbwHostName { 'com.shopbadwill.companion' }
 
 function Test-SbwChromeExtensionId {
@@ -306,45 +318,45 @@ function Invoke-SbwInstall {
   if ($FirefoxProfile) { Write-Host "  firefox:   $firefoxExePath (profile '$FirefoxProfile')" }
   Write-Host ''
 
-  if ($PSCmdlet.ShouldProcess($dataDir, 'create companion data directory')) {
+  if ((Test-SbwShouldProcess $dataDir 'create companion data directory')) {
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
   }
 
-  if ($PSCmdlet.ShouldProcess($configPath, 'write companion config')) {
+  if ((Test-SbwShouldProcess $configPath 'write companion config')) {
     $configJson = $config | ConvertTo-Json -Depth 8
     [IO.File]::WriteAllText($configPath, $configJson, (New-Object Text.UTF8Encoding($false)))
   }
 
-  if ($PSCmdlet.ShouldProcess($hostDir, 'copy the host scripts (the browser runs this private copy)')) {
+  if ((Test-SbwShouldProcess $hostDir 'copy the host scripts (the browser runs this private copy)')) {
     New-Item -ItemType Directory -Path $hostDir -Force | Out-Null
     foreach ($n in @(Get-SbwHostFileNames)) {
       Copy-Item -LiteralPath (Join-Path $sourceDir "host\$n") -Destination (Join-Path $hostDir $n) -Force
     }
   }
 
-  if ($PSCmdlet.ShouldProcess($launcherPath, 'write the host launcher')) {
+  if ((Test-SbwShouldProcess $launcherPath 'write the host launcher')) {
     [IO.File]::WriteAllText($launcherPath, (Get-SbwLauncherContent), [Text.Encoding]::ASCII)
   }
 
   if ($ChromeProfile) {
-    if ($PSCmdlet.ShouldProcess($chromeManifestPath, 'write the Chrome host manifest')) {
+    if ((Test-SbwShouldProcess $chromeManifestPath 'write the Chrome host manifest')) {
       $manifest = Get-SbwChromeManifest -ExtensionId $ChromeExtensionId -LauncherPath $launcherPath
       [IO.File]::WriteAllText($chromeManifestPath, ($manifest | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
     }
     $regKey = Get-SbwChromeRegKey
-    if ($PSCmdlet.ShouldProcess("$regKey\$hostName", 'register the Chrome native-messaging host (HKCU)')) {
+    if ((Test-SbwShouldProcess "$regKey\$hostName" 'register the Chrome native-messaging host (HKCU)')) {
       $code = Invoke-SbwReg -ArgList (Get-SbwRegAddArgs -Key $regKey -ValueName $hostName -ManifestPath $chromeManifestPath)
       if ($code -ne 0) { throw "reg add failed for $regKey\$hostName" }
     }
   }
 
   if ($FirefoxProfile) {
-    if ($PSCmdlet.ShouldProcess($firefoxManifestPath, 'write the Firefox host manifest')) {
+    if ((Test-SbwShouldProcess $firefoxManifestPath 'write the Firefox host manifest')) {
       $manifest = Get-SbwFirefoxManifest -ExtensionId $FirefoxExtensionId -LauncherPath $launcherPath
       [IO.File]::WriteAllText($firefoxManifestPath, ($manifest | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
     }
     $regKey = Get-SbwFirefoxRegKey
-    if ($PSCmdlet.ShouldProcess("$regKey\$hostName", 'register the Firefox native-messaging host (HKCU)')) {
+    if ((Test-SbwShouldProcess "$regKey\$hostName" 'register the Firefox native-messaging host (HKCU)')) {
       $code = Invoke-SbwReg -ArgList (Get-SbwRegAddArgs -Key $regKey -ValueName $hostName -ManifestPath $firefoxManifestPath)
       if ($code -ne 0) { throw "reg add failed for $regKey\$hostName" }
     }

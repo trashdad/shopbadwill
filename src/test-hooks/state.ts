@@ -2,6 +2,7 @@
 // so an E2E test can check from outside that the background ran (for example
 // that `reconcile()` re-created the `sbw:tick` alarm). Test builds only; see
 // ./index.ts for how hooks are loaded and called.
+import { listTestAlarms } from '../adapters/browser/alarms';
 import type { TestHookAlarm, TestHookContext } from './index';
 
 export const STATE_HOOK = 'sbw:test:state';
@@ -24,6 +25,7 @@ export function install(ctx: TestHookContext): void {
       storage.session.get(null),
       alarms.getAll(),
     ]);
-    return { installedAt, hooks: ctx.hooks, storage: { local, session }, alarms: allAlarms };
+    // T-59: a test build keeps its alarms in the adapter's fake registry, not the browser's.
+    return { installedAt, hooks: ctx.hooks, storage: { local, session }, alarms: [...allAlarms, ...listTestAlarms()] };
   });
 }

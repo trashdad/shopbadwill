@@ -520,3 +520,42 @@ describe('T-80b: a sent snipe judged with no read at all', () => {
     expect(classifyOutcome(snipe(), null, detail({ currentPrice: 1500 })).notify.message).toContain('re-reading the item');
   });
 });
+
+describe('T-87d: a bid that provably never registered is never "Lost: outbid"', () => {
+  // A registered max above the price would lead, so "not the high bidder at a price below your max"
+  // at the close proves the bid never landed (the reply was lost or unrecognised).
+  it('lost reply + closed read, not high, price below max → "Not won: … does not appear to have registered", no spend outcome, stamped lost', () => {
+    const r = classifyOutcome(snipe(), null, detail({ currentPrice: 1500, isHighBidder: false }));
+    expect(r.outcome).toBe('outbid'); // never counts toward spend
+    expect(r.notify.title).toMatch(/^Not won:/);
+    expect(r.notify.message).toMatch(/^Not won: your bid does not appear to have registered/);
+    expect(r.notify.message).not.toMatch(/no bid was placed|not bid|no bid (was )?sent/i); // T-80 I2
+    expect(r.notify.message).toContain('$15.00');
+    expect(r.notify.message).toContain('$20.00');
+    expect(r.notify.message).not.toMatch(/Lost: outbid|short by/);
+    expect(r.stamp?.outcome).toBe('lost');
+  });
+
+  it('the same read while the auction is still open is Unconfirmed, not "Currently outbid"', () => {
+    const open = detail({ isClosed: false, serverTime: new Date(END_MS - 2000).toISOString(), currentPrice: 1500, isHighBidder: false });
+    const r = classifyOutcome(snipe(), null, open);
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).not.toMatch(/outbid/i);
+  });
+
+  it('an accepted reply contradicted by the read is Unconfirmed, never "did not register"', () => {
+    const r = classifyOutcome(snipe(), bid('accepted', { isHighBidder: true }), detail({ currentPrice: 1500, isHighBidder: false }));
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).not.toMatch(/appear to have registered/);
+  });
+
+  it('a tie at the max (not high, price == max) is still a real loss', () => {
+    const r = classifyOutcome(snipe(), null, detail({ currentPrice: 2000, isHighBidder: false }));
+    expect(r.notify.message).toMatch(/^Lost: outbid/);
+  });
+
+  it('SGW reporting outbid stays outbid', () => {
+    const r = classifyOutcome(snipe(), bid('outbid'), detail({ currentPrice: 1500, isHighBidder: false }));
+    expect(r.notify.title).toMatch(/^Lost:/);
+  });
+});

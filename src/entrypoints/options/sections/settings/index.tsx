@@ -1,6 +1,7 @@
 import type { VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
+import { formatMoney } from '../../../../domain/money';
 import type { Settings } from '../../../../domain/settings/schema';
 import { Card, Field } from '../../../../ui/components/Field';
 import { describeError } from '../../../../ui/components/describeError';
@@ -221,6 +222,11 @@ export function SettingsSection(props: SectionProps): VNode {
         <Switch
           id="set-dry-bid"
           label="Dry run: bidding"
+          hint={
+            `Off means live bids with real money: at most ${formatMoney(s.snipe.caps.perItemMax)} for one item and ` +
+            `${formatMoney(s.snipe.caps.perDayMax)} per day. ShopGoodwill's terms may forbid automated bidding. ` +
+            `Live bidding unlocks after the required dry runs; if they fired on time less than 95% of the time, go live from the popup.`
+          }
           checked={s.dryRun.bidding}
           onChange={(bidding) => {
             save({ dryRun: { ...s.dryRun, bidding } }, 'bidding dry run');

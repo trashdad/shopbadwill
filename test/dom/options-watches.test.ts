@@ -1,4 +1,5 @@
 // T-55: the Watches options section, driven through FakeMessaging.
+import { announceSettingsSaved } from '../../src/entrypoints/options/settings-events';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -7,6 +8,7 @@ import { browser } from 'wxt/browser';
 import type { AuthStatus } from '../../src/domain/calendar/types';
 import type { Rule } from '../../src/domain/rules/schema';
 import { defaultSettings } from '../../src/domain/settings/defaults';
+import type { Settings } from '../../src/domain/settings/schema';
 import { WatchSchema, type Watch } from '../../src/domain/watches/schema';
 import { loadSections } from '../../src/entrypoints/options/registry';
 import { activeTabUrl, section, WatchesSection } from '../../src/entrypoints/options/sections/watches';
@@ -54,7 +56,7 @@ function app(opts: Opts = {}) {
   const fake = new FakeMessaging();
   const store: Watch[] = [...(opts.watches ?? [])];
   const rules = [...(opts.rules ?? [])];
-  const settings = defaultSettings();
+  let settings = defaultSettings();
   settings.calendar.enabled = opts.calendarEnabled ?? true;
   if (opts.dryRunFavorites !== undefined) settings.dryRun.favorites = opts.dryRunFavorites;
   fake.handle('settings.get', () => {
@@ -94,7 +96,11 @@ function app(opts: Opts = {}) {
       getActiveTabUrl: () => Promise.resolve('tab' in opts ? opts.tab : TAB),
     }),
   );
-  return { fake, store, rules };
+  /** Replaces what settings.get answers (a fresh object, as real messaging delivers). */
+  const replySettings = (next: Settings): void => {
+    settings = next;
+  };
+  return { fake, store, rules, replySettings };
 }
 
 const click = (name: string | RegExp): void => {
@@ -574,5 +580,21 @@ describe('rules section: deleting a rule that watches use', () => {
     expect(status.textContent).toContain(
       'Deleted "Pyrex", but could not update these watches: Lamp. Open them to remove the missing rule.',
     );
+  });
+});
+
+describe('T-70c: live settings', () => {
+  it('the calendar hint follows a calendar toggle saved elsewhere on the page, with no reload', async () => {
+    const { replySettings } = app({ calendarEnabled: false });
+    await openForm();
+    await screen.findByText(/Turn them on in the Google Calendar section/);
+    const on = defaultSettings();
+    on.calendar.enabled = true;
+    replySettings(on);
+    announceSettingsSaved();
+    await waitFor(() => {
+      expect(screen.getByLabelText<HTMLInputElement>('Add matches to my calendar').disabled).toBe(false);
+    });
+    expect(screen.queryByText(/Turn them on in the Google Calendar section/)).toBeNull();
   });
 });

@@ -1,5 +1,6 @@
 // T-69: the ntfy options section. The origin permission is requested from the
 // click handler itself (R9); FakePermissions stands in for the browser.
+import { announceSettingsSaved } from '../../src/entrypoints/options/settings-events';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -106,7 +107,7 @@ function app(opts: {
   const fake = new FakeMessaging();
   const saved: unknown[] = [];
   const order = opts.order ?? [];
-  const s = structuredClone(opts.settings ?? defaultSettings());
+  let s = structuredClone(opts.settings ?? defaultSettings());
   fake.handle('settings.get', () => s);
   fake.handle('settings.set', (p) => {
     order.push('save');
@@ -127,7 +128,11 @@ function app(opts: {
       ...(opts.clipboard === undefined ? {} : { clipboard: opts.clipboard }),
     }),
   );
-  return { fake, saved, order };
+  /** Replaces what settings.get answers (a fresh object, as real messaging delivers). */
+  const replySettings = (next: Settings): void => {
+    s = next;
+  };
+  return { fake, saved, order, replySettings };
 }
 
 /** Phone push on, with calendar events on (the sink is fed by calendar sync). */
@@ -459,5 +464,18 @@ describe('NtfySection', () => {
     expect(offOrder.filter((x) => x.startsWith('DELETE'))).toHaveLength(0);
     expect(offOrder).toContain('clear');
     expect(offOrder.at(-1)).toBe('save');
+  });
+});
+
+describe('T-70c: live settings', () => {
+  it('the calendar-off note clears when calendar events are turned on elsewhere on the page', async () => {
+    const off = defaultSettings();
+    const { replySettings } = app({ settings: { ...off, calendar: { ...off.calendar, enabled: false }, ntfy: { enabled: true, server: NTFY_SERVER, topic: TOPIC } } });
+    await screen.findByText(/calendar events are off/i);
+    replySettings({ ...off, calendar: { ...off.calendar, enabled: true }, ntfy: { enabled: true, server: NTFY_SERVER, topic: TOPIC } });
+    announceSettingsSaved();
+    await waitFor(() => {
+      expect(screen.queryByText(/calendar events are off/i)).toBeNull();
+    });
   });
 });

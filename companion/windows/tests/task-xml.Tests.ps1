@@ -69,7 +69,7 @@ Describe 'companion task XML' {
   }
 
   Context 'Get-SbwTaskName' {
-    It 'builds names that are always ShopBadwill-<snipeId>' {
+    It 'builds names that are always ShopBadwill-{snipeId}' {
       Assert-Equal (Get-SbwTaskName -SnipeId 'abc-123') 'ShopBadwill-abc-123'
       Assert-Equal (Get-SbwTaskName -SnipeId 'x_y-Z9') 'ShopBadwill-x_y-Z9'
       Assert-Match (Get-SbwTaskName -SnipeId 'abc-123') '^ShopBadwill-[A-Za-z0-9_-]{1,64}$'
@@ -210,13 +210,13 @@ Describe 'companion task XML' {
   }
 
   Context 'schtasks argument arrays' {
-    It 'schedule: /Create /TN <prefixed name> /XML <file> /F' {
+    It 'schedule: /Create /TN {prefixed name} /XML {file} /F' {
       Assert-ArrayEqual (Get-SbwScheduleArgs -TaskName 'ShopBadwill-x' -XmlPath 'C:\d\x.xml') @('/Create', '/TN', 'ShopBadwill-x', '/XML', 'C:\d\x.xml', '/F')
     }
-    It 'cancel: /Delete /TN <prefixed name> /F' {
+    It 'cancel: /Delete /TN {prefixed name} /F' {
       Assert-ArrayEqual (Get-SbwCancelArgs -TaskName 'ShopBadwill-x') @('/Delete', '/TN', 'ShopBadwill-x', '/F')
     }
-    It 'query: /Query /TN <prefixed name> /FO CSV /NH' {
+    It 'query: /Query /TN {prefixed name} /FO CSV /NH' {
       Assert-ArrayEqual (Get-SbwQueryArgs -TaskName 'ShopBadwill-x') @('/Query', '/TN', 'ShopBadwill-x', '/FO', 'CSV', '/NH')
     }
   }

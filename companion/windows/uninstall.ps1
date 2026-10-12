@@ -26,6 +26,18 @@ $script:SbwUninstallDataDir = $DataDir
 . "$PSScriptRoot\host\protocol.ps1"    # task-name allowlist regex
 . "$PSScriptRoot\host\task-xml.ps1"    # Get-SbwCancelArgs
 
+
+# -WhatIf without $PSCmdlet: a function called after the script was dot-sourced
+# (Pester 5) has no cmdlet to ask, but the script's [CmdletBinding()] still sets
+# $WhatIfPreference for -WhatIf. Returns $true when the change should be made.
+function Test-SbwShouldProcess([string]$Target, [string]$Action) {
+  if ($WhatIfPreference) {
+    Write-Host "What if: $Action ($Target)"
+    return $false
+  }
+  return $true
+}
+
 function Get-SbwUninstallDataDir {
   Get-SbwDataDir -Explicit $script:SbwUninstallDataDir
 }
@@ -109,7 +121,7 @@ function Remove-SbwEmptyDir {
   param([string]$Path, [string]$What)
   if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return }
   if (@(Get-ChildItem -LiteralPath $Path -Force).Count -gt 0) { return }
-  if ($PSCmdlet.ShouldProcess($Path, $What)) { Remove-Item -LiteralPath $Path -Force }
+  if ((Test-SbwShouldProcess $Path $What)) { Remove-Item -LiteralPath $Path -Force }
 }
 
 function Invoke-SbwUninstall {
@@ -133,7 +145,7 @@ function Invoke-SbwUninstall {
   $stateNames = @(Get-SbwStateTaskNames -StatePath $statePath)
   foreach ($taskName in @(Get-SbwTaskNamesToRemove -StateNames $stateNames -QueryCsv $queryCsv)) {
     if ($taskName -cnotmatch $SbwTaskNameRegex) { continue }
-    if ($PSCmdlet.ShouldProcess($taskName, 'delete the companion scheduled task')) {
+    if ((Test-SbwShouldProcess $taskName 'delete the companion scheduled task')) {
       $run = Invoke-SbwSchtasks -SchTasksPath $schtasksPath -ArgList (Get-SbwCancelArgs -TaskName $taskName)
       if ($run.ExitCode -ne 0) { Write-Host "  warning: could not delete $taskName" }
     }
@@ -141,7 +153,7 @@ function Invoke-SbwUninstall {
 
   foreach ($regKey in @((Get-SbwChromeRegKey), (Get-SbwFirefoxRegKey))) {
     if ($regKey -notlike 'HKCU\*') { throw "Refusing to touch a non-HKCU registry key: $regKey" }
-    if ($PSCmdlet.ShouldProcess("$regKey\$hostName", 'unregister the native-messaging host')) {
+    if ((Test-SbwShouldProcess "$regKey\$hostName" 'unregister the native-messaging host')) {
       $code = Invoke-SbwReg -ArgList (Get-SbwRegDeleteArgs -Key $regKey -ValueName $hostName)
       if ($code -ne 0) { Write-Host "  warning: could not remove $regKey\$hostName (already absent?)" }
     }
@@ -150,21 +162,21 @@ function Invoke-SbwUninstall {
   foreach ($file in @('config.json', 'state.json', 'chrome-manifest.json', 'firefox-manifest.json', 'shopbadwill-host.cmd')) {
     $p = Join-Path $dataDir $file
     if (Test-Path -LiteralPath $p) {
-      if ($PSCmdlet.ShouldProcess($p, 'delete companion data file')) { Remove-Item -LiteralPath $p -Force }
+      if ((Test-SbwShouldProcess $p 'delete companion data file')) { Remove-Item -LiteralPath $p -Force }
     }
   }
   $hostDir = Join-Path $dataDir 'host'
   foreach ($file in @(Get-SbwHostFileNames)) {
     $p = Join-Path $hostDir $file
     if (Test-Path -LiteralPath $p) {
-      if ($PSCmdlet.ShouldProcess($p, 'delete the private host copy')) { Remove-Item -LiteralPath $p -Force }
+      if ((Test-SbwShouldProcess $p 'delete the private host copy')) { Remove-Item -LiteralPath $p -Force }
     }
   }
   Remove-SbwEmptyDir -Path $hostDir -What 'remove the now-empty host copy directory'
   if (Test-Path -LiteralPath $dataDir) {
     foreach ($p in @(Get-ChildItem -LiteralPath $dataDir -Filter 'ShopBadwill-*.xml' -ErrorAction SilentlyContinue)) {
       if ($p.BaseName -cnotmatch $SbwTaskNameRegex) { continue }
-      if ($PSCmdlet.ShouldProcess($p.FullName, 'delete generated task XML')) { Remove-Item -LiteralPath $p.FullName -Force }
+      if ((Test-SbwShouldProcess $p.FullName 'delete generated task XML')) { Remove-Item -LiteralPath $p.FullName -Force }
     }
   }
   Remove-SbwEmptyDir -Path $dataDir -What 'remove the now-empty companion data directory'
