@@ -174,7 +174,11 @@ On first install, the **Set up ShopBadwill** tab's calendar step has a
 
 **11. Connect.**
 
-1. Click **Connect to Google Calendar**. A Google window opens.
+1. Click **Connect to Google Calendar**. The browser first asks for
+   permission to sign in to Google and to reach `oauth2.googleapis.com` and
+   `www.googleapis.com` (Chrome also lists the sign-in permission; Firefox
+   lists only the two sites). Click **Allow**. The browser asks only once.
+   A Google window then opens.
 2. Choose your Google account.
 3. "Google hasn't verified this app" appears. This is expected for a personal
    project. Click **Advanced** → **Go to ShopBadwill (personal) (unsafe)**. On
@@ -285,22 +289,5 @@ The **Last error** line in the card **Connection** names the problem.
 | Last error "Calendar access was not granted. Reconnect and allow it." | The calendar box was left unticked, or a broader permission was granted | Connect again and allow the calendar permission |
 | "That does not look like a Google client ID." | You pasted something else, such as the secret or the project number | Paste the value that ends `.apps.googleusercontent.com` |
 | **Connect to Google Calendar** is greyed out | The client ID or the secret is empty | Fill in both. A saved secret shows as `Saved: …` in the field |
-| Last error "Enter your client ID and client secret above, then connect." right after you clicked Connect, with both filled in | The browser has not granted the `identity` permission (see the known gap below) | See the known gap below |
+| "Google Calendar needs permission to sign in and add events. Nothing was changed." | You declined the browser's permission prompt | Click **Connect to Google Calendar** again and click **Allow** |
 | Toolbar badge **!** and "Google needs you to sign in again." | Access was removed at Google, or the token lapsed | Click **Reconnect Google** and approve |
-
-**Known gap (found while writing this guide).** On Chrome, `identity` and the
-two Google hosts (`oauth2.googleapis.com`, `www.googleapis.com`) are
-*optional* permissions. On Firefox, the two hosts are optional too. No button in
-ShopBadwill asks the browser for them yet. Until that is fixed:
-
-- **Firefox:** open `about:addons` → **ShopBadwill** → **Permissions**, and turn
-  on access to `oauth2.googleapis.com` and `www.googleapis.com`.
-- **Chrome:** there is no settings switch for optional permissions. This
-  workaround is **unverified**:
-  1. On the options page, open DevTools (F12) → **Console**.
-  2. Run the line below and accept the browser's prompt.
-  3. Then click **Connect to Google Calendar**.
-
-  ```js
-  chrome.permissions.request({ permissions: ['identity'], origins: ['https://oauth2.googleapis.com/*', 'https://www.googleapis.com/*'] })
-  ```

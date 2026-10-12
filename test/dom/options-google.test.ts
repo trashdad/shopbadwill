@@ -23,6 +23,7 @@ import { GoogleSection, section as googleSection } from '../../src/entrypoints/o
 import { HealthSection, section as healthSection } from '../../src/entrypoints/options/sections/health';
 import type { MsgReply } from '../../src/messaging/protocol';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
+import { FakePermissions } from '../fakes/ports/fake-permissions';
 
 afterEach(cleanup);
 
@@ -57,7 +58,9 @@ class MemStore implements GoogleConfigStore {
   }
 }
 
-function googleApp(opts: { auth?: AuthStatus; store?: MemStore; connectReply?: AuthStatus } = {}) {
+function googleApp(
+  opts: { auth?: AuthStatus; store?: MemStore; connectReply?: AuthStatus; permissions?: FakePermissions; firefox?: boolean } = {},
+) {
   const fake = new FakeMessaging();
   let auth = opts.auth ?? status();
   fake.handle('calendar.status', () => auth);
@@ -72,8 +75,9 @@ function googleApp(opts: { auth?: AuthStatus; store?: MemStore; connectReply?: A
   fake.handle('settings.get', () => defaultSettings());
   fake.handle('settings.set', () => undefined);
   const store = opts.store ?? new MemStore();
-  render(h(GoogleSection, { client: fake, store, now: () => NOW }));
-  return { fake, store };
+  const permissions = opts.permissions ?? new FakePermissions();
+  render(h(GoogleSection, { client: fake, store, now: () => NOW, permissions, firefox: opts.firefox ?? false }));
+  return { fake, store, permissions };
 }
 const sent = (fake: FakeMessaging, type: string) => fake.sent.filter((m) => m.type === type);
 
@@ -184,7 +188,7 @@ describe('google section', () => {
 
   it('handles an unavailable status', async () => {
     const fake = new FakeMessaging(); // no handlers at all
-    render(h(GoogleSection, { client: fake, store: new MemStore(), now: () => NOW }));
+    render(h(GoogleSection, { client: fake, store: new MemStore(), now: () => NOW, permissions: new FakePermissions() }));
     await screen.findByText('Google status is unavailable right now.');
   });
 
@@ -215,7 +219,7 @@ describe('google section', () => {
     fake.handle('calendar.status', () => status());
     fake.handle('settings.get', () => ({ ...defaultSettings(), calendar: { ...defaultSettings().calendar, mode: 'primary' as const } }));
     fake.handle('settings.set', () => undefined);
-    render(h(GoogleSection, { client: fake, store: new MemStore(), now: () => NOW }));
+    render(h(GoogleSection, { client: fake, store: new MemStore(), now: () => NOW, permissions: new FakePermissions() }));
     await waitFor(() => {
       expect(sent(fake, 'settings.get')).toHaveLength(1);
     });
@@ -253,6 +257,7 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
     render(
       h(GoogleSection, {
         client: fake,
+        permissions: new FakePermissions(),
         store: new MemStore({ clientId: GOOD_ID, secretTail: 'abcd' }),
         now: () => NOW,
       }),
@@ -509,6 +514,7 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
     render(
       h(GoogleSection, {
         client: fake,
+        permissions: new FakePermissions(),
         store: new MemStore({ clientId: GOOD_ID, secretTail: 'abcd' }),
         now: () => NOW,
       }),
@@ -551,7 +557,7 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
     fake.handle('calendar.syncNow', () => undefined);
     const store = new MemStore({ clientId: GOOD_ID, secretTail: 'abcd' });
     const mount = (): void => {
-      render(h(GoogleSection, { client: fake, store, now: () => NOW }));
+      render(h(GoogleSection, { client: fake, store, now: () => NOW, permissions: new FakePermissions() }));
     };
     mount();
     const connect = await screen.findByRole<HTMLButtonElement>('button', { name: 'Connect to Google Calendar' });
@@ -911,5 +917,138 @@ describe('health section', () => {
       expect(screen.getAllByText('Unavailable right now.').length).toBeGreaterThan(0);
     });
     expect(screen.getByText(/different ShopGoodwill account\? Disconnect first/)).toBeTruthy();
+  });
+});
+
+describe('T-70d: Connect asks for the optional Google permissions first', () => {
+  const ORIGINS = ['https://oauth2.googleapis.com/*', 'https://www.googleapis.com/*'];
+  const DENIED = 'Google Calendar needs permission to sign in and add events. Nothing was changed.';
+
+  /** Records what had been sent when request() ran; the grant waits for `answer`. */
+  class OrderedPermissions extends FakePermissions {
+    answer!: (granted: boolean) => void;
+    sentAtRequest: string[] | null = null;
+    sentSoFar: () => string[] = () => [];
+    override request(p: { permissions?: string[]; origins?: string[] }): Promise<boolean> {
+      this.requested.push(structuredClone(p));
+      this.sentAtRequest = this.sentSoFar();
+      return new Promise((resolve) => {
+        this.answer = resolve;
+      });
+    }
+  }
+
+  async function ready(): Promise<HTMLButtonElement> {
+    // Let the saved client load first, so it does not overwrite what is typed next.
+    await screen.findByText('Not connected');
+    fireEvent.input(screen.getByLabelText('Client ID'), { target: { value: GOOD_ID } });
+    fireEvent.input(screen.getByLabelText('Client secret'), { target: { value: SECRET } });
+    const btn = screen.getByRole<HTMLButtonElement>('button', { name: 'Connect to Google Calendar' });
+    await waitFor(() => {
+      expect(btn.disabled).toBe(false);
+    });
+    return btn;
+  }
+
+  it('Chrome: requests identity and both Google origins inside the click, before any await or send', async () => {
+    const permissions = new OrderedPermissions();
+    const { fake, store } = googleApp({ permissions, firefox: false });
+    permissions.sentSoFar = () => fake.sent.map((m) => m.type);
+    const btn = await ready();
+    const sentBeforeClick = fake.sent.length;
+    fireEvent.click(btn);
+    // Synchronously, still inside the click's user gesture: no await has run yet.
+    expect(permissions.requested).toEqual([{ permissions: ['identity'], origins: ORIGINS }]);
+    expect(permissions.sentAtRequest).toHaveLength(sentBeforeClick);
+    expect(permissions.sentAtRequest).not.toContain('calendar.connect');
+    expect(store.saves).toHaveLength(0);
+    // Nothing is saved or sent until the browser answers.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fake.sent).toHaveLength(sentBeforeClick);
+    expect(store.saves).toHaveLength(0);
+    permissions.answer(true);
+    await screen.findByText('Connected to Google Calendar.');
+    expect(sent(fake, 'calendar.connect')).toHaveLength(1);
+    expect(store.saves).toEqual([{ clientId: GOOD_ID, clientSecret: SECRET }]);
+  });
+
+  it('Firefox: requests only the two origins, never identity', async () => {
+    const { fake, permissions } = googleApp({ firefox: true });
+    fireEvent.click(await ready());
+    expect(permissions.requested).toEqual([{ origins: ORIGINS }]);
+    expect(JSON.stringify(permissions.requested)).not.toContain('identity');
+    await screen.findByText('Connected to Google Calendar.');
+    expect(sent(fake, 'calendar.connect')).toHaveLength(1);
+  });
+
+  it('granted: sends calendar.connect once', async () => {
+    const { fake, permissions } = googleApp();
+    fireEvent.click(await ready());
+    await screen.findByText('Connected to Google Calendar.');
+    expect(permissions.requested).toHaveLength(1);
+    expect(sent(fake, 'calendar.connect')).toHaveLength(1);
+  });
+
+  it('refused: sends nothing, saves nothing, and says why', async () => {
+    const permissions = new FakePermissions();
+    permissions.grantRequests = false;
+    const { fake, store } = googleApp({ permissions });
+    const before = fake.sent.length;
+    fireEvent.click(await ready());
+    expect(permissions.requested).toHaveLength(1);
+    await screen.findByText(DENIED);
+    expect(fake.sent.slice(before)).toEqual([]);
+    expect(sent(fake, 'calendar.connect')).toHaveLength(0);
+    expect(store.saves).toHaveLength(0);
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Connect to Google Calendar' }).disabled).toBe(false);
+  });
+
+  it('a request that throws connects nothing and shows the refusal message', async () => {
+    const permissions = new FakePermissions();
+    permissions.request = () => {
+      throw new Error('permissions API missing');
+    };
+    const { fake, store } = googleApp({ permissions });
+    fireEvent.click(await ready());
+    await screen.findByText(/Google Calendar needs permission to sign in and add events\. Nothing was changed\./);
+    expect(sent(fake, 'calendar.connect')).toHaveLength(0);
+    expect(store.saves).toHaveLength(0);
+  });
+
+  it('Reconnect goes through the same request', async () => {
+    const { fake, permissions } = googleApp({
+      auth: status({ needsInteraction: true, lastError: 'invalid_grant' }),
+      store: new MemStore({ clientId: GOOD_ID, secretTail: 'abcd' }),
+    });
+    const btn = await screen.findByRole<HTMLButtonElement>('button', { name: 'Reconnect Google' });
+    await waitFor(() => {
+      expect(btn.disabled).toBe(false);
+    });
+    fireEvent.click(btn);
+    expect(permissions.requested).toEqual([{ permissions: ['identity'], origins: ORIGINS }]);
+    await waitFor(() => {
+      expect(sent(fake, 'calendar.connect')).toHaveLength(1);
+    });
+  });
+
+  it('a malformed client id asks for nothing', async () => {
+    const { permissions } = googleApp();
+    fireEvent.input(screen.getByLabelText('Client ID'), { target: { value: 'not-an-id' } });
+    fireEvent.input(screen.getByLabelText('Client secret'), { target: { value: SECRET } });
+    fireEvent.click(screen.getByRole('button', { name: 'Connect to Google Calendar' }));
+    await screen.findByRole('alert');
+    expect(permissions.requested).toHaveLength(0);
+  });
+
+  it('Disconnect asks for no permission (the port has no remove, and nothing else is called)', async () => {
+    const permissions = new FakePermissions();
+    const { fake } = googleApp({ auth: status({ connected: true, grantedScopes: [SCOPE] }), permissions });
+    fireEvent.click(await screen.findByRole('button', { name: 'Disconnect' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Yes, disconnect' }));
+    await waitFor(() => {
+      expect(sent(fake, 'calendar.disconnect')).toHaveLength(1);
+    });
+    expect(permissions.requested).toHaveLength(0);
   });
 });
