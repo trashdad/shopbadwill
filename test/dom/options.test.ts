@@ -322,6 +322,33 @@ describe('settings', () => {
     const toggle = await screen.findByRole('switch', { name: 'Dry run: favorites' });
     expect(toggle.parentElement?.textContent).toContain('On');
   });
+
+  it('builds each group save on a fresh read, so a page left open never flips a sibling switch back (integration review)', async () => {
+    const fake = new FakeMessaging();
+    let stored = defaultSettings();
+    stored.dryRun.bidding = false; // bidding was live when this page loaded
+    fake.handle('settings.get', () => structuredClone(stored));
+    fake.handle('settings.set', (patch) => {
+      stored = { ...stored, ...patch };
+      return undefined;
+    });
+    render(h(SettingsSection, { client: fake }));
+    const calendar = await screen.findByRole('switch', { name: 'Dry run: calendar' });
+    // The popup's "Back to dry run" puts bidding in dry run while this page stays open.
+    stored = { ...stored, dryRun: { ...stored.dryRun, bidding: true } };
+    fireEvent.click(calendar);
+    await waitFor(() => {
+      expect(lastSent(fake, 'settings.set')).toEqual({ dryRun: { favorites: true, calendar: false, bidding: true } });
+    });
+    // Two quick toggles in one group: the second builds on the first.
+    fireEvent.click(screen.getByRole('switch', { name: 'Dry run: favorites' }));
+    fireEvent.click(await screen.findByRole('switch', { name: 'Quick favorite button' }));
+    await waitFor(() => {
+      expect(stored.dryRun).toEqual({ favorites: false, calendar: false, bidding: true });
+      expect(stored.overlay.quickFavorite).toBe(true);
+    });
+    expect((screen.getByRole<HTMLInputElement>('switch', { name: 'Dry run: bidding' })).checked).toBe(true);
+  });
 });
 
 describe('shell and registry', () => {

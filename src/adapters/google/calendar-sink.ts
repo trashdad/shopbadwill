@@ -517,6 +517,10 @@ export class GoogleCalendarSink implements CalendarSink {
         ops = actionable;
       }
       for (const op of ops) {
+        // Asked again before each write: at 1 request/s a run can take minutes,
+        // and a kill switch (or dry run) turned on meanwhile stops the next one.
+        const now = await this.deps.switches.writesAllowed('calendar');
+        if (!now.ok) throw new Halt('blocked', now.why ?? 'calendar writes are blocked');
         try {
           results.push({ itemId: op.itemId, op: await this.execute(calendarId, op) });
         } catch (e) {

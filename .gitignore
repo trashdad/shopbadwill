@@ -21,6 +21,9 @@ canary-out/
 # Raw, unsanitized SGW captures must never be committed (sanitized fixtures live beside them)
 test/fixtures/sgw/raw/
 
+# The user's own spike results (S-2, S-4, ...): personal observations, never committed
+docs/USER-STEPS/*-results.txt
+
 # Local agent workspace
 .superpowers/
 

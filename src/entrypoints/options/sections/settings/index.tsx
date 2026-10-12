@@ -1,5 +1,5 @@
 import type { VNode } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 import { formatMoney } from '../../../../domain/money';
 import type { Settings } from '../../../../domain/settings/schema';
@@ -33,20 +33,37 @@ export function SettingsSection(props: SectionProps): VNode {
     );
   }, [client]);
 
+  /** Saves run one at a time, so a quick second change builds on the first. */
+  const chain = useRef<Promise<unknown>>(Promise.resolve());
+  const latest = useRef(0);
+
   /**
    * Sends whole top-level groups (never half a group), keeps the change
    * on screen right away, and puts it back if the background refuses.
+   * `build` makes the patch from a FRESH settings.get (integration review):
+   * this page may stay open while the popup changes a sibling field, and a
+   * stale `dryRun` group sent back could turn live bidding on again.
    */
-  const save = (patch: Partial<Settings>, what: string): void => {
+  const save = (build: (current: Settings) => Partial<Settings>, what: string): void => {
     if (settings === null) return;
     const previous = settings;
-    setSettings({ ...settings, ...patch });
-    client.send('settings.set', patch).then(
-      () => {
+    const shown = build(settings);
+    const gen = ++latest.current;
+    setSettings({ ...settings, ...shown });
+    const run = chain.current.then(async () => {
+      const fresh = await client.send('settings.get', undefined);
+      const patch = build(fresh);
+      await client.send('settings.set', patch);
+      return { ...fresh, ...patch };
+    });
+    chain.current = run.catch(() => undefined);
+    run.then(
+      (next) => {
+        if (gen === latest.current) setSettings(next);
         setStatus({ message: `Saved: ${what}.`, tone: 'ok' });
       },
       (e: unknown) => {
-        setSettings((cur) => (cur === null ? cur : { ...cur, ...pick(previous, patch) }));
+        setSettings((cur) => (cur === null ? cur : { ...cur, ...pick(previous, shown) }));
         setStatus({ message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' });
       },
     );
@@ -65,7 +82,7 @@ export function SettingsSection(props: SectionProps): VNode {
       return;
     }
     setZipError(undefined);
-    save({ homeZip: value }, 'home ZIP');
+    save(() => ({ homeZip: value }), 'home ZIP');
   };
 
   return (
@@ -108,7 +125,7 @@ export function SettingsSection(props: SectionProps): VNode {
           hint="Checks your saved searches once a day and tells you what is new."
           checked={s.dailyRun.enabled}
           onChange={(enabled) => {
-            save({ dailyRun: { ...s.dailyRun, enabled } }, 'daily run');
+            save((c) => ({ dailyRun: { ...c.dailyRun, enabled } }), 'daily run');
           }}
         />
         <Field id="set-time" label={`Run time (${s.locale.timeZone})`} hint="Default is 07:00.">
@@ -120,7 +137,7 @@ export function SettingsSection(props: SectionProps): VNode {
               disabled={!s.dailyRun.enabled}
               onChange={(e) => {
                 const localTime = e.currentTarget.value;
-                if (TIME.test(localTime)) save({ dailyRun: { ...s.dailyRun, localTime } }, 'run time');
+                if (TIME.test(localTime)) save((c) => ({ dailyRun: { ...c.dailyRun, localTime } }), 'run time');
               }}
             />
           )}
@@ -132,7 +149,7 @@ export function SettingsSection(props: SectionProps): VNode {
           checked={s.dailyRun.catchUp}
           disabled={!s.dailyRun.enabled}
           onChange={(catchUp) => {
-            save({ dailyRun: { ...s.dailyRun, catchUp } }, 'catch-up');
+            save((c) => ({ dailyRun: { ...c.dailyRun, catchUp } }), 'catch-up');
           }}
         />
       </Card>
@@ -145,7 +162,7 @@ export function SettingsSection(props: SectionProps): VNode {
           hint="Turns the highlighting, hiding and badges on or off."
           checked={s.overlay.enabled}
           onChange={(enabled) => {
-            save({ overlay: { ...s.overlay, enabled } }, 'page markup');
+            save((c) => ({ overlay: { ...c.overlay, enabled } }), 'page markup');
           }}
         />
         <fieldset class="sbw-inline-fieldset">
@@ -163,7 +180,7 @@ export function SettingsSection(props: SectionProps): VNode {
                 value={value}
                 checked={s.overlay.hideStyle === value}
                 onChange={() => {
-                  save({ overlay: { ...s.overlay, hideStyle: value } }, 'hidden-listing style');
+                  save((c) => ({ overlay: { ...c.overlay, hideStyle: value } }), 'hidden-listing style');
                 }}
               />{' '}
               {label}
@@ -176,7 +193,7 @@ export function SettingsSection(props: SectionProps): VNode {
           hint="Adds a one-click favorite to listing cards."
           checked={s.overlay.quickFavorite}
           onChange={(quickFavorite) => {
-            save({ overlay: { ...s.overlay, quickFavorite } }, 'quick favorite');
+            save((c) => ({ overlay: { ...c.overlay, quickFavorite } }), 'quick favorite');
           }}
         />
         <Switch
@@ -185,7 +202,7 @@ export function SettingsSection(props: SectionProps): VNode {
           hint="Only shows when landed cost (below) is on."
           checked={s.overlay.landedCostBadges}
           onChange={(landedCostBadges) => {
-            save({ overlay: { ...s.overlay, landedCostBadges } }, 'landed-cost badges');
+            save((c) => ({ overlay: { ...c.overlay, landedCostBadges } }), 'landed-cost badges');
           }}
         />
         <Switch
@@ -193,7 +210,7 @@ export function SettingsSection(props: SectionProps): VNode {
           label="Show a countdown on listings"
           checked={s.overlay.countdown}
           onChange={(countdown) => {
-            save({ overlay: { ...s.overlay, countdown } }, 'countdown');
+            save((c) => ({ overlay: { ...c.overlay, countdown } }), 'countdown');
           }}
         />
       </Card>
@@ -208,7 +225,7 @@ export function SettingsSection(props: SectionProps): VNode {
           label="Dry run: favorites"
           checked={s.dryRun.favorites}
           onChange={(favorites) => {
-            save({ dryRun: { ...s.dryRun, favorites } }, 'favorites dry run');
+            save((c) => ({ dryRun: { ...c.dryRun, favorites } }), 'favorites dry run');
           }}
         />
         <Switch
@@ -216,7 +233,7 @@ export function SettingsSection(props: SectionProps): VNode {
           label="Dry run: calendar"
           checked={s.dryRun.calendar}
           onChange={(calendar) => {
-            save({ dryRun: { ...s.dryRun, calendar } }, 'calendar dry run');
+            save((c) => ({ dryRun: { ...c.dryRun, calendar } }), 'calendar dry run');
           }}
         />
         <Switch
@@ -229,7 +246,7 @@ export function SettingsSection(props: SectionProps): VNode {
           }
           checked={s.dryRun.bidding}
           onChange={(bidding) => {
-            save({ dryRun: { ...s.dryRun, bidding } }, 'bidding dry run');
+            save((c) => ({ dryRun: { ...c.dryRun, bidding } }), 'bidding dry run');
           }}
         />
       </Card>
@@ -255,7 +272,7 @@ export function SettingsSection(props: SectionProps): VNode {
                 checked={s.considerateMode === value}
                 aria-describedby="considerate-hint"
                 onChange={() => {
-                  save({ considerateMode: value }, 'considerate mode');
+                  save(() => ({ considerateMode: value }), 'considerate mode');
                 }}
               />{' '}
               {label}
@@ -268,7 +285,7 @@ export function SettingsSection(props: SectionProps): VNode {
           hint="Estimates bid + shipping + handling to your ZIP; makes extra requests to ShopGoodwill."
           checked={s.features.landedCost}
           onChange={(landedCost) => {
-            save({ features: { ...s.features, landedCost } }, 'landed cost');
+            save((c) => ({ features: { ...c.features, landedCost } }), 'landed cost');
           }}
         />
         {s.features.landedCost && s.homeZip === undefined ? (
@@ -282,7 +299,7 @@ export function SettingsSection(props: SectionProps): VNode {
           hint="Keeps on-page countdowns accurate; makes a few extra requests."
           checked={s.features.countdownRefresh}
           onChange={(countdownRefresh) => {
-            save({ features: { ...s.features, countdownRefresh } }, 'countdown refresh');
+            save((c) => ({ features: { ...c.features, countdownRefresh } }), 'countdown refresh');
           }}
         />
       </Card>
