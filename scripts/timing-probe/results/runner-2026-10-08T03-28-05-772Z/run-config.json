@@ -70,7 +70,7 @@
     "memGb": 31,
     "node": "v25.7.0"
   },
-  "chromium": "C:\\Users\\insan\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe",
+  "chromium": "C:\\Users\\<you>\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe",
   "firefox": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
   "endedAt": 1791431429227,
   "stopReason": "all lanes done",

@@ -68,7 +68,7 @@
     "memGb": 31,
     "node": "v25.7.0"
   },
-  "chromium": "C:\\Users\\insan\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe",
+  "chromium": "C:\\Users\\<you>\\AppData\\Local\\ms-playwright\\chromium-1243\\chrome-win64\\chrome.exe",
   "firefox": "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
   "ffPrefs": {
     "timer.maximum_firing_delay_tolerance_ms": "0.0",

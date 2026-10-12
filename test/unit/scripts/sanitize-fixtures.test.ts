@@ -402,10 +402,10 @@ describe('sanitize-fixtures', () => {
     it('(a) replaces saved shipping addresses in the shipping tab, and the leak check flags any that survive', () => {
       const s = new FixtureSanitizer({ salt: 'test-salt' });
       const html = s.sanitizeHtml(`<!DOCTYPE html><html><body><app-shipping-tab>
-        <select id="shippingAddress"><option value="7788991"> 12 Elm Way, OR 97201 United States </option><option value="7788992">PO Box 5, Bend, OR 97701-0005 United States</option></select>
+        <select id="shippingAddress"><option value="7788991"> 12 Elm Way, OR 97201 United States </option><option value="7788992">PO Box 5, Bend, OR 12345-6789 United States</option></select>
         <select id="country"><option>Puerto Rico</option><option>United States</option></select>
       </app-shipping-tab></body></html>`);
-      for (const real of ['Elm Way', '97201', 'PO Box 5', 'Bend', '97701', '7788991']) expect(html, real).not.toContain(real);
+      for (const real of ['Elm Way', '97201', 'PO Box 5', 'Bend', '12345', '7788991']) expect(html, real).not.toContain(real);
       expect(html).toContain('<option>United States</option>');
       expect(html.match(/\[redacted address\]/g)).toHaveLength(2);
       expect(s.findLeaks('<option value="1"> 12 Elm Way, OR 97201 United States </option>')).toContain('address option');
@@ -584,31 +584,31 @@ describe('sanitize-fixtures', () => {
         pickupZip: '97999-1234',
         buyerCountryCode: 'US',
         bidHistory: { authenticatedBuyerLogin: 'janeqb', isHighBidderLogIn: false, bidComplete: [] },
-        buyerShippingAddresses: [{ address: '12 Elmwood Lane', city: 'Bendington', state: 'OR', zip: '97701-0005', country: 'United States', buyerId: 4242, shippingAddressId: 0 }],
+        buyerShippingAddresses: [{ address: '12 Elmwood Lane', city: 'Bendington', state: 'OR', zip: '12345-6789', country: 'United States', buyerId: 4242, shippingAddressId: 0 }],
       };
     }
     // CalculateShipping answers with a JSON string of HTML; "Address:" is the buyer's destination.
     const QUOTE =
-      "<p>Estimated Shipping and Handling:</p><p>Shipped From: Samplton, OR 97999</p><p>Shipping Carrier: FedEx<p>Address:   97701-0005 US</p><p>Shipping: <span id='shipping-span'>¤11.04 (GROUND_HOME_DELIVERY)</span></p><p>Handling: ¤3.00</p>";
+      "<p>Estimated Shipping and Handling:</p><p>Shipped From: Samplton, OR 97999</p><p>Shipping Carrier: FedEx<p>Address:   12345-6789 US</p><p>Shipping: <span id='shipping-span'>¤11.04 (GROUND_HOME_DELIVERY)</span></p><p>Handling: ¤3.00</p>";
 
     it("learns the buyer's own address and login and scrubs them everywhere, with a leak check", () => {
       const s = new FixtureSanitizer({ salt: 'test-salt' });
       const detail = s.sanitizeJson(loggedInDetail());
       const quote = s.sanitizeJson(QUOTE);
       const html = s.sanitizeHtml(
-        '<!DOCTYPE html><html><body><app-header>Hi janeqb</app-header><p>Ship to 12 Elmwood Lane, Bendington, OR 97701</p></body></html>',
+        '<!DOCTYPE html><html><body><app-header>Hi janeqb</app-header><p>Ship to 12 Elmwood Lane, Bendington, OR 12345</p></body></html>',
       );
       const all = (allStrings(detail) + quote + html).toLowerCase();
-      for (const real of ['elmwood', 'bendington', '97701', 'janeqb', 'samplton', '97999']) expect(all, real).not.toContain(real);
+      for (const real of ['elmwood', 'bendington', '12345', 'janeqb', 'samplton', '97999']) expect(all, real).not.toContain(real);
       expect(quote).toContain('¤11.04 (GROUND_HOME_DELIVERY)');
       expect(quote).toContain('Handling: ¤3.00');
-      for (const leak of ['12 elmwood lane', 'BENDINGTON', 'zip 97701-0005', 'user janeqb']) expect(s.findLeaks(leak), leak).not.toEqual([]);
+      for (const leak of ['12 elmwood lane', 'BENDINGTON', 'zip 12345-6789', 'user janeqb']) expect(s.findLeaks(leak), leak).not.toEqual([]);
     });
 
     it('redacts the "Address:" line of a shipping quote even when nothing about the buyer was learned', () => {
       const out = new FixtureSanitizer({ salt: 'test-salt' }).sanitizeJson(QUOTE);
       expect(out).toContain('Address:   [redacted address]</p>');
-      expect(out).not.toContain('97701');
+      expect(out).not.toContain('12345');
     });
 
     it('applies learned seller identity before redact.txt, so a seller named after the user\'s city stays one synthetic seller', () => {
@@ -628,7 +628,7 @@ describe('sanitize-fixtures', () => {
 
     it('redacts every saved-address option in select#buyerAddress except the placeholder, digits or not', () => {
       const html = new FixtureSanitizer({ salt: 'test-salt' }).sanitizeHtml(`<!DOCTYPE html><html><body><app-shipping-tab>
-        <select id="buyerAddress" name="buyerAddress"><option value="">Select an address</option><option value="h">Home</option><option value="12 Elm Way 97701">12 Elm Way, Bend</option></select>
+        <select id="buyerAddress" name="buyerAddress"><option value="">Select an address</option><option value="h">Home</option><option value="12 Elm Way 12345">12 Elm Way, Bend</option></select>
         <select id="country"><option>United States</option></select></app-shipping-tab></body></html>`);
       expect(html).toContain('<option value="">Select an address</option>');
       expect(html).not.toContain('Home');

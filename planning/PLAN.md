@@ -1585,7 +1585,7 @@ Only items that block or materially change the plan. The ToS decision and the fi
 
 | Q | Answer | Effect on the plan |
 |---|---|---|
-| 1 Machine | Laptop (Lenovo 83F5), **plugged in and left on** with the browser running when auctions end. Supports S3 standby + hibernate; **no Modern Standby** (`powercfg /a`). | T1 (keep-awake) is the first sniping release as planned; T2 stays Phase 6. S-8 notes S3 wake timers should be honoured. |
+| 1 Machine | Laptop (the test laptop), **plugged in and left on** with the browser running when auctions end. Supports S3 standby + hibernate; **no Modern Standby** (`powercfg /a`). | T1 (keep-awake) is the first sniping release as planned; T2 stays Phase 6. S-8 notes S3 wake timers should be honoured. |
 | 2 Primary browser for sniping | **Both Chrome and Firefox equally.** | Firefox sniping is a first-class requirement: if S-7 shows the Firefox event page cannot be held alive, T-116 (runner-page `SnipeHost`) is **not conditional** and moves into Phase 4. Phase 4 E2E covers both browsers. |
 | 3 Spend caps | **$50 per item / $100 per day / $200 total open exposure** (defaults; user-editable). | `Settings` defaults in T-02/T-82: 5000 / 10000 / 20000 cents. |
 | 4 Google account | Personal Gmail (not Workspace). | 7-day Testing expiry applies → SETUP-GOOGLE "In production" path is required. Phone app check stays a USER STEP. |

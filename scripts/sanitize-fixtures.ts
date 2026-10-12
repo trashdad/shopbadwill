@@ -171,7 +171,7 @@ const PERSONAL_RECORD_KEYS = /^(address\d?|street\w*|city|name|firstname|lastnam
 const LOGIN_KEYS = /^(authenticatedbuyerlogin|username|buyerlogin|login)$/i;
 /** The buyer's saved shipping addresses on the logged-in item page (S-1 stage 2). */
 const HTML_SAVED_ADDRESS_SELECT = 'select#buyerAddress';
-/** A shipping quote's destination line ("<p>Address:   97701-0005 US</p>") is always the buyer's. */
+/** A shipping quote's destination line ("<p>Address:   12345-6789 US</p>") is always the buyer's. */
 const QUOTE_ADDRESS_LINE = /(Address:\s*)([^<]+)(<\/p>)/gi;
 /** Item ids inside strings; `/Item/` (og:url, recommendation links) and `/item/` both occur. */
 const ID_PATTERNS = [/\/item\/(\d{5,})/gi, /GetItemDetailModelByItemId\/(\d{5,})/gi, /[?&]itemId=(\d{5,})/gi];

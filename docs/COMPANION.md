@@ -32,7 +32,7 @@ leaves the browser.
 
 ## Power-plan guidance (from S-8 verdicts, provisional)
 
-The reference machine (Lenovo 83F5): S3 standby + hibernate, **no Modern
+The reference machine (the test laptop): S3 standby + hibernate, **no Modern
 Standby**, Balanced plan with **Sleep after = Never** on AC and battery and
 **Allow wake timers = Enable on AC, Disable on battery** (S-8 stage 1,
 read-only). The full wake test (`docs/USER-STEPS/S-8.md`) is still pending;
