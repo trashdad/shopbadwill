@@ -43,14 +43,14 @@ import type { AuditLog } from '../../domain/audit/types';
 import type { Settings } from '../../domain/settings/schema';
 import { AWAKE_RETENTION_MS } from '../../domain/snipe/awake-history';
 import { isoMs } from '../../domain/snipe/preflight';
-import { WAKE_BEFORE_FIRE_MS } from '../../domain/snipe/state-machine';
-import { assessClock, computeFireAt } from '../../domain/snipe/timing';
+import { assessClock } from '../../domain/snipe/timing';
 import type { Snipe } from '../../domain/snipe/types';
 import type { Repo } from '../../domain/storage/repo';
 import { parseCompanionWakes, STORAGE_KEYS, type CompanionWakesRecord } from '../../domain/storage/schema';
 import type { EpochMs } from '../../domain/types';
 import type { Clock } from '../../ports/clock';
 import type { Notifier } from '../../ports/notifier';
+import { COMPANION_WAKE_MARGIN_MS, companionWakeAt } from '../companion-wake';
 import type { BackgroundContext } from '../context';
 import { truncateTitle } from './notify';
 import { snipeSeams, type ArmHooks, type PreflightHookFailure } from './snipe-runner';
@@ -61,12 +61,8 @@ const HOUR = 60 * MIN;
 
 /** `sbw:companionWakes`. */
 export const COMPANION_WAKES_KEY = STORAGE_KEYS.companionWakes;
-/**
- * The companion wakes the computer this long before the runner's own T-5 min
- * wake: resume (S3 or hibernate), the browser launch, network-up and the
- * worker start all fit, and the runner's wake alarm then fires on time.
- */
-export const COMPANION_WAKE_MARGIN_MS = 3 * MIN;
+/** The wake margin and time live in ../companion-wake (T-111b: the runner shares them). */
+export { COMPANION_WAKE_MARGIN_MS, companionWakeAt };
 /** No cancel from this long before the wake on (T-110 3b: never cancel a fired task, nor race one). */
 export const COMPANION_CANCEL_GUARD_MS = 2 * MIN;
 /** A restarted worker retries a failed schedule or cancel at most this often. */
@@ -92,22 +88,6 @@ const WAKE_CLOSED: ReadonlySet<Snipe['state']> = new Set(['killed', 'resolved', 
 type WakeEntry = CompanionWakesRecord['wakes'][string];
 type Trigger = 'arm' | 'restart' | 'preflight';
 type Outcome = { kind: 'ok' } | { kind: 'skipped' } | { kind: 'failed'; error: string; detail: string };
-
-/**
- * The companion's wake (local epoch ms) for a snipe: the runner's T-5 min wake
- * (`fireAt`, or the planned fire before the verify, minus the clock offset)
- * minus the margin. Null when the snipe's times are unusable.
- */
-export function companionWakeAt(s: Snipe, fallbackOffsetMs: number): EpochMs | null {
-  try {
-    const fireServer = s.fireAt ?? computeFireAt(isoMs(s.endTime), s.leadMs, 0);
-    const offset = s.measured?.offsetMs ?? fallbackOffsetMs;
-    const at = fireServer - offset - WAKE_BEFORE_FIRE_MS - COMPANION_WAKE_MARGIN_MS;
-    return Number.isFinite(at) ? at : null;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * The awake history without the runs companion wakes caused, for advice. A

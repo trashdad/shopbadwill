@@ -76,6 +76,7 @@ import { PORT_NAMES, SnipeCountdownTickSchema } from '../../messaging/protocol';
 import type { Clock } from '../../ports/clock';
 import { SgwApiError } from '../../ports/errors';
 import type { SgwApi } from '../../ports/sgw-api';
+import { companionWakeAt } from '../companion-wake';
 import { errorText, type BackgroundContext, type RuntimePort } from '../context';
 import { quietHoursEnd } from './notify';
 import { WHY, type Verdict } from '../switches';
@@ -88,7 +89,7 @@ const HOUR = 60 * MIN;
 
 /** Alarm names: `sbw:snipe:<id>:<kind>` (PLAN §1.3). */
 export const SNIPE_ALARM_PREFIX = 'sbw:snipe:';
-export const SNIPE_ALARM_KINDS = ['health24', 'health1', 'preflight', 'wake', 'recover', 'postread', 'atrisk-defer'] as const;
+export const SNIPE_ALARM_KINDS = ['health24', 'health1', 'preflight', 'wake', 'recover', 'postread', 'atrisk-defer', 'companion-wake'] as const;
 export type SnipeAlarmKind = (typeof SNIPE_ALARM_KINDS)[number];
 
 /** `sbw:snipeRunner`: per snipe, the effects outbox and the runner's bookkeeping. */
@@ -1057,6 +1058,7 @@ export class SnipeRunner {
   private async armedStep(s: Snipe, entry: Entry): Promise<StepResult> {
     await this.ensureArmedAlarms(s);
     await this.holdAwake(s);
+    await this.alarmCompanionWake(s);
     const now = this.ctx.clock.now();
     if (now >= this.wakeAtLocal(s)) {
       await this.commit(s.id, { type: 'wake', now }, { expectVersion: s.history.length });
@@ -1071,7 +1073,7 @@ export class SnipeRunner {
   }
 
   private async wakingStep(s: Snipe): Promise<StepResult> {
-    // T1 holds it from arm already; T2 takes it here, at the wake (T-111b).
+    // T1 holds it from arm, T2 from the companion wake (armedStep); a restarted worker takes it again here.
     await this.holdAwake(s);
     await this.openWindow(s);
     if (await this.checkAnomaly(s)) return 'continue';
@@ -1673,20 +1675,43 @@ export class SnipeRunner {
   // ── KeepAwake (tiers T1 and T2, Chrome with `power`) ──────────────────
 
   /**
-   * T1 holds from arm to the end. T2 (T-111b) holds only from the T-5 min wake
-   * to the end: the companion woke the computer and Windows would put it back
-   * to sleep after about 2 min unattended, while a hold from arm would keep it
-   * from sleeping at all. So an armed T2 snipe, the preflight included, needs none.
+   * T1 holds from arm to the end. T2 (T-111b) holds from the companion's wake
+   * (T-111's value, about T-8 min) to the end: Windows puts a computer woken
+   * unattended back to sleep after about 2 min, while a hold from arm would
+   * keep it from sleeping at all. So an armed T2 snipe needs none before that
+   * wake (the T-15 min preflight included).
    */
   private async keepAwakeRequired(s: Snipe, settings: Settings): Promise<boolean> {
     const tier = settings.snipe.tier;
-    const due = tier === 'T1' || (tier === 'T2' && s.state !== 'armed');
-    if (!due || !this.ctx.keepAwake.available) return false;
+    const due = tier === 'T1' || (tier === 'T2' && (s.state !== 'armed' || this.companionWakeDue(s)));
+    return due && (await this.keepAwakeUsable());
+  }
+
+  /** Chrome's power API, with `power` granted. */
+  private async keepAwakeUsable(): Promise<boolean> {
+    if (!this.ctx.keepAwake.available) return false;
     try {
       return await this.ctx.permissions.contains({ permissions: ['power'] });
     } catch {
       return false;
     }
+  }
+
+  private companionWakeDue(s: Snipe): boolean {
+    const at = companionWakeAt(s, this.offsetFor(s));
+    return at !== null && this.ctx.clock.now() >= at;
+  }
+
+  /**
+   * T2: an alarm at the companion's wake, so a browser that kept running (no
+   * worker starts then) still takes the hold on time. Set again by each armed
+   * step before it, as a new clock offset may move the wake.
+   */
+  private async alarmCompanionWake(s: Snipe): Promise<void> {
+    if (this.awake.has(s.id) || (await this.settings()).snipe.tier !== 'T2' || !(await this.keepAwakeUsable())) return;
+    const at = companionWakeAt(s, this.offsetFor(s));
+    if (at === null || at <= this.ctx.clock.now()) return;
+    await this.safely('companion-wake alarm', () => this.ctx.alarms.create(snipeAlarmName(s.id, 'companion-wake'), { when: at }));
   }
 
   private async keepAwakeState(s: Snipe, settings: Settings): Promise<PreflightContext['keepAwake']> {
