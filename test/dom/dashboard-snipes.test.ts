@@ -5,6 +5,7 @@
 //   - the typo guard requires the retyped amount to equal the max;
 //   - the confirmation shows both times (user zone and SGW Pacific);
 //   - a dry-run snipe is visibly labelled everywhere it appears.
+import type { CardBadgeProps } from '../../src/content/ui/badge-registry';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -758,7 +759,7 @@ describe('the card Snipe… badge (deep link, R1)', () => {
   it('is hidden on an auction that has already ended, and shown while it is open', () => {
     const props = (endTime: string) => ({
       itemId: 7,
-      listing: { endTime } as unknown as NonNullable<Parameters<typeof snipeLinkBadge.Component>[0]['listing']>,
+      listing: { endTime } as unknown as NonNullable<CardBadgeProps['listing']>,
       settings: defaultSettings(),
       client: new FakeMessaging(),
       cardRoot: document.body,
