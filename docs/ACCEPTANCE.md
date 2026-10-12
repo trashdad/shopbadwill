@@ -183,9 +183,10 @@ anything you share. Paste back only the results asked for under **Record**.
    an hour before the auction ends, and leave it off until after the end. The
    60-, 15- and 5-minute popups arrive on the phone on time.
 10. **End-time change.** Opportunistic: if a tracked auction is extended at
-    the end (bids in the last minutes), after the next daily run reads it
-    again the event moves to the new end. It is the same event (one entry,
-    not two), still with its three popups.
+    the end (bids in the last minutes), ShopBadwill reads it again a few
+    minutes after its original end (the browser must be open) and the event
+    moves to the new end. It is the same event (one entry, not two), still
+    with its three popups.
 11. **Removing an item deletes its event.** Options → **Activity** → the
     `calendar.insert` entry for a tracked item → **Undo**. The event
     disappears from ShopGoodwill Auctions; your other events, including any

@@ -450,6 +450,7 @@ test('calendar sync: connect, 60/15/5 events, patch, delete, invalid_grant, reco
       const state = await calendarState(s.options);
       hold.calId = state.calendarId ?? '';
       const calId = hold.calId;
+      expect(calId, 'the extension stored the calendar it created').toMatch(/^[0-9a-f]+@group\.calendar\.google\.com$/);
       const reqs = await requestsSince(from);
       // One look for an existing calendar (forbidden for this scope), one
       // calendar created, one insert per calendar item. Nothing else.
@@ -619,6 +620,14 @@ test('calendar sync: connect, 60/15/5 events, patch, delete, invalid_grant, reco
         status: 'confirmed',
         sequence: 0,
         start: { dateTime: endIso(ITEM_D) },
+        reminders: {
+          useDefault: false,
+          overrides: [
+            { method: 'popup', minutes: 60 },
+            { method: 'popup', minutes: 15 },
+            { method: 'popup', minutes: 5 },
+          ],
+        },
         extendedProperties: { private: { sbwItemId: String(ITEM_D), sbwGen: '0', sbwState: 'open' } },
       });
       expect(byId.get(eventId(ITEM_A))).toMatchObject({ status: 'confirmed', sequence: 2 });
@@ -660,6 +669,7 @@ test('calendar dry-run: audit entries only, the Google server receives zero writ
   let s: Session | undefined;
   try {
     await googleScenario(RESET_SCENARIO);
+    const testStart = await mark();
     s = await start(ext, profile, guard, ANCHOR_MS);
     const opened = s;
 
@@ -704,6 +714,9 @@ test('calendar dry-run: audit entries only, the Google server receives zero writ
     await test.step('zero Google calls; every op is a dry-run audit entry; no links', async () => {
       const reqs = await requestsSince(from);
       expect(show(reqs), 'dry-run made a Google call').toEqual([]);
+      // Across the whole test, Google saw only the sign-in (consent page and code exchange): no Calendar API call at all.
+      expect(show((await requestsSince(testStart)).filter(isCalendarApi))).toEqual([]);
+      expect(show(await requestsSince(testStart))).toEqual(['GET /o/oauth2/v2/auth 302', 'POST /token 200']);
       const audits = calendarAudits(await auditEntries(opened.options));
       expect(audits.map((e) => [e.kind, e.itemId, e.dryRun])).toEqual([
         ['calendar.insert', ITEM_E, true],

@@ -15,9 +15,12 @@
 // looks it up on every use) with a stand-in, and the HARNESS plays the user:
 //
 //   1. `{ op: 'install', redirectUrl? }` puts the stand-in on the browser.
-//      `getRedirectURL()` answers `redirectUrl`, else Chrome's own
-//      `https://<extension id>.chromiumapp.org/`. Nothing changes until the
-//      harness calls this: a test build left alone behaves like production.
+//      `getRedirectURL()` answers `redirectUrl`, else the browser's own
+//      (the real `identity.getRedirectURL()` when the browser has one, as
+//      Firefox does), else Chrome's `https://<extension id>.chromiumapp.org/`
+//      (Chrome hides `identity` until its optional permission is granted).
+//      Nothing changes until the harness calls this: a test build left alone
+//      behaves like production.
 //   2. The provider opens consent; the stand-in keeps the flow open.
 //   3. `{ op: 'pending' }` answers `{ url, fakeUrl }` (or null): the consent
 //      URL exactly as the provider built it, and the same URL rewritten by
@@ -61,6 +64,16 @@ const RequestSchema = z.discriminatedUnion('op', [
   z.strictObject({ op: z.literal('uninstall') }),
 ]);
 
+/** The browser's own redirect URL, when it has a working `identity`. */
+function realRedirectUrl(identity: unknown): string | undefined {
+  try {
+    const url = (identity as Partial<WebAuthFlowLike> | undefined)?.getRedirectURL?.();
+    return typeof url === 'string' && url !== '' ? url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface OpenFlow {
   url: string;
   resolve(responseUrl: string): void;
@@ -74,6 +87,8 @@ export function install(ctx: TestHookContext): void {
   /** What `identity` was before install (undefined: absent, as on Chrome without the permission). */
   let previous: PropertyDescriptor | undefined;
   let redirectUrl = '';
+  /** The real identity's redirect URL, read before the stand-in replaced it (undefined on Chrome). */
+  let browserRedirect: string | undefined;
   let flow: OpenFlow | undefined;
 
   const stub: WebAuthFlowLike & { readonly [STUB_MARK]: true } = {
@@ -105,8 +120,11 @@ export function install(ctx: TestHookContext): void {
     const req = parsed.data;
     switch (req.op) {
       case 'install': {
-        if (!installed) previous = Object.getOwnPropertyDescriptor(target, 'identity');
-        redirectUrl = req.redirectUrl ?? `https://${ctx.browser.runtime.id}.chromiumapp.org/`;
+        if (!installed) {
+          previous = Object.getOwnPropertyDescriptor(target, 'identity');
+          browserRedirect = realRedirectUrl(target['identity']);
+        }
+        redirectUrl = req.redirectUrl ?? browserRedirect ?? `https://${ctx.browser.runtime.id}.chromiumapp.org/`;
         Object.defineProperty(target, 'identity', { configurable: true, enumerable: true, writable: true, value: stub });
         installed = true;
         return { redirectUrl };

@@ -5,10 +5,11 @@
 // the Calendar API, the OAuth token and revoke endpoints, and the consent page
 // (which the background never fetches; the google-auth-stub hook uses the
 // rewrite to point the stand-in consent window at the fake). The fake Google
-// server serves all of them on one origin, under the production paths. An override is accepted only when the parsed host is
-// loopback or a `.test` name. Test builds only; see ./index.ts for how hooks
-// are loaded and called. The port gate there refuses content scripts and web
-// pages, so only an extension page (the test harness) can set this.
+// server serves all of them on one origin, under the production paths. An
+// override is accepted only when the parsed host is loopback or a `.test`
+// name. Test builds only; see ./index.ts for how hooks are loaded and called.
+// The port gate there refuses content scripts and web pages, so only an
+// extension page (the test harness) can set this.
 //
 // Mechanism: a wrapper around the background's `globalThis.fetch`. The only
 // network caller in the background is BrowserHttp (src/adapters/browser/http.ts),

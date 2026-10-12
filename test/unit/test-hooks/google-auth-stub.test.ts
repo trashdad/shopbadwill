@@ -64,6 +64,16 @@ describe('sbw:test:googleAuth', () => {
     expect(identityOf(browser).getRedirectURL()).toBe('https://abcdef0123456789.extensions.allizom.org/');
   });
 
+  it('with a real identity already there (Firefox), install defaults to its redirect URL', async () => {
+    const { browser, call } = rig();
+    const allizom = 'https://0123456789abcdef0123456789abcdef01234567.extensions.allizom.org/';
+    browser.identity = { getRedirectURL: () => allizom, launchWebAuthFlow: () => Promise.resolve('real') };
+    expect((await call({ op: 'install' })).value).toEqual({ redirectUrl: allizom });
+    expect(identityOf(browser).getRedirectURL()).toBe(allizom);
+    // A second install keeps answering the browser's own URL (not the stand-in's).
+    expect((await call({ op: 'install' })).value).toEqual({ redirectUrl: allizom });
+  });
+
   it('an interactive launch waits for the harness; pending reports the URL as asked and where the window loads it', async () => {
     const { browser, call } = rig();
     await call({ op: 'install' });
