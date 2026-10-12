@@ -316,11 +316,23 @@ async function approachFire(r: Rig, verified: Snipe): Promise<number> {
 
 // ── Assertions ──────────────────────────────────────────────────────────────
 
-/** The money assertion: no PlaceBid (and no ShowBidModal) ever reached the fake SGW. */
-async function expectZeroBidWrites(): Promise<FakeLogEntry[]> {
+/**
+ * The send path's audit kinds (state-machine.ts AUDIT_KIND). A dry run writes none of them:
+ * `bid.not-sent` would mean a money effect was emitted for it and dropped by the runner.
+ */
+const SEND_AUDIT_KINDS = ['bid.sent', 'bid.result', 'bid.ambiguous', 'bid.not-sent'];
+
+/**
+ * The money assertion: no PlaceBid (and no ShowBidModal) ever reached the fake
+ * SGW, and the runner's audit holds no send attempt either (a request the
+ * server never saw would still have been audited).
+ */
+async function expectZeroBidWrites(r: Rig): Promise<FakeLogEntry[]> {
   const log = await fakeLog();
   const writes = log.filter((e) => BID_WRITE.test(e.endpoint) || BID_WRITE.test(e.path));
   expect(writes, 'a dry run must never reach PlaceBid or ShowBidModal').toEqual([]);
+  const sends = (await auditEntries(r.options)).filter((e) => SEND_AUDIT_KINDS.includes(e.kind));
+  expect(sends, 'a dry run must never attempt a send').toEqual([]);
   return log;
 }
 
@@ -397,7 +409,7 @@ test('on-time dry-run fire: the tight timer fires on time, the measured error is
     const fireLocal = await approachFire(r, verified as Snipe);
     const done = await waitForState(r, ['resolved', 'killed'], 'the dry run never resolved');
     expect(done).toMatchObject({ state: 'resolved', outcome: 'dry-run', dryRun: true });
-    const log = await expectZeroBidWrites();
+    const log = await expectZeroBidWrites(r);
     // The one harmless read at fire time: the only request after the fire.
     const after = readsSince(log, fireLocal);
     expect(after.map((e) => [e.endpoint, e.status])).toEqual([[ITEM_DETAIL, 200]]);
@@ -413,8 +425,6 @@ test('on-time dry-run fire: the tight timer fires on time, the measured error is
   await test.step('the audit trail: preflight, wake, verified, bid.dry-run, post-read; nothing sent', async () => {
     const audit = await auditFor(r);
     expect(kinds(audit)).toEqual(expect.arrayContaining(['snipe.arm', 'snipe.preflight', 'snipe.wake', 'snipe.verified', 'bid.dry-run', 'snipe.post-read']));
-    expect(kinds(audit)).not.toContain('bid.sent');
-    expect(kinds(audit)).not.toContain('bid.not-sent');
     const fired = audit.find((e) => e.kind === 'bid.dry-run');
     expect(fired).toMatchObject({ dryRun: true, details: { amount: MAX_BID } });
   });
@@ -529,7 +539,7 @@ test('restart mid-wake: the worker dies in the window; the restarted runner resu
     const done = await waitForState(r, ['resolved', 'killed'], 'the dry run never resolved');
     expect(done).toMatchObject({ state: 'resolved', outcome: 'dry-run' });
     expect(done.history.map((h) => h.to)).toEqual(['armed', 'waking', 'verified', 'firing', 'resolved']);
-    const log = await expectZeroBidWrites();
+    const log = await expectZeroBidWrites(r);
     const after = readsSince(log, fireLocal);
     expect(after.map((e) => e.endpoint)).toEqual([ITEM_DETAIL]);
     await logTiming('restart-mid-wake', done, after[0], r.endMs);
@@ -583,7 +593,7 @@ test('stalled fetch: the fire-time read stalls past the 20 s timeout, stays unre
     await expect
       .poll(async () => readsSince(await fakeLog(), fireLocal).length, { message: 'the stalled read is in the log once SGW answers it', timeout: 15_000 })
       .toBe(2);
-    const after = readsSince(await expectZeroBidWrites(), fireLocal).sort((a, b) => (a.fakeNowMs as number) - (b.fakeNowMs as number));
+    const after = readsSince(await expectZeroBidWrites(r), fireLocal).sort((a, b) => (a.fakeNowMs as number) - (b.fakeNowMs as number));
     expect(after.map((e) => e.endpoint)).toEqual([ITEM_DETAIL, ITEM_DETAIL]);
     expect((after[0]?.fakeNowMs as number) - fireLocal, 'the stalled read went out at the fire').toBeLessThan(1000);
     expect((after[1]?.fakeNowMs as number) - (after[0]?.fakeNowMs as number), 'the post-read came after the retry delay').toBeGreaterThanOrEqual(5 * MIN);
@@ -599,7 +609,7 @@ test('stalled fetch: the fire-time read stalls past the 20 s timeout, stays unre
 /** The snipe never fired: no dry-run fire audit, no read after `afterLocal`, not counted as a dry run. */
 async function expectNeverFired(r: Rig, afterLocal: number): Promise<void> {
   expect(kinds(await auditFor(r))).not.toContain('bid.dry-run');
-  const log = await expectZeroBidWrites();
+  const log = await expectZeroBidWrites(r);
   expect(readsSince(log, afterLocal + 1), 'no read after the snipe ended').toEqual([]);
   expect(((await sendMsg(r.options, 'settings.get')) as Settings).snipe.completedDryRuns, 'not a completed dry run').toBe(0);
 }

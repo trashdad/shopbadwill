@@ -292,7 +292,8 @@ def test_a_dry_run_snipe_holds_the_runner_page_through_its_window_and_fires_on_t
     kinds = [e["kind"] for e in rig.audit()]
     assert "snipe.host-degraded" not in kinds
     assert "bid.dry-run" in kinds and "snipe.post-read" in kinds
-    assert "bid.sent" not in kinds
+    # No send attempt (bid.not-sent would be a money effect emitted for a dry run, then dropped).
+    assert [k for k in kinds if k in ("bid.sent", "bid.result", "bid.ambiguous", "bid.not-sent")] == []
 
     # Zero bid writes; the one harmless read at fire time is the only request after the fire.
     log = fake_sgw.log()
