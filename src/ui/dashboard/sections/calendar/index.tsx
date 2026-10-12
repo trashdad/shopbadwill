@@ -3,11 +3,18 @@
 // downloads a .ics file (T-68's buildIcs, through `calendar.ics`) that needs no
 // Google at all. Every control is a native button; results use role="status" or
 // role="alert".
+//
+// T-117: the auctions on the calendar, each with "Stop tracking". A confirm
+// step says the event leaves our dedicated calendar; Yes sends the existing
+// `tracked.remove` (the background audits it; the sync then deletes our event
+// and audits that). There is no undo: re-tracking has no audit undo kind.
 import type { VNode } from 'preact';
 import { useState } from 'preact/hooks';
 
 import type { AuthStatus } from '../../../../domain/calendar/types';
+import type { TrackedItem } from '../../../../domain/types';
 import { describeError } from '../../../components/describeError';
+import { PacificTime } from '../../../time';
 import { ErrorAlert, LoadNotice, useLoad } from '../../parts';
 import type { SectionDef, SectionProps } from '../../registry';
 
@@ -17,6 +24,9 @@ export function describeStatus(s: AuthStatus): string {
   if (s.needsInteraction) return 'Google needs you to reconnect. Events are queued as pending until you do.';
   return `Connected${s.account === undefined ? '' : ` as ${s.account}`}.`;
 }
+
+/** Site-derived title, shown as a text node only. */
+const titleOf = (t: TrackedItem): string => (t.title === '' ? `Item ${String(t.itemId)}` : t.title);
 
 /** Saves `ics` as a file through a temporary link. */
 function download(ics: string): void {
@@ -37,7 +47,11 @@ export function CalendarSection(props: SectionProps): VNode {
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [tracked, reloadTracked] = useLoad(() => client.send('tracked.list', undefined), [client]);
+  /** The item whose "Stop tracking" awaits confirmation. */
+  const [confirming, setConfirming] = useState<TrackedItem | null>(null);
   const connected = status.kind === 'ok' && status.value.connected;
+  const onCalendar = tracked.kind === 'ok' ? tracked.value.filter((t) => t.calendar) : [];
 
   const act = async (label: string, fn: () => Promise<void>): Promise<void> => {
     setBusy(true);
@@ -51,6 +65,22 @@ export function CalendarSection(props: SectionProps): VNode {
     } finally {
       setBusy(false);
       refresh();
+    }
+  };
+
+  const stopTracking = async (t: TrackedItem): Promise<void> => {
+    setConfirming(null);
+    setBusy(true);
+    setError('');
+    setNote('');
+    try {
+      await client.send('tracked.remove', { itemId: t.itemId });
+      setNote(`Stopped tracking ${titleOf(t)}. Its event leaves your calendar at the next sync.`);
+    } catch (e) {
+      setError(`Could not stop tracking ${titleOf(t)}. ${describeError(e)}`);
+    } finally {
+      setBusy(false);
+      reloadTracked();
     }
   };
 
@@ -98,6 +128,39 @@ export function CalendarSection(props: SectionProps): VNode {
           Download .ics file
         </button>
       </div>
+      <h3>Auctions on your calendar</h3>
+      <LoadNotice state={tracked} what="Tracked auctions" />
+      {tracked.kind === 'ok' && onCalendar.length === 0 ? <p class="sbw-muted">No tracked auctions are on your calendar.</p> : null}
+      {onCalendar.length > 0 ? (
+        <ul class="sbw-list" aria-label="Auctions on your calendar">
+          {onCalendar.map((t) => (
+            <li key={t.itemId}>
+              <span>{titleOf(t)}</span>
+              <div class="sbw-meta">
+                Ends <PacificTime ms={new Date(t.endTime).getTime()} userTz={props.userTz} />{' '}
+                <button type="button" disabled={busy} aria-label={`Stop tracking ${titleOf(t)}`} onClick={() => setConfirming(t)}>
+                  Stop tracking
+                </button>
+              </div>
+              {confirming?.itemId === t.itemId ? (
+                <div>
+                  <p>
+                    Stop tracking {titleOf(t)}? Its event will be removed from your "ShopGoodwill Auctions" calendar, the dedicated
+                    calendar this extension made. Nothing else in your Google Calendar is touched, and nothing changes in your
+                    ShopGoodwill favorites.
+                  </p>
+                  <button type="button" disabled={busy} onClick={() => void stopTracking(t)}>
+                    Yes, stop tracking
+                  </button>{' '}
+                  <button type="button" onClick={() => setConfirming(null)}>
+                    Cancel
+                  </button>
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <p class="sbw-muted">The .ics file works without Google. Google may ignore its reminders when you import it; Apple and Outlook keep them.</p>
       {note === '' ? null : <p role="status">{note}</p>}
       <ErrorAlert message={error} />
