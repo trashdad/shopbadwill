@@ -17,6 +17,7 @@
 import { SettingsSchema, type Settings } from '../../domain/settings/schema';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import type { BackgroundContext } from '../context';
+import { nextDailySlot } from '../jobs/daily-job-runner';
 import type { HandlerContext } from '../router';
 
 export function register(ctx: BackgroundContext): void {
@@ -28,6 +29,7 @@ export function register(ctx: BackgroundContext): void {
 }
 
 export async function applySettingsPatch(ctx: BackgroundContext, patch: Partial<Settings>, hctx: HandlerContext): Promise<Settings> {
+  let before: Settings | undefined;
   const next = await ctx.repo.withLock(STORAGE_KEYS.settings, async () => {
     const current = await ctx.repo.get(STORAGE_KEYS.settings);
     const groups: Partial<Settings> = { ...patch };
@@ -39,8 +41,26 @@ export async function applySettingsPatch(ctx: BackgroundContext, patch: Partial<
     });
     await ctx.interceptors.settingsSet.check({ patch, current, next: merged, sender: hctx });
     await ctx.repo.set(STORAGE_KEYS.settings, merged);
+    before = current;
     return merged;
   });
   ctx.switches.noteSettings(next);
+  if (before !== undefined) await reslotWatches(ctx, before, next);
   return next;
+}
+
+/**
+ * T-118 (L5): a new daily run time (or zone) takes effect at its next
+ * occurrence: the same day if that time is still ahead. Each watch's pending
+ * slot moves to it; an overdue slot is left for the scheduler's catch-up rule.
+ */
+async function reslotWatches(ctx: BackgroundContext, before: Settings, after: Settings): Promise<void> {
+  if (before.dailyRun.localTime === after.dailyRun.localTime && before.locale.timeZone === after.locale.timeZone) return;
+  const now = ctx.clock.now();
+  const slot = nextDailySlot(after, now);
+  await ctx.repo.update(STORAGE_KEYS.watches, (watches) =>
+    watches.some((w) => w.nextRunAt > now && w.nextRunAt !== slot)
+      ? watches.map((w) => (w.nextRunAt > now ? { ...w, nextRunAt: slot } : w))
+      : watches,
+  );
 }
