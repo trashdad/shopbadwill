@@ -75,7 +75,18 @@ export function CalendarSection(props: SectionProps): VNode {
     setNote('');
     try {
       await client.send('tracked.remove', { itemId: t.itemId });
-      setNote(`Stopped tracking ${titleOf(t)}. Its event leaves your calendar at the next sync.`);
+      // Honest about calendar dry run (default on): then the sync only audits the delete.
+      const dryRun = await client.send('settings.get', undefined).then(
+        (s) => s.dryRun.calendar,
+        () => undefined,
+      );
+      setNote(
+        dryRun === true
+          ? 'Stopped tracking. Calendar dry run is on, so the event was not removed.'
+          : dryRun === false
+            ? `Stopped tracking ${titleOf(t)}. Its event leaves your calendar at the next sync.`
+            : `Stopped tracking ${titleOf(t)}.`,
+      );
     } catch (e) {
       setError(`Could not stop tracking ${titleOf(t)}. ${describeError(e)}`);
     } finally {

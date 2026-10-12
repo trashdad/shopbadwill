@@ -4,6 +4,7 @@ import { h } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuthStatus } from '../../src/domain/calendar/types';
+import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { TrackedItem } from '../../src/domain/types';
 import { loadSections } from '../../src/ui/dashboard/registry';
 import { builtinModules } from '../../src/ui/dashboard/sections';
@@ -116,6 +117,26 @@ describe('dashboard calendar section', () => {
         expect(screen.queryByText('Item 3')).toBeNull();
       });
       expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it.each([
+      [true, 'Stopped tracking. Calendar dry run is on, so the event was not removed.'],
+      [false, 'Stopped tracking Item 3. Its event leaves your calendar at the next sync.'],
+    ])('calendar dry run %s: the success note says what really happens to the event', async (dryRun, text) => {
+      const m = new FakeMessaging();
+      list(m);
+      m.handle('tracked.remove', () => undefined);
+      m.handle('settings.get', () => {
+        const s = defaultSettings();
+        return { ...s, dryRun: { ...s.dryRun, calendar: dryRun } };
+      });
+      mount(m);
+      await onCalendar();
+      fireEvent.click(screen.getByRole('button', { name: 'Stop tracking Item 3' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Yes, stop tracking' }));
+      await waitFor(() => {
+        expect(screen.getByRole('status').textContent).toBe(text);
+      });
     });
 
     it('cancel sends nothing and closes the confirm step', async () => {
