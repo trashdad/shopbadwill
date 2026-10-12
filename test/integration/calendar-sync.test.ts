@@ -17,6 +17,7 @@ import {
   CALENDAR_SUMMARY,
   RequestLimiter,
   SYNC_STATE_KEY,
+  TEST_EVENT_SUMMARY,
   deleteEventRef,
   parseDeleteEventRef,
 } from '../../src/adapters/google/calendar-sink';
@@ -881,6 +882,76 @@ describe('late add, reminder sinks, undo, handlers', () => {
     expect(out.ics).toContain('SUMMARY:Teapot');
     expect(out.ics.match(/BEGIN:VALARM/g)).toHaveLength(3);
     expect(r.fake.state.requests).toHaveLength(0);
+  });
+
+  // T-119: "Send a test event" on the options page.
+  it('calendar.testEvent creates one clearly-titled event 1 h ahead in our calendar, then deletes it', async () => {
+    const r = await rig();
+    const tracked = await r.repo.get(STORAGE_KEYS.tracked);
+    const before = Date.now();
+    const out = await createCalendarHandlers(fakeCtx(r))['calendar.testEvent'](undefined, {} as never);
+    expect(out).toEqual({ result: 'created-and-deleted' });
+
+    const events = r.events();
+    expect(events).toHaveLength(1);
+    const ev = must(events[0]);
+    expect(ev.summary).toBe(TEST_EVENT_SUMMARY);
+    expect(ev.summary).toBe('ShopBadwill test event — safe to delete');
+    expect(ev.status).toBe('cancelled');
+    // Never mistaken for an auction event: the ownership guard skips an empty sbwItemId.
+    expect(ev.extendedProperties.private['sbwItemId']).toBe('');
+    const start = Date.parse(ev.start.dateTime);
+    expect(start).toBeGreaterThanOrEqual(before + HOUR - MIN);
+    expect(start).toBeLessThanOrEqual(Date.now() + HOUR + MIN);
+    expect(r.writes()).toEqual([
+      'POST /calendars',
+      `POST /calendars/${encodeURIComponent(r.calendarId())}/events`,
+      `DELETE /calendars/${encodeURIComponent(r.calendarId())}/events/${ev.id}`,
+    ]);
+    expect(r.audit.entries.filter((e) => e.kind === 'calendar.testEvent')).toEqual([
+      expect.objectContaining({ actor: 'user', details: { deleted: true } }),
+    ]);
+    // Nothing else changed: no tracked item, no link.
+    expect(await r.repo.get(STORAGE_KEYS.tracked)).toEqual(tracked);
+    expect(await links(r)).toEqual({});
+  });
+
+  it('calendar.testEvent in calendar dry run writes nothing and says so', async () => {
+    const r = await rig();
+    await r.settings((s) => {
+      s.dryRun.calendar = true;
+    });
+    r.switches.block('calendar', 'dry run');
+    const out = await createCalendarHandlers(fakeCtx(r))['calendar.testEvent'](undefined, {} as never);
+    expect(out).toEqual({ result: 'dry-run' });
+    expect(calendarRequests(r)).toBe(0);
+    expect(r.audit.entries.filter((e) => e.kind === 'calendar.testEvent')).toEqual([
+      expect.objectContaining({ actor: 'user', dryRun: true }),
+    ]);
+  });
+
+  it('calendar.testEvent is refused, with no Google request, when Google is not connected', async () => {
+    const r = await rig({ connect: false });
+    await expect(createCalendarHandlers(fakeCtx(r))['calendar.testEvent'](undefined, {} as never)).rejects.toThrow(/not connected/);
+    expect(r.fake.state.requests).toHaveLength(0);
+  });
+
+  it('calendar.testEvent is refused, with no Google request, when calendar events are off', async () => {
+    const r = await rig();
+    await r.settings((s) => {
+      s.calendar.enabled = false;
+    });
+    const n = r.fake.state.requests.length;
+    await expect(createCalendarHandlers(fakeCtx(r))['calendar.testEvent'](undefined, {} as never)).rejects.toThrow(/calendar events are off/i);
+    expect(r.fake.state.requests).toHaveLength(n);
+  });
+
+  it('calendar.testEvent is refused, with no Calendar request, while the kill switch is on', async () => {
+    const r = await rig();
+    r.switches.killAll('kill switch');
+    await expect(createCalendarHandlers(fakeCtx(r))['calendar.testEvent'](undefined, {} as never)).rejects.toThrow(/kill switch/);
+    expect(calendarRequests(r)).toBe(0);
+    expect(r.audit.kinds.filter((k) => k === 'calendar.testEvent')).toEqual([]);
   });
 
   it('the calendarUpsert step executor syncs and reports done; default export is { kind, run }', async () => {

@@ -696,3 +696,19 @@ Source: T-113, the relist detector ("Seen before at $X (date)" on search cards).
 **`relist.lookup`** (content -> background). Payload `{ itemIds: ItemId[] }`, at most 40. Reply `Record<ItemId, { itemId, price, seenAt } | null>`: the earlier listing of each item, or null. The handler (`src/background/handlers/relist.ts`, self-registered) makes no SGW request. With the feature off it answers null for every id and reads nothing but the settings. A `relistId` on the listing wins when the history knows that item; otherwise the fingerprint matches an EARLIER item id (SGW ids grow), the most recently seen first. An item never matches itself. The badge (`src/content/ui/badges/relist.tsx`, loaded by the badge glob) batches every card of a flush into one message.
 
 **Follow-up for the next PLAN edit.** Add `sbw:relistSeen` to PLAN §2.3 and `relist.lookup` to §3.12 and contracts.md.
+
+## T-119 contract change: `calendar.testEvent`
+
+Source: T-119 item 1, the options page's "Send a test event". Additive; `schemaVersion` stays 1 and nothing migrates.
+
+**`calendar.testEvent`** (ui -> background, a signal: no payload). Reply `{ result: 'created-and-deleted' | 'dry-run' }`. The handler (`src/background/handlers/calendar.ts`) refuses, before any Google request, when Google is not connected, needs a reconnect, or `settings.calendar.enabled` is off. It then calls `GoogleCalendarSink.sendTestEvent()` (`src/adapters/google/calendar-sink.ts`) through the same `syncFor(ctx)` sink as calendar sync, so the same gates, limiter and cooldown apply:
+
+- With calendar writes allowed: the dedicated calendar is ensured (created or adopted as in a sync), ONE event titled "ShopBadwill test event — safe to delete" is inserted 1 h from now (15 min long, no reminders, id `testevt<base32hex ms>`), and deleted at once. Its private `sbwItemId` is `''`, so the ownership guard and every sync treat it as not ours. Audit `calendar.testEvent` (actor `user`, `ref` = event id, `details.deleted`). A failed delete is audited with `deleted: false` and the error tells the user to delete the event by hand.
+- Calendar dry run (`dryRun.calendar` on, kill switch off): nothing is sent. Audit `calendar.testEvent` with `dryRun: true`; reply `dry-run`.
+- Any other block (kill switch, health, cooldown): throws, nothing is sent.
+
+`test/contract/types/messages.test.ts` lists the type, its sender group and its reply; examples `examples/Msg/calendar.testEvent.{valid,invalid}.json`.
+
+**Not a contract change, recorded for completeness (T-119 item 3).** `PkceRefreshProvider.markNeedsInteraction('permission-revoked')` is a new adapter method (not on the `GoogleAuthProvider` port). The new job `src/background/jobs/permission-watch.ts` calls it when `identity` or a Google host permission is removed; its audit entry is `google.needsInteraction` with `details: { reason: 'permission-revoked' }` (the invalid_grant one carries `details.error`). The same job sets `sbw:ntfy.status` to the existing `needs-permission` value when the ntfy host is removed while phone push is on.
+
+**Follow-up for the next PLAN edit.** Add `calendar.testEvent` to §3.12 and contracts.md.

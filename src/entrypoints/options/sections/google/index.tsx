@@ -3,6 +3,7 @@ import { announceSettingsSaved } from '../../settings-events';
 import { useEffect, useRef, useState } from 'preact/hooks';
 
 import { isFirefox } from '../../../../adapters/browser/env';
+import { googleRedirectUri } from '../../../../adapters/browser/identity';
 import { BrowserPermissions } from '../../../../adapters/browser/permissions';
 import type { AuthStatus } from '../../../../domain/calendar/types';
 import type { Settings } from '../../../../domain/settings/schema';
@@ -32,6 +33,10 @@ export interface GoogleSectionProps extends SectionProps {
   permissions?: Pick<Permissions, 'contains' | 'request'>;
   /** Injectable for tests: the build target (Chrome asks for `identity` too). */
   firefox?: boolean;
+  /** Injectable for tests (T-119): the redirect URI, or undefined until `identity` is available. */
+  redirectUri?: () => string | undefined;
+  /** Injectable for tests (T-119). */
+  clipboard?: { writeText(text: string): Promise<void> };
 }
 
 const DAY_MS = 86_400_000;
@@ -74,6 +79,11 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
   const [reminders, setReminders] = useState<string[]>(DEFAULT_REMINDERS.map(String));
   const [reminderError, setReminderError] = useState<string | undefined>(undefined);
   const [modeMsg, setModeMsg] = useState<Msg>({ message: '', tone: 'ok' });
+  const readRedirect = props.redirectUri ?? googleRedirectUri;
+  const [redirectUri, setRedirectUri] = useState<string | undefined>(() => readRedirect());
+  const [redirectMsg, setRedirectMsg] = useState<Msg>({ message: '', tone: 'ok' });
+  const [testMsg, setTestMsg] = useState<Msg>({ message: '', tone: 'ok' });
+  const [testing, setTesting] = useState(false);
 
   const refreshStatus = (): Promise<void> =>
     client.send('calendar.status', undefined).then(
@@ -268,10 +278,71 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
     );
   };
 
+  /** T-119: copies the redirect URI; the status line says what happened. */
+  const copyRedirect = (uri: string): void => {
+    const clip = props.clipboard ?? (typeof navigator === 'undefined' ? undefined : navigator.clipboard);
+    if (clip === undefined) {
+      setRedirectMsg({ message: 'Select the address and press Ctrl+C (Command+C on a Mac) to copy it.', tone: 'ok' });
+      return;
+    }
+    clip.writeText(uri).then(
+      () => {
+        setRedirectMsg({ message: 'Redirect URI copied. Paste it under Authorized redirect URIs in your Google client.', tone: 'ok' });
+      },
+      () => {
+        setRedirectMsg({ message: 'Could not copy automatically. Select the address and press Ctrl+C (Command+C on a Mac).', tone: 'error' });
+      },
+    );
+  };
+
+  /**
+   * T-119, Chrome before `identity` is granted: the click asks for it first
+   * (still inside the user gesture, I-21), then shows and copies the URI.
+   */
+  const revealRedirect = (): void => {
+    const access = requestAccess(permissionsApi, { permissions: ['identity'] });
+    void access.then((r) => {
+      const uri = r.kind === 'granted' ? readRedirect() : undefined;
+      if (uri === undefined) {
+        setRedirectMsg({
+          message: "The redirect URI needs the browser's sign-in permission. Click again and choose Allow, or connect once and come back.",
+          tone: 'error',
+        });
+        return;
+      }
+      setRedirectUri(uri);
+      copyRedirect(uri);
+    });
+  };
+
+  /** T-119: "Send a test event" (one event, deleted at once; nothing in calendar dry run). */
+  const sendTestEvent = (): void => {
+    setTesting(true);
+    setTestMsg({ message: '', tone: 'ok' });
+    client.send('calendar.testEvent', undefined).then(
+      (r) => {
+        setTesting(false);
+        setTestMsg(
+          r.result === 'dry-run'
+            ? {
+                message: 'Dry run: nothing was written to Google. Turn off Dry run: calendar in Settings to send a real test event.',
+                tone: 'ok',
+              }
+            : { message: 'A test event was added to ShopGoodwill Auctions and deleted again. Google Calendar works.', tone: 'ok' },
+        );
+      },
+      (e: unknown) => {
+        setTesting(false);
+        setTestMsg({ message: `Could not send the test event. ${describeError(e)}`, tone: 'error' });
+      },
+    );
+  };
+
   const expiresAt = auth?.refreshTokenExpiresAt;
   const testingWarning = auth?.connected === true && expiresAt !== undefined && expiresAt <= now() + TESTING_WINDOW_MS;
 
   const calendarToggleOff = settings === null || auth === null || !auth.connected;
+  const canTest = auth?.connected === true && !auth.needsInteraction && settings?.calendar.enabled === true && !testing;
   const calendarToggleHint =
     auth === null
       ? authUnavailable
@@ -292,6 +363,51 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
         <p class="sbw-hint">
           ShopBadwill uses your own Google OAuth client, so nothing is shared with anyone else. Create a Web application client in Google Cloud console and paste its details here. They stay on this device.
         </p>
+        <Status message={redirectMsg.message} tone={redirectMsg.tone} />
+        {redirectUri === undefined ? (
+          <div class="sbw-field">
+            <p class="sbw-hint">
+              Your client's redirect URI appears once ShopBadwill may use the browser's sign-in. The button asks for that
+              permission, then shows and copies the address.
+            </p>
+            <div class="sbw-actions">
+              <button type="button" class="sbw-secondary" onClick={revealRedirect}>
+                Show and copy redirect URI
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div class="sbw-field">
+            <label for="g-redirect-uri">Authorized redirect URI</label>
+            <div class="sbw-row">
+              <input
+                id="g-redirect-uri"
+                type="text"
+                readOnly
+                spellcheck={false}
+                value={redirectUri}
+                aria-describedby="g-redirect-uri-hint"
+                onFocus={(e) => {
+                  e.currentTarget.select();
+                }}
+              />
+              <button
+                type="button"
+                class="sbw-secondary"
+                onClick={() => {
+                  copyRedirect(redirectUri);
+                }}
+              >
+                Copy redirect URI
+              </button>
+            </div>
+            <p class="sbw-hint" id="g-redirect-uri-hint">
+              {firefox
+                ? 'Firefox signs in through this loopback address. A Desktop app client needs no redirect URI; a Web application client must list it exactly.'
+                : 'Paste it exactly, with the trailing slash, under Authorized redirect URIs. It changes if you load the extension from another folder.'}
+            </p>
+          </div>
+        )}
         <div class={idError === undefined ? 'sbw-field' : 'sbw-field sbw-field-invalid'}>
           <label for="g-client-id">Client ID</label>
           <input
@@ -453,6 +569,19 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
             });
           }}
         />
+        <div class="sbw-actions">
+          <button type="button" class="sbw-secondary" disabled={!canTest} aria-describedby="g-test-hint" onClick={sendTestEvent}>
+            Send a test event
+          </button>
+        </div>
+        <p class="sbw-hint" id="g-test-hint">
+          {auth?.connected !== true || settings?.calendar.enabled !== true
+            ? 'Connect Google and turn on calendar events to send a test event.'
+            : settings.dryRun.calendar
+              ? 'Calendar dry run is on, so the test writes nothing to Google.'
+              : 'Adds one event, "ShopBadwill test event \u2014 safe to delete", an hour from now, and deletes it at once.'}
+        </p>
+        <Status message={testMsg.message} tone={testMsg.tone} />
         <fieldset class="sbw-inline-fieldset">
           <legend>Which calendar</legend>
           <label>

@@ -1052,3 +1052,154 @@ describe('T-70d: Connect asks for the optional Google permissions first', () => 
     expect(permissions.requested).toHaveLength(0);
   });
 });
+
+// ── T-119: setup aids ───────────────────────────────────────────────────────
+
+describe('T-119: redirect URI with a Copy button', () => {
+  const CHROME_URI = 'https://gjbekijbmjlkdildfknfbcfnhjhohmlh.chromiumapp.org/';
+  const FF_URI = 'http://127.0.0.1/mozoauth2/3f855aad165e9bf088575dff75668afa3e901fb1';
+
+  class Clip {
+    readonly written: string[] = [];
+    fail = false;
+    writeText(text: string): Promise<void> {
+      if (this.fail) return Promise.reject(new Error('denied'));
+      this.written.push(text);
+      return Promise.resolve();
+    }
+  }
+
+  function app(opts: { uri: () => string | undefined; firefox?: boolean; permissions?: FakePermissions }) {
+    const fake = new FakeMessaging();
+    fake.handle('calendar.status', () => status());
+    fake.handle('settings.get', () => defaultSettings());
+    const clipboard = new Clip();
+    const permissions = opts.permissions ?? new FakePermissions();
+    render(
+      h(GoogleSection, {
+        client: fake,
+        store: new MemStore(),
+        now: () => NOW,
+        permissions,
+        firefox: opts.firefox ?? false,
+        redirectUri: opts.uri,
+        clipboard,
+      }),
+    );
+    return { fake, clipboard, permissions };
+  }
+
+  it('shows the exact redirect URI read-only, and Copy puts it on the clipboard', async () => {
+    const { clipboard, permissions } = app({ uri: () => CHROME_URI });
+    const field = screen.getByLabelText<HTMLInputElement>('Authorized redirect URI');
+    expect(field.value).toBe(CHROME_URI);
+    expect(field.readOnly).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy redirect URI' }));
+    await screen.findByText('Redirect URI copied. Paste it under Authorized redirect URIs in your Google client.');
+    expect(clipboard.written).toEqual([CHROME_URI]);
+    expect(permissions.requested).toEqual([]);
+  });
+
+  it('Chrome without identity: explains, and the click asks for identity first, then shows and copies the URI', async () => {
+    const permissions = new FakePermissions();
+    const { clipboard } = app({ permissions, uri: () => (permissions.requested.length > 0 ? CHROME_URI : undefined) });
+    expect(screen.queryByLabelText('Authorized redirect URI')).toBeNull();
+    expect(screen.getByText(/appears once ShopBadwill may use the browser's sign-in/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Show and copy redirect URI' }));
+    // Inside the click, before any await.
+    expect(permissions.requested).toEqual([{ permissions: ['identity'] }]);
+    await waitFor(() => {
+      expect(screen.getByLabelText<HTMLInputElement>('Authorized redirect URI').value).toBe(CHROME_URI);
+    });
+    expect(clipboard.written).toEqual([CHROME_URI]);
+  });
+
+  it('Chrome: a refused identity prompt shows nothing and says why', async () => {
+    const permissions = new FakePermissions();
+    permissions.grantRequests = false;
+    const { clipboard } = app({ permissions, uri: () => undefined });
+    fireEvent.click(screen.getByRole('button', { name: 'Show and copy redirect URI' }));
+    await screen.findByText(/The redirect URI needs the browser's sign-in permission/);
+    expect(clipboard.written).toEqual([]);
+  });
+
+  it('a clipboard failure says to copy by hand', async () => {
+    const { clipboard } = app({ uri: () => CHROME_URI });
+    clipboard.fail = true;
+    fireEvent.click(screen.getByRole('button', { name: 'Copy redirect URI' }));
+    await screen.findByText(/Could not copy automatically/);
+  });
+
+  it('Firefox: shows the loopback address and says the Desktop app client needs none', () => {
+    app({ uri: () => FF_URI, firefox: true });
+    expect(screen.getByLabelText<HTMLInputElement>('Authorized redirect URI').value).toBe(FF_URI);
+    expect(screen.getByText(/Desktop app client needs no redirect URI/)).toBeTruthy();
+  });
+});
+
+describe('T-119: Send a test event', () => {
+  function app(opts: { auth?: AuthStatus; settings?: Settings; reply?: () => MsgReply<'calendar.testEvent'> }) {
+    const fake = new FakeMessaging();
+    fake.handle('calendar.status', () => opts.auth ?? status({ connected: true, grantedScopes: [SCOPE] }));
+    fake.handle('settings.get', () => opts.settings ?? on());
+    fake.handle('calendar.testEvent', () => (opts.reply ?? (() => ({ result: 'created-and-deleted' as const })))());
+    render(h(GoogleSection, { client: fake, store: new MemStore(), now: () => NOW, permissions: new FakePermissions(), redirectUri: () => undefined }));
+    return { fake };
+  }
+  function on(dryRun = false): Settings {
+    const s = defaultSettings();
+    return { ...s, calendar: { ...s.calendar, enabled: true }, dryRun: { ...s.dryRun, calendar: dryRun } };
+  }
+  const button = () => screen.getByRole<HTMLButtonElement>('button', { name: 'Send a test event' });
+
+  it('is disabled until Google is connected', async () => {
+    const { fake } = app({ auth: status() });
+    await screen.findByText('Not connected');
+    expect(button().disabled).toBe(true);
+    expect(screen.getByText(/Connect Google and turn on calendar events to send a test event/)).toBeTruthy();
+    fireEvent.click(button());
+    expect(sent(fake, 'calendar.testEvent')).toHaveLength(0);
+  });
+
+  it('is disabled while calendar events are off', async () => {
+    app({ settings: defaultSettings() });
+    await screen.findByText('Connected');
+    await waitFor(() => {
+      expect(screen.getByLabelText<HTMLInputElement>('Add auction ends to Google Calendar').disabled).toBe(false);
+    });
+    expect(button().disabled).toBe(true);
+  });
+
+  it('connected with calendar on: sends calendar.testEvent once and reports success', async () => {
+    const { fake } = app({});
+    await waitFor(() => {
+      expect(button().disabled).toBe(false);
+    });
+    fireEvent.click(button());
+    await screen.findByText(/A test event was added to ShopGoodwill Auctions and deleted again/);
+    expect(sent(fake, 'calendar.testEvent')).toHaveLength(1);
+  });
+
+  it('in calendar dry run, says beforehand and afterwards that nothing is written', async () => {
+    app({ settings: on(true), reply: () => ({ result: 'dry-run' }) });
+    await screen.findByText(/Calendar dry run is on, so the test writes nothing to Google/);
+    await waitFor(() => {
+      expect(button().disabled).toBe(false);
+    });
+    fireEvent.click(button());
+    await screen.findByText(/Dry run: nothing was written to Google/);
+  });
+
+  it('shows a refusal as an error', async () => {
+    app({
+      reply: () => {
+        throw new Error('calendar writes are off: kill switch is on');
+      },
+    });
+    await waitFor(() => {
+      expect(button().disabled).toBe(false);
+    });
+    fireEvent.click(button());
+    await screen.findByText(/Could not send the test event\. .*kill switch/);
+  });
+});

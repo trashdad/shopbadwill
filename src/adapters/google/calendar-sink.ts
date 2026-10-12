@@ -104,6 +104,13 @@ export const SYNC_STATE_KEY = 'sbw:calendarSync';
 /** Event title prefixes once the outcome is known. */
 export const OUTCOME_LABEL: Readonly<Record<Outcome, string>> = { won: 'WON', lost: 'LOST', 'ended-early': 'ENDED EARLY' };
 const MAX_BUMPS = 3;
+
+/** T-119: the options page's "Send a test event". */
+export const TEST_EVENT_SUMMARY = 'ShopBadwill test event — safe to delete';
+const TEST_EVENT_DESCRIPTION =
+  'Created by "Send a test event" in the ShopBadwill options and deleted at once. If you can still see it, delete it.';
+const TEST_EVENT_LEAD_MS = 60 * 60_000;
+const TEST_EVENT_LENGTH_MS = 15 * 60_000;
 const MAX_ERROR_CHARS = 200;
 
 // ── Undo ref (audit `undo.kind: 'deleteEvent'`) ─────────────────────────────
@@ -423,6 +430,50 @@ export class GoogleCalendarSink implements CalendarSink {
 
   async reconcile(desired: DesiredEvent[], links: CalendarLink[]): Promise<SinkResult[]> {
     return (await this.run(desired, links)).results;
+  }
+
+  /**
+   * T-119: creates ONE test event 1 h from now in the dedicated calendar (made
+   * if missing), then deletes it. Its private `sbwItemId` is '', so no sync or
+   * guard ever takes it for an auction event. With calendar dry run on, nothing
+   * is sent: an audit entry only. Blocked writes (kill switch, health,
+   * cooldown) throw before any request.
+   */
+  async sendTestEvent(): Promise<'created-and-deleted' | 'dry-run'> {
+    const { api, audit, clock, store } = this.deps;
+    const verdict = await this.deps.switches.writesAllowed('calendar');
+    if (!verdict.ok) {
+      if (!(await store.dryRun())) throw new Error(`calendar writes are off: ${verdict.why ?? 'blocked'}`);
+      await audit.append({ actor: 'user', kind: 'calendar.testEvent', details: { written: false }, dryRun: true });
+      return 'dry-run';
+    }
+    return this.exclusive(async () => {
+      const { cooldownUntil } = await this.state.read();
+      if (cooldownUntil > clock.now()) throw new Error(`Google asked us to slow down; try again after ${new Date(cooldownUntil).toISOString()}`);
+      const calendarId = await this.ensureCalendarInner();
+      const now = clock.now();
+      const id = `testevt${now.toString(32)}`; // base32hex, like every event id we write
+      await api.eventsInsert(calendarId, {
+        id,
+        summary: TEST_EVENT_SUMMARY,
+        description: TEST_EVENT_DESCRIPTION,
+        start: { dateTime: new Date(now + TEST_EVENT_LEAD_MS).toISOString(), timeZone: 'UTC' },
+        end: { dateTime: new Date(now + TEST_EVENT_LEAD_MS + TEST_EVENT_LENGTH_MS).toISOString(), timeZone: 'UTC' },
+        reminders: { useDefault: false, overrides: [] },
+        extendedProperties: { private: { sbwItemId: '', sbwGen: '0', sbwState: 'open' } },
+      });
+      try {
+        await api.eventsDelete(calendarId, id);
+      } catch (e) {
+        await audit.append({ actor: 'user', kind: 'calendar.testEvent', ref: id, details: { deleted: false } });
+        throw new Error(
+          `The test event was created but could not be deleted (${errorText(e)}). Delete "${TEST_EVENT_SUMMARY}" from the ${CALENDAR_SUMMARY} calendar yourself.`,
+          { cause: e },
+        );
+      }
+      await audit.append({ actor: 'user', kind: 'calendar.testEvent', ref: id, details: { deleted: true } });
+      return 'created-and-deleted' as const;
+    });
   }
 
   // ── queueing while disconnected ───────────────────────────────────────────
