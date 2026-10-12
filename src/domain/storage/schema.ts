@@ -82,6 +82,12 @@ export const STORAGE_KEYS = {
    * `schemaVersion` stays 1. Invalid data parses to the empty record.
    */
   dryRunCounted: 'sbw:dryRunCounted',
+  /**
+   * Optional (T-111): the wake tasks the T2 companion may hold, per snipe,
+   * kept 15 days after the wake for the awake-history filter. Absent means
+   * none. No migration; `schemaVersion` stays 1. Invalid data parses to empty.
+   */
+  companionWakes: 'sbw:companionWakes',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -345,6 +351,39 @@ export function checkedDryRunCounted(record: DryRunCountedRecord): DryRunCounted
   return DryRunCountedRecordSchema.parse(record);
 }
 
+/**
+ * `sbw:companionWakes` (T-111). Optional. Module-private schema (an exported
+ * `*Schema` would join the locked example list). Snipe id → the wake the
+ * companion was asked for:
+ * - `state`: `confirmed` (the host made the task), `asked` (a `schedule` left
+ *   but no usable answer came back: the task may exist), `none` (nothing was
+ *   made: not sent, or refused). An entry is written BEFORE the request leaves.
+ * - `triedAt` / `cancelTriedAt`: the last schedule / cancel attempt, to space
+ *   out retries after a restart.
+ * A confirmed cancel removes the entry. Entries stay 15 days after `wakeAt`:
+ * the awake history uses `confirmed` and `asked` ones to leave out the runs a
+ * companion wake caused.
+ */
+const CompanionWakesRecordSchema = z.object({
+  version: z.literal(1),
+  wakes: z.record(
+    SnipeIdSchema,
+    z.object({
+      wakeAt: EpochMsSchema,
+      state: z.enum(['confirmed', 'asked', 'none']),
+      triedAt: EpochMsSchema,
+      cancelTriedAt: EpochMsSchema.optional(),
+    }),
+  ),
+});
+export type CompanionWakesRecord = z.infer<typeof CompanionWakesRecordSchema>;
+
+/** Missing or invalid `sbw:companionWakes` parses to the empty record. */
+export function parseCompanionWakes(raw: unknown): CompanionWakesRecord {
+  const parsed = CompanionWakesRecordSchema.safeParse(raw);
+  return parsed.success ? parsed.data : { version: 1, wakes: {} };
+}
+
 /** `sbw:googleAccess` (storage.session only; never persisted to disk). */
 export const GoogleAccessSchema = z.object({ token: z.string().min(1), expiresAt: EpochMsSchema });
 export type GoogleAccess = z.infer<typeof GoogleAccessSchema>;
@@ -421,6 +460,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.healthProbe]: { area: 'local', schema: HealthProbeSchema },
   [STORAGE_KEYS.snipeRunner]: { area: 'local', schema: SnipeRunnerRecordSchema },
   [STORAGE_KEYS.dryRunCounted]: { area: 'local', schema: DryRunCountedRecordSchema },
+  [STORAGE_KEYS.companionWakes]: { area: 'local', schema: CompanionWakesRecordSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

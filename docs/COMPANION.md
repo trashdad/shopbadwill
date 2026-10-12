@@ -100,10 +100,21 @@ unattended option.
    reg query HKCU\Software\Mozilla\NativeMessagingHosts\com.shopbadwill.companion
    ```
 
-   In the extension, arm a dry-run snipe and confirm a task appears
-   (`Get-ScheduledTask -TaskName "ShopBadwill-*"`). Tell us: the two `reg
-   query` outputs, the task name and its `WakeToRun`/`State` values, and
-   anything the extension's companion status shows.
+   In the extension, open Options, **Sniping**, card **Wake the computer
+   (T2)**: click **Connect the companion** (the browser asks for the native
+   messaging permission), type the same profile you gave install.ps1 into
+   **Browser profile for the companion**, click **Save profile**, then **Test
+   the companion** (it should say "The companion answered: 0 wake tasks
+   scheduled."). Pick tier **T2**. Then arm a dry-run snipe and confirm a task
+   appears (`Get-ScheduledTask -TaskName "ShopBadwill-*"`); it should wake the
+   PC about 8 minutes before the end (the snipe's 5-minute wake minus a
+   3-minute margin). Tell us: the two `reg query` outputs, the task name and
+   its `WakeToRun`/`State` values, and what **Test the companion** shows.
+
+   What the extension sends the companion: the snipe id, the wake time, the
+   browser and that profile. Never the item, the bid or anything about your
+   account. A disarm before the wake cancels the task; a wake that has already
+   fired is never cancelled.
 
 **Never paste** from this step: anything under the Chrome/Firefox profile
 folders (no `Local State`, no `Preferences`, no cookies), no tokens, no

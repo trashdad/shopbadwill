@@ -502,6 +502,8 @@ interface SpecSettings {
     completedDryRuns: number;
     tier: 'T0' | 'T1' | 'T2';
   };
+  /** T-111 (additive): the T2 companion's browser profile. */
+  companion?: { profile: string };
   killSwitch: boolean;
 }
 interface SpecSgwSessionRecord {
