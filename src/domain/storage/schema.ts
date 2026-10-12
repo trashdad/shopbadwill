@@ -95,6 +95,13 @@ export const STORAGE_KEYS = {
    * Absent means none. No migration; `schemaVersion` stays 1.
    */
   deferredAlarms: 'sbw:deferredAlarms',
+  /**
+   * Optional (T-112): the bid groups ("win at most N of these items"), their
+   * per-member verdicts and the cancellations they made. Members are the
+   * snipes whose `groupId` names the group. Absent means no group. No
+   * migration; `schemaVersion` stays 1. Invalid data parses to empty.
+   */
+  snipeGroups: 'sbw:snipeGroups',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -396,6 +403,69 @@ export function parseCompanionWakes(raw: unknown): CompanionWakesRecord {
   return parsed.success ? parsed.data : { version: 1, wakes: {} };
 }
 
+/** T-112: the limits of a bid group, shared by the storage record, the `groups.save` payload and the UI. */
+export const SNIPE_GROUP_LIMITS = Object.freeze({
+  /** Group ids: 1-64 of `A-Z a-z 0-9 _ -`. */
+  idPattern: /^[A-Za-z0-9_-]{1,64}$/,
+  nameMax: 80,
+  /** N in "win at most N". */
+  maxWinsMax: 50,
+  /** Stored groups (a create beyond it is refused). */
+  groupsMax: 100,
+});
+
+/**
+ * `sbw:snipeGroups` (T-112). Optional. Module-private schema (an exported
+ * `*Schema` would join the locked example list). Group id → the group:
+ * - `name`, `maxWins` (N): what the user set; editable until 2 minutes before
+ *   the next member's end (the background enforces the freeze).
+ * - `results`: per member snipe, what the group concluded about its result.
+ *   `checking` (a confirming read is due at `nextAt`), `confirmed` (T-87's
+ *   classifier: won and final, on a read after the end; for a dry run, would
+ *   have won at the close), `unconfirmed` (it may have been won, but nothing
+ *   proves it: the group keeps going), `not-won`. `warned`: the user was told
+ *   the group keeps going without a confirmation.
+ * - `cancels`: the members the group asked the runner to disarm once N wins
+ *   were confirmed; `ok: false` when the runner refused (the bid was out).
+ */
+const SnipeGroupsRecordSchema = z.object({
+  version: z.literal(1),
+  groups: z.record(
+    z.string().regex(SNIPE_GROUP_LIMITS.idPattern),
+    z.object({
+      id: z.string().regex(SNIPE_GROUP_LIMITS.idPattern),
+      name: z.string().min(1).max(SNIPE_GROUP_LIMITS.nameMax),
+      maxWins: z.number().int().min(1).max(SNIPE_GROUP_LIMITS.maxWinsMax),
+      createdAt: EpochMsSchema,
+      updatedAt: EpochMsSchema,
+      results: z.record(
+        SnipeIdSchema,
+        z.object({
+          verdict: z.enum(['checking', 'confirmed', 'unconfirmed', 'not-won']),
+          dryRun: z.boolean(),
+          at: EpochMsSchema,
+          attempts: z.number().int().nonnegative(),
+          nextAt: EpochMsSchema.optional(),
+          why: z.string(),
+          finalPrice: CentsSchema.optional(),
+          warned: z.boolean().optional(),
+        }),
+      ),
+      cancels: z.record(SnipeIdSchema, z.object({ at: EpochMsSchema, ok: z.boolean(), why: z.string() })),
+    }),
+  ),
+});
+export type SnipeGroupsRecord = z.infer<typeof SnipeGroupsRecordSchema>;
+export type SnipeGroup = SnipeGroupsRecord['groups'][string];
+export type SnipeGroupResult = SnipeGroup['results'][string];
+export type SnipeGroupCancel = SnipeGroup['cancels'][string];
+
+/** Missing or invalid `sbw:snipeGroups` parses to the empty record. */
+export function parseSnipeGroups(raw: unknown): SnipeGroupsRecord {
+  const parsed = SnipeGroupsRecordSchema.safeParse(raw);
+  return parsed.success ? parsed.data : { version: 1, groups: {} };
+}
+
 /** `sbw:deferredAlarms` (T-118, L6). Optional. Module-private schema. Alarm name -> its `when`. */
 const DeferredAlarmsSchema = z.record(z.string().min(1), EpochMsSchema);
 
@@ -477,6 +547,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.dryRunCounted]: { area: 'local', schema: DryRunCountedRecordSchema },
   [STORAGE_KEYS.companionWakes]: { area: 'local', schema: CompanionWakesRecordSchema },
   [STORAGE_KEYS.deferredAlarms]: { area: 'local', schema: DeferredAlarmsSchema },
+  [STORAGE_KEYS.snipeGroups]: { area: 'local', schema: SnipeGroupsRecordSchema },
 } as const satisfies Record<string, { area: StorageArea; schema: z.ZodType }>;
 
 export type StorageKey = keyof typeof STORAGE_RECORDS;

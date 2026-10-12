@@ -15,7 +15,7 @@ import { AuthStatusSchema } from '../domain/calendar/types';
 import { MatchResultSchema, RuleSchema } from '../domain/rules/schema';
 import { SettingsSchema } from '../domain/settings/schema';
 import { CapsResultSchema, SnipeIdSchema, SnipeSchema, SnipeStateSchema } from '../domain/snipe/types';
-import { STORAGE_KEYS, STORAGE_RECORDS } from '../domain/storage/schema';
+import { SNIPE_GROUP_LIMITS, STORAGE_KEYS, STORAGE_RECORDS } from '../domain/storage/schema';
 import {
   CentsSchema,
   EpochMsSchema,
@@ -119,6 +119,23 @@ export const MsgSchema = z.discriminatedUnion('type', [
   ),
   msg('snipe.disarm', z.object({ id: SnipeIdSchema })),
   signal('snipe.list'),
+  /**
+   * T-112 contract change (docs/CONTRACT-DECISIONS.md): bid groups, "win at
+   * most N". `groups.save` creates the group or renames it / changes N; the
+   * background refuses it from 2 minutes before the group's next end (edit
+   * freeze). `groups.delete` is refused while the group is frozen or has open
+   * snipes. Members join at arm time through `snipe.arm`'s `snipe.groupId`.
+   */
+  signal('groups.list'),
+  msg(
+    'groups.save',
+    z.object({
+      id: z.string().regex(SNIPE_GROUP_LIMITS.idPattern),
+      name: z.string().min(1).max(SNIPE_GROUP_LIMITS.nameMax),
+      maxWins: z.number().int().min(1).max(SNIPE_GROUP_LIMITS.maxWinsMax),
+    }),
+  ),
+  msg('groups.delete', z.object({ id: z.string().regex(SNIPE_GROUP_LIMITS.idPattern) })),
   /** Persisted `sbw:awake` heartbeat history (T-90). Empty request; reply is the stored epochs, or []. */
   signal('timing.awake'),
   msg('kill.set', z.object({ on: z.boolean() })),
@@ -184,6 +201,9 @@ export const MSG_SENDER = Object.freeze({
   'snipe.arm': 'ui',
   'snipe.disarm': 'ui',
   'snipe.list': 'ui',
+  'groups.list': 'ui',
+  'groups.save': 'ui',
+  'groups.delete': 'ui',
   'timing.awake': 'ui',
   'kill.set': 'ui',
   'health.get': 'ui',
@@ -245,6 +265,8 @@ export const MsgReplySchemas = Object.freeze({
   'snipe.prepare': z.object({ detail: ItemDetailSchema, estAllIn: CentsSchema.nullable(), caps: CapsResultSchema }),
   'snipe.arm': SnipeSchema,
   'snipe.list': z.array(SnipeSchema),
+  /** T-112: the same schema as `sbw:snipeGroups`, so the reply cannot drift from storage. */
+  'groups.list': STORAGE_RECORDS[STORAGE_KEYS.snipeGroups].schema,
   /** The same schema as `sbw:awake`, so the reply cannot drift from storage. */
   'timing.awake': STORAGE_RECORDS[STORAGE_KEYS.awake].schema,
   /** `session` is SgwSessionRecord['expiresAt']; `sessionState` and `budget` per I-08. */
