@@ -32,7 +32,7 @@ Unknown path is 404, wrong method 405. CORS reflects the request origin.
 
 - `POST /__scenario` with a patch, `GET /__scenario` for the current state. Fields (all optional): `name` (preset, resets first), `reset`, `skewMs`, `serverNowMs`, `latencyMs`, `errors`, `tokenLifetimeMs`, `bidSetsCookie`, `followFakeNow`. For `latencyMs` and `errors`, keys are endpoint names (`Search/ItemListing`, case-insensitive) or `*`; a `null` value removes a key.
 - `POST /__token {expiresInMs?, buyerId?}` mints a valid bearer.
-- `GET /__log` returns `{entries}`; `DELETE /__log` clears. Each entry has `seq, method, path, query, endpoint, status, receivedAtMs, fakeNowMs, requestTimeMs, hasBearer, body`. `fakeNowMs` is parsed from the `x-sbw-fake-now` header (epoch ms or ISO) and `requestTimeMs` prefers it (T-59). A request whose client gave up during the injected latency is logged with status `499` (client closed request) and never answered. Control routes are not logged.
+- `GET /__log` returns `{entries}`; `DELETE /__log` clears. Each entry has `seq, method, path, query, endpoint, status, receivedAtMs, fakeNowMs, requestTimeMs, hasBearer, cookie, body`. `cookie` is the Cookie header exactly as received, or null (T-104: what rode on the wire). `fakeNowMs` is parsed from the `x-sbw-fake-now` header (epoch ms or ISO) and `requestTimeMs` prefers it (T-59). A request whose client gave up during the injected latency is logged with status `499` (client closed request) and never answered. Control routes are not logged.
 
 ## Scenario list
 

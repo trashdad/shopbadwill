@@ -322,4 +322,10 @@ describe('request log', () => {
     expect(log.entries[2]?.hasBearer).toBe(true);
     expect(log.entries[1]?.requestTimeMs).toBe(log.entries[1]?.receivedAtMs);
   });
+  it('records the Cookie header exactly as received, null when none (T-104: what rode on the wire)', async () => {
+    await post('/api/Dashboard/GetCurrentTime');
+    await post('/api/Dashboard/GetCurrentTime', {}, { cookie: 'Bid=1; other=x' });
+    const log = await parse(await get('/__log'), LogResponseSchema);
+    expect(log.entries.map((e) => e.cookie)).toEqual([null, 'Bid=1; other=x']);
+  });
 });
