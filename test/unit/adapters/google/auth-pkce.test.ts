@@ -780,6 +780,39 @@ describe('getAccessToken()', () => {
     expect(snapshot(w)).toEqual(before);
   });
 
+  // T-119: the user revoked `identity` or a Google host in browser settings.
+  it('markNeedsInteraction flags a connected grant: badge, audit, cached token dropped, nothing else cleared', async () => {
+    const w = world();
+    seedConnected(w, { access: { token: newAccess(), expiresAt: T0 + 3_000_000 } });
+    const localBefore = w.storage.local.dump();
+
+    await w.provider.markNeedsInteraction('permission-revoked');
+
+    expect(AuthStatusSchema.parse(await w.provider.status())).toMatchObject({ connected: true, needsInteraction: true });
+    expect(w.badge.states).toEqual([true]);
+    expect(w.audit.entries.map((x) => [x.actor, x.kind, x.details])).toEqual([
+      ['calendar', 'google.needsInteraction', { reason: 'permission-revoked' }],
+    ]);
+    expect(w.storage.local.dump()).toEqual(localBefore);
+    expect(w.storage.session.dump()[STORAGE_KEYS.googleAccess]).toBeUndefined();
+    // Background calls now fail fast, with no request.
+    expect((await fails(w.provider.getAccessToken({ interactive: false }))).code).toBe('needs_interaction');
+    expect(w.http.requests).toHaveLength(0);
+
+    // Idempotent: no second badge or audit entry.
+    await w.provider.markNeedsInteraction('permission-revoked');
+    expect(w.badge.states).toEqual([true]);
+    expect(w.audit.kinds).toEqual(['google.needsInteraction']);
+  });
+
+  it('markNeedsInteraction does nothing when Google is not connected', async () => {
+    const w = world();
+    await w.provider.markNeedsInteraction('permission-revoked');
+    expect(await w.provider.status()).toMatchObject({ connected: false, needsInteraction: false });
+    expect(w.badge.states).toEqual([]);
+    expect(w.audit.entries).toEqual([]);
+  });
+
   it('a failing badge or audit log never breaks auth', async () => {
     const w = world();
     seedConnected(w);

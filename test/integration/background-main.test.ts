@@ -1704,3 +1704,36 @@ describe('T-118 L5: a new daily run time takes effect at its next occurrence', (
     expect(stored()).toEqual({ late: at(10, 7), a: at(10, 20) });
   });
 });
+
+// ── T-119: permission-revoke notice, end to end ─────────────────────────────
+
+describe('T-119 permission revoke', () => {
+  const GOOGLE_HOSTS = ['https://oauth2.googleapis.com/*', 'https://www.googleapis.com/*'];
+
+  it('revoking identity in browser settings marks Google as needing a reconnect (calendar.status and the badge flag)', async () => {
+    const h = boot({
+      seed: {
+        [STORAGE_KEYS.googleClient]: { clientId: 'abc.apps.googleusercontent.com', updatedAt: T0 },
+        [STORAGE_KEYS.google]: {
+          provider: 'pkce',
+          clientId: 'abc.apps.googleusercontent.com',
+          refreshToken: '1//0integration-refresh',
+          grantedScopes: ['https://www.googleapis.com/auth/calendar.app.created'],
+          connectedAt: T0 - 86_400_000,
+        },
+      },
+    });
+    await h.permissions.request({ permissions: ['identity'], origins: GOOGLE_HOSTS });
+    const ctx = await h.handle.ready;
+    expect(await h.ok('calendar.status')).toMatchObject({ connected: true, needsInteraction: false });
+
+    h.permissions.revoke({ permissions: ['identity'] });
+    await vi.waitFor(async () => {
+      expect(await h.ok('calendar.status')).toMatchObject({ connected: true, needsInteraction: true });
+    });
+    expect(ctx.googleNeedsInteraction.get()).toBe(true);
+    expect(h.audit().filter((e) => e.kind === 'google.needsInteraction')).toEqual([
+      expect.objectContaining({ actor: 'calendar', details: { reason: 'permission-revoked' } }),
+    ]);
+  });
+});

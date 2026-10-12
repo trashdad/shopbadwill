@@ -372,6 +372,27 @@ export class PkceRefreshProvider implements GoogleAuthProvider {
     }
   }
 
+  /**
+   * T-119: something outside Google made the grant unusable (the user revoked
+   * `identity` or a Google host permission in browser settings). Like
+   * invalid_grant: the flag, the badge and one audit entry go up, and only the
+   * cached access token is dropped, so background calls stop until the user
+   * reconnects. Does nothing when not connected or already flagged.
+   */
+  async markNeedsInteraction(reason: 'permission-revoked'): Promise<void> {
+    if (this.needsInteraction) return;
+    // Set before the await, so a concurrent call returns above. status() reports
+    // the flag only with credentials, so a disconnected provider never shows it.
+    this.needsInteraction = true;
+    if ((await this.readCredentials()) === undefined) {
+      this.needsInteraction = false;
+      return;
+    }
+    await this.withLock(() => this.storage.session.remove([STORAGE_KEYS.googleAccess]));
+    await this.setBadge(true);
+    await this.record({ actor: 'calendar', kind: 'google.needsInteraction', details: { reason } });
+  }
+
   async status(): Promise<PkceAuthStatus> {
     const creds = await this.readCredentials();
     const configured = (await this.config()) !== undefined;
