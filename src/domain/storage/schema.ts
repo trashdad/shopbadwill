@@ -380,6 +380,8 @@ export type SgwSessionRejection = z.infer<typeof SgwSessionRejectionSchema>;
 const QuoteCacheEntrySchema = z.object({
   shipping: CentsSchema,
   handling: CentsSchema,
+  /** T-57b (additive): SGW answered "no quote" for this item and ZIP; shipping and handling are 0 and unused. */
+  none: z.literal(true).optional(),
   'zip-hash': z.string().min(1),
   fetchedAt: EpochMsSchema,
 });

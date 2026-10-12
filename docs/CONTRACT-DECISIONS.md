@@ -630,3 +630,13 @@ A plain SHA-256 of a 5-digit ZIP is reversible: there are only 100 000 ZIPs, so 
 **Tests.** `test/contract/types/storage.test.ts` (the key, its area, a sample value, rejected values) and `test/unit/background/landed-cost.test.ts` ("ZIP hash privacy: a per-install salt").
 
 **Follow-up for the next PLAN edit.** Add `sbw:quoteCache` and `sbw:quoteSalt` to PLAN §2.3 and the new reply shape to §3.12 and contracts.md.
+
+## T-57b: negative quote cache (`sbw:quoteCache` entry gains optional `none`)
+
+Source: the controller, from the T-57 final check (considerate use).
+
+**Change (additive).** A `sbw:quoteCache` entry may carry `none: true`. That means SGW *answered* "no quote" for this item and ZIP hash; `shipping` and `handling` are then 0 and unused. The 24 h TTL and the eviction are unchanged. A failed request (network, 5xx, timeout, scheduler refusal) is never stored as `none`, so the next page view or job step asks again. Older entries without the field read as before, with no migration.
+
+**Why.** Items with no quote (often pickup-only) were re-requested on every page view and in every job run.
+
+**Tests.** `test/unit/background/landed-cost.test.ts`: the handler's and the quote step's negative cache, the 24 h expiry, and no caching of failures.
