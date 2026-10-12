@@ -4,6 +4,7 @@ import { h } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AuthStatus } from '../../src/domain/calendar/types';
+import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { TrackedItem } from '../../src/domain/types';
 import { loadSections } from '../../src/ui/dashboard/registry';
 import { builtinModules } from '../../src/ui/dashboard/sections';
@@ -73,6 +74,97 @@ describe('dashboard calendar section', () => {
     fireEvent.click(screen.getByRole('button', { name: /Connect Google Calendar/ }));
     await waitFor(() => {
       expect(m.sent.filter((s) => s.type === 'calendar.connect')).toHaveLength(1);
+    });
+  });
+
+  describe('T-117: Stop tracking', () => {
+    const list = (m: FakeMessaging): TrackedItem[] => {
+      const items = [tracked(1, true), tracked(2, false), tracked(3, true)];
+      m.handle('calendar.status', () => CONNECTED);
+      m.handle('tracked.list', () => items.filter((t) => !m.sent.some((s) => s.type === 'tracked.remove' && (s.payload as { itemId: number }).itemId === t.itemId)));
+      return items;
+    };
+    const onCalendar = () => screen.findByRole('list', { name: 'Auctions on your calendar' });
+
+    it('lists only the calendar items, each with a Stop tracking button; titles are text only', async () => {
+      const m = new FakeMessaging();
+      const items = list(m);
+      items[0] = { ...items[0], title: '<img src=x onerror=alert(1)>' } as TrackedItem;
+      mount(m);
+      const ul = await onCalendar();
+      const rows = ul.querySelectorAll('li');
+      expect(rows).toHaveLength(2);
+      expect(rows[0]?.textContent).toContain('<img src=x onerror=alert(1)>');
+      expect(ul.querySelector('img')).toBeNull();
+      expect(rows[1]?.textContent).toContain('Item 3');
+      expect(screen.getAllByRole('button', { name: /^Stop tracking/ })).toHaveLength(2);
+    });
+
+    it('confirm, then tracked.remove is sent once, the list reloads and the result is shown', async () => {
+      const m = new FakeMessaging();
+      list(m);
+      m.handle('tracked.remove', () => undefined);
+      mount(m);
+      await onCalendar();
+      fireEvent.click(screen.getByRole('button', { name: 'Stop tracking Item 3' }));
+      // The confirm step names the dedicated calendar; nothing is sent yet.
+      expect(screen.getByText(/removed from your "ShopGoodwill Auctions" calendar/)).toBeTruthy();
+      expect(m.sent.filter((s) => s.type === 'tracked.remove')).toEqual([]);
+      fireEvent.click(screen.getByRole('button', { name: 'Yes, stop tracking' }));
+      expect((await screen.findByRole('status')).textContent).toMatch(/Stopped tracking Item 3/);
+      expect(m.sent.filter((s) => s.type === 'tracked.remove').map((s) => s.payload)).toEqual([{ itemId: 3 }]);
+      await waitFor(() => {
+        expect(screen.queryByText('Item 3')).toBeNull();
+      });
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it.each([
+      [true, 'Stopped tracking. Calendar dry run is on, so the event was not removed.'],
+      [false, 'Stopped tracking Item 3. Its event leaves your calendar at the next sync.'],
+    ])('calendar dry run %s: the success note says what really happens to the event', async (dryRun, text) => {
+      const m = new FakeMessaging();
+      list(m);
+      m.handle('tracked.remove', () => undefined);
+      m.handle('settings.get', () => {
+        const s = defaultSettings();
+        return { ...s, dryRun: { ...s.dryRun, calendar: dryRun } };
+      });
+      mount(m);
+      await onCalendar();
+      fireEvent.click(screen.getByRole('button', { name: 'Stop tracking Item 3' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Yes, stop tracking' }));
+      await waitFor(() => {
+        expect(screen.getByRole('status').textContent).toBe(text);
+      });
+    });
+
+    it('cancel sends nothing and closes the confirm step', async () => {
+      const m = new FakeMessaging();
+      list(m);
+      m.handle('tracked.remove', () => undefined);
+      mount(m);
+      await onCalendar();
+      fireEvent.click(screen.getByRole('button', { name: 'Stop tracking Item 1' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByRole('button', { name: 'Yes, stop tracking' })).toBeNull();
+      expect(m.sent.some((s) => s.type === 'tracked.remove')).toBe(false);
+      expect(screen.getByText('Item 1')).toBeTruthy();
+    });
+
+    it('a failure is shown as an alert and the item stays listed', async () => {
+      const m = new FakeMessaging();
+      list(m);
+      m.handle('tracked.remove', () => {
+        throw new Error('storage is full');
+      });
+      mount(m);
+      await onCalendar();
+      fireEvent.click(screen.getByRole('button', { name: 'Stop tracking Item 1' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Yes, stop tracking' }));
+      expect((await screen.findByRole('alert')).textContent).toMatch(/Could not stop tracking Item 1/);
+      expect(screen.queryByRole('status')).toBeNull();
+      expect(screen.getByText('Item 1')).toBeTruthy();
     });
   });
 
