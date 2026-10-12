@@ -1561,13 +1561,15 @@ describe('lanes, preflight and health alarms', () => {
     const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T1' }) });
     await shared.permissions.request({ permissions: ['power'] });
     const { w } = await boot(shared);
+    // T-111c: the startup releases a possible leftover first (nothing needed it); counted from here.
+    const atBoot = shared.keepAwake.releases;
     await arm(w);
     await flush();
     expect(shared.keepAwake.isHeld).toBe(true);
     await runTo(shared, END + 2 * MIN);
     expect(kinds(shared)).toContain('snipe.preflight');
     expect(shared.keepAwake.isHeld).toBe(false);
-    expect(shared.keepAwake.releases).toBe(1);
+    expect(shared.keepAwake.releases - atBoot).toBe(1);
   });
 
   it('KeepAwake is not touched below tier T1', async () => {
@@ -1596,6 +1598,8 @@ describe('lanes, preflight and health alarms', () => {
       return hold(reason);
     });
     const { w } = await boot(shared, { jobModules: noCompanion() });
+    // T-111c: the startup releases a possible leftover first (nothing needed it); counted from here.
+    const atBoot = shared.keepAwake.releases;
     await arm(w);
     await flush();
     // Not at arm: a hold from arm would keep the computer from sleeping at all.
@@ -1619,7 +1623,7 @@ describe('lanes, preflight and health alarms', () => {
     await runTo(shared, FIRE_LOCAL + 2 * SEC);
     expect(shared.sgw.placeBids).toHaveLength(1);
     expect(shared.keepAwake.isHeld).toBe(true);
-    expect(shared.keepAwake.releases).toBe(0);
+    expect(shared.keepAwake.releases - atBoot).toBe(0);
     // The resolve releases it.
     await runTo(shared, END + 2 * MIN);
     const s = stored(shared);
@@ -1628,13 +1632,15 @@ describe('lanes, preflight and health alarms', () => {
     expect(shared.sgw.placeBids).toHaveLength(1);
     expect(shared.keepAwake.holds).toEqual(['snipe s1']);
     expect(shared.keepAwake.isHeld).toBe(false);
-    expect(shared.keepAwake.releases).toBe(1);
+    expect(shared.keepAwake.releases - atBoot).toBe(1);
   });
 
   it('KeepAwake under tier T2: the browser the companion starts at T-8 min holds before the late preflight, which sees it held', async () => {
     const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T2' }) });
     await shared.permissions.request({ permissions: ['power'] });
     const first = await boot(shared, { jobModules: noCompanion() });
+    // T-111c: the first startup releases a possible leftover (nothing needed it); counted from here.
+    const atBoot = shared.keepAwake.releases;
     await arm(first.w);
     // The computer sleeps before the T-15 min preflight: no worker until the companion wakes it.
     await runTo(shared, END - 20 * MIN);
@@ -1656,7 +1662,7 @@ describe('lanes, preflight and health alarms', () => {
     expect(shared.sgw.placeBids).toHaveLength(1);
     expect(shared.keepAwake.holds).toEqual(['snipe s1']);
     expect(shared.keepAwake.isHeld).toBe(false);
-    expect(shared.keepAwake.releases).toBe(1);
+    expect(shared.keepAwake.releases - atBoot).toBe(1);
   });
 
   it.each([
@@ -1674,6 +1680,106 @@ describe('lanes, preflight and health alarms', () => {
     expect(s.state).toBe('resolved');
     expect(shared.sgw.placeBids).toHaveLength(1);
     expect(shared.keepAwake.holds).toEqual([]);
+  });
+
+  // T-111c: Chrome keeps power.requestKeepAwake per extension, not per worker (the shared
+  // FakeKeepAwake outlives each worker the same way), so a worker that dies holding it leaves it.
+  describe('T-111c: a hold a dead worker left is released at startup unless a snipe needs it', () => {
+    /** A dead worker's leftover hold, for a snipe whose record no longer needs it. */
+    const leftover = (shared: Shared): Promise<void> => shared.keepAwake.hold('snipe s0');
+
+    it('a leftover hold with no snipe in its window (T1, the only snipe resolved) is released', async () => {
+      const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T1' }) });
+      await shared.permissions.request({ permissions: ['power'] });
+      const first = await boot(shared);
+      await arm(first.w);
+      await runTo(shared, END + 2 * MIN);
+      expect(stored(shared).state).toBe('resolved');
+      await leftover(shared);
+      first.w.kill();
+      const before = shared.keepAwake.releases;
+
+      await boot(shared);
+      expect(shared.keepAwake.isHeld).toBe(false);
+      expect(shared.keepAwake.releases).toBe(before + 1);
+    });
+
+    it('a T1 snipe still armed keeps it: never released at startup', async () => {
+      const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T1' }) });
+      await shared.permissions.request({ permissions: ['power'] });
+      const first = await boot(shared);
+      await arm(first.w);
+      await runTo(shared, T0 + 10 * MIN);
+      expect(shared.keepAwake.isHeld).toBe(true);
+      first.w.kill();
+      const before = shared.keepAwake.releases;
+
+      await boot(shared);
+      expect(stored(shared).state).toBe('armed');
+      expect(shared.keepAwake.isHeld).toBe(true);
+      expect(shared.keepAwake.releases).toBe(before);
+      await runTo(shared, END + 2 * MIN);
+      expect(stored(shared).state).toBe('resolved');
+      expect(shared.sgw.placeBids).toHaveLength(1);
+      expect(shared.keepAwake.isHeld).toBe(false);
+    });
+
+    it('a T2 snipe before its companion wake does not need it: released, and the wake takes it again', async () => {
+      const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T2' }) });
+      await shared.permissions.request({ permissions: ['power'] });
+      const first = await boot(shared, { jobModules: noCompanion() });
+      await arm(first.w);
+      await runTo(shared, T0 + 10 * MIN);
+      await leftover(shared);
+      first.w.kill();
+
+      await boot(shared, { jobModules: noCompanion() });
+      expect(stored(shared).state).toBe('armed');
+      expect(shared.keepAwake.isHeld).toBe(false);
+      await runTo(shared, companionWake() + ALARM_DELAY + 5 * SEC);
+      expect(shared.keepAwake.isHeld).toBe(true);
+      await runTo(shared, END + 2 * MIN);
+      expect(stored(shared).state).toBe('resolved');
+      expect(shared.sgw.placeBids).toHaveLength(1);
+    });
+
+    it('a T2 snipe past its companion wake keeps it: never released at startup', async () => {
+      const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T2' }) });
+      await shared.permissions.request({ permissions: ['power'] });
+      const first = await boot(shared, { jobModules: noCompanion() });
+      await arm(first.w);
+      await runTo(shared, companionWake() + ALARM_DELAY + 5 * SEC);
+      expect(stored(shared).state).toBe('armed');
+      expect(shared.keepAwake.isHeld).toBe(true);
+      first.w.kill();
+      const before = shared.keepAwake.releases;
+
+      await boot(shared, { jobModules: noCompanion() });
+      expect(shared.keepAwake.isHeld).toBe(true);
+      expect(shared.keepAwake.releases).toBe(before);
+      await runTo(shared, END + 2 * MIN);
+      expect(stored(shared).state).toBe('resolved');
+      expect(shared.sgw.placeBids).toHaveLength(1);
+      expect(shared.keepAwake.isHeld).toBe(false);
+    });
+
+    it('reconcile never releases a hold this worker took, even when the stored snipes no longer ask for one', async () => {
+      const shared = makeShared({ settings: settingsWith({ live: true, tier: 'T1' }) });
+      await shared.permissions.request({ permissions: ['power'] });
+      const { w, ctx } = await boot(shared);
+      await arm(w);
+      await flush();
+      expect(shared.keepAwake.isHeld).toBe(true);
+      // Tier T0 mid-snipe: no stored snipe asks for a hold, but this worker's record says it holds one.
+      await w.ok('settings.set', { snipe: { ...settingsWith({ live: true, tier: 'T1' }).snipe, tier: 'T0' } });
+      expect(stored(shared).state).toBe('armed');
+      const runner = getSnipeRunner(ctx);
+      if (runner === undefined) throw new Error('no runner');
+      const before = shared.keepAwake.releases;
+      await runner.reconcile();
+      expect(shared.keepAwake.isHeld).toBe(true);
+      expect(shared.keepAwake.releases).toBe(before);
+    });
   });
 });
 
