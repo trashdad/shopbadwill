@@ -1,5 +1,6 @@
 // T-67: the dashboard's Calendar section (I-06 registry, I-10). Shows whether Google
-// Calendar is connected, lets the user connect, disconnect and sync now, and
+// Calendar is connected, sends the user to the options Google section to
+// connect (T-70d), lets them disconnect and sync now, and
 // downloads a .ics file (T-68's buildIcs, through `calendar.ics`) that needs no
 // Google at all. Every control is a native button; results use role="status" or
 // role="alert".
@@ -103,11 +104,11 @@ export function CalendarSection(props: SectionProps): VNode {
         <button
           type="button"
           disabled={busy}
-          onClick={() =>
-            void act('Connected.', async () => {
-              await client.send('calendar.connect', undefined);
-            })
-          }
+          onClick={() => {
+            // T-70d: connecting needs optional permissions that only a click on the
+            // options page can ask for (a popup closes under the prompt), so go there.
+            props.openOptions('google');
+          }}
         >
           Connect Google Calendar
         </button>{' '}

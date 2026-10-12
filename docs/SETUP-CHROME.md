@@ -102,7 +102,7 @@ that needs it:
 | Permission | Asked for by | Why |
 |---|---|---|
 | `notifications` | Options → **Notifications**, or step 4 of setup | Run, outcome and at-risk notifications |
-| `identity`, `oauth2.googleapis.com`, `www.googleapis.com` | Connecting Google Calendar | Sign-in and the Calendar API. See the known gap in `docs/SETUP-GOOGLE.md` |
+| `identity`, `oauth2.googleapis.com`, `www.googleapis.com` | Connecting Google Calendar | Sign-in and the Calendar API. **Connect to Google Calendar** asks for them (`docs/SETUP-GOOGLE.md`, step 11) |
 | `ntfy.sh` | Options → **Phone push** | Optional phone push through ntfy |
 | `background`, `power` | Options → **Sniping** → **Keep awake (T1)** → **Turn on Keep awake** | Keep Chrome running and the PC awake while a snipe is armed |
 | `nativeMessaging` | Options → **Sniping** → **Wake the computer (T2)** → **Connect the companion** | Talk to the Windows companion (`docs/COMPANION.md`) |

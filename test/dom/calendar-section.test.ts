@@ -64,17 +64,19 @@ describe('dashboard calendar section', () => {
     expect(m.sent.some((s) => s.type === 'calendar.connect' || s.type === 'calendar.syncNow')).toBe(false);
   });
 
-  it('disconnected: says events wait as pending, Disconnect is off, Connect sends calendar.connect', async () => {
+  it('disconnected: says events wait as pending, Disconnect is off, Connect opens the options Google section (T-70d)', async () => {
     const m = new FakeMessaging();
     m.handle('calendar.status', () => OFF);
     m.handle('calendar.connect', () => CONNECTED);
-    mount(m);
+    const opened: Array<string | undefined> = [];
+    render(h(section.Component, { client: m, userTz: 'UTC', openOptions: (s) => opened.push(s) }));
     expect(await screen.findByText(/Not connected. Events are queued as pending/)).toBeTruthy();
     expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Disconnect' }).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: /Connect Google Calendar/ }));
-    await waitFor(() => {
-      expect(m.sent.filter((s) => s.type === 'calendar.connect')).toHaveLength(1);
-    });
+    expect(opened).toEqual(['google']);
+    // The dashboard never connects without the permission grant that only the options section asks for.
+    await Promise.resolve();
+    expect(m.sent.filter((s) => s.type === 'calendar.connect')).toHaveLength(0);
   });
 
   describe('T-117: Stop tracking', () => {

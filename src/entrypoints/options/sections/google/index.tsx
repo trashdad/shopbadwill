@@ -2,13 +2,18 @@ import type { VNode } from 'preact';
 import { announceSettingsSaved } from '../../settings-events';
 import { useEffect, useRef, useState } from 'preact/hooks';
 
+import { isFirefox } from '../../../../adapters/browser/env';
+import { BrowserPermissions } from '../../../../adapters/browser/permissions';
 import type { AuthStatus } from '../../../../domain/calendar/types';
 import type { Settings } from '../../../../domain/settings/schema';
+import type { Permissions } from '../../../../ports/permissions';
 import { describeError } from '../../../../ui/components/describeError';
 import { Card } from '../../../../ui/components/Field';
 import { Status } from '../../../../ui/components/Status';
 import { Switch } from '../../../../ui/components/Switch';
+import { requestAccess, type PermissionResult } from '../../../../ui/permissions';
 import type { SectionDef, SectionProps } from '../../registry';
+import { GOOGLE_PERMISSION_REFUSED, googleAccessRequest } from './access';
 import {
   CLIENT_ID_RE,
   createGoogleConfigStore,
@@ -23,6 +28,10 @@ export interface GoogleSectionProps extends SectionProps {
   /** Injectable for tests. */
   store?: GoogleConfigStore;
   now?: () => number;
+  /** Injectable for tests: the optional-permissions API (T-70d). */
+  permissions?: Pick<Permissions, 'contains' | 'request'>;
+  /** Injectable for tests: the build target (Chrome asks for `identity` too). */
+  firefox?: boolean;
 }
 
 const DAY_MS = 86_400_000;
@@ -46,6 +55,8 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
   const storeRef = useRef<GoogleConfigStore | null>(null);
   storeRef.current ??= props.store ?? createGoogleConfigStore();
   const store = storeRef.current;
+  const [permissionsApi] = useState(() => props.permissions ?? new BrowserPermissions());
+  const firefox = props.firefox ?? isFirefox();
 
   const [saved, setSaved] = useState<ClientConfigView>({ clientId: '', secretTail: null });
   const [clientId, setClientId] = useState('');
@@ -102,15 +113,29 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
   // S-4: Chrome verified; Firefox pending
   const canConnect = idTrim !== '' && hasSecret && !busy;
 
-  const connect = async (): Promise<void> => {
+  /**
+   * T-70d: the click handler. Not async: the permission prompt needs the click's
+   * user gesture, so `requestAccess` runs before any await (I-21). Only a grant
+   * goes on to save the client and send calendar.connect.
+   */
+  const connect = (): void => {
     if (!CLIENT_ID_RE.test(idTrim)) {
       setIdError('That does not look like a Google client ID. It looks like 1234567890-abc123.apps.googleusercontent.com.');
       return;
     }
     setIdError(undefined);
+    const access = requestAccess(permissionsApi, googleAccessRequest(firefox));
     setBusy(true);
     setMsg({ message: '', tone: 'ok' });
+    void connectAfterGrant(access);
+  };
+
+  const connectAfterGrant = async (access: Promise<PermissionResult>): Promise<void> => {
     try {
+      if ((await access).kind !== 'granted') {
+        setMsg({ message: GOOGLE_PERMISSION_REFUSED, tone: 'error' });
+        return;
+      }
       // Saved first: the background reads the client from storage when it connects.
       await store.save({ clientId: idTrim, clientSecret: secret.trim() });
       setSecret('');
@@ -309,9 +334,7 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
           <button
             type="button"
             disabled={!canConnect}
-            onClick={() => {
-              void connect();
-            }}
+            onClick={connect}
           >
             Connect to Google Calendar
           </button>
@@ -366,9 +389,7 @@ export function GoogleSection(props: GoogleSectionProps): VNode {
                 <button
                   type="button"
                   disabled={!canConnect}
-                  onClick={() => {
-                    void connect();
-                  }}
+                  onClick={connect}
                 >
                   Reconnect Google
                 </button>

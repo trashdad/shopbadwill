@@ -122,7 +122,7 @@ Firefox asks for the others only when you turn on the feature:
 | Permission | Asked for by |
 |---|---|
 | `notifications` | Options → **Notifications** → **Allow notifications**, or the setup tab's dry-run step |
-| `oauth2.googleapis.com`, `www.googleapis.com` | Google Calendar. No button asks for these yet: turn them on in `about:addons` → ShopBadwill → **Permissions** (see `docs/SETUP-GOOGLE.md`, known gap) |
+| `oauth2.googleapis.com`, `www.googleapis.com` | Google Calendar. **Connect to Google Calendar** asks for them (`docs/SETUP-GOOGLE.md`, step 11) |
 | `ntfy.sh` | Options → **Phone push** → **Allow ntfy.sh** |
 | `nativeMessaging` | Options → **Sniping** → **Wake the computer (T2)** → **Connect the companion** |
 
