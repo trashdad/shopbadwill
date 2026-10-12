@@ -183,6 +183,58 @@ describe('sbw:test:baseUrl', () => {
     expect(baseUrlHook.rewriteUrl(API)).toBe(API);
   });
 
+  // T-72 (T-39 carry): the `google` override covers every Google host the
+  // background or the consent window reaches, not only the Calendar API.
+  it('the google override also rewrites the OAuth token, revoke and authorize hosts', async () => {
+    const spy = fetchSpy();
+    vi.stubGlobal('fetch', spy);
+    const browserStub = fakeHookBrowser();
+    installHooks({ './base-url.ts': baseUrlHook }, browserStub);
+
+    const port = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
+    port.post({ payload: { google: 'http://127.0.0.1:8788' } });
+    expect((await port.nextReply()).ok).toBe(true);
+
+    await globalThis.fetch('https://oauth2.googleapis.com/token', { method: 'POST', body: 'grant_type=refresh_token' });
+    await globalThis.fetch(new Request('https://oauth2.googleapis.com/revoke', { method: 'POST', body: 'token=x' }));
+    await globalThis.fetch(CAL);
+    const urls = spy.mock.calls.map((c) => String(c[0] instanceof Request ? c[0].url : c[0]));
+    expect(urls).toEqual([
+      'http://127.0.0.1:8788/token',
+      'http://127.0.0.1:8788/revoke',
+      'http://127.0.0.1:8788/calendar/v3/calendars/x/events',
+    ]);
+    // The consent page is never fetched by the background; the identity stub
+    // (google-auth-stub.ts) points the "window" at the fake through this.
+    expect(baseUrlHook.rewriteUrl('https://accounts.google.com/o/oauth2/v2/auth?client_id=1')).toBe(
+      'http://127.0.0.1:8788/o/oauth2/v2/auth?client_id=1',
+    );
+    // Look-alike hosts and other Google hosts are left alone (the route then refuses them).
+    for (const other of [
+      'https://oauth2.googleapis.com.evil.example/token',
+      'https://www.google.com/calendar',
+      'https://accounts.google.com.evil.example/o/oauth2/v2/auth',
+    ]) {
+      expect(baseUrlHook.rewriteUrl(other), other).toBe(other);
+    }
+    // The sgw override is independent: still unset.
+    expect(baseUrlHook.rewriteUrl(API)).toBe(API);
+  });
+
+  it('clearing the google override restores every Google host', async () => {
+    const browserStub = fakeHookBrowser();
+    installHooks({ './base-url.ts': baseUrlHook }, browserStub);
+    const set = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
+    set.post({ payload: { google: 'http://127.0.0.1:8788' } });
+    expect((await set.nextReply()).ok).toBe(true);
+    const clear = browserStub.connect(baseUrlHook.BASE_URL_HOOK);
+    clear.post({ payload: { google: null } });
+    expect((await clear.nextReply()).ok).toBe(true);
+    for (const raw of ['https://oauth2.googleapis.com/token', 'https://accounts.google.com/o/oauth2/v2/auth', CAL]) {
+      expect(baseUrlHook.rewriteUrl(raw), raw).toBe(raw);
+    }
+  });
+
   it('installing twice never double-wraps fetch', async () => {
     const spy = fetchSpy();
     vi.stubGlobal('fetch', spy);

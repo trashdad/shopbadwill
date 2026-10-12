@@ -18,7 +18,8 @@
 // Every browser request is either fulfilled by the route from the local fake
 // servers or aborted; a request to any host beyond the known set fails the
 // spec (R5). The background's own base URLs are overridden through the real
-// `sbw:test:baseUrl` hook, so nothing can leave the machine. The fake
+// `sbw:test:baseUrl` hook, so nothing can leave the machine. The browser,
+// route and hook helpers are shared with calendar.spec.ts (helpers/harness.ts). The fake
 // buyerapi clock is pinned to 2026-10-08T00:00:00 Pacific and the
 // background's Clock is anchored 30 minutes later, so the open-auction set is
 // fixed forever. Time moves only through `sbw:test:advance` (fake time; no
@@ -27,17 +28,28 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { chromium, expect, test, type BrowserContext, type Page, type Route, type Worker } from '@playwright/test';
+import { expect, test, type BrowserContext, type Page, type Worker } from '@playwright/test';
 
 import { pacificNaiveToEpoch } from '../../fakes/fake-sgw-server/clock';
-import type { AuditEntry } from '../../../src/domain/audit/types';
 import type { Rule } from '../../../src/domain/rules/schema';
 import type { SgwSessionRecord, TrackedItem } from '../../../src/domain/types';
 import type { JobRun, Watch } from '../../../src/domain/watches/schema';
-import { MSG_VERSION } from '../../../src/messaging/protocol';
 import { seed, testExtensionDir } from './fixtures';
+import {
+  advance,
+  anchorClock as anchorClockAt,
+  applyBaseUrl,
+  auditEntries,
+  createRouteGuard,
+  fireTick,
+  launchInto as launchGuarded,
+  openOptions,
+  sendMsg,
+  stateHook,
+  verifyBaseUrl,
+} from './helpers/harness';
 import { DAY, HOUR, TICK_STEP_MS } from './helpers/time';
-import { decideRequest, FAKE_BUYERAPI, FAKE_GOOGLE } from './network';
+import { FAKE_BUYERAPI } from './network';
 
 // ── The fixed clock ──────────────────────────────────────────────────────────
 
@@ -65,32 +77,6 @@ interface FakeLogEntry {
   requestTimeMs: number;
   hasBearer: boolean;
   body: string;
-}
-
-interface HookReply {
-  ok: boolean;
-  value?: unknown;
-  error?: string;
-}
-
-interface MessageResponse {
-  ok: boolean;
-  reply?: unknown;
-  error?: { code: string; message: string };
-}
-
-interface ChromePort {
-  onMessage: { addListener(cb: (m: unknown) => void): void };
-  postMessage(m: unknown): void;
-  disconnect(): void;
-}
-interface ChromeRuntime {
-  chrome: {
-    runtime: {
-      sendMessage(m: unknown): Promise<unknown>;
-      connect(info: { name: string }): ChromePort;
-    };
-  };
 }
 
 // ── The fake-server side (Node) ──────────────────────────────────────────────
@@ -143,150 +129,18 @@ async function mintSession(): Promise<SgwSessionRecord> {
 
 // ── The browser side ─────────────────────────────────────────────────────────
 
-/** Requests to hosts beyond the known set: the spec fails unless this stays empty. */
-const unexpected: string[] = [];
+/** The fail-closed route (helpers/harness.ts); requests to hosts beyond the known set land in `unexpected`. */
+const guard = createRouteGuard();
+const unexpected = guard.unexpected;
 
-async function fulfil(route: Route): Promise<void> {
-  const req = route.request();
-  const decision = decideRequest(req.url(), { serviceWorker: req.serviceWorker() !== null });
-  if (decision.action === 'continue') {
-    await route.continue();
-    return;
-  }
-  if (decision.action === 'abort') {
-    if (decision.unexpected) unexpected.push(req.url());
-    await route.abort();
-    return;
-  }
-  const res = await route.fetch({
-    url: decision.url,
-    method: req.method(),
-    headers: req.headers(),
-    postData: req.postData() ?? undefined,
-  });
-  await route.fulfill({ response: res });
-}
-
-/**
- * The fail-closed browser over a real profile directory (the same args the
- * shared harness uses: no name resolves, every proxied request hits a dead
- * port). The directory is the point: a context restart over the same profile
- * keeps storage.local, which is what "resume after a restart" means.
- */
+/** The shared fail-closed browser over a real profile directory, with this spec's route guard. */
 async function launchInto(extension: string, profileDir: string): Promise<{ context: BrowserContext; worker: Worker }> {
-  const context = await chromium.launchPersistentContext(profileDir, {
-    channel: 'chromium',
-    headless: true,
-    viewport: { width: 1280, height: 800 },
-    args: [
-      `--disable-extensions-except=${extension}`,
-      `--load-extension=${extension}`,
-      '--host-resolver-rules=MAP * ~NOTFOUND',
-      '--proxy-server=http://127.0.0.1:9',
-    ],
-  });
-  await context.route('**/*', fulfil);
-  const worker = context.serviceWorkers()[0] ?? (await context.waitForEvent('serviceworker'));
-  return { context, worker };
-}
-
-/** The options page: where messages are sent from and the test hooks are called. */
-async function openOptions(context: BrowserContext, worker: Worker): Promise<Page> {
-  const id = new URL(worker.url()).host;
-  const page = await context.newPage();
-  await page.goto(`chrome-extension://${id}/options.html`);
-  await expect(page.locator('h1')).toHaveText('ShopBadwill options');
-  return page;
-}
-
-/** Calls a test hook from the options page (the only place the hook port accepts). */
-async function callHook(page: Page, name: string, payload: unknown): Promise<HookReply> {
-  return page.evaluate(
-    async ({ hook, data }) => {
-      const chrome = (globalThis as unknown as ChromeRuntime).chrome;
-      const reply = await new Promise<HookReply>((resolve) => {
-        const port = chrome.runtime.connect({ name: hook });
-        const timer = setTimeout(() => {
-          port.disconnect();
-          resolve({ ok: false, error: `no reply on ${hook} within 10 s` });
-        }, 10_000);
-        port.onMessage.addListener((m) => {
-          clearTimeout(timer);
-          port.disconnect();
-          resolve(m as HookReply);
-        });
-        port.postMessage({ payload: data });
-      });
-      return reply;
-    },
-    { hook: name, data: payload },
-  );
-}
-
-/** A background message, through the real router. Throws on a failed reply. */
-async function sendMsg(page: Page, type: string, payload?: unknown): Promise<unknown> {
-  return page.evaluate(
-    async ({ v, type: t, payload: p }) => {
-      const chrome = (globalThis as unknown as ChromeRuntime).chrome;
-      const reply = (await chrome.runtime.sendMessage({
-        v,
-        reqId: crypto.randomUUID(),
-        type: t,
-        ...(p === undefined ? {} : { payload: p }),
-      })) as MessageResponse;
-      if (!reply.ok) throw new Error(`${t} failed: ${String(reply.error?.code)}: ${String(reply.error?.message)}`);
-      return reply.reply;
-    },
-    { v: MSG_VERSION, type, payload },
-  );
-}
-
-/** R2: the base-URL override is in-memory; every (re)started background gets it again from the harness. */
-async function applyBaseUrl(page: Page): Promise<void> {
-  const reply = await callHook(page, 'sbw:test:baseUrl', { sgw: FAKE_BUYERAPI, google: FAKE_GOOGLE });
-  expect(reply, JSON.stringify(reply)).toEqual({ ok: true, value: { sgw: FAKE_BUYERAPI, google: FAKE_GOOGLE } });
-}
-
-/**
- * The overlay spec's rewrite check, with a bounded retry: the route aborts a
- * service-worker request that still names the prod origin, so a 200 proves
- * the hook really rewrote the URL. A freshly relaunched browser can refuse
- * its very first proxied fetch once ("Failed to fetch") and then settle; the
- * retries ride that out without any sleep.
- */
-async function verifyBaseUrl(worker: Worker): Promise<void> {
-  for (let attempt = 0; ; attempt++) {
-    const status = await worker.evaluate(async () => {
-      try {
-        const response = await fetch('https://buyerapi.shopgoodwill.com/__log');
-        return response.status;
-      } catch {
-        return 0;
-      }
-    });
-    if (status === 200) return;
-    expect(attempt, 'the rewritten background fetch never reached the fake buyerapi').toBeLessThan(4);
-  }
+  return launchGuarded(extension, profileDir, (route) => guard.fulfil(route));
 }
 
 /** Anchors the background's Clock to the fixed instant (absolute set: a restart's lost offset is re-anchored, not re-added). */
 async function anchorClock(page: Page, at = ANCHOR_MS): Promise<void> {
-  const reply = await callHook(page, 'sbw:test:advance', { to: at });
-  expect(reply.ok, reply.error ?? 'sbw:test:advance failed').toBe(true);
-  const value = reply.value as { now: number; fired: string[] };
-  expect(value.now).toBe(at);
-}
-
-/** Moves the fake clock by `ms` (firing due alarms and Clock timers); returns the new now and the pending Clock timer deadlines. */
-async function advance(page: Page, ms: number): Promise<{ now: number; timers: number[] }> {
-  const adv = await callHook(page, 'sbw:test:advance', { ms });
-  expect(adv.ok, adv.error ?? 'sbw:test:advance failed').toBe(true);
-  return adv.value as { now: number; timers: number[] };
-}
-
-async function fireTick(page: Page): Promise<void> {
-  const fire = await callHook(page, 'sbw:test:fireAlarm', { name: 'sbw:tick' });
-  expect(fire.ok, fire.error ?? 'sbw:test:fireAlarm failed').toBe(true);
+  await anchorClockAt(page, at);
 }
 
 /** One fake-time step plus one tick alarm, waiting until the run moved and the tick settled. */
@@ -339,22 +193,6 @@ async function settleRun(page: Page): Promise<JobRun> {
 
 async function jobStatus(page: Page): Promise<JobRun | null> {
   return (await sendMsg(page, 'job.status', undefined)) as JobRun | null;
-}
-
-/** Storage dumps through `sbw:test:state` (only extension pages may call it). */
-async function stateHook(page: Page): Promise<{ local: Record<string, unknown>; session: Record<string, unknown> }> {
-  const reply = await callHook(page, 'sbw:test:state', undefined);
-  expect(reply.ok, reply.error ?? 'sbw:test:state failed').toBe(true);
-  return (reply.value as { storage: { local: Record<string, unknown>; session: Record<string, unknown> } }).storage;
-}
-
-/** The audit entries across the stored chunks, oldest first. */
-async function auditEntries(page: Page): Promise<AuditEntry[]> {
-  const { local } = await stateHook(page);
-  return Object.entries(local)
-    .filter(([k]) => k.startsWith('sbw:audit:'))
-    .flatMap(([, v]) => v as AuditEntry[])
-    .sort((a, b) => a.seq - b.seq);
 }
 
 async function tracked(page: Page): Promise<Record<string, TrackedItem>> {
