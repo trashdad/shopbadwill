@@ -392,7 +392,9 @@ test('on-time dry-run fire: the tight timer fires on time, the measured error is
   });
 
   let verified: Snipe | undefined;
+  let wakeAt = 0;
   await test.step('wake, three clock samples 20 s apart, the T−60 s verify measures SGW +1.3 s', async () => {
+    wakeAt = (await alarmAt(r, 'wake')) as number;
     const second = await wake(r);
     const verifyTimer = await sampleClock(r, second);
     verified = await verify(r, verifyTimer);
@@ -420,6 +422,19 @@ test('on-time dry-run fire: the tight timer fires on time, the measured error is
     expect(isOnTime(error)).toBe(true);
     expect(Math.abs(timing.fireErrorVsSgwClockMs as number)).toBeLessThanOrEqual(CI_FIRE_ERROR_BOUND_MS);
     expect(timing.firedBeforeEndMs as number).toBeGreaterThan(0);
+  });
+
+  await test.step('the window: five snipe-lane reads, signed in, within the 6-read budget (PLAN §9)', async () => {
+    const log = await fakeLog();
+    const window = readsSince(log, wakeAt);
+    // Three clock samples 20 s apart, the T−60 s verify, the read at fire time.
+    expect(window.map((e) => e.endpoint)).toEqual([ITEM_DETAIL, ITEM_DETAIL, ITEM_DETAIL, ITEM_DETAIL, ITEM_DETAIL]);
+    const at = window.map((e) => e.fakeNowMs as number);
+    expect((at[1] as number) - (at[0] as number)).toBeGreaterThanOrEqual(CLOCK_SAMPLE_SPACING_MS - 5);
+    expect((at[2] as number) - (at[1] as number)).toBeGreaterThanOrEqual(CLOCK_SAMPLE_SPACING_MS - 5);
+    // The snipe lane carries the session (isHighBidder is known at the verify); the reads before it do not.
+    expect(window.every((e) => e.hasBearer)).toBe(true);
+    expect(log.filter((e) => (e.fakeNowMs as number) < wakeAt).every((e) => !e.hasBearer)).toBe(true);
   });
 
   await test.step('the audit trail: preflight, wake, verified, bid.dry-run, post-read; nothing sent', async () => {
