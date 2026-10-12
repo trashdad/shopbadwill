@@ -127,4 +127,87 @@ account details.
 
 ---
 
-<!-- A-3 (T-72) and the consolidated sections land later; T-73 owns the final file. -->
+## A-3 Calendar (Phase 3)
+
+Purpose: with your own Google project, tracked auction ends land on a
+dedicated "ShopGoodwill Auctions" calendar with popups 60, 15 and 5 minutes
+before the end; **the popups arrive on your phone with the PC off**; an
+extended auction moves its event; removing an item deletes its event; and
+Disconnect really revokes the grant at Google.
+
+Everything here writes only to the dedicated calendar ShopBadwill creates
+(the extension's permission is `calendar.app.created`: it cannot see or
+change your other calendars). The only live step is turning **Dry run:
+calendar** off at step 6; you can turn it back on at the end.
+
+Never paste your client secret, tokens, or your Google account name into
+anything you share. Paste back only the results asked for under **Record**.
+
+**Setup**
+
+1. Build and load the extension (Chrome: `pnpm build`, Load unpacked
+   `.output/chrome-mv3`; Firefox: `pnpm build:firefox`, temporary install).
+2. Have your own Google Cloud project with the Calendar API enabled and an
+   OAuth client (Chrome: **Web application**, redirect URI
+   `https://<your-extension-id>.chromiumapp.org/`; Firefox: **Desktop app**).
+   The setup guide (`docs/SETUP-GOOGLE.md`, T-73) has the full steps. Publish
+   the app (**In production**) first, so the grant does not lapse after 7 days.
+3. On your phone, install the Google Calendar app signed in to the same
+   Google account, with notifications allowed for it.
+
+**Checks** (run on Chrome; then repeat steps 4–5 and 12 on Firefox)
+
+4. Options page → **Google Calendar**: paste the client ID and secret, press
+   **Connect to Google Calendar**, and approve the single calendar permission
+   on Google's screen ("Google hasn't verified this app" → Advanced → Go to
+   ShopBadwill is expected for a personal project). The section shows
+   **Connected**, the permission `.../auth/calendar.app.created`, and
+   "Last error: None".
+5. Answer **Turn on calendar events now?** (or switch on **Add auction ends to
+   Google Calendar**). Open calendar.google.com: a new calendar named
+   **ShopGoodwill Auctions** appears in your list. Nothing appears in your
+   primary calendar.
+6. Options page → **Settings** → Dry run (practice mode): turn **Dry run:
+   calendar** OFF. While it is on, the **Activity** log shows
+   `calendar.insert` entries marked **dry-run** and nothing reaches Google;
+   check that first if you like.
+7. On a real ShopGoodwill item page, open the item's **Actions** and press
+   **Track** for one auction that ends in about 1½–3 hours. In the dashboard
+   (side panel) → **Calendar**, press **Sync now**.
+8. On calendar.google.com, open the new event: it is on **ShopGoodwill
+   Auctions**, starts at the auction's end time, links to the item, and has
+   three popup notifications: **60, 15 and 5 minutes** before.
+9. **Phone with the PC off.** On the phone, open Google Calendar → Settings →
+   the ShopGoodwill Auctions calendar: it is synced (shown) and its
+   notifications are on. Then shut the PC down (or put it to sleep) more than
+   an hour before the auction ends, and leave it off until after the end. The
+   60-, 15- and 5-minute popups arrive on the phone on time.
+10. **End-time change.** Opportunistic: if a tracked auction is extended at
+    the end (bids in the last minutes), after the next daily run reads it
+    again the event moves to the new end. It is the same event (one entry,
+    not two), still with its three popups.
+11. **Removing an item deletes its event.** Options → **Activity** → the
+    `calendar.insert` entry for a tracked item → **Undo**. The event
+    disappears from ShopGoodwill Auctions; your other events, including any
+    you added to that calendar yourself, are untouched.
+12. **Disconnect revokes.** Options → Google Calendar → **Disconnect** → **Yes,
+    disconnect**. Open myaccount.google.com/connections (Third-party apps
+    with account access): your ShopBadwill project is no longer listed.
+    Events already created stay on the calendar (expected).
+13. Optional, the lost-grant path. Connect again, then remove ShopBadwill at
+    myaccount.google.com/connections while the browser stays open, track one
+    more auction and press **Sync now**: the toolbar badge shows **!**, the
+    dashboard says Google needs you to reconnect and the new item waits as
+    pending, and nothing new appears on Google. Press **Reconnect Google** in
+    the options page and approve: the badge clears and the waiting event
+    appears once (not twice).
+
+**Record**
+
+Paste back: the browser(s) tested, whether ShopGoodwill Auctions appeared
+(and nothing landed in the primary calendar), the three popup offsets you saw
+on the event, whether the phone popups arrived with the PC off (and which of
+60/15/5 you saw), whether an end-time change was observed (and that it moved
+the same event), that Undo removed the event, that the app left the
+connections page after Disconnect, and the result of step 13 if you ran it.
+Never paste the client secret, tokens or account details.
