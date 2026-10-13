@@ -1,0 +1,67 @@
+{
+  "invalidBecause": "run status has no 'cancelled'",
+  "path": [
+    "status"
+  ],
+  "value": {
+    "id": "run-2026-10-07",
+    "trigger": "scheduled",
+    "startedAt": 1791396400000,
+    "finishedAt": 1791400000000,
+    "status": "cancelled",
+    "steps": [
+      {
+        "kind": "search",
+        "watchId": "w-pyrex",
+        "page": 1
+      },
+      {
+        "kind": "favoritesList"
+      },
+      {
+        "kind": "detail",
+        "itemId": 279250057,
+        "reason": "new-match"
+      },
+      {
+        "kind": "favorite",
+        "itemId": 279250057,
+        "watchId": "w-pyrex",
+        "notBefore": 1791404310000
+      },
+      {
+        "kind": "quote",
+        "itemId": 279250057
+      },
+      {
+        "kind": "calendarUpsert",
+        "itemId": 279250057
+      },
+      {
+        "kind": "notifyDigest"
+      },
+      {
+        "kind": "postEnd",
+        "itemId": 279250057
+      }
+    ],
+    "cursor": 8,
+    "results": {
+      "newMatches": [
+        279250057
+      ],
+      "favorited": [
+        279250057
+      ],
+      "calendarUpserts": [
+        279250057
+      ],
+      "errors": [
+        {
+          "step": 4,
+          "message": "quote: HTTP 403"
+        }
+      ]
+    }
+  }
+}

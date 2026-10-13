@@ -1,0 +1,662 @@
+import type { VNode } from 'preact';
+import { announceSettingsSaved } from '../../settings-events';
+import { useEffect, useRef, useState } from 'preact/hooks';
+
+import { isFirefox } from '../../../../adapters/browser/env';
+import { googleRedirectUri } from '../../../../adapters/browser/identity';
+import { BrowserPermissions } from '../../../../adapters/browser/permissions';
+import type { AuthStatus } from '../../../../domain/calendar/types';
+import type { Settings } from '../../../../domain/settings/schema';
+import type { Permissions } from '../../../../ports/permissions';
+import { describeError } from '../../../../ui/components/describeError';
+import { Card } from '../../../../ui/components/Field';
+import { Status } from '../../../../ui/components/Status';
+import { Switch } from '../../../../ui/components/Switch';
+import { requestAccess, type PermissionResult } from '../../../../ui/permissions';
+import type { SectionDef, SectionProps } from '../../registry';
+import { GOOGLE_PERMISSION_REFUSED, googleAccessRequest } from './access';
+import {
+  CLIENT_ID_RE,
+  createGoogleConfigStore,
+  maskSecret,
+  type ClientConfigView,
+  type GoogleConfigStore,
+} from './config-store';
+import { ERROR_HINTS } from './hints';
+import { canAddReminder, DEFAULT_REMINDERS, parseReminders } from './reminders';
+
+export interface GoogleSectionProps extends SectionProps {
+  /** Injectable for tests. */
+  store?: GoogleConfigStore;
+  now?: () => number;
+  /** Injectable for tests: the optional-permissions API (T-70d). */
+  permissions?: Pick<Permissions, 'contains' | 'request'>;
+  /** Injectable for tests: the build target (Chrome asks for `identity` too). */
+  firefox?: boolean;
+  /** Injectable for tests (T-119): the redirect URI, or undefined until `identity` is available. */
+  redirectUri?: () => string | undefined;
+  /** Injectable for tests (T-119). */
+  clipboard?: { writeText(text: string): Promise<void> };
+}
+
+const DAY_MS = 86_400_000;
+/** Google's Testing-mode refresh-token lifetime. */
+const TESTING_WINDOW_MS = 7 * DAY_MS;
+
+type Msg = { message: string; tone: 'ok' | 'error' };
+
+function Alert(props: { id: string; text: string | undefined }): VNode | null {
+  if (props.text === undefined) return null;
+  return (
+    <p class="sbw-error" id={props.id} role="alert">
+      <strong>Error:</strong> {props.text}
+    </p>
+  );
+}
+
+export function GoogleSection(props: GoogleSectionProps): VNode {
+  const { client } = props;
+  const now = props.now ?? Date.now;
+  const storeRef = useRef<GoogleConfigStore | null>(null);
+  storeRef.current ??= props.store ?? createGoogleConfigStore();
+  const store = storeRef.current;
+  const [permissionsApi] = useState(() => props.permissions ?? new BrowserPermissions());
+  const firefox = props.firefox ?? isFirefox();
+
+  const [saved, setSaved] = useState<ClientConfigView>({ clientId: '', secretTail: null });
+  const [clientId, setClientId] = useState('');
+  const [secret, setSecret] = useState('');
+  const [idError, setIdError] = useState<string | undefined>(undefined);
+  const [auth, setAuth] = useState<AuthStatus | null>(null);
+  const [authUnavailable, setAuthUnavailable] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [offerEnable, setOfferEnable] = useState(false);
+  /** Latest calendar on/off save. An older reply must not sync or overwrite a newer click. */
+  const calendarWrite = useRef(0);
+  const [msg, setMsg] = useState<Msg>({ message: '', tone: 'ok' });
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [reminders, setReminders] = useState<string[]>(DEFAULT_REMINDERS.map(String));
+  const [reminderError, setReminderError] = useState<string | undefined>(undefined);
+  const [modeMsg, setModeMsg] = useState<Msg>({ message: '', tone: 'ok' });
+  const readRedirect = props.redirectUri ?? googleRedirectUri;
+  const [redirectUri, setRedirectUri] = useState<string | undefined>(() => readRedirect());
+  const [redirectMsg, setRedirectMsg] = useState<Msg>({ message: '', tone: 'ok' });
+  const [testMsg, setTestMsg] = useState<Msg>({ message: '', tone: 'ok' });
+  const [testing, setTesting] = useState(false);
+
+  const refreshStatus = (): Promise<void> =>
+    client.send('calendar.status', undefined).then(
+      (s) => {
+        setAuth(s);
+        setAuthUnavailable(false);
+      },
+      () => {
+        setAuthUnavailable(true);
+      },
+    );
+
+  useEffect(() => {
+    store.load().then(
+      (v) => {
+        setSaved(v);
+        setClientId(v.clientId);
+      },
+      () => {
+        setMsg({ message: 'Could not read your saved Google client.', tone: 'error' });
+      },
+    );
+    void refreshStatus();
+    client.send('settings.get', undefined).then(
+      (s) => {
+        setSettings(s);
+        setReminders(s.calendar.reminders.map(String));
+      },
+      () => {
+        /* the editors stay on their defaults */
+      },
+    );
+  }, [client, store]);
+
+  const idTrim = clientId.trim();
+  const hasSecret = secret.trim() !== '' || saved.secretTail !== null;
+  // S-4: Chrome verified; Firefox pending
+  const canConnect = idTrim !== '' && hasSecret && !busy;
+
+  /**
+   * T-70d: the click handler. Not async: the permission prompt needs the click's
+   * user gesture, so `requestAccess` runs before any await (I-21). Only a grant
+   * goes on to save the client and send calendar.connect.
+   */
+  const connect = (): void => {
+    if (!CLIENT_ID_RE.test(idTrim)) {
+      setIdError('That does not look like a Google client ID. It looks like 1234567890-abc123.apps.googleusercontent.com.');
+      return;
+    }
+    setIdError(undefined);
+    const access = requestAccess(permissionsApi, googleAccessRequest(firefox));
+    setBusy(true);
+    setMsg({ message: '', tone: 'ok' });
+    void connectAfterGrant(access);
+  };
+
+  const connectAfterGrant = async (access: Promise<PermissionResult>): Promise<void> => {
+    try {
+      if ((await access).kind !== 'granted') {
+        setMsg({ message: GOOGLE_PERMISSION_REFUSED, tone: 'error' });
+        return;
+      }
+      // Saved first: the background reads the client from storage when it connects.
+      await store.save({ clientId: idTrim, clientSecret: secret.trim() });
+      setSecret('');
+      setSaved(await store.load());
+      const status = await client.send('calendar.connect', undefined);
+      setAuth(status);
+      setAuthUnavailable(false);
+      // Never turn calendar events on silently. The prompt renders only once settings
+      // are known to be off, including when settings.get finishes after this connect.
+      // A failed settings.get leaves settings null, so the prompt stays hidden.
+      if (status.connected) setOfferEnable(true);
+      setMsg(
+        status.connected
+          ? { message: 'Connected to Google Calendar.', tone: 'ok' }
+          : {
+              message: status.lastError === undefined ? 'Google did not connect.' : ERROR_HINTS[status.lastError],
+              tone: 'error',
+            },
+      );
+    } catch (e) {
+      setMsg({ message: `Could not connect to Google. ${describeError(e)}`, tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disconnect = async (): Promise<void> => {
+    setConfirming(false);
+    setOfferEnable(false);
+    setBusy(true);
+    try {
+      await client.send('calendar.disconnect', undefined);
+      await refreshStatus();
+      setMsg({ message: 'Disconnected from Google. Your client ID and secret are kept.', tone: 'ok' });
+    } catch (e) {
+      setMsg({ message: `Could not disconnect. ${describeError(e)}`, tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * T-70c: settings.set replaces the whole calendar group, so calendar writes
+   * run one at a time, each on a fresh settings.get: a reminders save made
+   * while the toggle's save is in flight keeps both changes. Each successful
+   * save is announced so the other sections re-read settings.
+   */
+  const calendarChain = useRef<Promise<unknown>>(Promise.resolve());
+  const writeCalendar = (
+    change: (cal: Settings['calendar']) => Settings['calendar'],
+  ): Promise<{ base: Settings; next: Settings['calendar'] }> => {
+    const run = calendarChain.current.then(async () => {
+      const base = await client.send('settings.get', undefined);
+      const next = change(base.calendar);
+      await client.send('settings.set', { calendar: next });
+      announceSettingsSaved();
+      return { base, next };
+    });
+    calendarChain.current = run.catch(() => undefined);
+    return run;
+  };
+
+  const saveCalendar = (patch: Partial<Settings['calendar']>, what: string): void => {
+    if (settings === null) {
+      setModeMsg({ message: `Could not save ${what}: your settings have not loaded.`, tone: 'error' });
+      return;
+    }
+    // Only the dedicated calendar works with the narrow scope (T-62), so never store another mode.
+    writeCalendar((cal) => ({ ...cal, ...patch, mode: 'dedicated' as const })).then(
+      ({ base, next }) => {
+        setSettings({ ...base, calendar: next });
+        setModeMsg({ message: `Saved: ${what}.`, tone: 'ok' });
+      },
+      (e: unknown) => {
+        setModeMsg({ message: `Could not save ${what}. ${describeError(e)}`, tone: 'error' });
+      },
+    );
+  };
+
+  const saveReminders = (e: Event): void => {
+    e.preventDefault();
+    const parsed = parseReminders(reminders);
+    if (parsed === null) {
+      setReminderError('Use whole minutes of 1 or more, and at most 5 reminders.');
+      return;
+    }
+    setReminderError(undefined);
+    saveCalendar({ reminders: parsed }, 'reminders');
+  };
+
+  /**
+   * T-70b: the calendar on/off toggle. Turning it off only stops future syncs;
+   * it never deletes events (that is the per-event audit undo). Turning it on
+   * saves `calendar.enabled` first, so the sync it then starts sees it on.
+   *
+   * settings.set replaces the whole calendar group, so the payload is the group
+   * last read with only `enabled` changed. Mode, reminders and icsFallback stay.
+   * The reminders editor is what forces `mode: 'dedicated'` (T-62).
+   */
+  const setCalendarEnabled = (on: boolean, afterSaved?: () => void): void => {
+    if (settings === null) {
+      setModeMsg({ message: 'Could not save calendar events: your settings have not loaded.', tone: 'error' });
+      return;
+    }
+    const gen = ++calendarWrite.current;
+    writeCalendar((cal) => ({ ...cal, enabled: on })).then(
+      ({ base, next }) => {
+        if (gen !== calendarWrite.current) return;
+        setSettings({ ...base, calendar: next });
+        afterSaved?.();
+        if (on) {
+          setModeMsg({ message: 'Calendar events are on. Syncing your auctions now...', tone: 'ok' });
+          client.send('calendar.syncNow', undefined).catch((e: unknown) => {
+            if (gen !== calendarWrite.current) return;
+            setModeMsg({ message: `Calendar events are on, but the sync could not start. ${describeError(e)}`, tone: 'error' });
+          });
+        } else {
+          // Turning off sends no DELETE, ntfy's included, so pushes ntfy.sh already holds still fire.
+          setModeMsg({
+            message:
+              'Calendar sync is off. Existing events stay on your calendar; delete them with Undo in Activity. Phone pushes already scheduled still arrive unless you turn off Phone push.',
+            tone: 'ok',
+          });
+        }
+      },
+      (e: unknown) => {
+        if (gen !== calendarWrite.current) return;
+        setModeMsg({ message: `Could not save calendar events. ${describeError(e)}`, tone: 'error' });
+      },
+    );
+  };
+
+  /** T-119: copies the redirect URI; the status line says what happened. */
+  const copyRedirect = (uri: string): void => {
+    const clip = props.clipboard ?? (typeof navigator === 'undefined' ? undefined : navigator.clipboard);
+    if (clip === undefined) {
+      setRedirectMsg({ message: 'Select the address and press Ctrl+C (Command+C on a Mac) to copy it.', tone: 'ok' });
+      return;
+    }
+    clip.writeText(uri).then(
+      () => {
+        setRedirectMsg({ message: 'Redirect URI copied. Paste it under Authorized redirect URIs in your Google client.', tone: 'ok' });
+      },
+      () => {
+        setRedirectMsg({ message: 'Could not copy automatically. Select the address and press Ctrl+C (Command+C on a Mac).', tone: 'error' });
+      },
+    );
+  };
+
+  /**
+   * T-119, Chrome before `identity` is granted: the click asks for it first
+   * (still inside the user gesture, I-21), then shows and copies the URI.
+   */
+  const revealRedirect = (): void => {
+    const access = requestAccess(permissionsApi, { permissions: ['identity'] });
+    void access.then((r) => {
+      const uri = r.kind === 'granted' ? readRedirect() : undefined;
+      if (uri === undefined) {
+        setRedirectMsg({
+          message: "The redirect URI needs the browser's sign-in permission. Click again and choose Allow, or connect once and come back.",
+          tone: 'error',
+        });
+        return;
+      }
+      setRedirectUri(uri);
+      copyRedirect(uri);
+    });
+  };
+
+  /** T-119: "Send a test event" (one event, deleted at once; nothing in calendar dry run). */
+  const sendTestEvent = (): void => {
+    setTesting(true);
+    setTestMsg({ message: '', tone: 'ok' });
+    client.send('calendar.testEvent', undefined).then(
+      (r) => {
+        setTesting(false);
+        setTestMsg(
+          r.result === 'dry-run'
+            ? {
+                message: 'Dry run: nothing was written to Google. Turn off Dry run: calendar in Settings to send a real test event.',
+                tone: 'ok',
+              }
+            : { message: 'A test event was added to ShopGoodwill Auctions and deleted again. Google Calendar works.', tone: 'ok' },
+        );
+      },
+      (e: unknown) => {
+        setTesting(false);
+        setTestMsg({ message: `Could not send the test event. ${describeError(e)}`, tone: 'error' });
+      },
+    );
+  };
+
+  const expiresAt = auth?.refreshTokenExpiresAt;
+  const testingWarning = auth?.connected === true && expiresAt !== undefined && expiresAt <= now() + TESTING_WINDOW_MS;
+
+  const calendarToggleOff = settings === null || auth === null || !auth.connected;
+  const canTest = auth?.connected === true && !auth.needsInteraction && settings?.calendar.enabled === true && !testing;
+  const calendarToggleHint =
+    auth === null
+      ? authUnavailable
+        ? 'Could not check Google, so this stays off. Reload the page to try again.'
+        : 'Checking Google...'
+      : !auth.connected
+        ? 'Connect Google first'
+        : settings === null
+          ? 'Could not read your settings, so this stays off. Reload the page to try again.'
+          : 'Adds auction ends to your calendar.';
+
+  return (
+    <div class="sbw-google">
+      <Status message={msg.message} tone={msg.tone} />
+
+      <Card>
+        <h3>Your Google client</h3>
+        <p class="sbw-hint">
+          ShopBadwill uses your own Google OAuth client, so nothing is shared with anyone else. Create a Web application client in Google Cloud console and paste its details here. They stay on this device.
+        </p>
+        <Status message={redirectMsg.message} tone={redirectMsg.tone} />
+        {redirectUri === undefined ? (
+          <div class="sbw-field">
+            <p class="sbw-hint">
+              Your client's redirect URI appears once ShopBadwill may use the browser's sign-in. The button asks for that
+              permission, then shows and copies the address.
+            </p>
+            <div class="sbw-actions">
+              <button type="button" class="sbw-secondary" onClick={revealRedirect}>
+                Show and copy redirect URI
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div class="sbw-field">
+            <label for="g-redirect-uri">Authorized redirect URI</label>
+            <div class="sbw-row">
+              <input
+                id="g-redirect-uri"
+                type="text"
+                readOnly
+                spellcheck={false}
+                value={redirectUri}
+                aria-describedby="g-redirect-uri-hint"
+                onFocus={(e) => {
+                  e.currentTarget.select();
+                }}
+              />
+              <button
+                type="button"
+                class="sbw-secondary"
+                onClick={() => {
+                  copyRedirect(redirectUri);
+                }}
+              >
+                Copy redirect URI
+              </button>
+            </div>
+            <p class="sbw-hint" id="g-redirect-uri-hint">
+              {firefox
+                ? 'Firefox signs in through this loopback address. A Desktop app client needs no redirect URI; a Web application client must list it exactly.'
+                : 'Paste it exactly, with the trailing slash, under Authorized redirect URIs. It changes if you load the extension from another folder.'}
+            </p>
+          </div>
+        )}
+        <div class={idError === undefined ? 'sbw-field' : 'sbw-field sbw-field-invalid'}>
+          <label for="g-client-id">Client ID</label>
+          <input
+            id="g-client-id"
+            type="text"
+            autoComplete="off"
+            spellcheck={false}
+            value={clientId}
+            aria-describedby={idError === undefined ? undefined : 'g-client-id-error'}
+            aria-invalid={idError === undefined ? undefined : true}
+            onInput={(e) => {
+              setClientId(e.currentTarget.value);
+              setIdError(undefined);
+            }}
+          />
+          <Alert id="g-client-id-error" text={idError} />
+        </div>
+        <div class="sbw-field">
+          <label for="g-client-secret">Client secret</label>
+          <input
+            id="g-client-secret"
+            type="password"
+            autoComplete="off"
+            spellcheck={false}
+            ref={(el) => {
+              el?.setAttribute('spellcheck', 'false');
+            }}
+            placeholder={saved.secretTail === null ? '' : `Saved: ${maskSecret(saved.secretTail)}`}
+            aria-describedby="g-client-secret-hint"
+            value={secret}
+            onInput={(e) => {
+              setSecret(e.currentTarget.value);
+            }}
+          />
+          <p class="sbw-hint" id="g-client-secret-hint">
+            Required for Chrome's Web client (Google rejects the sign-in without it).
+          </p>
+        </div>
+        <div class="sbw-actions">
+          <button
+            type="button"
+            disabled={!canConnect}
+            onClick={connect}
+          >
+            Connect to Google Calendar
+          </button>
+        </div>
+      </Card>
+
+      <Card>
+        <h3>Connection</h3>
+        {auth === null ? (
+          <p>{authUnavailable ? 'Google status is unavailable right now.' : 'Checking Google...'}</p>
+        ) : (
+          <div>
+            <p>
+              <strong>{auth.connected ? 'Connected' : 'Not connected'}</strong>
+              {auth.account === undefined ? null : <> as {auth.account}</>}
+            </p>
+            <dl class="sbw-caps">
+              <dt>Permission</dt>
+              <dd>{auth.grantedScopes.length === 0 ? 'None' : auth.grantedScopes.join(', ')}</dd>
+              {auth.refreshTokenAgeDays === undefined ? null : (
+                <>
+                  <dt>Signed in</dt>
+                  <dd>{`${String(Math.floor(auth.refreshTokenAgeDays))} days ago`}</dd>
+                </>
+              )}
+              <dt>Last error</dt>
+              <dd>{auth.lastError === undefined ? 'None' : ERROR_HINTS[auth.lastError]}</dd>
+            </dl>
+            {offerEnable && auth.connected && settings?.calendar.enabled === false ? (
+              <div role="group" aria-label="Turn on calendar events" class="sbw-actions">
+                <p>Calendar events are still off. One click turns them on:</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCalendarEnabled(true, () => {
+                      setOfferEnable(false);
+                    });
+                  }}
+                >
+                  Turn on calendar events now?
+                </button>
+              </div>
+            ) : null}
+            {testingWarning ? (
+              <p class="sbw-warn" role="note">
+                <strong>Warning:</strong> Your Google app is in Testing mode, so Google signs you out every 7 days. Open Google Cloud console → OAuth consent screen → Publish app.
+              </p>
+            ) : null}
+            {auth.needsInteraction ? (
+              <div class="sbw-actions">
+                <p>Google needs you to sign in again.</p>
+                <button
+                  type="button"
+                  disabled={!canConnect}
+                  onClick={connect}
+                >
+                  Reconnect Google
+                </button>
+              </div>
+            ) : null}
+            {auth.connected && !confirming ? (
+              <div class="sbw-actions">
+                <button
+                  type="button"
+                  class="sbw-secondary"
+                  disabled={busy}
+                  onClick={() => {
+                    setConfirming(true);
+                  }}
+                >
+                  Disconnect
+                </button>
+              </div>
+            ) : null}
+            {confirming ? (
+              <div role="group" aria-label="Confirm disconnect" class="sbw-actions">
+                <p>
+                  Disconnect Google? ShopBadwill's access to your calendar will be revoked. Events already created stay on your calendar.
+                </p>
+                <button
+                  type="button"
+                  class="sbw-danger"
+                  onClick={() => {
+                    void disconnect();
+                  }}
+                >
+                  Yes, disconnect
+                </button>
+                <button
+                  type="button"
+                  class="sbw-secondary"
+                  onClick={() => {
+                    setConfirming(false);
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : null}
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <h3>Calendar</h3>
+        <Status message={modeMsg.message} tone={modeMsg.tone} />
+        <Switch
+          id="g-calendar-enabled"
+          label="Add auction ends to Google Calendar"
+          hint={calendarToggleHint}
+          checked={settings?.calendar.enabled === true}
+          disabled={calendarToggleOff}
+          onChange={(v) => {
+            setCalendarEnabled(v, () => {
+              setOfferEnable(false);
+            });
+          }}
+        />
+        <div class="sbw-actions">
+          <button type="button" class="sbw-secondary" disabled={!canTest} aria-describedby="g-test-hint" onClick={sendTestEvent}>
+            Send a test event
+          </button>
+        </div>
+        <p class="sbw-hint" id="g-test-hint">
+          {auth?.connected !== true || settings?.calendar.enabled !== true
+            ? 'Connect Google and turn on calendar events to send a test event.'
+            : settings.dryRun.calendar
+              ? 'Calendar dry run is on, so the test writes nothing to Google.'
+              : 'Adds one event, "ShopBadwill test event \u2014 safe to delete", an hour from now, and deletes it at once.'}
+        </p>
+        <Status message={testMsg.message} tone={testMsg.tone} />
+        <fieldset class="sbw-inline-fieldset">
+          <legend>Which calendar</legend>
+          <label>
+            <input type="radio" name="calendar-mode" value="dedicated" checked readOnly aria-describedby="g-mode-hint" /> A separate
+            ShopBadwill calendar (recommended)
+          </label>
+          <label>
+            <input type="radio" name="calendar-mode" value="primary" checked={false} disabled aria-describedby="g-mode-hint" /> My
+            primary calendar
+          </label>
+          <p class="sbw-hint" id="g-mode-hint">
+            Not available: uses a narrower Google permission (only calendars this extension creates).
+          </p>
+        </fieldset>
+
+        <form onSubmit={saveReminders} noValidate aria-label="Reminders">
+          <fieldset class="sbw-inline-fieldset">
+            <legend>Reminders (minutes before the auction ends)</legend>
+            {reminders.map((r, i) => (
+              <div class="sbw-row" key={i}>
+                <label for={`g-rem-${String(i)}`}>{`Reminder ${String(i + 1)} (minutes)`}</label>
+                <input
+                  id={`g-rem-${String(i)}`}
+                  type="text"
+                  inputMode="numeric"
+                  value={r}
+                  aria-describedby={reminderError === undefined ? undefined : 'g-rem-error'}
+                  aria-invalid={reminderError === undefined ? undefined : true}
+                  onInput={(e) => {
+                    const v = e.currentTarget.value;
+                    setReminders((cur) => cur.map((x, j) => (j === i ? v : x)));
+                  }}
+                />
+                <button
+                  type="button"
+                  class="sbw-secondary"
+                  aria-label={`Remove reminder ${String(i + 1)}`}
+                  onClick={() => {
+                    setReminders((cur) => cur.filter((_, j) => j !== i));
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            <Alert id="g-rem-error" text={reminderError} />
+            <p class="sbw-hint">Google allows at most 5 reminders per event.</p>
+          </fieldset>
+          <div class="sbw-actions">
+            <button
+              type="button"
+              class="sbw-secondary"
+              disabled={!canAddReminder(reminders.length)}
+              onClick={() => {
+                setReminders((cur) => [...cur, '']);
+              }}
+            >
+              Add reminder
+            </button>
+            <button
+              type="button"
+              class="sbw-secondary"
+              onClick={() => {
+                setReminders(DEFAULT_REMINDERS.map(String));
+                setReminderError(undefined);
+              }}
+            >
+              Reset to 60, 15, 5
+            </button>
+            <button type="submit">Save reminders</button>
+          </div>
+        </form>
+      </Card>
+    </div>
+  );
+}
+
+export const section: SectionDef = { id: 'google', title: 'Google Calendar', order: 25, Component: GoogleSection };

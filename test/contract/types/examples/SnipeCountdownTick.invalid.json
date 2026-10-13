@@ -1,0 +1,12 @@
+{
+  "invalidBecause": "state is a SnipeState",
+  "path": [
+    "state"
+  ],
+  "value": {
+    "snipeId": "snp-1",
+    "serverNow": null,
+    "fireAt": null,
+    "state": "counting"
+  }
+}

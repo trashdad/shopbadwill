@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "an empty term would hide every listing",
+  "path": [
+    "payload",
+    "term"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-9",
+    "type": "quick.hideKeyword",
+    "payload": {
+      "term": ""
+    }
+  }
+}

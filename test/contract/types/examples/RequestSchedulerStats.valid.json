@@ -1,0 +1,30 @@
+{
+  "lanes": {
+    "interactive": {
+      "usedToday": 12,
+      "budget": 300,
+      "nextAllowedAt": 1791400001000
+    },
+    "background": {
+      "usedToday": 20,
+      "budget": 120,
+      "nextAllowedAt": 1791400120000,
+      "backoffUntil": 1791400060000
+    },
+    "snipe": {
+      "usedToday": 0,
+      "budget": 80,
+      "nextAllowedAt": 1791400000000
+    },
+    "canary": {
+      "usedToday": 1,
+      "budget": 4,
+      "nextAllowedAt": 1791400120000
+    }
+  },
+  "cacheHits": 7,
+  "paused": {
+    "until": 1791421600000,
+    "reason": "SGW is refusing requests; automation paused"
+  }
+}

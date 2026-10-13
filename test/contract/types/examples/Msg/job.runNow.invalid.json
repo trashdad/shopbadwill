@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "watchIds is an array",
+  "path": [
+    "payload",
+    "watchIds"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-22",
+    "type": "job.runNow",
+    "payload": {
+      "watchIds": "w-pyrex"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "the budget day is YYYY-MM-DD",
+  "path": [
+    "day"
+  ],
+  "value": {
+    "day": "10/07/2026",
+    "used": {
+      "interactive": 12,
+      "background": 20,
+      "snipe": 0,
+      "canary": 1
+    }
+  }
+}

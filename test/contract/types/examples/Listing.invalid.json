@@ -1,0 +1,22 @@
+{
+  "invalidBecause": "money is integer cents",
+  "path": [
+    "currentPrice"
+  ],
+  "value": {
+    "itemId": 279250057,
+    "title": "Vintage Pyrex Butterfly Gold Bowl 403",
+    "currentPrice": 12.99,
+    "startingMinimumBid": 1299,
+    "numBids": 0,
+    "endTime": "2026-10-08T02:18:30.000Z",
+    "endTimeRaw": "2026-10-07T19:18:30",
+    "sellerId": 123,
+    "sellerName": "Goodwill of Example",
+    "categoryId": 45,
+    "shippingPrice": null,
+    "pickupOnly": false,
+    "source": "api",
+    "observedAt": 1791400000000
+  }
+}

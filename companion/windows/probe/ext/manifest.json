@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "SBW S-8 Probe (throwaway)",
+  "version": "0.0.1",
+  "description": "Throwaway S-8 spike probe. Never shipped.",
+  "permissions": ["alarms", "storage", "power"],
+  "optional_permissions": ["background"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "S-8 probe", "default_popup": "probe.html" }
+}

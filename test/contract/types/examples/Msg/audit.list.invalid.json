@@ -1,0 +1,16 @@
+{
+  "invalidBecause": "limit is a positive count",
+  "path": [
+    "payload",
+    "limit"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-38",
+    "type": "audit.list",
+    "payload": {
+      "limit": 0,
+      "before": 41
+    }
+  }
+}

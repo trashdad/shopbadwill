@@ -1,0 +1,11 @@
+{
+  "invalidBecause": "envelope version is 1",
+  "path": [
+    "v"
+  ],
+  "value": {
+    "v": 2,
+    "reqId": "r-12",
+    "type": "settings.get"
+  }
+}

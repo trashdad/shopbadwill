@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "itemId is required",
+  "path": [
+    "payload",
+    "itemId"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-25",
+    "type": "tracked.remove",
+    "payload": {
+      "itemId": null
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "invalidBecause": "unknown check name",
+  "path": [
+    "checks",
+    0,
+    "name"
+  ],
+  "value": {
+    "ok": false,
+    "checkedAt": 1791400000000,
+    "configVersion": "2026.10.07-1",
+    "checks": [
+      {
+        "name": "dom",
+        "ok": true
+      },
+      {
+        "name": "card-selectors",
+        "ok": false,
+        "detail": "primary selector matched 0 cards; fallback matched 40"
+      }
+    ]
+  }
+}

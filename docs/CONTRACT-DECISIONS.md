@@ -1,0 +1,779 @@
+# Contract decisions (T-02, contracts v1 — frozen 2026-10-07)
+
+The merged code is the authoritative contract: `src/ports/**`, `src/domain/**/types.ts`, `src/domain/**/schema.ts`, `src/domain/settings/**`, `src/domain/storage/schema.ts`, `src/messaging/protocol.ts`. Where `planning/PLAN.md` §3 differs, the code wins. Changes go through a contract-change PR (`.github/PULL_REQUEST_TEMPLATE/contract-change.md`).
+
+Below: every place §3 (v1.1) was ambiguous or incomplete and how it was resolved, followed by the review fix round.
+
+## Decisions (round 0)
+
+These are every place where §3 (v1.1) was ambiguous or incomplete and I chose the smallest faithful definition.
+
+### Placement and layering
+
+1. **Some §3.3, §3.4 and §3.11 data shapes live in `src/domain/types.ts`, not `src/ports`.** This covers `SearchQuery`, `ClockSample`, `HealthReport`, `SgwSessionState`, `Lane`, `LaneConfig`, `DEFAULT_LANES`, `RequestSchedulerStats`, `SgwSessionRecord` and `GoogleCredentials`. Two reasons:
+   - These shapes need schemas, and ports are pure interfaces (your decision).
+   - The ESLint zone lets adapters import only `domain/types.ts` and the snipe, calendar and audit `types.ts` files, not `watches/schema.ts`. T-50's `query-url.ts` needs `SearchQuery`.
+2. **Some port parameters stay plain interfaces with no schema** because they are never serialized: `HttpRequest`, `HttpResponse`, `AlarmInfo`, `Notification`, `CardHandle`, `Decoration` and `ScheduledRequest<T>`. `MatchContext` is the same; it holds a function.
+3. **`GlobalSwitches` is a port** (`src/ports/global-switches.ts`), not part of `settings/schema.ts`. T-26 (an adapter) depends on it and cannot import `domain/settings`.
+4. **Domain service interfaces:**
+   - `DailyJob`, `Scheduler` and `FavoritesReconciler` are in `domain/watches/schema.ts`.
+   - `AuditLog` sits beside `AuditEntry`.
+   - `SnipeHost`, `CalendarSink`, `CalendarApi` and `GoogleAuthProvider` are in `src/ports`, as §2.1 lists them.
+5. **The error classes are real classes in `src/ports/errors.ts`**, the only runtime code in `src/ports` (enforced by a test).
+   - **Why:** §3 declares `SgwApiError`, `CalendarApiError` and `GoogleAuthError` as `export class`, and §3.2 names `HttpTimeoutError` and `HttpNetworkError`. I-08 converted only `function` and `const` lines to types. T-03's fakes and T-25/26/34/62/64 must throw the same class so that `instanceof` works across cards, and no other card owns them.
+   - **Constructors:**
+     - `new SgwApiError(kind, message?, { status?, retryAfterMs?, cause? })`
+     - `new CalendarApiError(code, message?, { status?, cause? })`
+     - `new GoogleAuthError(code, message?, { cause? })`
+     - `new HttpTimeoutError(timeoutMs, { cause? })`
+     - `new HttpNetworkError(message, { beforeSend?, cause? })`
+   - The message defaults to the kind or code.
+   - New alias names: `SgwApiErrorKind` and `CalendarApiErrorCode`.
+6. **`HttpNetworkError.beforeSend: boolean` was added (default `false`).** Without it, T-101 cannot apply the §3.9 proof ("a `HttpNetworkError` thrown before any bytes were sent"). Every other network error stays ambiguous.
+7. **Function types use PascalCase names (I-08):** `Evaluate`, `EvaluateBatch`, `CompileKeyword`, `EventIdFor`, `Reduce`, `ComputeFireAt`, `CheckCaps`, `SearchQueryFromUrl` and `SearchQueryToUrl`. The last two are in `ports/sgw-api.ts`.
+8. **`DEFAULT_LANES` is exported as a frozen value with the §3.4 numbers.** It is data, not a function; I-08's "export const → type" rule was aimed at function-valued constants. T-25 should import it.
+
+### Gap fills
+
+9. **`Effect` payloads (I-08 left them to T-02):**
+   - `scheduleWake{at}`
+   - `holdKeepAwake{hold: boolean}` (true holds, false releases; the runner applies it only on tier T1)
+   - `sampleClock{}`
+   - `readDetail{purpose: 'verify' | 'post-read' | 'measure'}` (`measure` is the dry-run read at fire time)
+   - `placeBid{amount}`
+   - `notify{title, message}`
+   - `stampCalendar{outcome, finalPrice?}`
+   - `audit{entry: Omit<AuditEntry, 'seq' | 'at'>}`
+   - `applyFallbackProxy{amount}`
+   - `proposeRearm{}`
+
+   The runner generates the idempotency key and reports it with the `sent` event, so the reducer stays pure.
+10. **`GcalEvent`.** §3.8's `interface GcalEvent extends GcalEventBody` widens `status`, which TypeScript rejects. I encoded the intended shape as `GcalEventBodySchema.extend(...)`: `status` is required and can be `confirmed`, `tentative` or `cancelled`.
+11. **I kept `Listing.sellerState` (optional) and the `location` condition.** S-1 (T-07) depends on T-02 and has not run yet. If S-1 finds no source field, dropping `location` is a contract-change PR.
+12. **Names for §3 inline types:** `SgwSessionState`, `RequestSchedulerStats` (= `ReturnType<RequestScheduler['stats']>`), `FavoriteMode`, `SnipeId` (which §2.3 already uses), `UsState` and `LeadMsSchema`.
+13. **Messages.**
+    - `Msg` is the §3.12 request union without `reply`. A reply's type is `MsgReply<K>`, validated by `MsgReplySchemas[K]`.
+    - Messages that have no `reply` answer `undefined`.
+    - On the wire, `MsgEnvelope` is `{ v: 1, reqId }` combined with `Msg` (§2.4). Messages without a payload have no `payload` key.
+    - `MSG_SENDER` encodes §3.12's comment grouping.
+    - **Left to T-35:** the response and error envelope, which §3 does not define.
+14. **Port streams.**
+    - The `sbw:snipe-countdown` tick is `{ snipeId, serverNow: EpochMs | null, fireAt: EpochMs | null, state }`. Both are nullable because `SgwClock.serverNow()` returns null before any sample and `Snipe.fireAt` is optional.
+    - `sbw:job-progress` streams the active `JobRun`. §3.12 gives it no shape; T-54 renders JobRun progress.
+15. **Storage.**
+    - `StorageMeta` is `{ schemaVersion: 1, installedAt, lastMigrationAt, migrating? }`, with `migrating` taken from the §2.3 text.
+    - `QuarantineRecord` is `{ at, error, value }`. §2.3 names the key but gives no shape.
+    - The `sbw:shippingCache` key is a plain string ("itemId:zip").
+    - **Retention is not enforced by the schemas.** This covers audit chunks of 500 in a ring of 20, the last 30 job runs, the cache TTLs and 14 days of awake history (in `STORAGE_LIMITS`), and the 2000-id `seenItemIds` ring (`WATCH_SEEN_RING_SIZE`). If a schema enforced them, a writer bug would quarantine the whole record. Writers enforce them instead.
+16. **"Durable records are versioned."** The store as a whole is versioned by `sbw:meta.schemaVersion` (literal 1, `STORAGE_SCHEMA_VERSION`), and `Settings` carries `schemaVersion: 1` (§3.10). I added no per-record version fields elsewhere, because that would add fields to §3 types. Renames and re-keys go through T-33's migrations, as §2.3 says.
+
+### Validation strictness
+
+17. **Objects use zod's default strip mode:** unknown keys are dropped, not rejected. This is forward-compatible for stored records, and handlers see only known fields from untrusted senders.
+18. **Constraints taken from §3 types and comments:**
+    - `Cents`: integer ≥ 0. `ItemId`: positive integer.
+    - `EpochMs`: finite and ≥ 0, but not required to be an integer, because `fireAt` subtracts rtt/2.
+    - `IsoUtc` is `z.iso.datetime()` (Z only). `PacificNaiveRaw` must have no zone designator.
+    - `sellerState` and `location.states` must match `^[A-Z]{2}$`. `localTime` and quiet hours are "HH:MM".
+    - At most 5 reminders, in both `Settings` and `DesiredEvent`.
+    - The lead is 3000–30000 ms, in both `Snipe.leadMs` and `defaultLeadMs`.
+    - `CalendarLink.eventId` must match `^[a-v0-9]{5,1024}$`. Ids are non-empty, and counts are integers ≥ 0.
+19. **Defensive constraints on content-script messages (I-27):** `page.token.bearer` must be JWT-shaped, and `quick.hideKeyword.term` must be non-empty (an empty term would hide every listing). `SgwSessionRecord.bearer` is only required to be non-empty; T-28 validates its shape.
+20. **`Permissions.request()` stays in the port** because §3.2 is unchanged. I-21 removed only the message.
+21. **`Notifier.onAction`'s `actionId: string | 'click'` is kept verbatim**, with a justified `eslint-disable` for `no-redundant-type-constituents`.
+
+### Defaults beyond §15 (please confirm)
+
+22. **`DEFAULT_SETTINGS` values that §15 does not fix:**
+
+    | Setting | Default | Basis |
+    |---|---|---|
+    | `typoAbsolute` | **2500 ($25)** | Not specified anywhere; please confirm. |
+    | `locale.timeZone` | `America/New_York` | §15 Q7. The composition root may replace it with the detected zone. |
+    | `dailyRun` | enabled, `07:00`, catch-up on | — |
+    | `overlay` | enabled, `hideStyle: 'collapse'`, `quickFavorite` **false**, `landedCostBadges` true, `countdown` true | `collapse` per §1.8; `quickFavorite` is a content-script write and opt-in per §2.4 |
+    | `features.*` | all **false** | Request-spending features start off (§9); comps and relist are Phase 6 |
+    | `calendar` | **disabled**, `mode: 'dedicated'`, reminders `[60, 15, 5]`, `icsFallback` **true** | Disabled until Google is connected; `icsFallback` per T-71 ("skip path leaves … `icsFallback` on") |
+    | `notifications` | enabled, digest on, no quiet hours | — |
+    | `ntfy` | absent | §15 Q10 |
+    | `snipe` | disabled, 8000 ms lead, `early-proxy` fallback, `keepAlive` true, `tier` **T0**, `completedDryRuns` 0 | Fallback per §1.4; T1 needs the `power` permission and is Chrome-only |
+    | `killSwitch` | false | — |
+    | `considerateMode` | `normal` | — |
+
+    `DEFAULT_FAVORITE_WITHIN_HOURS` is 6 (§1.8). `WatchSchema` uses `DEFAULT_WATCH_FAVORITE_MODE` (`'sgw'`) as its default.
+
+## Review fix round 1 (amendments to the decisions above)
+
+**Commit:** `b037ae8 fix(contracts): review round 1 — Messaging port, adapter storage access, freeze minors (T-02)` (on top of `32129a9`).
+
+### Changes
+
+**Important**
+
+1. **Messaging port.** New file `src/ports/messaging.ts`, interface only, with:
+   ```ts
+   interface MessagingClient {
+     send<K extends MsgType>(type: K, payload: MsgPayload<K>): Promise<MsgReply<K>>;
+     connect<P extends PortName>(name: P, onTick: (t: PortTick<P>) => void): () => void;
+     onBroadcast<K extends MsgBroadcastType>(type: K, cb: (payload: MsgPayload<K>) => void): () => void;
+   }
+   ```
+   - `send` and `connect` follow the signature you gave. For messages without a payload, callers pass `undefined`; messages without a reply resolve `undefined`.
+   - **`onBroadcast` is my addition.** Content and UI must receive `rules.changed` and `switches.changed` (T-32, and T-38's "badge reflects `switches.changed`"). Leaving it out would force a contract change in Phase 1.
+   - `MsgBroadcastType` (= `'rules.changed' | 'switches.changed'`) is derived from `MSG_SENDER` in `protocol.ts`.
+   - `ports.test.ts` now locks in `messaging.ts`, and `spec-shapes.test.ts` mirrors `MessagingClient`, `PortName` and both `PortTick`s.
+2. **Adapter access to storage.**
+   - `eslint.config.js` has one added line: `'./domain/storage/schema.ts'` is now in the adapter zone's `except` list (controller ruling).
+   - `RequestBudget.used` is now `z.partialRecord(LaneSchema, …)`, typed `Partial<Record<Lane, number>>`. A missing lane reads as 0, and unknown lanes are still rejected.
+   - The valid example is now partial (`{ interactive: 12, background: 20 }`). A new storage test covers an empty, a partial and a full record, rejects an unknown lane, and checks the type.
+
+**Freeze minors**
+
+3. `export type LeadMs` (mirrored in `spec-shapes`).
+4. **`calendarId` has one home:** `CalendarState.calendarId` (`sbw:calendar`). I removed it from `GoogleCredentials` and from both `GoogleCredentials` examples. A storage test proves the credentials schema drops a stray `calendarId`.
+5. **Doc comments only:**
+   - `HttpNetworkError.beforeSend`: T-34 may set it true only when it throws without calling `fetch()`, that is, the request could not be built or `navigator.onLine` was false. Every rejection from `fetch()` is `false`.
+   - `placeBid` effect: T-101 persists `attempt.idempotencyKey` and dispatches `sent { key }` BEFORE the request leaves, then dispatches `result` or `ambiguous`.
+   - `readDetail`: `verify` is followed by `verified` or `verify-failed`, and `post-read` by `post-read`. `measure` (dry run) is followed by `post-read` with the detail just read, and the reducer resolves the snipe with outcome `'dry-run'`.
+   - `ShippingCacheEntry.cents`: shipping and handling combined.
+   - `LeadMs`: `.int()`, so computed leads (T-90) must be rounded.
+   - `page.token`: the bearer is the bare JWT, with no `Bearer ` prefix.
+   - `GcalEventSchema`: this is the normalized form; T-64 parses raw responses leniently and normalizes them.
+   - `snipe.arm`: the T-84 handler sets `state`, `history` and `armedAt`, resets `attempt` to `{}`, and clears `fireAt`, `wakeAlarm`, `measured`, `outcome` and `outcomeDetail`.
+6. **`DEFAULT_SETTINGS`** is now typed `DeepReadonly<Settings>` (exported helper type), so nested writes are compile errors, and it stays deeply frozen at runtime.
+   - **New:** `defaultSettings(): Settings` returns a writable `structuredClone`.
+   - `DEFAULT_CAPS` is `DeepReadonly<CapsCheck>`. `DEFAULT_SETTINGS.snipe.caps` is now a separate copy, so the two constants share no objects.
+   - Tests use `@ts-expect-error` on a nested object write and a readonly array write, both of which still throw a `TypeError` at runtime. They also check that `defaultSettings()` returns independent, unfrozen copies whose mutations never reach the constants.
+
+**Controller rulings applied without change:** `typoAbsolute` stays 2500, `features.landedCost` stays false (the defaults comment now notes that onboarding offers it), and `snipe.keepAlive` stays true (comment added).
+
+### TDD
+
+**RED.** I updated the tests and examples first: the regenerated examples, `storage`, `defaults`, `ports` and `spec-shapes`.
+
+`pnpm test:contract -- test/contract/types` (exit 1):
+```
+ FAIL  |contract| test/contract/types/ports.test.ts
+Error: Cannot find module '../../../src/ports/messaging' imported from …/ports.test.ts
+ FAIL  … defaults.test.ts > Settings defaults > defaultSettings() returns a fresh, writable copy … — TypeError: defaultSettings is not a function
+ FAIL  … examples.test.ts > RequestBudget > parses its valid example and returns it unchanged
+ FAIL  … storage.test.ts > storage schema v1 > validates a sample record for every key  (sbw:requestBudget)
+ FAIL  … storage.test.ts > … accepts a request budget that has used only some lanes, and rejects unknown lanes — ZodError
+ FAIL  … storage.test.ts > … keeps calendarId in one place … — expected { provider: 'pkce', …(7) } to not have property "calendarId"
+ Test Files  4 failed | 3 passed (7)
+      Tests  5 failed | 255 passed (260)
+```
+
+`pnpm typecheck` (exit 2):
+- missing `defaultSettings` and `DeepReadonly` exports
+- unused `@ts-expect-error` ×2 (`DEFAULT_SETTINGS` was not deep-readonly yet)
+- `ports/messaging` not found
+- no exported `LeadMs`
+- `SpecGoogleCredentials`: `calendarId` mismatch
+- `RequestBudget['used']` was not `Partial<Record<Lane, number>>`
+
+**GREEN.** Gate: 281 passed. Typecheck and lint are clean after one lint fix: `@ts-expect-error` on `.push` (absent from readonly arrays) tripped `no-unsafe-call`, so that test uses an index write.
+
+**Extra verification.** Both temporary changes were removed before the commit.
+- **Adapter zone.** A probe file `src/adapters/zz-probe/probe.ts` imported `STORAGE_KEYS` and `RuleSchema`. ESLint flagged only the `domain/rules/schema` import, so the storage import is allowed and other domain schemas are still blocked.
+- **Messaging mirror.** Making `send`'s payload optional made `tsc` fail at `spec-shapes.test.ts(613)`: `Types of property 'send' are incompatible`. After restoring, it was clean.
+
+### Commands and output (committed tree `b037ae8`)
+
+`pnpm test:contract -- test/contract/types` (gate, exit 0):
+```
+$ tsx scripts/run-vitest.ts contract -- test/contract/types
+> vitest run --project contract test/contract/types
+
+ RUN  v4.1.11 C:/tools/shopbadwill-wt/T-02
+
+ Test Files  7 passed (7)
+      Tests  281 passed (281)
+   Start at  22:59:09
+   Duration  366ms (transform 426ms, setup 212ms, import 638ms, tests 189ms, environment 0ms)
+```
+Per file: examples 124, messages 96, ports 21, defaults 16, storage 10, spec-shapes 8, errors 6.
+
+`pnpm typecheck` (exit 0):
+```
+$ tsc --noEmit
+```
+
+`pnpm lint` (exit 0):
+```
+$ eslint . --max-warnings=0
+```
+
+### Updates to the main report
+
+- **Decision 1:** adapters may now also import `domain/storage/schema.ts`.
+- **Decision 15:** `RequestBudget.used` is partial.
+- **New decisions:**
+  - `MessagingClient.onBroadcast` and `MsgBroadcastType`.
+  - `defaultSettings()` and `DeepReadonly`.
+  - `GoogleCredentials` no longer has `calendarId`. This differs from §3.11, so PLAN §3.11 and §2.3 should be updated in the next contract-change PR, along with the other decisions.
+- **Concern 1** (`typoAbsolute`): resolved by your ruling.
+- **Concern 6** (adapter zone): resolved by this round.
+
+## Contract change: request scheduler state (T-25)
+
+Approved by the controller on 2026-10-07 and made in `task/T-25`.
+
+**Why.** An MV3 background worker is killed after about 30 s idle. The daily job sends one request per 2-minute alarm tick, so each tick usually runs on a fresh `RequestScheduler`. Before this change only the budget (`sbw:requestBudget`) was persisted. A restarted worker therefore forgot:
+- the 6 h pause after three 403s;
+- the 1 h 403 backoff;
+- the 429/5xx backoffs, including any `Retry-After`;
+- the consecutive-403/429 counters;
+- the 120 s gap.
+
+It could keep calling SGW after SGW had asked it to stop. The user's "considerate guest" rule requires that a restarted worker never forgets a pause or backoff SGW asked for.
+
+### Changes
+
+1. **New storage key `sbw:requestSchedulerState`** (`STORAGE_KEYS.requestSchedulerState`, area `local`), validated by the new `RequestSchedulerStateSchema` in `src/domain/storage/schema.ts`. It is registered in `STORAGE_RECORDS`, so the T-33 `Repo` validates it, lists it and quarantines it like every other record.
+   - `version: 1`: the literal `REQUEST_SCHEDULER_STATE_VERSION`. A reader rejects any other version, which is handled as an invalid record.
+   - `pause: { cause: 'manual' | 'blocked' | 'rate-limited', reason, until: EpochMs | null } | null`: the all-lane pause. `until: null` means until `resume()`.
+   - `consecutive403` and `consecutive429`: the burst counters, counted across lanes.
+   - `lanes`: a partial `Lane` record. A lane that has nothing a restart needs has no entry. Each entry is `{ lastEndAt?, gapJitterMs, backoffUntil?, backoffKind?: 'rate-limited' | 'blocked' | 'server', failures }`, which holds the lane gap, the lane backoff and the exponent n of min(2^n × 30 s, 30 min).
+2. **Scheduler behaviour (`src/adapters/sgw/request-scheduler.ts`).**
+   - It writes the record on every change: after each request settles, and on `pause()` and `resume()`.
+   - It reads the record at construction.
+   - On read, a pause or backoff that has already expired is ignored. A live one is merged, keeping whichever is stricter, so refusals carry the correct `retryAfterMs`.
+   - A missing record means no pause.
+   - An invalid record also means no pause. It is quarantined as a `QuarantineRecord` at `sbw:quarantine:sbw:requestSchedulerState` (generation 0; the record is copied first, then removed, as the Repo does) and flagged with a `{ type: 'state-invalid', key, error }` scheduler event. `sbw:requestBudget` is handled the same way.
+   - Persistence is always on; there is no opt-out.
+3. **`RequestSchedulerStatsSchema` gains `paused?: { until: EpochMs | null, reason: string }`** (`src/domain/types.ts`).
+   - It is present only while every lane is paused. `null` means open-ended: a manual or health pause.
+   - A lane's `backoffUntil` now reports only that lane's backoff. A timed pause still raises every lane's `nextAllowedAt`.
+   - The `pauseState()` method drafted in T-25 is gone.
+   - `health.get`'s `budget` reply (`ReturnType<RequestScheduler['stats']>`) inherits the field.
+4. **No migration.** This is a new key with nothing stored under it before, and `sbw:meta.schemaVersion` stays 1 (§2.3: adding a key or an optional field is not a migration).
+
+### Tests and fixtures updated
+
+- `test/contract/types/examples/RequestSchedulerState.{valid,invalid}.json`: new. The invalid example is rejected at `["version"]`.
+- `test/contract/types/examples/RequestSchedulerStats.valid.json`: now includes `paused`.
+- `test/contract/types/examples.test.ts`: `RequestSchedulerState` added to the locked schema list for `src/domain/storage/schema.ts`.
+- `test/contract/types/storage.test.ts`:
+  - the new key is in the local-key list and the per-key sample values;
+  - a new test checks versioning, the empty and open-ended-pause shapes, and that unknown lanes are rejected.
+- `test/contract/types/spec-shapes.test.ts`: `SpecSchedulerStats` gains `paused?`.
+
+**Follow-up for the next PLAN edit.** Add `sbw:requestSchedulerState` to PLAN §2.3's table, and `paused?` to §3.4's `stats()` return type.
+
+## Contract change: Listing.pickupOnly optional (T-24)
+
+`Listing.pickupOnly` becomes `boolean | undefined` (`src/domain/types.ts`); undefined means unknown. `ItemDetail` still requires it (its schema overrides the field).
+
+**Why.** SGW search rows carry no pickup flag, so the adapter had to invent `false`. The rules matcher then showed items that a "hide pickup-only" rule should hide, and matched `pickupOnly: false` conditions it could not know, which can lead to SGW favorite writes.
+
+**Changes.**
+- `matcher.ts`: the `pickupOnly` condition returns UNKNOWN when `listing.pickupOnly` is undefined (same pattern as `location`).
+- `normalizeSearch` sets `pickupOnly` from the query filter only: `pickupOnly: true` gives true, `excludePickupOnly: true` gives false, neither leaves it unset.
+- `test/contract/types/spec-shapes.test.ts`: `SpecListing.pickupOnly` is optional, `SpecItemDetail` requires it.
+- Tests: two matcher cases (unknown for both condition values); `test/fakes/ports/fake-shared.test.ts` detail builder now sets `pickupOnly` explicitly.
+
+## T-51 contract change: JobRun.candidates
+
+Approved by the controller on 2026-10-08 (T-51 ruling R5) and made in `task/T-51`.
+
+**Why.** Per-item, per-watch working state must survive service-worker death between ticks.
+
+The daily job runs one SGW request per alarm tick, and the worker dies between ticks. The only state that survives is the persisted `JobRun` (PLAN §2.3: "resumable state lives in the active run"). The two-pass evaluation (rulings R1–R3) has to carry some per-item state from one tick to the next:
+- which watch or watches selected an item;
+- the search row and the fetched detail, until the item's quote arrives;
+- the quote;
+- the per-watch ids the run will add to `seenItemIds`.
+
+The frozen `JobRun` had no field for any of this. `Repo.set` parses before writing, so zod strips any extra key. Without per-watch attribution, an item that only a `local` watch found could be favorited on SGW for an `sgw` watch.
+
+### Changes
+
+1. **`JobRun.candidates?: JobCandidate[]`** in `src/domain/watches/schema.ts`. It is optional; runs written before this change have none. Each `JobCandidate` has:
+   - `itemId`;
+   - `watchIds`: at least one; the watches whose search returned the item and whose optimistic pass selected it;
+   - `endTime`;
+   - `status`: one of `pending`, `matched`, `rejected`, `skipped-budget` or `failed`;
+   - optional `row` (`Listing`) and `detail` (`ItemDetail`). T-51 drops both once the strict pass decides, which keeps `sbw:jobRuns` small;
+   - optional `quote`: `{ shipping, handling }`, or `null` when no quote is available;
+   - optional `note`.
+2. **Exports.** `type JobCandidate` is exported. Its zod schema is module-private and validated only through `JobRunSchema`. Exporting a new `*Schema` would add it to the locked list in `test/contract/types/examples.test.ts` and require example files, which are outside T-51's ownership.
+3. **Who reads it.** T-52 reads it through `seenUpdates(run)` (`src/domain/jobs/daily-job.ts`): candidates that are `matched` or `rejected`, grouped per watch, to record with `recordSeen` at the end of the run. Candidates that are `skipped-budget` or `failed` are left out so tomorrow's run retries them. No other card needs to read it.
+4. **No migration.** This adds an optional field, and `sbw:meta.schemaVersion` stays 1 (§2.3).
+
+### Tests
+
+- `test/contract/types/spec-shapes.test.ts`:
+  - adds `SpecJobCandidate`;
+  - `SpecJobRun` gains `candidates?`;
+  - asserts `JobCandidate` equals `SpecJobCandidate`.
+- `test/unit/domain/jobs/daily-job.test.ts`:
+  - **"R5 JobRun.candidates"**: a `Repo.set` → `get` round trip of a run whose candidates include `row`, `detail` and `quote`, which proves nothing is stripped;
+  - the property test asserts `JobRunSchema.parse(run)` equals `run` for every finished run.
+
+**Follow-up for the next PLAN edit.** Add `candidates?` to PLAN §3.6 `JobRun` and to contracts.md.
+
+## T-53 contract change: FavoritesReconciler.desired takes the favorites list
+
+`desired(tracked, watches, now, favorites)` gains a required fourth parameter, `favorites: readonly Favorite[]` (the `sbw:favoritesCache` items). Without it the "not in favoritesCache" rule in PLAN §3.7 cannot be evaluated by a pure function. `test/contract/types/spec-shapes.test.ts` asserts the new signature.
+
+**Follow-up for the next PLAN edit.** Add the parameter to PLAN §3.7 and contracts.md.
+
+## T-58: disableRule undo ref = rule id
+
+An audit entry with `undo: { kind: 'disableRule', ref }` carries the disabled rule's id in `ref`. `createUndoExecutors` (`src/background/handlers/audit.ts`) re-enables that rule. No card writes such an entry yet; the writer must use this format. Audit entries cannot be updated in place, so an undo is recorded as a new `undo` entry (`details.undoneSeq`), and `audit.list` reports `undo.done` from those.
+
+## T-28 contract change: SgwSession `expiring` is 72 h, and `reportRejected()` is new
+
+Source: S-2 (`docs/spikes/S-2.md`) and the controller's T-28 rulings.
+
+1. **R1: `expiring` means less than 72 h left**, not 12 h. `src/adapters/sgw/session-adapter.ts` exports `SESSION_EXPIRING_MS = 72 * 3_600_000`. The comments in `src/ports/sgw-session.ts` and on `SgwSessionStateSchema` (`src/domain/types.ts`) say 72 h. No type changes. `expiring` still allows writes (I-08). Why: SGW has no refresh (S-2), so only the user can renew, and 12 h is too late to ask.
+2. **R2 (revised in fix round 1): new port method `reportRejected(bearer: string): Promise<void>`.**
+   - It sets state `expired` with no network call and **keeps the record** (R3), so the BuyerId rule still applies. `current()` returns `null` while expired. `clear()` stays the explicit logout path (`logged-out`) and keeps the rejected-token history.
+   - **It takes the bearer the rejected request actually carried** and is ignored unless that is the held token (same identity: `jti`, else `exp` plus hash). A late 401 for an older token therefore cannot poison a newer one.
+   - Rejected identities are SHA-256 hashes (of the `jti`, or `exp` plus a hash of the token). The last 8 are kept under the new storage key `sbw:sgwSessionRejection` (`STORAGE_KEYS`, area `local`, record `{ ids: string[] (max 8), at: EpochMs }`, schema module-private). The record is optional (absent = nothing rejected), so there is no migration and `schemaVersion` stays 1. It is read and written through `Repo`, so an invalid record is quarantined. The raw token and raw `jti` are never stored. Accepting a new token does not erase the history.
+   - `observe()` never accepts a token whose identity is in that history, and never lets a token with an earlier `exp` replace a held token that is still valid and not rejected.
+   - `jti` is read from the payload only to be hashed (token identity). It is never stored or logged raw. `BuyerId` and `exp` are the other two claims read.
+   - `SgwApiAdapter` (T-26) calls it once when a request that was actually **sent** with the bearer ends in an `auth` error (HTTP 401 or `isUnauthorized`), passing that bearer. Requests the scheduler fails while queued behind a 401 never left and report nothing. A PlaceBid reply with `isUnauthorized` is returned by `bid.ts` as `kind: 'auth'`; the adapter reports it when PlaceBid was sent. `ApiAdapterDeps.session` requires the method (`Pick<SgwSession, 'current' | 'reportRejected'>`), so a forgotten wiring cannot silently skip the expired marking. The deps builders in `test/contract/sgw/bid.test.ts` and `test/integration/sgw-api.test.ts` were updated.
+3. **R4/R5:** `SBW_SESSION_REFRESH = false`, so `refresh()` resolves `false` with no call. Only `BuyerId`, `exp` and (hashed) `jti` are read from the token.
+
+**Follow-up for the next PLAN edit.** Add `reportRejected(bearer)` and the 72 h threshold to PLAN §3.3 and contracts.md, and list the new key `sbw:sgwSessionRejection` in PLAN §3.11.
+
+## T-70 contract change: AuthStatus gains optional `refreshTokenExpiresAt`
+
+Source: S-4 (`docs/USER-STEPS/S-4-results.txt`) and the controller's T-70 ruling R3.
+
+`AuthStatusSchema` (`src/domain/calendar/types.ts`) gains `refreshTokenExpiresAt?: EpochMs`. Google states `refresh_token_expires_in` (about 604800 s) for an app in "Testing" publishing mode, so the refresh token dies 7 days after consent. T-62's provider already keeps the value in memory (`PkceAuthStatus`); with the field in the schema it survives the `calendar.connect`, `calendar.status` and `health.get` replies, and the options page can warn before the daily sync starts failing with `invalid_grant`. Optional, so no migration and no change for providers that cannot state it. `test/contract/types/spec-shapes.test.ts` and `examples/AuthStatus.valid.json` are updated.
+
+**Follow-up for the next PLAN edit.** Add the field to PLAN §3.8 `AuthStatus` and contracts.md.
+
+## T-70 contract change: new optional storage key `sbw:googleClient`
+
+Source: controller ruling on T-70 concern 1.
+
+The options page used to write the pasted client into `sbw:google`, where the background also writes tokens: a lost update could overwrite a live connection (`grantedScopes: []`). Instead `STORAGE_KEYS.googleClient = 'sbw:googleClient'` (area `local`, `GoogleClientSchema` in `src/domain/storage/schema.ts`) holds `{ clientId: string (min 1); clientSecret?: string; updatedAt: EpochMs }`. Optional record, no migration, `schemaVersion` stays 1.
+
+- The options page is its only writer and validates against the schema before writing. It never touches `sbw:google`.
+- T-36's `clientConfig()` reads `sbw:googleClient` (carried by the controller). T-62's own copy of the client in `sbw:google` is never used to authenticate.
+- The secret is never rendered back beyond "••••" plus the last 4 characters, and is never logged, audited or put in an error.
+- `test/contract/types/storage.test.ts` pins the key and schema; `test/dom/options-google.test.ts` pins that saving leaves `sbw:google` byte-identical.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-30 contract change: new optional storage key `sbw:healthReport`
+
+Source: controller ruling on T-30 concern 4.
+
+`GlobalSwitches` blocks writes while the last HealthReport within 24 h has `ok === false`, but `sbw:runtimeHealth` is in the session area, so a browser restart forgot a failure. `STORAGE_KEYS.healthReport = 'sbw:healthReport'` (area `local`, `HealthReportSchema`) holds the same report. `SgwHealthAdapter` writes both keys and `last()` reads the local one (falling back to `sbw:runtimeHealth`). Optional record, no migration, `schemaVersion` stays 1. `test/contract/types/storage.test.ts` pins the key.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
+
+## T-30 contract change: new optional storage key `sbw:healthProbe`
+
+Source: controller ruling, T-30 fix round 1.
+
+`STORAGE_KEYS.healthProbe = 'sbw:healthProbe'` (area `local`, `HealthProbeSchema`): `{ probedAt: EpochMs | null; lastGoodProbeAt: { search?, detail? }; sticky: Array<{ endpoint, at, detail }> }`. `probedAt` is the only clock for SgwHealth's 6 h trust and 10 min re-probe rules (a report's `checkedAt` is refreshed by every run and must not be used). `lastGoodProbeAt` drives the 24 h stale escalation. `sticky` holds per-endpoint schema failures that keep the report failing until `recordSchemaSuccess(endpoint)` (or a full run that probes that read endpoint). Optional, no migration, `schemaVersion` stays 1.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN section 2.3 and contracts.md.
+
+**T-30 round 2 addition.** `HealthProbe` gains optional `firstSeenAt: EpochMs`, set once at the first run or recorded failure. A schema check that has never had a good probe escalates to `stale` (`ok:false`) once `now - firstSeenAt > 24h`, the same fail-closed path as the `lastGoodProbeAt` rule (an empty search, which leaves detail with nothing to probe, is exempt). Optional, backward compatible.
+
+## T-80 contract change: `Snipe.attempt.reply`
+
+Approved by the controller in the T-80 review (fix round 1, ruling on concern 1).
+
+**Change.** `Snipe.attempt` gains `reply?: BidResult` (`src/domain/snipe/types.ts`). It holds SGW's reply to the attempt's PlaceBid, and the reducer (`src/domain/snipe/state-machine.ts`) records it on `result`.
+
+**Why.** When a reply might have registered (`accepted`, `outbid`, `rejected-unknown`), the snipe waits for the outcome read. That read must be judged together with the reply: T-87's `classifyOutcome(snipe, reply, postDetail)` needs `rejected-unknown` to give the right copy, and `accepted` to infer a win from the price. The `post-read` event carries only the ItemDetail.
+
+Before this change, the reply could only be held in the runner's memory (the stopgap `ReduceContext.reply`, now removed). After a worker restart the reply was lost, so an accepted bid with an anonymous post-read under the max read "Unconfirmed" instead of "Won".
+
+**Rules.**
+- **One reply per attempt.** A second `result`, an `ambiguous` after a `result`, or a `result` after an `ambiguous` is refused as `duplicate`. T-101's SendStrategy dispatches exactly one of the two.
+- **Ambiguous sends.** After `ambiguous`, the outcome read is judged with no reply. A stored record that has both a reply and the ambiguity flag is judged the same way, conservatively. The reducer never writes such a record.
+- **Re-arming.** The `snipe.arm` handler already resets `attempt` to `{}`, so a re-armed snipe carries no reply. `arm` also refuses a draft that has one.
+
+**Migration.** None. The field is optional, so `sbw:meta.schemaVersion` stays 1, and snipes stored before this change have no reply.
+
+**Tests.**
+- `test/contract/types/spec-shapes.test.ts`: `SpecSnipe.attempt.reply?: SpecBidResult`.
+- `test/unit/domain/snipe/state-machine.test.ts`: covers a restart round trip through `SnipeSchema` (accepted reply, then an anonymous post-read under the max, resolves to Won), one reply per attempt, and the ambiguous-plus-reply record.
+
+**Follow-up for the next PLAN edit.** Add `reply?: BidResult` to `Snipe.attempt` in PLAN §3.9 and in `contracts.md`.
+
+## T-36 ruling: calendar writes are not gated by the SGW session (§3.3 note)
+
+Source: controller ruling on T-36 concern 2.
+
+§3.3's fail-closed rule lists four conditions for `GlobalSwitches.writesAllowed(feature)`. For `feature === 'calendar'`, the SGW-session condition (`SgwSession.state()` neither `'ok'` nor `'expiring'`) does not apply: calendar writes go to Google, not to SGW, so a lapsed SGW sign-in must not stop calendar sync. The other conditions still apply to calendar: the kill switch, `dryRun.calendar`, and a failing SGW HealthReport within 24 h (drifted SGW data could carry wrong end times). The storage-repair block (migrate() meta-corrupt or failed, T-33 carry) applies to every feature. `favorites` and `bidding` keep all four conditions.
+
+The port type (`src/ports/global-switches.ts`) is unchanged. `src/background/switches.ts` implements the rule, and `test/integration/background-main.test.ts` pins it ("calendar is exempt from the SGW session, but not from SGW health, the kill switch or dryRun.calendar").
+
+**Follow-up for the next PLAN edit.** Add the exemption to the fail-closed rule in PLAN §3.3 and contracts.md.
+
+## T-30b: feature-scoped sticky blocking, `health.clearSticky`, and `health.get.sticky`
+
+Source: controller rulings R1 to R3 on T-30b (follow-up to T-30, T-36 and T-70).
+
+**Problem.** A sticky per-endpoint schema failure (`sbw:healthProbe.sticky`) failed the whole HealthReport, so GlobalSwitches blocked writes for every feature. A sticky failure on a write endpoint could never clear, because the writes that would prove recovery were blocked.
+
+**R1. Feature-scoped blocking.** `stickyFeatures(endpoint)` in `src/background/switches.ts`: `addFavorite`, `removeFavorite`, `saveFavoriteNote`, `favorites` affect `favorites`; `placeBid`, `showBidModal` affect `bidding`; `search`, `itemDetail` and any other endpoint affect all features. `writesAllowed(feature)` blocks on a failing report in one of two ways:
+- If every failing check is a sticky-only check (its detail starts with `sticky schema failure` and carries no `shipping-quote:` part), only the features the sticky entries map to are blocked. The entries come from `sbw:healthProbe.sticky`, which Switches loads at startup and follows through `storage.onChanged`. An empty or unreadable list fails closed (all features).
+- Any other failing check (stale, a failed probe, clock, session in `full` mode, shipping quote, or card drift if it ever fails) blocks every feature, as before.
+
+A schema failure flagged by the API but not yet stored (`flagSchemaFailure`) is scoped the same way. The calendar exemption from the SGW session (T-36 ruling) is unchanged. The `HealthReport` schema is frozen and untouched; the per-feature information is derived in `switches.ts`.
+
+**R2. `health.clearSticky { endpoint: string }`.** A new protocol message, sender `ui` only (a content sender is refused by the router). The handler removes that endpoint's sticky entry (through T-30's `recordSchemaSuccess`, which recomposes and stores the report), audits `health.resume` (`actor: 'user'`, `details: { endpoint, action: 'user resumed after checking' }`), and re-evaluates GlobalSwitches at once (`noteHealthProbe`, `noteHealthReport`). An endpoint that is not sticky is a no-op with no audit entry. It never clears stale, clock or session failures; those clear only through probes or real state. `health.recovered` is still audited by T-30 when the report turns ok.
+
+**`health.get` reply gains optional `sticky`.** `sticky?: Array<{ endpoint, at, detail, features }>` (`features` are the write features the entry blocks). The options health panel needs each entry's time and detail, and the frozen HealthReport carries neither. Optional, so older fixtures stay valid; no migration, no storage change. `test/contract/types/messages.test.ts` and `examples/Msg/health.clearSticky.*.json` are updated.
+
+**R3. UI.** The options Health section lists each sticky failure (endpoint, time, detail, blocked features) with an "I've checked; resume <feature>" button. It opens an inline `alertdialog` first; only "Yes, resume ..." sends `health.clearSticky`. Errors use `role="alert"`; every control is a native button (Escape cancels, focus starts on Cancel).
+
+**Tests.** `test/integration/background-main.test.ts` (T-30b block), `test/dom/options-google.test.ts` (sticky failures).
+
+**Follow-up for the next PLAN edit.** Add `health.clearSticky` to PLAN §3.12 and the `sticky` field to the `health.get` reply; add the feature scoping to §3.3.
+
+## T-67: CalendarSink, calendar sync job, `deleteEvent` undo, `sbw:calendarSync`
+
+Source: T-67 (provisional: S-5 pending, so the recreate strategy is `bump-generation`).
+
+**Undo ref.** A real `calendar.insert` audit entry carries `undo: { kind: 'deleteEvent', ref: 'deleteEvent:<itemId>:<eventId>' }` (e.g. `deleteEvent:9000001:sbv9000001g0`; `parseDeleteEventRef` in `src/adapters/google/calendar-sink.ts` accepts only `/^deleteEvent:(\d+):([a-v0-9]{5,1024})$/`). The executor (`createCalendarUndoExecutors`, `src/background/handlers/calendar.ts`, merged into T-58's map by `wiredUndoExecutors` in `handlers/audit.ts`; the activity UI's `UNDOABLE_KINDS` includes `deleteEvent` and a unit test pins it to those keys) first sets `tracked[itemId].calendar = false`, so a sync running meanwhile cannot put the event back, then deletes the event through the sink (ownership guard, kill switch, dry-run, health and cooldown gates apply). A refusal restores the flag and is "not now: ..."; the entry stays not done. Google not connected (or needing a reconnect) is refused before any Google call. A second run is a no-op (the link is `deleted`). Turning the item's calendar back on later inserts a fresh generation (`bump-generation`); the cancelled id is never reused. A dry-run `calendar.insert` has no `undo`.
+
+**Ownership guard.** The sink patches, stamps or deletes an event only when `extendedProperties.private.sbwItemId !== ''`, equals the item, and the event id equals `eventIdFor(itemId, generation)`, on our dedicated calendar. It reads the event first (one GET) to check. A failing check is audited `calendar.refused`, the event is not written, and the link is set to `error` (patch/stamp) or `deleted` (delete).
+
+**Dedicated calendar lookup.** Before `calendars.insert`, `ensureCalendar` calls `calendarList.list` (`CalendarApi.calendarListList`, rows carry `accessRole` and `primary`) and adopts an existing calendar only when ALL hold: its description contains `sbw:dedicated-calendar` (written on every insert), `accessRole === 'owner'`, and it is not the primary calendar (`primary: true` or id `primary`). The summary alone never qualifies (Opus check, T-67): a user calendar, or one shared with the user, may carry the same name, and the adopted calendar is where every later write goes. No build ever created our calendar without the marker. That covers a crash between insert and saving the id, and a deleted saved calendar when a marked leftover is still listed. Google's published scope list for `calendarList.list` does not include `calendar.app.created` (it does for `calendarList.get`); a 403 `insufficient-scope` on the list falls through to insert and does not raise the reconnect notice. A 429 or other error still halts. Adoption is audited as `calendar.adopted`.
+
+**Pacing (R4).** The sink's `RequestLimiter` starts each Calendar port call at least 1 s after the previous one ENDED. `GoogleCalendarApi` (T-64) waits at least `minRetryDelayMs` (default 1000 ms) before any internal retry, whatever the backoff or Retry-After says. Together no two Calendar requests from the sync start less than 1 s apart. The one exception is T-62's `authorizedHttp`: a 401 refreshes the token and resends that request once at once.
+
+**`sbw:calendarSync` (storage.local).** Bookkeeping the frozen `CalendarLink` has no room for: `retries` per item (reconciler backoff), `cooldownUntil`/`cooldownCount` (after a 403/429, exponential 60 s to 1 h), `noticeDay` (one reconnect notice per local day), `sinkHashes` (ReminderSink change detection), `dryRunSeen` (dry-run audit de-duplication). Not a Repo key: the sink owns it.
+
+**Pending links.** While Google is disconnected (or needs a reconnect) desired events are stored as `status: 'pending'` links with `calendarId: 'pending'`; when the calendar is created they are re-homed to its real id and inserted.
+
+**Stable description.** Sync drops the `Current price:` line from the event description (the price changes every bid and would patch the event each time). `calendar.ics` keeps it.
+
+**ReminderSink (I-34).** `registerReminderSink(sink)` and `ReminderSink { name, upsert(event), remove(itemId) }` are exported from `src/background/jobs/calendar-sync.ts`. Sinks are fed from the desired set (open items only), independent of Google, changed events only, and not at all in dry-run or under the kill switch.
+
+**Late add (I-18).** An insert whose event ends in under 60 minutes (T-56's `isLateAdd`) sends one local notification, id `sbw:notify:late:<itemId>`, and appends the same `notify.late-add` audit entry T-56 uses, so the two never double-alert.
+
+## T-80b contract change: `post-read-failed` and `not-sent` events, `Snipe.attempt.notSent`
+
+Approved by the controller (T-80b rulings R1–R5) and made in `task/T-80b`.
+
+**Why.** The T-84 runner retries the post-read for a sent snipe with a bound (about 7 days), then gives up and tells the user "Unconfirmed: check the item" — but the reducer had no event to settle `sent` without an ItemDetail, so the snipe kept counting in the caps' exposure forever. And a bid that provably never went out (`bid.ts` threw `BidNotSentError` after `sent` was dispatched) could only be recorded as `ambiguous`, so the post-read judge could label it "outbid" when the bid had never registered.
+
+**Changes.**
+
+1. **New event `post-read-failed`** (`{ type: 'post-read-failed', now }`), accepted in `sent`. It resolves the snipe through `classifyOutcome(snipe, attempt.reply ?? null, null, ctx)` — with no post-read the outcome is "Unconfirmed: the bid may have been placed … check ShopGoodwill", never "Not bid". Terminal, emits the usual notify/audit effects and no money effect. See the review correction below for the dry-run `firing` exception.
+2. **New event `not-sent`** (`{ type: 'not-sent', now, reason }`), accepted only in `sent` and only when no reply and no ambiguity are recorded (else `duplicate`). The runner dispatches it when `bid.ts` throws `BidNotSentError`. It resolves through `classifyOutcome` with abort `network` and copy "No bid was sent (reason). This is not an outbid." — never the judge path. Terminal, no money effect.
+3. **`Snipe.attempt.notSent?: boolean`** (`src/domain/snipe/types.ts`). The `not-sent` handler records the proof on the attempt, so it survives a restart. `classifyOutcome` treats it as overriding the send evidence (the abort path wins over the judge path), and `spentToday` reads it (R4).
+4. **`OutcomeContext.abortDetail?: string`** (`src/domain/snipe/outcome.ts`): the text after "No bid was sent". The abort-`network` copy is now "No bid was sent (…). This is not an outbid."
+5. **Spend accounting (R4, `src/domain/snipe/caps.ts`).** An Unconfirmed outcome (`network` with send evidence: `sentAt` or `ambiguous`) counts toward `spentToday` at the ceiling (max bid plus known shipping/handling), because the bid may have been placed. A proven `not-sent` does not count.
+
+**Migration.** None. `notSent` is optional, so `sbw:meta.schemaVersion` stays 1; snipes stored before this change have no flag.
+
+**Tests.** `test/contract/types/spec-shapes.test.ts` mirrors both events and `notSent`. The reducer table, the fast-check properties and the spend tests are in `test/unit/domain/snipe/`.
+
+**Follow-up for the next PLAN edit.** Add both events to PLAN §3.9's event list, `notSent` to `Snipe.attempt`, and the R4 rule to the caps text; update `contracts.md`.
+
+**Review correction (Grok).** `post-read-failed` is also accepted in `firing` when `snipe.dryRun` is true, and never when it is false. A dry run whose measure read fails forever would otherwise stay in `firing` with no settle path. That settlement is outcome `dry-run`, heading Unconfirmed, copy that the dry-run measure failed — not "the bid may have been placed", and not "No bid was sent". No money effect. A live snipe in `firing` is still refused with `not-sent`. No schema change and no migration.
+
+**Final check correction (Opus).** Three changes, all additive. No schema change and no migration.
+
+1. **The dry-run give-up keeps its title.** A dry run settled by `post-read-failed` in `firing` is titled "Dry run", like every other dry-run outcome. The review correction above had it titled "Unconfirmed". The result is still unconfirmed (`final: false`, copy "the dry-run measure failed, so the result is unconfirmed"). "Unconfirmed" stays the live heading for a bid that may be out. The flag is `OutcomeContext.dryRunMeasureFailed?: boolean` in `src/domain/snipe/outcome.ts`; it is additive and ignored for a live snipe.
+2. **A settlement with no read says so.** When `classifyOutcome` judges a sent snipe with no ItemDetail (`post-read-failed` in `sent`), the copy now says that the item could not be read. Three phrases change:
+   - "this comes from re-reading the item" no longer appears, because nothing was read;
+   - "leading; auction still open" becomes "leading when the bid went in";
+   - "Currently outbid (auction still open; …)" becomes "Outbid when the bid went in".
+
+   Outcomes, `final`, stamps and the with-a-read copy are unchanged.
+3. **No stale proof on a draft.** `reduce(arm)` refuses a draft that carries `attempt.notSent` (`invalid-snipe`), as it already refused `sentAt`, the key and a `reply`. A stale proof would keep the next attempt's Unconfirmed outcome out of `spentToday` (R4).
+
+## T-32 contract change: `rules.disable`
+
+Approved by the controller in the T-32 review (fix round 1, ruling on concern 1).
+
+**Change.** A new message, `rules.disable { ruleId: string (min 1) }`, with no reply. It is in the `content` sender group (`MSG_SENDER['rules.disable'] = 'content'`), so content scripts may send it, and, like every content type, extension pages may too. `src/background/handlers/rules.ts` accepts both sender classes; it does not call `requireContent`.
+
+**Why.** The overlay's undo is "local re-show + optional 'disable rule'" (T-32 card). Before this change, a content script had no way to turn a rule off: `rules.save` and `audit.undo` are UI-only.
+
+**Handler rules.**
+- The rule's `enabled` becomes false and `updatedAt` is set to now. Nothing else changes.
+- An audit entry is written: `{ actor: 'user', kind: 'rule.disabled', ref: ruleId, details: { ruleId, name, from: 'content' | 'ui' }, undo: { kind: 'disableRule', ref: ruleId } }`. This is the T-58 format ("disableRule undo ref = rule id"), so the activity log's undo re-enables the rule.
+- `rules.changed` is broadcast.
+- An already disabled rule is a no-op: no audit, no broadcast. An unknown rule id is an error. Content senders get the router's generic "internal error".
+- The overlay sends it only from a trusted click (`event.isTrusted`) in the Why? dialog, which lives in a closed shadow root.
+
+**Tests.**
+- `test/contract/types/messages.test.ts`: the union, the sender group, and the payload type.
+- `test/contract/types/examples/Msg/rules.disable.{valid,invalid}.json`: the example pair.
+- `test/unit/background/rules-disable.test.ts`: the handler, with both senders, the audit undo round trip, the no-op, the unknown rule, and an empty id.
+- `test/dom/overlay.test.ts`: the trusted-click check.
+
+**Follow-up for the next PLAN edit.** Add `rules.disable` to PLAN §3.12 (content → background) and §2.4 rule 3, and to contracts.md.
+
+## T-84 contract change: optional storage key `sbw:snipeRunner`
+
+Source: controller ruling on T-84 concern 5.
+
+The snipe runner keeps its effect outbox and per-snipe bookkeeping in `sbw:snipeRunner`, and writes that record in the same `storage.local.set` as `sbw:snipes`. That is what makes the state and the outbox atomic. The key was private. It is now a storage record.
+
+`STORAGE_KEYS.snipeRunner = 'sbw:snipeRunner'` (area `local`, `SnipeRunnerRecordSchema`): `{ version: 1, entries: Record<SnipeId, { outbox: Effect[], preflightAt?, preflightNotBefore?, atRisk?, readFailures?, lastReadAt?, unconfirmedAt? }> }`. `outbox` is the reducer's effects, in order. The bookkeeping fields are the runner's own (when preflight ran, an AuthHealth warning, outcome-read retries, the Unconfirmed alert).
+
+Optional. A profile with no record is "nothing pending". No migration, and `sbw:meta.schemaVersion` stays 1.
+
+An invalid record fail-closes. The runner parses it with `SnipeRunnerRecordSchema` and, on failure, treats the outbox as empty. Nothing is replayed, so a corrupt record cannot send a bid. The repo quarantines the record if something reads it through `find`.
+
+**Tests.** `test/contract/types/storage.test.ts`, `test/contract/types/examples/SnipeRunnerRecord.*.json`, and the snipe-runner integration test that corrupts the record and expects no PlaceBid.
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-84: `verdictNow(feature, { ignoreDryRun: true })`
+
+Source: controller ruling on T-84 concern 4.
+
+A dry-run snipe has to ask "would live bidding be allowed?" without the dry-run condition, so its fallback audit can say "would have placed" only when a live snipe would have been allowed to send. `Switches.verdictNow` stopped at `dryRun[feature]` before health and the session, and the runner kept a private copy of the health check. That copy missed a schema failure `flagSchemaFailure` had recorded but T-30 had not stored yet.
+
+`verdictNow(feature, { ignoreDryRun: true })` skips only that one condition. Kill, storage repair, health (including T-30b sticky scoping and a pending flagged failure) and the session check are unchanged. `writesAllowed` and `view` never pass the option, so a dry run still blocks a real write. The runner uses this verdict for a dry-run snipe's `writesAllowed` and for its window anomaly check, and no longer mirrors `healthFailing`.
+
+**Tests.** `test/integration/background-main.test.ts` ("verdictNow ignoreDryRun") and `test/integration/snipe-runner.test.ts` (a pending `placeBid` failure does not audit "would have placed"; a favorites-only pending failure still does).
+
+## T-69: the `sbw:ntfy` storage key and the ntfy ReminderSink
+
+Source: T-69 (controller ruling R7 authorises this additive storage change).
+
+**`sbw:ntfy` (storage.local, optional).** One new Repo key (R7): `{ status?: 'disabled' | 'needs-permission'; items: Record<ItemId, { fingerprint: string; entries: Array<{ seq; leadMin; fireAt; status: 'scheduled' | 'deferred' }> }> }`. The schema is module-private in `src/domain/storage/schema.ts` (an exported `*Schema` would join the frozen schema surface of `test/contract/types/examples.test.ts`), and only the `NtfyState` type is exported. The change is additive: `schemaVersion` stays 1 and `STORAGE_RECORDS` gains `sbw:ntfy` → local. An invalid record is quarantined by the Repo and reads as empty, so it can never cause a resend storm — the seqs are deterministic (`sbw-<itemId>-<leadMin>-<gen>`), so a re-publish overwrites on ntfy instead of duplicating. `test/contract/types/storage.test.ts` lists the key (LOCAL_KEYS + sample). T-118 (L4) adds an optional per-item `topicTag` (a 32-bit FNV-1a hex of the topic, never the topic), also additive: entries tagged for another topic are not taken as scheduled on the current one, so a publish that wrote back after the options page cleared the record for a rotation cannot leave the new topic empty. A pass that sees the topic change or phone push turn off after publishing cancels what it just put on the old topic and records nothing.
+
+**Sink.** `src/adapters/ntfy/ntfy-sink.ts` implements T-67's `ReminderSink { name: 'ntfy', upsert(event), remove(itemId) }`; `src/background/jobs/ntfy-reminders.ts` registers it with `registerReminderSink` (self-registering job module; `main.ts`, `calendar-sync.ts` and `wxt.config.ts` untouched). No alarm of its own: the sink is fed by calendar sync's `feedSinks`. feedSinks records an item's hash once `upsert` resolves, and the sink never rejects, so an unchanged item is offered only once. The job module therefore runs `NtfySink.reconcile`, one idempotent pass that re-offers every open event and removes stored items that are no longer open. It runs after every job run (R1's daily re-call: deferred reminders, and anything a 429/5xx cut short), at startup, when the ntfy settings group changes (turned on, new topic), and on a scheduler tick only while `sbw:ntfy.status` is `needs-permission` and the host permission is now granted. A pass makes no request and no write when nothing is owed, and no request while the gate is closed. Calls for one item are serialized, so calendar sync and the pass never double-publish. The wire shape (`POST` plain text with `X-Title`/`X-Click`/`X-Tags: hourglass`/`X-Delay`/`X-Sequence-ID`, `DELETE /<topic>/<seq>`) is isolated in one function and marked provisional — must be checked live. Pacing: at most 1 request/s; a 429/5xx backs off and gives up for that sync; failures never throw into calendar sync. A 429 while cancelling an end-time change keeps the old fingerprint and every seq not yet cancelled, so the next upsert retries instead of forgetting them. The topic is a 128-bit secret: generated lowercase base32, prefixed `sbw-`; never logged, audited or put in an error message, and masked to its last 4 characters outside the options field. Messages carry only the item title, the end time in the user's zone, the lead and the item link.
+
+**Options cancel (review ruling).** Turning phone push off, or generating a new topic, runs from the options click path while the host permission is still granted: DELETE each stored `scheduled` seq on the old topic (paced, `https://ntfy.sh` only), then clear `sbw:ntfy`, then save. Deferred seqs were never sent and are not deleted. If a DELETE fails, phone push is still turned off and the page says already-scheduled pushes may still arrive; the stored seqs are kept. A failed regenerate keeps the old topic. `parseNtfyState` reads a missing or invalid record as empty.
+
+**Follow-up for the next PLAN edit.** Add the `sbw:ntfy` key to PLAN §2.3's storage table.
+
+## T-90 contract change: optional storage key `sbw:dryRunCounted`
+
+Source: controller ruling on T-90 concern 4.
+
+The dry-run counter keeps the snipe ids it has already counted in `sbw:dryRunCounted`, so a replayed completion event does not increment `settings.snipe.completedDryRuns` twice. The key was module-private. It is now a storage record, the same kind of optional bookkeeping as `sbw:snipeRunner` and `sbw:ntfy`.
+
+`STORAGE_KEYS.dryRunCounted = 'sbw:dryRunCounted'` (area `local`). The schema is module-private (an exported `*Schema` would join the locked example list): `{ version: 1, counted: Record<SnipeId, EpochMs> }`. `counted` maps a snipe id to when it was counted.
+
+Optional and additive. A profile with no record has counted nothing. No migration, and `sbw:meta.schemaVersion` stays 1.
+
+Invalid data parses to the empty record `{ version: 1, counted: {} }` through `parseDryRunCounted` (missing or unreadable). A typed `repo.find` quarantines an invalid record and returns undefined, which is that empty record. The counter does not read the key through `find`. It reads the raw bytes and, when a record is present but invalid, refuses the increment and leaves the bytes in place. Adopting the empty parse would drop the idempotency set, and a replay could count again. Over-counting is the direction that opens the live-bidding gate early.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, the sample, invalid parses to empty) and `test/unit/background/dry-run-counter.test.ts` (refuse on a corrupt record; `repo.find` quarantines).
+
+**Follow-up for the next PLAN edit.** Add the key to PLAN §2.3 and contracts.md.
+
+## T-90 contract change: `timing.awake`
+
+Source: controller ruling on T-90 concern 1. Additive. No other protocol change.
+
+The Timing page's awake chart needs the persisted heartbeat history. No existing message carries `sbw:awake`.
+
+`timing.awake` is a UI signal (empty request). The reply is `STORAGE_RECORDS[STORAGE_KEYS.awake].schema`, which is `EpochMs[]`: the stored history, or an empty array when nothing is stored. A content script is refused (`forbidden`), same as every other UI message. The handler is read only (T-90 final check): it reads the raw bytes and validates them with that schema, so an invalid record answers `[]` and is left in place. The heartbeat job quarantines it under its own `sbw:awake` lock on its next beat. A `repo.get` here would quarantine outside that lock, and its remove could delete a history the heartbeat had just written.
+
+**Tests.** `test/contract/types/messages.test.ts`, `test/contract/types/examples/Msg/timing.awake.{valid,invalid}.json`, `test/unit/background/timing-awake.test.ts`, and `test/dom/timing-section.test.ts`.
+
+**Follow-up for the next PLAN edit.** Add `timing.awake` to PLAN §3.12 and contracts.md.
+
+## T-90: `settings.set` never changes `snipe.completedDryRuns`
+
+Source: T-90 final check (Opus). A behaviour rule on an existing message, like `killSwitch` (T-36 R3). No schema or protocol change.
+
+`settings.set` replaces whole top-level groups. A page that edits one `snipe` field must send the whole `snipe` group, and that group carries `completedDryRuns`. A copy loaded before the last dry runs were counted would roll the count back. A crafted group could raise it and open the live-bidding gate early. `applySettingsPatch` now keeps `current.snipe.completedDryRuns`, whatever the patch says. The dry-run counter (`src/background/jobs/dry-run-counter.ts`) is the only writer. The kept count is in `next` before the `settings.set` interceptors run, so T-102's live gate judges the real count. The handler and the counter both take the `sbw:settings` lock, so the two cannot interleave.
+
+The Timing page's Apply also reads the settings fresh (`settings.get`) just before it writes, so it does not send back stale caps or other `snipe` fields either.
+
+**Tests.** `test/integration/background-main.test.ts` ("settings.set never changes completedDryRuns") and `test/dom/timing-section.test.ts` ("Apply re-reads the settings first").
+
+**Follow-up for the next PLAN edit.** Note the rule beside `killSwitch` in PLAN §3.12 (`settings.set`) and contracts.md.
+
+## T-57 contract change: landedCost.get reply and `sbw:quoteCache`
+
+Approved by the controller (T-57 rulings R1, R2) and made in `task/T-57`.
+
+### R1: the `landedCost.get` reply value
+
+**Before:** `MsgReplySchemas['landedCost.get']` was `record(ItemId, Cents | null)`, which cannot carry the brief's `pickup` flag.
+
+**Change** (`src/messaging/protocol.ts`): the reply is now `record(ItemId, { shipping: Cents; handling: Cents; pickup: boolean } | null)`.
+
+- The badge computes landed = the card's current price + shipping + handling.
+- Pickup-only items answer `{ shipping: 0, handling: 0, pickup: true }` with no SGW request.
+- The entry schema is module-private (`LandedCostQuoteSchema`); only the type `LandedCostQuote` is exported, so the locked schema surface in `test/contract/types/examples.test.ts` is unchanged.
+- `test/contract/types/messages.test.ts` pins the new reply type and validation examples. No other consumer of the reply existed (the handler and the badge are new in T-57). The request payload's TypeScript type stays `{ itemIds: ItemId[] }`; the runtime zod schema caps `itemIds` at 40 (R5).
+
+### R2: the `sbw:quoteCache` storage key
+
+**Change** (`src/domain/storage/schema.ts`, plus the Repo default in `src/domain/storage/repo.ts`): one new optional key `STORAGE_KEYS.quoteCache = 'sbw:quoteCache'` (area `local`), `record(ItemId, { shipping, handling, zip-hash, fetchedAt })`.
+
+- `zip-hash` is the HMAC-SHA-256 hex of the home ZIP under the per-install salt `sbw:quoteSalt` (below): the ZIP itself is never stored, and a ZIP change misses the cache.
+- The 24 h TTL runs from `fetchedAt` (readers compute it; the record has no `expiresAt`).
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration. An invalid record parses to empty (the Repo default `{}` after quarantine).
+- The entry schema is module-private (`QuoteCacheEntrySchema`), like `SgwSessionRejectionSchema`, so the locked example list is unchanged; `test/contract/types/storage.test.ts` pins the new key, its area and a sample value.
+
+### `sbw:quoteSalt`: the per-install key for `zip-hash` (T-57 final check)
+
+Source: T-57 final check (Opus). The controller's check asked for a salted or keyed hash, kept in local storage, with any new key optional and additive.
+
+A plain SHA-256 of a 5-digit ZIP is reversible: there are only 100 000 ZIPs, so a table of every hash recovers the ZIP from the cache. The hash is now keyed.
+
+**Change** (`src/domain/storage/schema.ts`): one new optional key `STORAGE_KEYS.quoteSalt = 'sbw:quoteSalt'` (area `local`). The value is 32 random bytes as lowercase hex (`/^[0-9a-f]{64}$/`). The schema is module-private, so the locked example list is unchanged.
+
+- `zip-hash` = HMAC-SHA-256(key = the salt, message = the trimmed ZIP), as hex. The handler and the `quote` step share the helper (`zipHashFor` in `src/background/handlers/landed-cost.ts`), so they read each other's entries.
+- The salt is made on the first quote, under the key's Repo lock, so concurrent first uses agree on one salt. No salt is made while the feature is off, the kill switch is on, or the ZIP is invalid.
+- An invalid record is quarantined by the Repo and a fresh salt is made. The old cache entries then miss and expire within 24 h.
+- Additive and optional, so `schemaVersion` stays 1 and there is no migration.
+- **Limit.** The salt and the cache live in the same `storage.local`. The salt defeats a precomputed table and links nothing across installs. It does not stop someone who can read this profile's storage, but they can also read `settings.homeZip` there.
+
+**Tests.** `test/contract/types/storage.test.ts` (the key, its area, a sample value, rejected values) and `test/unit/background/landed-cost.test.ts` ("ZIP hash privacy: a per-install salt").
+
+**Follow-up for the next PLAN edit.** Add `sbw:quoteCache` and `sbw:quoteSalt` to PLAN §2.3 and the new reply shape to §3.12 and contracts.md.
+
+## T-57b: negative quote cache (`sbw:quoteCache` entry gains optional `none`)
+
+Source: the controller, from the T-57 final check (considerate use).
+
+**Change (additive).** A `sbw:quoteCache` entry may carry `none: true`. That means SGW *answered* "no quote" for this item and ZIP hash; `shipping` and `handling` are then 0 and unused. The 24 h TTL and the eviction are unchanged. A failed request (network, 5xx, timeout, scheduler refusal) is never stored as `none`, so the next page view or job step asks again. Older entries without the field read as before, with no migration.
+
+**Why.** Items with no quote (often pickup-only) were re-requested on every page view and in every job run.
+
+**Tests.** `test/unit/background/landed-cost.test.ts`: the handler's and the quote step's negative cache, the 24 h expiry, and no caching of failures.
+
+## T-111 contract change: `settings.companion` and the optional storage key `sbw:companionWakes`
+
+Source: T-111 (extension side of T2). Requirement 5 of the card's brief authorises additive contract changes recorded here. Both changes are additive and optional: `sbw:meta.schemaVersion` stays 1 and there is no migration.
+
+**No manifest change.** `nativeMessaging` was already an optional permission on both browsers (T-10, PLAN §2.5), and both permission snapshots already list it. T-111 only requests it, from the options snipe section's "Connect the companion" click through `src/ui/permissions.ts` (I-21).
+
+**`Settings.companion?: { profile: string }`** (`src/domain/settings/schema.ts`; `profile` is 1-260 chars). The browser profile name or folder given to `companion/windows/install.ps1`. It is sent to the host with each `schedule`, which is how the brief's "profile: from settings" is met. It is a top-level group, so `settings.set` writes it alone (`{ companion: { profile } }`) and no `snipe`-group writer can drop it. The host's character rules (ruling R2: no `"` `&` `|` `<` `>` `^` `%` `!`, backticks, `$(`/`${`, `..` segments, newlines or a leading `-`) are not in the settings schema, so a later rule change can never quarantine the whole settings record. The adapter (`validCompanionProfile`) checks them before anything is sent, and the options page checks them before saving. Absent means "not set": a T2 arm then notifies the user, and the preflight fails as `keep-awake` with "the browser profile for the wake companion is not set". `test/contract/types/spec-shapes.test.ts` mirrors the field.
+
+**`sbw:companionWakes`** (storage.local, optional). `STORAGE_KEYS.companionWakes`. The schema is module-private, so the locked example list is unchanged: `{ version: 1, wakes: Record<SnipeId, { wakeAt: EpochMs, state: 'confirmed' | 'asked' | 'none', triedAt: EpochMs, cancelTriedAt?: EpochMs }> }`.
+
+- `wakeAt` is the wake the companion was asked for. The entry is written BEFORE a `schedule` request leaves, because a request that timed out may still have made the task.
+- `state`:
+  - `confirmed`: the host made the task.
+  - `asked`: no usable answer came back, so the task may exist.
+  - `none`: nothing was made (the request was not sent, or the host refused it).
+- A clean refusal restores the previous entry. A confirmed `cancel` removes it.
+- `triedAt` / `cancelTriedAt` space out retries after a worker restart (`COMPANION_RETRY_MS`, 10 min).
+- Entries are kept 15 days after `wakeAt` (`AWAKE_RETENTION_MS`), capped at 500. The awake history uses `confirmed` and `asked` entries.
+- Missing or invalid data parses to the empty record (`parseCompanionWakes`). Losing it costs at most a retry or an awake-history filter, never money.
+
+**`timing.awake` behaviour (no shape change).** The reply is still `EpochMs[]`. It now leaves out the heartbeat runs that a companion wake caused (`withoutCompanionWakes` in `src/background/jobs/companion-sync.ts`). A wake at W caused a run when there is no heartbeat in the 30 min before W. The run starts at the first heartbeat within 70 min after W. It ends at the first gap of 30 min or more, and at most 8 h after W. The stored `sbw:awake` is never changed. This is the card's "awake-history ignores companion-caused wakes for advice". `awakeAdvice` (T-83, `src/domain/snipe/**`) is unchanged; a future arm-time advice caller should pass it the same filtered history.
+
+**Tests.**
+- `test/contract/types/storage.test.ts`: the key, its area, a sample, and that invalid data parses to empty.
+- `test/contract/types/spec-shapes.test.ts`: the settings field.
+- `test/integration/companion.test.ts`: the "contract additions" block, and `timing.awake` end to end.
+
+**Follow-up for the next PLAN edit.** Add `sbw:companionWakes` to PLAN §2.3 and `Settings.companion` to §3.10 and contracts.md. PLAN §2.5 names the permission button "Install companion". The options page says "Connect the companion", because the button grants the permission and does not install anything.
+
+## T-118 contract change: the optional storage key `sbw:deferredAlarms`
+
+**`sbw:deferredAlarms`** (storage.local, optional). `STORAGE_KEYS.deferredAlarms`, a Repo key with a default of `{}`. The schema is module-private: `Record<alarmName, EpochMs>`. It records the deferred one-shot alarms, because the browser may drop them: an extension update clears alarms, Firefox does not persist them, and Chrome before 150 may lose them on a restart. The alarms are:
+- `sbw:notify:digest:<run>`, the quiet-hours digest;
+- `sbw:notify:outcome:<item>`, the outcome notice;
+- `sbw:authhealth:<id>:<which>`, the auth-health warning.
+
+The owners create these alarms through `deferAlarm` (`src/background/jobs/deferred-alarms.ts`), which records the alarm and then creates it. That job module runs at every background start. It re-creates any recorded alarm the browser no longer holds; a past `when` fires at once. When an alarm fires, its record is removed, unless the owner deferred it again to a later time. The owners' handlers are idempotent: each re-checks its audit marker or the snipe state. A re-created alarm therefore never sends a notice twice. The change is additive, and `schemaVersion` stays 1. `test/contract/types/storage.test.ts` lists the key.
+
+## T-118: two internal storage keys, documented (no contract change)
+
+Neither key is a Repo record, so neither is in `STORAGE_KEYS`. Each is private to one module, and losing it costs nothing that matters.
+
+**`sbw:notifier:map`** (storage.session). `NOTIFIER_MAP_KEY` in `src/adapters/browser/notifier.ts`. It maps a notification id to `{ at: EpochMs, url?: string, buttons?: string[] }`, so that a click or a button press can be resolved after a service-worker restart. Entries are kept for at most 24 h, and at most 50 of them. A body click consumes its entry, and so does a close. The map is validated on read: a record that is not an object reads as empty, and an invalid entry is dropped. Bad data can therefore never become a URL to open. It lives in session storage, so a browser restart clears it. The only cost is that a click on a notification left over from before the restart opens nothing.
+
+**`sbw:cacheOrder:<cacheKey>`** (storage.local, one per cache: `sbw:listingCache`, `sbw:detailCache`, `sbw:shippingCache`). `CACHE_ORDER_PREFIX` in `src/domain/storage/repo.ts`. It holds the recency list (oldest first) that the Repo uses to evict entries past `CACHE_MAX_ENTRIES`. A separate list is needed because a JS object orders integer-like keys numerically, not by insertion. It is validated as `string[]`; missing or invalid data reads as empty, and entries with no recency record are then evicted first. It is written only inside the cache's own lock.
+
+## T-113 contract change: `relist.lookup` and the optional storage key `sbw:relistSeen`
+
+Source: T-113, the relist detector ("Seen before at $X (date)" on search cards). Both changes are additive; `schemaVersion` stays 1 and nothing migrates.
+
+**`sbw:relistSeen`** (storage.local, optional). `STORAGE_KEYS.relistSeen`, a Repo key with a default of `{ version: 1, entries: {} }`. The schema is module-private: `{ version: 1, entries: Record<ItemId, { fp, price, seenAt }> }`, where `fp` is the relist fingerprint (`sellerId|normalized title|image basename`, `src/domain/relist/fingerprint.ts`), `price` the last seen current price in cents, and `seenAt` the last time the listing was seen. `parseRelistSeen` reads missing or invalid data as the empty record, and the Repo quarantines an invalid record as usual. The writer (`recordSightings`, `src/domain/relist/history.ts`) keeps at most 2,000 entries and 60 days, evicting the least recently seen first. The handler writes it only while `settings.features.relistDetector` is on (default off). The history holds public listing data only, never the user's bids. It is filled from listings the extension already has: the tap (`page.listings` / `page.detail`, held in `ctx.pages`) and `sbw:listingCache`, whose 6 h TTL is too short for relists. `test/contract/types/storage.test.ts` lists the key.
+
+**`relist.lookup`** (content -> background). Payload `{ itemIds: ItemId[] }`, at most 40. Reply `Record<ItemId, { itemId, price, seenAt } | null>`: the earlier listing of each item, or null. The handler (`src/background/handlers/relist.ts`, self-registered) makes no SGW request. With the feature off it answers null for every id and reads nothing but the settings. A `relistId` on the listing wins when the history knows that item; otherwise the fingerprint matches an EARLIER item id (SGW ids grow), the most recently seen first. An item never matches itself. The badge (`src/content/ui/badges/relist.tsx`, loaded by the badge glob) batches every card of a flush into one message.
+
+**Follow-up for the next PLAN edit.** Add `sbw:relistSeen` to PLAN §2.3 and `relist.lookup` to §3.12 and contracts.md.
+
+## T-119 contract change: `calendar.testEvent`
+
+Source: T-119 item 1, the options page's "Send a test event". Additive; `schemaVersion` stays 1 and nothing migrates.
+
+**`calendar.testEvent`** (ui -> background, a signal: no payload). Reply `{ result: 'created-and-deleted' | 'dry-run' }`. The handler (`src/background/handlers/calendar.ts`) refuses, before any Google request, when Google is not connected, needs a reconnect, or `settings.calendar.enabled` is off. It then calls `GoogleCalendarSink.sendTestEvent()` (`src/adapters/google/calendar-sink.ts`) through the same `syncFor(ctx)` sink as calendar sync, so the same gates, limiter and cooldown apply:
+
+- With calendar writes allowed: the dedicated calendar is ensured (created or adopted as in a sync), ONE event titled "ShopBadwill test event — safe to delete" is inserted 1 h from now (15 min long, no reminders, id `testevt<base32hex ms>`), and deleted at once. Its private `sbwItemId` is `''`, so the ownership guard and every sync treat it as not ours. Audit `calendar.testEvent` (actor `user`, `ref` = event id, `details.deleted`). A failed delete is audited with `deleted: false` and the error tells the user to delete the event by hand.
+- Calendar dry run (`dryRun.calendar` on, kill switch off): nothing is sent. Audit `calendar.testEvent` with `dryRun: true`; reply `dry-run`.
+- Any other block (kill switch, health, cooldown): throws, nothing is sent.
+
+`test/contract/types/messages.test.ts` lists the type, its sender group and its reply; examples `examples/Msg/calendar.testEvent.{valid,invalid}.json`.
+
+**Not a contract change, recorded for completeness (T-119 item 3).** `PkceRefreshProvider.markNeedsInteraction('permission-revoked')` is a new adapter method (not on the `GoogleAuthProvider` port). The new job `src/background/jobs/permission-watch.ts` calls it when `identity` or a Google host permission is removed; its audit entry is `google.needsInteraction` with `details: { reason: 'permission-revoked' }` (the invalid_grant one carries `details.error`). The same job sets `sbw:ntfy.status` to the existing `needs-permission` value when the ntfy host is removed while phone push is on.
+
+**Follow-up for the next PLAN edit.** Add `calendar.testEvent` to §3.12 and contracts.md.
+
+## T-112 contract change: bid groups (`sbw:snipeGroups`, `groups.list` / `groups.save` / `groups.delete`)
+
+Source: T-112 (bid groups, "win at most N of these items"). `Snipe.groupId` was already in the contract (T-02); it names the group a snipe joins at arm time (`snipe.arm`'s `snipe.groupId`). Everything below is additive and optional: `sbw:meta.schemaVersion` stays 1 and there is no migration.
+
+**`sbw:snipeGroups`** (storage.local, optional). `STORAGE_KEYS.snipeGroups`. The schema is module-private, so the locked example list is unchanged: `{ version: 1, groups: Record<GroupId, { id, name, maxWins, createdAt, updatedAt, results, cancels }> }`.
+
+- `id`: 1-64 of `A-Z a-z 0-9 _ -` (`SNIPE_GROUP_LIMITS.idPattern`). `name`: 1-80 chars. `maxWins` (N): an integer from 1 to 50. At most 100 groups.
+- `results`: per member snipe id, `{ verdict, dryRun, at, attempts, nextAt?, why, finalPrice?, warned? }`. `verdict` is `checking` (a confirming read is due at `nextAt`; `at` is the first attempt), `confirmed`, `unconfirmed` or `not-won`. `confirmed` means T-87's `classifyOutcome`, run on a read of the item made after the end, said `won` with `final: true`, the reducer had stored `won`, and the closing price was not above the max. For a dry run it means "would have won" on a read showing the auction closed. `warned`: the user was told the group keeps going without a confirmation.
+- `cancels`: per member snipe id, `{ at, ok, why }`: the members the group asked the runner to disarm once N wins were confirmed. `ok: false` when the runner refused (a bid already sent cannot be stopped); `why` is the refusal.
+- Missing or invalid data parses to the empty record (`parseSnipeGroups`). The job reads it through `Repo.find`, so an invalid record is quarantined (health panel) rather than silently replaced. Losing it loses the groups' N: a member whose group is gone is never cancelled (each snipe then bids on its own), and new arms into it are refused.
+
+**Messages** (UI only; `MSG_SENDER` 'ui'):
+
+- `groups.list` (no payload). Reply: the stored record, validated with the same schema as `sbw:snipeGroups`.
+- `groups.save { id, name, maxWins }`. Creates the group, or renames it / changes N. No reply. Refused from 2 minutes before the group's next end until that member is settled (edit freeze). Lowering N to the confirmed wins stops the remaining members (the confirmed wins are the proof).
+- `groups.delete { id }`. No reply. Refused while frozen, or while the group has open snipes.
+
+The handlers live in `src/background/jobs/snipe-groups.ts`, which registers itself (I-01). The job also registers `ArmHooks` on T-84's registry (I-12): `beforeArm` vetoes a member that ends less than 2 minutes from another, mixes dry run and live, joins a frozen group, joins a group that already won N, or names an unknown group. `snipe-runner.ts`, `handlers/snipe.ts`, `state-machine.ts` and `main.ts` are unchanged.
+
+**One more alarm name, not a storage key.** `sbw:groups:check` is the alarm for the soonest due confirming read. It is re-armed from `sbw:snipeGroups` at every start, so it needs no record of its own.
+
+**Tests.**
+- `test/contract/types/storage.test.ts`: the key, its area, a sample, the limits, and that invalid data parses to empty.
+- `test/contract/types/messages.test.ts` and `examples/Msg/groups.*.json`: the three messages, their sender group and the reply.
+- `test/unit/domain/snipe/groups.test.ts`, `test/integration/snipe-groups.test.ts`, `test/dom/groups-section.test.ts`, `test/e2e/chromium/groups.spec.ts`.
+
+**Follow-up for the next PLAN edit.** Add `sbw:snipeGroups` to PLAN §2.3, and the three messages to §3.12 and contracts.md.
+
+## T-121 contract change: the outcome `missed` (a snipe that slept through an on-time close)
+
+Source: T-121 (T-87d part B, after T-103). Before, a snipe whose browser or computer was asleep at the auction's end showed **ENDED EARLY**, although SGW closed the auction on time. Users read ENDED EARLY as "SGW closed it before the posted end". It now shows **Missed** wherever its result appears. Every change is additive: `sbw:meta.schemaVersion` stays 1, nothing migrates, and every stored value that parsed before still parses.
+
+**The signal (no new stored field).** `sleptThroughEnd(snipe, read)` (`src/domain/snipe/outcome.ts`) uses only records that already exist:
+
+- nothing can have gone out (I2): the snipe is still before its fire (`armed`, `waking` or `verified`; never `fallback-applied`, `firing` or later), and its record holds no fire or send trace of any kind (`measured.firedAt`, `attempt.sentAt`, `idempotencyKey`, `reply`, `ambiguous`, `notSent` all absent);
+- a read made after the end shows the auction closed at or after the end the snipe was waiting for: SGW's `serverTime` is at or past SGW's `endTime`, and that `endTime` is not earlier than `Snipe.endTime`.
+
+An early close is never Missed: SGW closed the item before its posted end (`isClosed` while `serverTime` is before `endTime`), or moved the end before the scheduled one. Without a read, it stays ENDED EARLY as before. The reads are the existing ones: the T-60 s verify read (also on a worker that resumes after the end), the T-15 min preflight read, and T-103's one post-end read. T-121 adds no SGW request.
+
+**Limit of the signal.** A single read cannot tell an auction SGW withdrew early but whose posted `endTime` it left unchanged, once that end has passed, from an on-time close. That case reads Missed. The snipe slept through its scheduled end either way, and both labels say no bid was placed.
+
+**Reducer and classifier (no SnipeEvent or SnipeOutcome change).**
+
+- `AbortReason` gains `'asleep'` (a TypeScript type, not stored). `classifyOutcome` gives it outcome `skipped` (as T-87c's `missed`), heading "Missed", and the reason "Missed: the browser was not awake when the auction ended" (`outcomeDetail`). A dry run gets the same label with dry-run wording. It stamps the calendar `missed`. As for every abort, a recorded possible send overrides it (the judge path: Unconfirmed, never "No bid was placed").
+- The reducer's three `ended` exits go through `closedBeforeBid`: `verified` with a closed read, `verify-failed {reason:'ended'}` and `preflight-failed {reason:'ended'}`. When `sleptThroughEnd` holds, the abort is `'asleep'` and the history `why` starts with `MISSED_END_WHY` (`'missed the end: '`). `settledAsMissed(snipe)` reads that marker. The post-end scan and the dashboard use it, so they need no new stored field.
+- `ReduceContext.endedRead?: ItemDetail` (not stored; like T-87e's `preflightDetail`): the read that showed the close, for the two `ended` events that carry no `ItemDetail`. The runner passes an explicitly given read on an `ended` event (`CommitOptions.detail`), never its cached one. `SnipeRunner.endedEarly(id, event, read?)` lets T-103's post-end pass its read.
+
+**Enum additions (`'missed'`).**
+
+| Where | Before | After |
+|---|---|---|
+| `TrackedItem.outcome` (`sbw:tracked`) | `won \| lost \| ended-early \| unknown` | + `missed` |
+| `Effect` `stampCalendar.outcome` (runner outbox `sbw:snipeRunner`) | `won \| lost \| ended-early` | + `missed` |
+| `DesiredEvent.privateProps.sbwState` / Google event private `sbwState` | `open \| won \| lost \| ended-early` | + `missed` (an older build reads an unknown state as `open`) |
+| `CalendarSink.stamp(itemId, outcome)` (`src/ports/calendar.ts`), `CalendarStamper.stamp` | `won \| lost \| ended-early` | + `missed`; event title prefix `MISSED: ` |
+| `stamped:<outcome>` link hash (`CalendarLink.lastSyncedHash`) | three outcomes | + `stamped:missed` |
+
+**Post-end (T-103).** For pre-fire snipes, the step passes its read to `endedEarly`. It records `missed` on the tracked item only when every snipe it settled is Missed; any early close records `ended-early`. A snipe the runner already settled as Missed is decisive (`decisiveOutcome` → `missed`), so it gets no second read and no second notification. The post-end notification copy is "MISSED: <title>" / "The browser was not awake when the auction ended, so the snipe did not bid."
+
+**Unchanged.** T-87c's `missed` abort (the fire came at or after the end, for a snipe that woke and verified) keeps its copy and still stamps nothing. Its calendar result is still decided by the post-end read.
+
+**Tests.** `test/unit/domain/snipe/outcome.test.ts` and `state-machine.test.ts` (the signal, the three exits, I2), `test/integration/snipe-runner.test.ts` (a resume after the end), `test/integration/outcomes.test.ts` (MISSED vs ENDED EARLY, decisive, stamp recovery, quiet hours, possible sends), `test/integration/calendar-sync.test.ts`, the reconciler, event builder and Google normalizer tests, `test/dom/dashboard-snipes.test.ts` (the row label), `test/contract/types/spec-shapes.test.ts` (the two enums).
+
+**Follow-up for the next PLAN edit.** Add `missed` beside `ended-early` in PLAN §3 (`TrackedItem.outcome`, `sbwState`) and in the T-103 card text.

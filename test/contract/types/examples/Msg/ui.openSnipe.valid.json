@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-5",
+  "type": "ui.openSnipe",
+  "payload": {
+    "itemId": 279250057
+  }
+}

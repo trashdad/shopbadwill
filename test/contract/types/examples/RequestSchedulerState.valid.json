@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "pause": {
+    "cause": "blocked",
+    "reason": "SGW is refusing requests; automation paused",
+    "until": 1791421600000
+  },
+  "consecutive403": 0,
+  "consecutive429": 1,
+  "lanes": {
+    "interactive": {
+      "lastEndAt": 1791400000000,
+      "gapJitterMs": 120,
+      "backoffUntil": 1791403600000,
+      "backoffKind": "blocked",
+      "failures": 0
+    },
+    "background": {
+      "lastEndAt": 1791400000000,
+      "gapJitterMs": 9000,
+      "backoffUntil": 1791400060000,
+      "backoffKind": "rate-limited",
+      "failures": 1
+    },
+    "snipe": {
+      "gapJitterMs": 0,
+      "failures": 0
+    }
+  }
+}

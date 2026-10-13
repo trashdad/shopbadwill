@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-20",
+  "type": "watches.delete",
+  "payload": {
+    "id": "w-pyrex"
+  }
+}

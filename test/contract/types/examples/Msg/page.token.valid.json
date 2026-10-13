@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "reqId": "r-3",
+  "type": "page.token",
+  "payload": {
+    "bearer": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3OTE0NDAwMDAsInN1YiI6ImJ1eWVyLTAwMDEifQ.ZXhhbXBsZS1zaWduYXR1cmU",
+    "capturedAt": 1791400000000
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "invalidBecause": "a watch reads at most 3 pages",
+  "path": [
+    "maxPages"
+  ],
+  "value": {
+    "id": "w-pyrex",
+    "name": "Pyrex",
+    "enabled": true,
+    "query": {
+      "searchText": "pyrex",
+      "categoryIds": [],
+      "sellerIds": [],
+      "page": 1
+    },
+    "ruleIds": [
+      "r-pyrex"
+    ],
+    "maxPages": 4,
+    "favoriteMode": "sgw-late",
+    "favoriteWithinHours": 6,
+    "calendar": true,
+    "notify": true,
+    "lastRunAt": 1791313600000,
+    "nextRunAt": 1791443200000,
+    "lastError": "search page 2: HTTP 429",
+    "seenItemIds": [
+      279250057,
+      279250058
+    ]
+  }
+}

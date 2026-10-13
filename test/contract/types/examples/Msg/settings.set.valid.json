@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "reqId": "r-13",
+  "type": "settings.set",
+  "payload": {
+    "dryRun": {
+      "favorites": false,
+      "calendar": true,
+      "bidding": true
+    }
+  }
+}

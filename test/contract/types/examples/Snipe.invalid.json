@@ -1,0 +1,53 @@
+{
+  "invalidBecause": "maxBid is integer cents",
+  "path": [
+    "maxBid"
+  ],
+  "value": {
+    "id": "snp-1",
+    "itemId": 279250057,
+    "title": "Vintage Pyrex Butterfly Gold Bowl 403",
+    "endTime": "2026-10-08T02:18:30.000Z",
+    "endTimeAtArm": "2026-10-08T02:18:30.000Z",
+    "sellerId": 123,
+    "maxBid": 35.5,
+    "allInMax": 4700,
+    "estShipping": 899,
+    "estHandling": 300,
+    "leadMs": 8000,
+    "fallback": "early-proxy",
+    "dryRun": true,
+    "state": "resolved",
+    "outcome": "dry-run",
+    "outcomeDetail": "dry run fired 0.21 s late",
+    "armedAt": 1791400000000,
+    "fireAt": 1791425901910,
+    "wakeAlarm": "sbw:snipe:snp-1:wake",
+    "attempt": {
+      "sentAt": 1791425901920,
+      "idempotencyKey": "snp-1:a1",
+      "ambiguous": false
+    },
+    "measured": {
+      "offsetMs": -1300,
+      "rttMs": 180,
+      "firedAt": 1791425902120,
+      "responseAt": 1791425902300
+    },
+    "groupId": "g-1",
+    "history": [
+      {
+        "at": 1791400000000,
+        "from": "draft",
+        "to": "armed",
+        "why": "user armed (dry run)"
+      },
+      {
+        "at": 1791425610000,
+        "from": "armed",
+        "to": "waking",
+        "why": "wake alarm"
+      }
+    ]
+  }
+}

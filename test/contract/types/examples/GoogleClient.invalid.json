@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "a client id is non-empty",
+  "path": [
+    "clientId"
+  ],
+  "value": {
+    "clientId": "",
+    "updatedAt": 1791400000000
+  }
+}

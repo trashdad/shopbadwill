@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "violations is a list of messages",
+  "path": [
+    "violations"
+  ],
+  "value": {
+    "ok": false,
+    "violations": "per-item max exceeded"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "reqId": "r-8",
+  "type": "quick.hideSeller",
+  "payload": {
+    "sellerId": 123,
+    "sellerName": "Goodwill of Example"
+  }
+}

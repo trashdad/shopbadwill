@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "placeBid carries the amount (derived only from Snipe.maxBid)",
+  "path": [
+    "amount"
+  ],
+  "value": {
+    "kind": "placeBid",
+    "snipeId": "snp-1"
+  }
+}

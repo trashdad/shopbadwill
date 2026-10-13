@@ -1,0 +1,35 @@
+name: Companion (Windows)
+
+# Runs the companion's Node protocol round-trip (Vitest `unit` project already
+# includes companion/**) and the Pester suite on windows-latest. Every action is
+# pinned to a full commit SHA copied from ci.yml (controller ruling R4).
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  companion:
+    name: companion (Node round-trip + Pester)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0 - version comes from package.json "packageManager"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Spawns the real PowerShell host with a stubbed schtasks; no scheduled
+      # tasks are created (controller ruling R1).
+      - name: Node protocol round-trip (Vitest, companion/**)
+        run: pnpm test:unit -- companion
+      # Pester 5.x is preinstalled on windows-latest (and 3.4 locally); the
+      # tests use portable plain-PowerShell assertions so both run green.
+      - name: Pester (task XML, validation, host, installer)
+        run: powershell -File companion/windows/tests/run.ps1

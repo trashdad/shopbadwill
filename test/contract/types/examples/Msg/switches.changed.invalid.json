@@ -1,0 +1,21 @@
+{
+  "invalidBecause": "writesAllowed values are booleans",
+  "path": [
+    "payload",
+    "writesAllowed",
+    "favorites"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-41",
+    "type": "switches.changed",
+    "payload": {
+      "killSwitch": false,
+      "writesAllowed": {
+        "favorites": "no",
+        "calendar": false,
+        "bidding": false
+      }
+    }
+  }
+}

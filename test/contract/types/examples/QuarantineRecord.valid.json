@@ -1,0 +1,12 @@
+{
+  "at": 1791400000000,
+  "error": "✖ Invalid input: expected number, received string\n  → at snipe.caps.perItemMax",
+  "value": {
+    "schemaVersion": 1,
+    "snipe": {
+      "caps": {
+        "perItemMax": "50"
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "invalidBecause": "IsoUtc is RFC 3339 with Z; an offset is not allowed",
+  "path": [],
+  "value": "2026-10-07T19:18:30-07:00"
+}

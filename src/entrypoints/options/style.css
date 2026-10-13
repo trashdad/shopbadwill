@@ -1,0 +1,256 @@
+:root {
+  --bg: #f6f7f8;
+  --surface: #ffffff;
+  --text: #1c2024;
+  --muted: #56606b;
+  --border: #b9c0c8;
+  --accent: #0b5cad;
+  --accent-text: #ffffff;
+  --danger: #a4262c;
+  --focus: #0b5cad;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171a;
+    --surface: #1d2126;
+    --text: #e8eaed;
+    --muted: #a6aeb7;
+    --border: #4a525b;
+    --accent: #6cb2ff;
+    --accent-text: #0b1620;
+    --danger: #ff8f94;
+    --focus: #6cb2ff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+.sbw-options {
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 1rem 1rem 4rem;
+}
+h1 {
+  font-size: 1.6rem;
+  margin: 0.5rem 0;
+}
+h2 {
+  font-size: 1.3rem;
+  margin: 2rem 0 0.5rem;
+  padding-bottom: 0.25rem;
+  border-bottom: 2px solid var(--border);
+}
+h3 {
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+}
+h4 {
+  font-size: 0.95rem;
+  margin: 1rem 0 0.25rem;
+}
+nav ul {
+  display: flex;
+  gap: 1rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+a {
+  color: var(--accent);
+}
+.sbw-skip {
+  position: absolute;
+  left: -999px;
+}
+.sbw-skip:focus {
+  left: 1rem;
+  top: 1rem;
+  background: var(--surface);
+  padding: 0.5rem;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.sbw-card,
+.sbw-rule,
+.sbw-editor {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 0 0 1rem;
+}
+.sbw-rule-list {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0 0;
+}
+.sbw-rule-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.sbw-rule-head h3 {
+  margin: 0;
+  flex: 1;
+}
+.sbw-rule[data-enabled='false'] {
+  border-style: dashed;
+}
+.sbw-tag {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 0.6rem;
+  font-size: 0.85rem;
+  text-transform: capitalize;
+}
+
+.sbw-field {
+  margin: 0 0 0.75rem;
+}
+.sbw-field label,
+legend {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.2rem;
+}
+input[type='text'],
+input[type='time'],
+select,
+textarea {
+  width: 100%;
+  max-width: 28rem;
+  font: inherit;
+  color: inherit;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+}
+[aria-invalid='true'] {
+  border: 2px solid var(--danger);
+}
+.sbw-hint {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0.2rem 0 0;
+}
+.sbw-error {
+  color: var(--danger);
+  margin: 0.2rem 0;
+}
+ul.sbw-error {
+  padding-left: 1.25rem;
+}
+.sbw-warn {
+  margin: 0.25rem 0 0.75rem;
+}
+.sbw-row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.sbw-row > * {
+  flex: 1 1 14rem;
+}
+.sbw-checks label,
+.sbw-inline-fieldset label {
+  display: block;
+  margin: 0.25rem 0;
+}
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0 0 0.75rem;
+}
+.sbw-condition legend {
+  padding: 0 0.4rem;
+}
+
+.sbw-switch {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  column-gap: 0.6rem;
+  margin: 0 0 0.75rem;
+}
+.sbw-switch input {
+  width: 1.2rem;
+  height: 1.2rem;
+}
+.sbw-switch .sbw-hint {
+  grid-column: 2 / -1;
+}
+.sbw-switch-state {
+  font-weight: 700;
+  min-width: 2.5rem;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 2px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+}
+button.sbw-secondary {
+  background: transparent;
+  color: var(--accent);
+}
+button.sbw-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--surface);
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.sbw-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+.sbw-summary {
+  border-left: 4px solid var(--border);
+  padding-left: 0.75rem;
+  margin: 1rem 0;
+}
+.sbw-status {
+  min-height: 1.5rem;
+  margin: 0.25rem 0;
+}
+.sbw-status[data-tone='error'] {
+  color: var(--danger);
+}
+.sbw-caps {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+}
+.sbw-caps dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  button {
+    transition: opacity 0.15s;
+  }
+}

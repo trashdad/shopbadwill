@@ -1,0 +1,21 @@
+{
+  "invalidBecause": "favorite status is 'open' or 'closed'",
+  "path": [
+    "items",
+    0,
+    "status"
+  ],
+  "value": {
+    "fetchedAt": 1791400000000,
+    "items": [
+      {
+        "itemId": 279250057,
+        "watchlistId": 88001,
+        "notes": "ShopBadwill watch: Pyrex",
+        "endTime": "2026-10-08T02:18:30.000Z",
+        "sellerId": 123,
+        "status": "watching"
+      }
+    ]
+  }
+}

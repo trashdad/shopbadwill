@@ -1,0 +1,25 @@
+{
+  "invalidBecause": "decision has no 'show'",
+  "path": [
+    "decision"
+  ],
+  "value": {
+    "itemId": 279250057,
+    "decision": "show",
+    "matched": [
+      {
+        "ruleId": "r-pyrex",
+        "action": "highlight",
+        "reasons": [
+          {
+            "ruleId": "r-pyrex",
+            "conditionIndex": 0,
+            "field": "title",
+            "detail": "title contains 'pyrex' (whole word)"
+          }
+        ]
+      }
+    ],
+    "unknownConditions": 0
+  }
+}
