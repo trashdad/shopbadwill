@@ -740,3 +740,40 @@ The handlers live in `src/background/jobs/snipe-groups.ts`, which registers itse
 - `test/unit/domain/snipe/groups.test.ts`, `test/integration/snipe-groups.test.ts`, `test/dom/groups-section.test.ts`, `test/e2e/chromium/groups.spec.ts`.
 
 **Follow-up for the next PLAN edit.** Add `sbw:snipeGroups` to PLAN §2.3, and the three messages to §3.12 and contracts.md.
+
+## T-121 contract change: the outcome `missed` (a snipe that slept through an on-time close)
+
+Source: T-121 (T-87d part B, after T-103). Before, a snipe whose browser or computer was asleep at the auction's end showed **ENDED EARLY**, although SGW closed the auction on time. Users read ENDED EARLY as "SGW closed it before the posted end". It now shows **Missed** wherever its result appears. Every change is additive: `sbw:meta.schemaVersion` stays 1, nothing migrates, and every stored value that parsed before still parses.
+
+**The signal (no new stored field).** `sleptThroughEnd(snipe, read)` (`src/domain/snipe/outcome.ts`) uses only records that already exist:
+
+- nothing can have gone out (I2): the snipe is still before its fire (`armed`, `waking` or `verified`; never `fallback-applied`, `firing` or later), and its record holds no fire or send trace of any kind (`measured.firedAt`, `attempt.sentAt`, `idempotencyKey`, `reply`, `ambiguous`, `notSent` all absent);
+- a read made after the end shows the auction closed at or after the end the snipe was waiting for: SGW's `serverTime` is at or past SGW's `endTime`, and that `endTime` is not earlier than `Snipe.endTime`.
+
+An early close is never Missed: SGW closed the item before its posted end (`isClosed` while `serverTime` is before `endTime`), or moved the end before the scheduled one. Without a read, it stays ENDED EARLY as before. The reads are the existing ones: the T-60 s verify read (also on a worker that resumes after the end), the T-15 min preflight read, and T-103's one post-end read. T-121 adds no SGW request.
+
+**Limit of the signal.** A single read cannot tell an auction SGW withdrew early but whose posted `endTime` it left unchanged, once that end has passed, from an on-time close. That case reads Missed. The snipe slept through its scheduled end either way, and both labels say no bid was placed.
+
+**Reducer and classifier (no SnipeEvent or SnipeOutcome change).**
+
+- `AbortReason` gains `'asleep'` (a TypeScript type, not stored). `classifyOutcome` gives it outcome `skipped` (as T-87c's `missed`), heading "Missed", and the reason "Missed: the browser was not awake when the auction ended" (`outcomeDetail`). A dry run gets the same label with dry-run wording. It stamps the calendar `missed`. As for every abort, a recorded possible send overrides it (the judge path: Unconfirmed, never "No bid was placed").
+- The reducer's three `ended` exits go through `closedBeforeBid`: `verified` with a closed read, `verify-failed {reason:'ended'}` and `preflight-failed {reason:'ended'}`. When `sleptThroughEnd` holds, the abort is `'asleep'` and the history `why` starts with `MISSED_END_WHY` (`'missed the end: '`). `settledAsMissed(snipe)` reads that marker. The post-end scan and the dashboard use it, so they need no new stored field.
+- `ReduceContext.endedRead?: ItemDetail` (not stored; like T-87e's `preflightDetail`): the read that showed the close, for the two `ended` events that carry no `ItemDetail`. The runner passes an explicitly given read on an `ended` event (`CommitOptions.detail`), never its cached one. `SnipeRunner.endedEarly(id, event, read?)` lets T-103's post-end pass its read.
+
+**Enum additions (`'missed'`).**
+
+| Where | Before | After |
+|---|---|---|
+| `TrackedItem.outcome` (`sbw:tracked`) | `won \| lost \| ended-early \| unknown` | + `missed` |
+| `Effect` `stampCalendar.outcome` (runner outbox `sbw:snipeRunner`) | `won \| lost \| ended-early` | + `missed` |
+| `DesiredEvent.privateProps.sbwState` / Google event private `sbwState` | `open \| won \| lost \| ended-early` | + `missed` (an older build reads an unknown state as `open`) |
+| `CalendarSink.stamp(itemId, outcome)` (`src/ports/calendar.ts`), `CalendarStamper.stamp` | `won \| lost \| ended-early` | + `missed`; event title prefix `MISSED: ` |
+| `stamped:<outcome>` link hash (`CalendarLink.lastSyncedHash`) | three outcomes | + `stamped:missed` |
+
+**Post-end (T-103).** For pre-fire snipes, the step passes its read to `endedEarly`. It records `missed` on the tracked item only when every snipe it settled is Missed; any early close records `ended-early`. A snipe the runner already settled as Missed is decisive (`decisiveOutcome` → `missed`), so it gets no second read and no second notification. The post-end notification copy is "MISSED: <title>" / "The browser was not awake when the auction ended, so the snipe did not bid."
+
+**Unchanged.** T-87c's `missed` abort (the fire came at or after the end, for a snipe that woke and verified) keeps its copy and still stamps nothing. Its calendar result is still decided by the post-end read.
+
+**Tests.** `test/unit/domain/snipe/outcome.test.ts` and `state-machine.test.ts` (the signal, the three exits, I2), `test/integration/snipe-runner.test.ts` (a resume after the end), `test/integration/outcomes.test.ts` (MISSED vs ENDED EARLY, decisive, stamp recovery, quiet hours, possible sends), `test/integration/calendar-sync.test.ts`, the reconciler, event builder and Google normalizer tests, `test/dom/dashboard-snipes.test.ts` (the row label), `test/contract/types/spec-shapes.test.ts` (the two enums).
+
+**Follow-up for the next PLAN edit.** Add `missed` beside `ended-early` in PLAN §3 (`TrackedItem.outcome`, `sbwState`) and in the T-103 card text.
