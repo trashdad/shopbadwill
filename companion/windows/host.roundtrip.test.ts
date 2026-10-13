@@ -109,7 +109,9 @@ interface WakeResponse {
 
 describe.skipIf(process.platform !== 'win32')(
   'companion host protocol round-trip (Windows)',
-  { timeout: 30_000 },
+  // The first reply waits on a cold powershell.exe start, which has taken
+  // over 30 s on a GitHub Windows runner.
+  { timeout: 90_000 },
   () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'sbw-companion-'));
   const fakeSchtasks = path.join(tmp, 'fake-schtasks.cmd');
