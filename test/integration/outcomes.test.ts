@@ -33,6 +33,7 @@ import { spentToday } from '../../src/domain/snipe/caps';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import { Repo } from '../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
+import { MISSED_END_WHY, settledAsMissed } from '../../src/domain/snipe/outcome';
 import type { Snipe } from '../../src/domain/snipe/types';
 import type { ItemDetail, SgwSessionState, TrackedItem } from '../../src/domain/types';
 import { FakeAlarms } from '../fakes/ports/fake-alarms';
@@ -112,7 +113,7 @@ afterEach(() => {
   RIGS.length = 0;
 });
 
-async function rig(opts: { now?: number; quiet?: { from: string; to: string } } = {}): Promise<Rig> {
+async function rig(opts: { now?: number; quiet?: { from: string; to: string }; runner?: boolean } = {}): Promise<Rig> {
   const clock = new FakeClock(opts.now ?? T0);
   const areas = new FakeStorageAreas();
   const repo = new Repo(areas, clock);
@@ -163,7 +164,7 @@ async function rig(opts: { now?: number; quiet?: { from: string; to: string } } 
   await repo.set(STORAGE_KEYS.settings, settings);
 
   registerOutcomes(ctx);
-  registerSnipeRunner(ctx);
+  if (opts.runner !== false) registerSnipeRunner(ctx);
 
   const r: Rig = {
     ctx,
@@ -209,7 +210,10 @@ async function track(r: Rig, itemId: number, over: Partial<TrackedItem> = {}): P
   }));
 }
 
-/** A closed ItemDetail as the FakeSgwApi answers. */
+/** T-121: an early close as a post-end read shows it: SGW's end is 25 minutes before the tracked (scheduled) one. */
+const EARLY_END = new Date(T0 - 30 * MIN).toISOString();
+
+/** A closed ItemDetail as the FakeSgwApi answers (an on-time close: SGW's end is the tracked one, and has passed). */
 function closedDetail(itemId: number, over: Partial<ItemDetail> = {}): ItemDetail {
   return {
     itemId,
@@ -299,6 +303,10 @@ describe('outcome classification helpers', () => {
     expect(decisiveOutcome(snipe('below-minimum'))).toBe('lost');
     expect(decisiveOutcome(snipe('late'))).toBe('lost');
     expect(decisiveOutcome(snipe('ended'))).toBe('ended-early');
+    // T-121: a snipe settled as Missed (the reducer's marker) decided MISSED; any other skip decides nothing.
+    expect(decisiveOutcome(snipe('skipped', `${MISSED_END_WHY}: verify-failed: ended`))).toBe('missed');
+    expect(decisiveOutcome(snipe('skipped', 'verify-failed: price-over-max'))).toBeUndefined();
+    expect(decisiveOutcome(snipe('skipped', 'fire: after the end'))).toBeUndefined();
     expect(decisiveOutcome(snipe('killed'))).toBeUndefined();
     expect(decisiveOutcome(snipe('dry-run'))).toBeUndefined();
     expect(decisiveOutcome(snipe('network'))).toBeUndefined();
@@ -320,6 +328,7 @@ describe('outcome classification helpers', () => {
     expect(stampedOutcome('stamped:won')).toBe('won');
     expect(stampedOutcome('stamped:lost')).toBe('lost');
     expect(stampedOutcome('stamped:ended-early')).toBe('ended-early');
+    expect(stampedOutcome('stamped:missed')).toBe('missed');
     expect(stampedOutcome('abcdef0123456789')).toBeUndefined();
     expect(stampedOutcome('')).toBeUndefined();
   });
@@ -384,7 +393,8 @@ describe('post-end outcome detection', () => {
     await track(r, 13, { reasons: [{ kind: 'snipe' }] });
     await seedEvent(r, 13, 'Pyrex bowl 13');
     const snipeId = await seedSnipe(r, { itemId: 13, state: 'armed' });
-    r.api.details.set(13, closedDetail(13, { isHighBidder: null, currentPrice: 1299 }));
+    // T-121: an early close: SGW's end is before the end the snipe was waiting for.
+    r.api.details.set(13, closedDetail(13, { isHighBidder: null, currentPrice: 1299, endTime: EARLY_END }));
 
     await r.tick();
     const ev = await eventOf(r, 13);
@@ -653,7 +663,7 @@ describe('post-end outcome detection', () => {
       await track(r, itemId, { reasons: [{ kind: 'snipe' }] });
       await seedEvent(r, itemId, `Pyrex bowl ${String(itemId)}`);
       const snipeId = await seedSnipe(r, { itemId, state });
-      r.api.details.set(itemId, closedDetail(itemId, { isHighBidder: null }));
+      r.api.details.set(itemId, closedDetail(itemId, { isHighBidder: null, endTime: EARLY_END }));
 
       await r.tick();
       expect(await r.repo.get(STORAGE_KEYS.snipes)).toMatchObject({
@@ -1017,5 +1027,179 @@ describe('post-end claims only what the data proves', () => {
     expect(r.notifier.sent).toHaveLength(1);
     expect(r.notifier.sent[0]?.notification.title).toBe('Over your max: Pyrex bowl 51');
     expect(r.notifier.sent[0]?.notification.message).toBe('The final price was above your max of $10.00. https://shopgoodwill.com/item/51');
+  });
+});
+
+// ── T-121: Missed (a snipe the browser slept through an on-time close) ───────
+
+describe('T-121: a snipe that never woke for an on-time close is MISSED, never ENDED EARLY', () => {
+  const patches = (r: Rig): number => r.calendarApi.calls.filter((c) => c.method === 'eventsPatch').length;
+
+  it('an armed snipe: MISSED on the calendar, the snipe settled as Missed, one notification, recorded once', async () => {
+    const r = await rig();
+    await track(r, 60, { reasons: [{ kind: 'snipe' }] });
+    await seedEvent(r, 60, 'Pyrex bowl 60');
+    const snipeId = await seedSnipe(r, { itemId: 60, state: 'armed' });
+    // The one post-end read: SGW's end is the scheduled one, and its clock is past it.
+    r.api.details.set(60, closedDetail(60, { isHighBidder: null, currentPrice: 1299 }));
+
+    await r.tick();
+    const ev = await eventOf(r, 60);
+    expect(ev?.summary).toBe('MISSED: Pyrex bowl 60');
+    expect(ev?.reminders.overrides).toEqual([]);
+    expect(ev?.extendedProperties.private.sbwState).toBe('missed');
+    expect(await outcomes(r)).toMatchObject({ 60: 'missed' });
+
+    const snipes = await r.repo.get(STORAGE_KEYS.snipes);
+    const s = snipes[snipeId];
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(s !== undefined && settledAsMissed(s)).toBe(true);
+    expect(s?.outcomeDetail).toBe('Missed: the browser was not awake when the auction ended; no bid sent.');
+    // Not a spend.
+    expect(spentToday(Object.values(snipes), r.clock.now())).toBe(0);
+
+    // Zero new SGW requests: the one bounded post-end read.
+    expect(reads(r)).toHaveLength(1);
+    expect(r.notifier.sent).toHaveLength(1);
+    expect(r.notifier.sent[0]?.notification.title).toBe('Missed: Pyrex bowl 60');
+    expect(r.notifier.sent[0]?.notification.message).toMatch(/^The browser was not awake when the auction ended/);
+    expect(r.notifier.sent[0]?.notification.title).not.toMatch(/ended early/i);
+    expect(r.audit.entries.some((e) => e.kind === 'outcome.recorded' && e.itemId === 60 && e.details.outcome === 'missed')).toBe(true);
+
+    // Recorded: no second read, stamp or notification.
+    const before = patches(r);
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+    expect(patches(r)).toBe(before);
+    expect(r.notifier.sent).toHaveLength(1);
+  });
+
+  it('a waking or verified snipe (asleep at the fire) is MISSED too', async () => {
+    for (const state of ['waking', 'verified'] as const) {
+      const itemId = state === 'waking' ? 61 : 62;
+      const r = await rig();
+      await track(r, itemId, { reasons: [{ kind: 'snipe' }] });
+      await seedEvent(r, itemId, `Pyrex bowl ${String(itemId)}`);
+      const snipeId = await seedSnipe(r, { itemId, state });
+      r.api.details.set(itemId, closedDetail(itemId, { isHighBidder: null }));
+
+      await r.tick();
+      expect(await r.repo.get(STORAGE_KEYS.snipes)).toMatchObject({ [snipeId]: { state: 'resolved', outcome: 'skipped' } });
+      expect((await eventOf(r, itemId))?.summary).toBe(`MISSED: Pyrex bowl ${String(itemId)}`);
+      expect(await outcomes(r)).toMatchObject({ [itemId]: 'missed' });
+      expect(reads(r)).toHaveLength(1);
+      expect(r.notifier.sent.map((n) => n.notification.title)).toEqual([`Missed: Pyrex bowl ${String(itemId)}`]);
+    }
+  });
+
+  it('a dry-run snipe: the same label, with dry-run wording', async () => {
+    const r = await rig();
+    await track(r, 63, { reasons: [{ kind: 'snipe' }] });
+    await seedEvent(r, 63, 'Pyrex bowl 63');
+    await seedSnipe(r, { itemId: 63, state: 'armed', dryRun: true });
+    r.api.details.set(63, closedDetail(63, { isHighBidder: null }));
+
+    await r.tick();
+    expect((await eventOf(r, 63))?.summary).toBe('MISSED: Pyrex bowl 63');
+    expect(await outcomes(r)).toMatchObject({ 63: 'missed' });
+    expect(r.notifier.sent).toHaveLength(1);
+    expect(r.notifier.sent[0]?.notification.title).toBe('Missed: Pyrex bowl 63');
+    expect(r.notifier.sent[0]?.notification.message).toMatch(/so the dry run did not run/);
+    expect(r.notifier.sent[0]?.notification.message).not.toContain('No bid was placed');
+  });
+
+  it('a snipe the runner already settled as Missed is recorded from its own state: no read, stamp or notification', async () => {
+    const r = await rig();
+    await track(r, 64, { reasons: [{ kind: 'snipe' }] });
+    await seedEvent(r, 64, 'Pyrex bowl 64');
+    await seedSnipe(r, {
+      itemId: 64,
+      state: 'resolved',
+      outcome: 'skipped',
+      history: [
+        { at: T0 - 60 * MIN, from: 'draft', to: 'armed', why: 'armed' },
+        { at: T0 - 4 * MIN, from: 'armed', to: 'waking', why: 'wake' },
+        { at: T0 - 4 * MIN, from: 'waking', to: 'resolved', why: `${MISSED_END_WHY}: verified: auction closed` },
+      ],
+    });
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 64: 'missed' });
+    expect(reads(r)).toHaveLength(0);
+    expect(r.notifier.sent).toHaveLength(0);
+    expect(patches(r)).toBe(0);
+    expect(r.audit.entries.some((e) => e.kind === 'outcome.recorded' && e.itemId === 64 && e.details.from === 'snipe')).toBe(true);
+  });
+
+  it('a calendar link stamped missed by a crashed post-end run recovers MISSED, with its own notification copy', async () => {
+    const r = await rig();
+    await track(r, 65);
+    await seedEvent(r, 65, 'Pyrex bowl 65');
+    await r.repo.update(STORAGE_KEYS.calendar, (c) => ({
+      ...c,
+      links: { ...c.links, 65: { ...(c.links[65] as NonNullable<(typeof c.links)[number]>), lastSyncedHash: 'stamped:missed' } },
+    }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 65: 'missed' });
+    expect(reads(r)).toHaveLength(0);
+    expect(r.notifier.sent).toHaveLength(1);
+    expect(r.notifier.sent[0]?.notification.title).toBe('MISSED: Pyrex bowl 65');
+    expect(r.notifier.sent[0]?.notification.message).toBe(
+      'The browser was not awake when the auction ended, so the snipe did not bid. https://shopgoodwill.com/item/65',
+    );
+  });
+
+  it('quiet hours: a deferred MISSED notification is re-sent with the MISSED copy', async () => {
+    const r = await rig({ now: T0_QUIET, quiet: { from: '22:00', to: '06:00' } });
+    await track(r, 66, { endTime: new Date(T0_QUIET - 5 * MIN).toISOString() });
+    await seedEvent(r, 66, 'Pyrex bowl 66');
+    await r.repo.update(STORAGE_KEYS.calendar, (c) => ({
+      ...c,
+      links: { ...c.links, 66: { ...(c.links[66] as NonNullable<(typeof c.links)[number]>), lastSyncedHash: 'stamped:missed' } },
+    }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 66: 'missed' });
+    expect(r.notifier.sent).toHaveLength(0);
+    r.clock.advance(6 * 60 * MIN + 10 * MIN);
+    await settle(r.clock);
+    expect(r.notifier.sent.map((n) => n.notification.title)).toEqual(['MISSED: Pyrex bowl 66']);
+  });
+
+  it('a snipe with a possible send is never MISSED: post-end defers to the runner and records nothing', async () => {
+    const r = await rig();
+    await track(r, 67, { reasons: [{ kind: 'snipe' }] });
+    await seedEvent(r, 67, 'Pyrex bowl 67');
+    for (const state of ['firing', 'sent', 'fallback-applied'] as const) {
+      await r.repo.set(STORAGE_KEYS.snipes, {});
+      await seedSnipe(r, { itemId: 67, state, ...(state === 'sent' ? { attempt: { sentAt: T0 - 6 * MIN, idempotencyKey: 'k-67' } } : {}) });
+      r.api.details.set(67, closedDetail(67, { isHighBidder: null }));
+      await r.tick();
+      expect(reads(r)).toHaveLength(0);
+      expect(await outcomes(r)).toMatchObject({ 67: undefined });
+      expect((await eventOf(r, 67))?.summary).toBe('Pyrex bowl 67');
+      expect(r.notifier.sent).toHaveLength(0);
+    }
+  });
+
+  it('without the runner (never in production), the post-end step decides MISSED vs ENDED EARLY from the same read', async () => {
+    for (const [itemId, endTime, outcome, label] of [
+      [68, undefined, 'missed', 'MISSED'],
+      [69, EARLY_END, 'ended-early', 'ENDED EARLY'],
+    ] as const) {
+      const r = await rig({ runner: false });
+      await track(r, itemId, { reasons: [{ kind: 'snipe' }] });
+      await seedEvent(r, itemId, `Pyrex bowl ${String(itemId)}`);
+      const snipeId = await seedSnipe(r, { itemId, state: 'armed' });
+      r.api.details.set(itemId, closedDetail(itemId, { isHighBidder: null, ...(endTime === undefined ? {} : { endTime }) }));
+
+      await r.tick();
+      expect((await eventOf(r, itemId))?.summary).toBe(`${label}: Pyrex bowl ${String(itemId)}`);
+      expect(await outcomes(r)).toMatchObject({ [itemId]: outcome });
+      // R4: the snipe is left alone without a runner.
+      expect((await r.repo.get(STORAGE_KEYS.snipes))[snipeId]?.state).toBe('armed');
+      expect(r.notifier.sent.map((n) => n.notification.title)).toEqual([`${label}: Pyrex bowl ${String(itemId)}`]);
+    }
   });
 });

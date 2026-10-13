@@ -11,10 +11,13 @@
 //                   R7: it obeys writesAllowed('calendar') and is not gated by
 //                   the SGW session), recorded on the TrackedItem, notified once;
 //   ended-early     the auction closed while a snipe was still pre-fire: each
-//                   such snipe is moved to its ended terminal state with an
-//                   EXISTING reducer event (R4, no domain edit): `preflight-failed
+//   / missed        such snipe is moved to its ended terminal state with an
+//                   EXISTING reducer event (R4): `preflight-failed
 //                   {reason:'ended'}` from `armed`, `verify-failed {reason:'ended'}`
-//                   from `waking` or `verified`. Its effects stamp and notify.
+//                   from `waking` or `verified`, together with this read
+//                   (T-121). The reducer settles it "Missed" when the read
+//                   shows an on-time close the snipe slept through, else
+//                   "Ended early". Its effects stamp and notify.
 //   still running   the end moved: the tracked end time is refreshed, no
 //                   outcome, and the scan waits for the new end;
 //   mid-flight      a snipe with a possible send out (`firing`, `sent`,
@@ -29,6 +32,7 @@
 // the send, R6).
 import type { AuditLog } from '../../../domain/audit/types';
 import { formatMoney } from '../../../domain/money';
+import { settledAsMissed, sleptThroughEnd } from '../../../domain/snipe/outcome';
 import type { Snipe, SnipeEvent } from '../../../domain/snipe/types';
 import type { Repo } from '../../../domain/storage/repo';
 import { STORAGE_KEYS } from '../../../domain/storage/schema';
@@ -43,8 +47,8 @@ import { deferAlarm } from '../deferred-alarms';
 import { itemUrl, plainText, quietHoursEnd, truncateTitle } from '../notify';
 import { getSnipeRunner } from '../snipe-runner';
 
-/** A decided tracked/calendar outcome (TrackedItem.outcome minus 'unknown'). */
-export type OutcomeKind = 'won' | 'lost' | 'ended-early';
+/** A decided tracked/calendar outcome (TrackedItem.outcome minus 'unknown'). T-121 adds 'missed'. */
+export type OutcomeKind = 'won' | 'lost' | 'ended-early' | 'missed';
 
 /** The outcome notification: OS notification id and deferral alarm name share this prefix. */
 export const OUTCOME_NOTIFY_PREFIX = 'sbw:notify:outcome:';
@@ -55,10 +59,10 @@ const AUDIT_PAGE = 200;
 
 /** A tracked item whose outcome is decided (R2: never read such an item again). */
 export function decidedOutcome(t: Pick<TrackedItem, 'outcome'>): t is TrackedItem & { outcome: OutcomeKind } {
-  return t.outcome === 'won' || t.outcome === 'lost' || t.outcome === 'ended-early';
+  return t.outcome === 'won' || t.outcome === 'lost' || t.outcome === 'ended-early' || t.outcome === 'missed';
 }
 
-const STAMPED_OUTCOMES: ReadonlySet<string> = new Set<OutcomeKind>(['won', 'lost', 'ended-early']);
+const STAMPED_OUTCOMES: ReadonlySet<string> = new Set<OutcomeKind>(['won', 'lost', 'ended-early', 'missed']);
 
 /** The outcome recorded on a calendar link by CalendarSink.stamp (`stamped:<outcome>`). */
 export function stampedOutcome(hash: string): OutcomeKind | undefined {
@@ -91,6 +95,16 @@ export function overMaxLimit(snipes: readonly Snipe[]): Cents | undefined {
   return max > 0 ? max : undefined;
 }
 
+/** The outcome notification's title prefix (the calendar stamp's label). */
+const OUTCOME_HEADING: Readonly<Record<OutcomeKind, string>> = { won: 'WON', lost: 'LOST', 'ended-early': 'ENDED EARLY', missed: 'MISSED' };
+const OUTCOME_MESSAGE: Readonly<Record<OutcomeKind, string>> = {
+  won: 'You won this auction.',
+  lost: 'You did not win this auction.',
+  'ended-early': 'The auction ended before any bid could be placed.',
+  // T-121: recorded only for a pre-fire snipe that provably sent nothing (sleptThroughEnd).
+  missed: 'The browser was not awake when the auction ended, so the snipe did not bid.',
+};
+
 /**
  * The OS notification for one outcome. Plain text. A loss inferred from the
  * price says only that (ShopBadwill cannot see bids placed on SGW directly),
@@ -109,17 +123,10 @@ export function outcomeNotification(t: TrackedItem, outcome: OutcomeKind, overMa
       openUrlOnClick: url,
     };
   }
-  const heading = outcome === 'won' ? 'WON' : outcome === 'lost' ? 'LOST' : 'ENDED EARLY';
-  const message =
-    outcome === 'won'
-      ? `You won this auction. ${url}`
-      : outcome === 'lost'
-        ? `You did not win this auction. ${url}`
-        : `The auction ended before any bid could be placed. ${url}`;
   return {
     id: OUTCOME_NOTIFY_PREFIX + String(t.itemId),
-    title: `${heading}: ${title}`,
-    message,
+    title: `${OUTCOME_HEADING[outcome]}: ${title}`,
+    message: `${OUTCOME_MESSAGE[outcome]} ${url}`,
     priority: 1,
     openUrlOnClick: url,
   };
@@ -324,33 +331,37 @@ export async function executePostEnd(step: JobStep, deps: PostEndDeps): Promise<
   const preFire = snipes.filter((s) => PRE_FIRE.has(s.state));
   if (preFire.length > 0) {
     // R4: the auction closed before the snipe could fire. Move each pre-fire snipe
-    // with the existing event for its state (the reducer resolves it `ended`,
-    // whose effects stamp ENDED EARLY and notify).
+    // with the existing event for its state, and this read (T-121): the reducer
+    // resolves it "Missed" (an on-time close it slept through, stamped MISSED)
+    // or `ended` (an early close, stamped ENDED EARLY); its effects stamp and notify.
     const runner = getSnipeRunner(ctx);
     const now = repo.now();
-    let moved = 0;
+    const settled: Snipe[] = [];
     for (const s of preFire) {
       const event = endedEvent(s, now);
       if (event === undefined) continue;
-      const r = await runner?.endedEarly(s.id, event);
-      if (r !== undefined && r.kind === 'accepted') moved += 1;
+      const r = await runner?.endedEarly(s.id, event, detail);
+      if (r !== undefined && r.kind === 'accepted') settled.push(r.next);
     }
     if (runner === undefined) {
       // No runner (never in production): leave the snipe alone (R4) and cover
-      // the stamp and the notification ourselves.
-      await stampOutcome(ctx, itemId, 'ended-early');
-      await recordOutcome(repo, audit, itemId, 'ended-early', { from: 'read' });
-      await notifyOutcome(ctx, itemId, 'ended-early');
+      // the stamp and the notification ourselves, judged as the reducer would.
+      const outcome: OutcomeKind = preFire.every((s) => sleptThroughEnd(s, detail)) ? 'missed' : 'ended-early';
+      await stampOutcome(ctx, itemId, outcome);
+      await recordOutcome(repo, audit, itemId, outcome, { from: 'read' });
+      await notifyOutcome(ctx, itemId, outcome);
       return { kind: 'postEnd', detail };
     }
-    if (moved !== preFire.length) {
+    if (settled.length !== preFire.length) {
       // A dispatch was refused (the state moved): record nothing; the runner
       // settles the snipe and a later tick records its outcome.
       return { kind: 'postEnd', detail };
     }
-    await recordOutcome(repo, audit, itemId, 'ended-early', { from: 'read' });
+    // MISSED only when every snipe of the item was settled as Missed; any early close is ENDED EARLY.
+    const outcome: OutcomeKind = settled.every((s) => settledAsMissed(s)) ? 'missed' : 'ended-early';
+    await recordOutcome(repo, audit, itemId, outcome, { from: 'read' });
     // The snipe path stamps and notifies through its effects; mark the obligation handled (R6).
-    await audit.append({ actor: 'daily-job', kind: NOTIFY_OUTCOME_KIND, itemId, details: { outcome: 'ended-early', via: 'snipe' } });
+    await audit.append({ actor: 'daily-job', kind: NOTIFY_OUTCOME_KIND, itemId, details: { outcome, via: 'snipe' } });
     return { kind: 'postEnd', detail };
   }
 
