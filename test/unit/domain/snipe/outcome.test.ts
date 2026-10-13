@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { formatMoney } from '../../../../src/domain/money';
 import { formatDual } from '../../../../src/domain/time/pacific';
-import { classifyOutcome } from '../../../../src/domain/snipe/outcome';
+import { classifyOutcome, MISSED_END_WHY, settledAsMissed, sleptThroughEnd } from '../../../../src/domain/snipe/outcome';
 import type { Snipe } from '../../../../src/domain/snipe/types';
 import type { BidResult, ItemDetail } from '../../../../src/domain/types';
 
@@ -66,7 +66,7 @@ describe('classifyOutcome table', () => {
     post: Partial<ItemDetail> | null;
     ctx?: Parameters<typeof classifyOutcome>[3];
     outcome: string;
-    stamp: 'won' | 'lost' | 'ended-early' | null;
+    stamp: 'won' | 'lost' | 'ended-early' | 'missed' | null;
   }[] = [
     { name: 'won (high bidder)', bid: bid('accepted'), post: { isHighBidder: true, currentPrice: 1800 }, outcome: 'won', stamp: 'won' },
     { name: 'outbid (reported)', bid: bid('outbid'), post: { isHighBidder: false }, outcome: 'outbid', stamp: 'lost' },
@@ -557,5 +557,152 @@ describe('T-87d: a bid that provably never registered is never "Lost: outbid"', 
   it('SGW reporting outbid stays outbid', () => {
     const r = classifyOutcome(snipe(), bid('outbid'), detail({ currentPrice: 1500, isHighBidder: false }));
     expect(r.notify.title).toMatch(/^Lost:/);
+  });
+});
+
+// ── T-121: "Missed" for a snipe the browser slept through ────────────────────
+
+describe('T-121: sleptThroughEnd, the never-woke signal', () => {
+  /** A pre-fire snipe: no fire, no send attempt. */
+  const asleep = (over: Partial<Snipe> = {}): Snipe =>
+    snipe({ state: 'waking', fireAt: END_MS - 8000, attempt: {}, measured: undefined, ...over });
+  /** A read made after the end: SGW's clock is past its own end, which is the scheduled one. */
+  const onTime = (over: Partial<ItemDetail> = {}): ItemDetail => detail({ serverTime: new Date(END_MS + 30_000).toISOString(), ...over });
+
+  it('true: no fire or attempt record, and the read shows the auction closed at its scheduled end', () => {
+    expect(sleptThroughEnd(asleep(), onTime())).toBe(true);
+  });
+
+  it('true in every pre-fire state (armed, waking, verified)', () => {
+    for (const state of ['armed', 'waking', 'verified'] as const) {
+      const measured = state === 'verified' ? { offsetMs: 40, rttMs: 200 } : undefined;
+      expect(sleptThroughEnd(asleep({ state, ...(measured ? { measured } : {}) }), onTime())).toBe(true);
+    }
+  });
+
+  it('true when the auction closed after its scheduled end (the end moved later, and that end passed too)', () => {
+    const later = END_MS + 120_000;
+    expect(sleptThroughEnd(asleep(), onTime({ endTime: new Date(later).toISOString(), serverTime: new Date(later + 5000).toISOString() }))).toBe(true);
+  });
+
+  it("true once SGW's own clock is past its end, even before SGW flags the item closed", () => {
+    expect(sleptThroughEnd(asleep(), onTime({ isClosed: false }))).toBe(true);
+  });
+
+  it('false: an early close, SGW closed the item before its posted end', () => {
+    expect(sleptThroughEnd(asleep(), detail({ isClosed: true, serverTime: new Date(END_MS - 60_000).toISOString() }))).toBe(false);
+  });
+
+  it('false: an early close, SGW moved the end before the scheduled one', () => {
+    const earlier = new Date(END_MS - 30 * 60_000).toISOString();
+    expect(sleptThroughEnd(asleep(), onTime({ endTime: earlier }))).toBe(false);
+  });
+
+  it("false: the auction is still running by SGW's clock (an end that moved later and has not passed)", () => {
+    const later = new Date(END_MS + 10 * 60_000).toISOString();
+    expect(sleptThroughEnd(asleep(), onTime({ isClosed: false, endTime: later }))).toBe(false);
+  });
+
+  it.each([
+    ['a fire', { measured: { firedAt: END_MS - 8000 } }],
+    ['a send time', { attempt: { sentAt: END_MS - 8000 } }],
+    ['an idempotency key', { attempt: { idempotencyKey: 'k1' } }],
+    ['a reply', { attempt: { reply: bid('accepted') } }],
+    ['an ambiguous send', { attempt: { ambiguous: true } }],
+    ['a not-sent proof (a send was attempted)', { attempt: { notSent: true } }],
+  ] as const)('false (I2): any fire or send record, here %s', (_name, over) => {
+    expect(sleptThroughEnd(asleep(over as Partial<Snipe>), onTime())).toBe(false);
+  });
+
+  it.each(['draft', 'fallback-applied', 'firing', 'sent', 'resolved', 'killed'] as const)(
+    'false outside the pre-fire states: %s (an early proxy or a fire may be out)',
+    (state) => {
+      expect(sleptThroughEnd(asleep({ state }), onTime())).toBe(false);
+    },
+  );
+
+  it("false: another item's read", () => {
+    expect(sleptThroughEnd(asleep(), onTime({ itemId: 1 }))).toBe(false);
+  });
+});
+
+describe("T-121: classifyOutcome abort 'asleep' (Missed)", () => {
+  const asleep = (over: Partial<Snipe> = {}): Snipe =>
+    snipe({ state: 'waking', fireAt: END_MS - 8000, attempt: {}, measured: undefined, ...over });
+
+  it('live: the label is Missed, the reason is plain, no bid was placed, the calendar is stamped missed', () => {
+    const r = classifyOutcome(asleep(), null, null, { abort: 'asleep' });
+    expect(r.outcome).toBe('skipped');
+    expect(r.report.outcome).toBe('skipped');
+    expect(r.notify.title).toBe('Missed: Blue vase');
+    expect(r.notify.message).toMatch(/^The browser was not awake when the auction ended/);
+    expect(r.notify.message).toContain(`No bid was placed (your max ${formatMoney(2000)})`);
+    expect(r.notify.message).toContain('companion');
+    expect(r.notify.message).toContain(`Ended ${formatDual(END_MS, 'America/Los_Angeles')}`);
+    expect(r.notify.message).not.toMatch(/early|guarantee|will always/i);
+    expect(r.detail).toBe('Missed: the browser was not awake when the auction ended; no bid sent.');
+    expect(r.final).toBe(true);
+    expect(r.stamp).toEqual({ kind: 'stampCalendar', snipeId: 's1', outcome: 'missed' });
+  });
+
+  it('dry run: the same label, with dry-run wording', () => {
+    const r = classifyOutcome(asleep({ dryRun: true }), null, null, { abort: 'asleep' });
+    expect(r.outcome).toBe('skipped');
+    expect(r.notify.title).toBe('Missed: Blue vase');
+    expect(r.notify.message).toMatch(/^The browser was not awake when the auction ended, so the dry run did not run/);
+    expect(r.notify.message).toContain('a dry run never bids');
+    expect(r.notify.message).not.toContain('No bid was placed');
+    expect(r.detail).toBe('Missed: the browser was not awake when the auction ended; dry run, nothing sent.');
+    expect(r.report.dryRun).toBe(true);
+    expect(r.stamp).toEqual({ kind: 'stampCalendar', snipeId: 's1', outcome: 'missed' });
+  });
+
+  it('the copy does not depend on the read (the dashboard re-derives it without one)', () => {
+    const read = detail({ serverTime: new Date(END_MS + 30_000).toISOString() });
+    for (const dryRun of [false, true]) {
+      const withRead = classifyOutcome(asleep({ dryRun }), null, read, { abort: 'asleep' });
+      const without = classifyOutcome(asleep({ dryRun }), null, null, { abort: 'asleep' });
+      expect(withRead.notify).toEqual(without.notify);
+      expect(withRead.detail).toBe(without.detail);
+      expect(withRead.stamp).toEqual(without.stamp);
+    }
+  });
+
+  it.each([
+    ['sentAt', { attempt: { sentAt: END_MS - 8000 } }],
+    ['ambiguous', { attempt: { ambiguous: true } }],
+  ] as const)('I2: with a possible send (%s) it is never Missed and never says no bid was placed', (_name, over) => {
+    const r = classifyOutcome(asleep(over), null, null, { abort: 'asleep' });
+    expect(r.outcome).toBe('network');
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).not.toMatch(/Missed|No bid was placed/);
+    expect(r.stamp).toBeNull();
+  });
+
+  it('I2: a recorded reply wins over the abort (the judge path)', () => {
+    const r = classifyOutcome(asleep(), bid('outbid'), detail({ isHighBidder: false }), { abort: 'asleep' });
+    expect(r.outcome).toBe('outbid');
+    expect(r.notify.message).not.toMatch(/Missed|No bid was placed/);
+  });
+
+  it('an early close keeps the Ended early copy and stamp', () => {
+    const r = classifyOutcome(asleep(), null, null, { abort: 'ended' });
+    expect(r.outcome).toBe('ended');
+    expect(r.notify.title).toBe('Ended early: Blue vase');
+    expect(r.stamp?.outcome).toBe('ended-early');
+  });
+});
+
+describe('T-121: settledAsMissed reads the reducer history', () => {
+  const settled = (outcome: Snipe['outcome'], why: string): Pick<Snipe, 'outcome' | 'history'> => ({
+    outcome,
+    history: [{ at: END_MS + 30_000, from: 'waking', to: 'resolved', why }],
+  });
+  it('true only for a skipped settle whose why starts with the missed marker', () => {
+    expect(settledAsMissed(settled('skipped', `${MISSED_END_WHY}: verified: auction closed`))).toBe(true);
+    expect(settledAsMissed(settled('skipped', 'verify-failed: price-over-max'))).toBe(false);
+    expect(settledAsMissed(settled('skipped', 'fire: after the end'))).toBe(false);
+    expect(settledAsMissed(settled('ended', `${MISSED_END_WHY}: verified: auction closed`))).toBe(false);
+    expect(settledAsMissed({ outcome: 'skipped', history: [] })).toBe(false);
   });
 });

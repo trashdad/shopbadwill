@@ -36,7 +36,7 @@ export function itemUrl(itemId: number): string {
 }
 
 function sbwState(outcome: TrackedItem['outcome']): DesiredEvent['privateProps']['sbwState'] {
-  return outcome === 'won' || outcome === 'lost' || outcome === 'ended-early' ? outcome : 'open';
+  return outcome === 'won' || outcome === 'lost' || outcome === 'ended-early' || outcome === 'missed' ? outcome : 'open';
 }
 
 export function buildDesiredEvent(

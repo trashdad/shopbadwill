@@ -131,7 +131,8 @@ export const TrackedItemSchema = z.object({
   favoriteState: z.enum(['none', 'queued', 'favorited', 'failed']),
   /** Desired on the calendar? */
   calendar: z.boolean(),
-  outcome: z.enum(['won', 'lost', 'ended-early', 'unknown']).optional(),
+  /** T-121 adds 'missed' (additive): a snipe slept through an on-time close. */
+  outcome: z.enum(['won', 'lost', 'ended-early', 'missed', 'unknown']).optional(),
   addedAt: EpochMsSchema,
   updatedAt: EpochMsSchema,
 });

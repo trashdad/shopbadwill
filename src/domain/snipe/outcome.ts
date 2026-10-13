@@ -24,7 +24,14 @@ export type AbortReason =
   /** The user already led, so no bid was needed. */
   | 'already-high'
   /** The fire moment passed (browser or computer asleep, or fire after the end) and nothing was sent. */
-  | 'missed';
+  | 'missed'
+  /**
+   * T-121: the auction closed on time while the browser or computer was not
+   * awake, so the snipe never got to fire. The reducer passes it only when
+   * `sleptThroughEnd` holds: no fire or send record, and a read showing the
+   * close at or after the scheduled end. Never for an early close ('ended').
+   */
+  | 'asleep';
 
 export interface OutcomeContext {
   /** IANA zone for the notification's local time. Default America/Los_Angeles. */
@@ -128,6 +135,51 @@ function isClosed(d: ItemDetail): boolean {
   return d.isClosed || isoMs(d.serverTime) >= isoMs(d.endTime);
 }
 
+/** The states before the fire: no PlaceBid has been emitted, and no early proxy is out ('fallback-applied' is not one). */
+const PRE_FIRE: ReadonlySet<Snipe['state']> = new Set(['armed', 'waking', 'verified']);
+
+/**
+ * T-121: the never-woke signal, from records that already exist. True only when
+ * both hold:
+ * - nothing can have gone out (I2): the snipe is still before its fire (armed,
+ *   waking or verified) and carries no fire or send record at all (no fired
+ *   time, no send time or key, no reply, no ambiguity, no not-sent proof);
+ * - `read` shows the auction closed at or after the end the snipe was waiting
+ *   for: SGW's own clock is past SGW's own end, and that end is not earlier
+ *   than `snipe.endTime`.
+ * An early close (SGW closed the item before its posted end, or moved the end
+ * before the scheduled one) is never this: it stays 'ended' ("Ended early").
+ * A read alone cannot tell a withdrawal whose posted end SGW left unchanged,
+ * once that end has passed, from an on-time close; the snipe slept through
+ * its scheduled end either way, so that case reads "Missed".
+ */
+export function sleptThroughEnd(snipe: Snipe, read: ItemDetail): boolean {
+  if (read.itemId !== snipe.itemId || !PRE_FIRE.has(snipe.state)) return false;
+  const a = snipe.attempt;
+  const anyRecord =
+    snipe.measured?.firedAt !== undefined ||
+    a.sentAt !== undefined ||
+    a.idempotencyKey !== undefined ||
+    a.reply !== undefined ||
+    a.ambiguous !== undefined ||
+    a.notSent !== undefined;
+  if (anyRecord) return false;
+  const end = isoMs(read.endTime);
+  return end >= isoMs(snipe.endTime) && isoMs(read.serverTime) >= end;
+}
+
+/**
+ * T-121: the history `why` prefix of a settle as "Missed" (abort 'asleep'). The
+ * outcome stays 'skipped' (no SnipeOutcome change), so this marker is what lets
+ * the post-end scan and the dashboard tell it from the other skips.
+ */
+export const MISSED_END_WHY = 'missed the end';
+
+/** Whether the snipe was settled as "Missed" (the reducer's abort 'asleep'). */
+export function settledAsMissed(s: Pick<Snipe, 'outcome' | 'history'>): boolean {
+  return s.outcome === 'skipped' && (s.history.at(-1)?.why ?? '').startsWith(`${MISSED_END_WHY}: `);
+}
+
 interface Verdict {
   outcome: 'won' | 'outbid' | 'not-registered' | 'unconfirmed';
   how: string;
@@ -188,7 +240,7 @@ export function classifyOutcome(
   let finalPrice: Cents | undefined;
   let marginCents: Cents | undefined;
   let wouldHaveWon: boolean | undefined;
-  let stampAs: 'won' | 'lost' | 'ended-early' | null = null;
+  let stampAs: Extract<Effect, { kind: 'stampCalendar' }>['outcome'] | null = null;
   let newEndTime: string | undefined;
   let showEnd = true;
 
@@ -261,6 +313,21 @@ export function classifyOutcome(
     heading = "Missed: the browser wasn't running at the end";
     message = `The fire moment passed (the browser or computer was asleep, or the fire came after the end) and no bid was sent. No bid was placed (your max ${max}). To avoid this, keep the browser running through the end, or use the companion.`;
     detail = 'Fire moment passed without the browser running; no bid sent.';
+  } else if (abort === 'asleep') {
+    // T-121: an on-time close the snipe slept through. Not "Ended early": SGW
+    // did not close it before its end. The copy never depends on the read, so
+    // the dashboard can re-derive it from the stored snipe.
+    outcome = 'skipped';
+    heading = 'Missed';
+    const advice = 'To avoid this, keep the computer awake and the browser running through the end, or use the companion.';
+    if (snipe.dryRun) {
+      message = `The browser was not awake when the auction ended, so the dry run did not run (your max ${max}). Nothing was sent: a dry run never bids. ${advice}`;
+      detail = 'Missed: the browser was not awake when the auction ended; dry run, nothing sent.';
+    } else {
+      message = `The browser was not awake when the auction ended, so the snipe could not bid. No bid was placed (your max ${max}). ${advice}`;
+      detail = 'Missed: the browser was not awake when the auction ended; no bid sent.';
+    }
+    stampAs = 'missed';
   } else if (snipe.dryRun) {
     // A dry run never bids; the post-read is the harmless measuring read at fire time.
     outcome = 'dry-run';

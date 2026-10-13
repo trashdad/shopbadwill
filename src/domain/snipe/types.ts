@@ -197,11 +197,11 @@ export const EffectSchema = z.discriminatedUnion('kind', [
    */
   z.object({ kind: z.literal('placeBid'), snipeId: SnipeIdSchema, amount: CentsSchema }),
   z.object({ kind: z.literal('notify'), snipeId: SnipeIdSchema, title: z.string(), message: z.string() }),
-  /** `CalendarSink.stamp(itemId, outcome, finalPrice)`. */
+  /** `CalendarSink.stamp(itemId, outcome, finalPrice)`. T-121 adds 'missed' (additive). */
   z.object({
     kind: z.literal('stampCalendar'),
     snipeId: SnipeIdSchema,
-    outcome: z.enum(['won', 'lost', 'ended-early']),
+    outcome: z.enum(['won', 'lost', 'ended-early', 'missed']),
     finalPrice: CentsSchema.optional(),
   }),
   /** `AuditLog.append(entry)`. */

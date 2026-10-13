@@ -49,7 +49,7 @@
 // placed in the table.
 import type { BidResultKind, EpochMs, ItemDetail } from '../types';
 import { checkCaps, DEFAULT_TIME_ZONE, spentToday } from './caps';
-import { classifyOutcome, type AbortReason, type Classification, type OutcomeContext } from './outcome';
+import { classifyOutcome, MISSED_END_WHY, sleptThroughEnd, type AbortReason, type Classification, type OutcomeContext } from './outcome';
 import { fallbackDecision, isoMs, type Fallback, type FallbackReason, type PreflightReason } from './preflight';
 import { assessClock, computeFireAt, type ClockAbortReason } from './timing';
 import { LeadMsSchema, type CapsCheck, type CapsResult, type Effect, type Snipe, type SnipeEvent, type SnipeState } from './types';
@@ -155,6 +155,16 @@ export interface ReduceContext {
    * instead of the generic auth / clock / keep-awake cause. Copy only.
    */
   preflightDetail?: string;
+  /**
+   * T-121: the read that showed the auction closed, for an `ended`
+   * `preflight-failed` or `verify-failed` (the T-15 min preflight read, the
+   * T-60 s verify read, or T-103's post-end read). With it the reducer tells an
+   * on-time close the snipe slept through ("Missed", `sleptThroughEnd`) from an
+   * early close ("Ended early"); without it, or for another item, the event is
+   * "Ended early" as before. Copy and stamp only: the snipe ends 'resolved'
+   * either way, and no other event reads it.
+   */
+  endedRead?: ItemDetail;
 }
 
 const accept =(...to: SnipeState[]): TransitionCell => Object.freeze({ to: Object.freeze(to) });
@@ -422,7 +432,7 @@ function settled(s: Snipe, e: SnipeEvent, to: 'resolved' | 'killed', c: Classifi
 
 /**
  * A pre-bid end, classified by T-87 from its `abort` reason (killed, ended,
- * cap, extended, price, already-high, missed). `post` is the read that showed
+ * cap, extended, price, already-high, missed, asleep). `post` is the read that showed
  * it, when there is one.
  */
 function aborted(
@@ -435,6 +445,18 @@ function aborted(
   post: ItemDetail | null = null,
 ): Accepted {
   return settled(s, e, to, classifyOutcome(s, null, post, outcomeContext(ctx, abort)), why);
+}
+
+/**
+ * A pre-bid end because the auction closed (`read` showed it, when there is
+ * one). T-121: when the read proves an on-time close the snipe slept through
+ * (`sleptThroughEnd`: no fire or send record, closed at or after the scheduled
+ * end), it is "Missed" (abort 'asleep', its `why` marked MISSED_END_WHY);
+ * otherwise "Ended early" (abort 'ended'), as before.
+ */
+function closedBeforeBid(s: Snipe, e: SnipeEvent, ctx: ReduceContext, why: string, read: ItemDetail | null): Accepted {
+  if (read !== null && sleptThroughEnd(s, read)) return aborted(s, e, ctx, 'resolved', 'asleep', `${MISSED_END_WHY}: ${why}`, read);
+  return aborted(s, e, ctx, 'resolved', 'ended', why, read);
 }
 
 /** I1: a cap failure ends the snipe 'cap-blocked'; it never reaches the fallback. */
@@ -552,7 +574,7 @@ function onVerified(s: Snipe, e: Extract<SnipeEvent, { type: 'verified' }>, caps
   const d: ItemDetail = e.detail;
   if (d.itemId !== s.itemId) return refuse('invalid-event', 'The verify read is for another item.');
   const endMs = isoMs(d.endTime);
-  if (d.isClosed || isoMs(d.serverTime) >= endMs) return aborted(s, e, ctx, 'resolved', 'ended', 'verified: auction closed', d);
+  if (d.isClosed || isoMs(d.serverTime) >= endMs) return closedBeforeBid(s, e, ctx, 'verified: auction closed', d);
   if (endMs > isoMs(s.endTime) + ASSUME_EXTENSION_MS) return aborted(s, e, ctx, 'resolved', 'extended', 'verified: end moved later', d);
   // The runner sends `verified` only with a usable sample, so the event has no
   // confidence field; 'low' re-checks the rtt and skew bounds (T-81).
@@ -578,7 +600,7 @@ function onVerifyFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'verify-failed'
   let done: Accepted;
   switch (e.reason) {
     case 'ended':
-      done = aborted(s, e, ctx, 'resolved', 'ended', why);
+      done = closedBeforeBid(s, e, ctx, why, ctx.endedRead ?? null);
       break;
     case 'extended':
       done = aborted(s, e, ctx, 'resolved', 'extended', why);
@@ -743,7 +765,7 @@ function onPreflightFailed(s: Snipe, e: Extract<SnipeEvent, { type: 'preflight-f
   let done: Accepted;
   switch (reason) {
     case 'ended':
-      done = aborted(s, e, ctx, 'resolved', 'ended', why);
+      done = closedBeforeBid(s, e, ctx, why, ctx.endedRead ?? null);
       break;
     case 'price':
       done = aborted(s, e, ctx, 'resolved', 'price', why);

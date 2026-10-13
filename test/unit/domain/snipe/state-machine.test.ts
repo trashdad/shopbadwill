@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DEFAULT_CAPS } from '../../../../src/domain/settings/defaults';
 import { exposure, spentToday } from '../../../../src/domain/snipe/caps';
-import { classifyOutcome } from '../../../../src/domain/snipe/outcome';
+import { classifyOutcome, MISSED_END_WHY, settledAsMissed } from '../../../../src/domain/snipe/outcome';
 import type * as OutcomeModule from '../../../../src/domain/snipe/outcome';
 import { fallbackDecision } from '../../../../src/domain/snipe/preflight';
 import type * as PreflightModule from '../../../../src/domain/snipe/preflight';
@@ -1852,5 +1852,93 @@ describe('R1 and R5 as properties', { timeout: PROP_TIMEOUT_MS }, () => {
       }),
       { numRuns: SIDE_RUNS },
     );
+  });
+});
+
+// ── T-121: Missed (an on-time close the snipe slept through) vs Ended early ──
+
+describe('T-121: an on-time close the snipe slept through is Missed; an early close stays Ended early', () => {
+  /** A read made after the scheduled end, showing the auction closed at that end. */
+  const onTime = (over: Partial<ItemDetail> = {}): ItemDetail => closedDetail({ serverTime: iso(END_MS + 30_000), ...over });
+  /** SGW closed it before its posted end (withdrawn), read in the window. */
+  const closedEarly = (): ItemDetail => detail({ isClosed: true });
+  /** SGW moved the end before the scheduled one; read after both. */
+  const movedEarlier = (): ItemDetail => onTime({ endTime: iso(END_MS - 30 * MIN) });
+  const AFTER_END = END_MS + 30_000 - OFFSET;
+  const stampOf = (r: ReduceResult): string | undefined => ofKind(r.effects, 'stampCalendar')[0]?.outcome;
+  const titleOf = (r: ReduceResult): string | undefined => ofKind(r.effects, 'notify')[0]?.title;
+
+  it('a verify read after the end, showing the close at the scheduled end: Missed (abort asleep), MISSED stamp, no money', () => {
+    const r = reduce(inState('waking'), E.verified(onTime(), OFFSET, RTT, AFTER_END), CAPS_OK, CTX);
+    expect(r.rejection).toBeNull();
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'asleep' });
+    expect(titleOf(r)).toBe('Missed: Pyrex bowl');
+    expect(stampOf(r)).toBe('missed');
+    expect(money(r.effects)).toEqual([]);
+    expect(settledAsMissed(r.next)).toBe(true);
+    expect(r.next.history.at(-1)?.why.startsWith(`${MISSED_END_WHY}: `)).toBe(true);
+  });
+
+  it('a verify read showing an early close stays Ended early (ENDED EARLY stamp)', () => {
+    for (const d of [closedEarly(), movedEarlier()]) {
+      vi.mocked(classifyOutcome).mockClear();
+      const r = reduce(inState('waking'), E.verified(d), CAPS_OK, CTX);
+      expect(r.next).toMatchObject({ state: 'resolved', outcome: 'ended' });
+      expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'ended' });
+      expect(titleOf(r)).toBe('Ended early: Pyrex bowl');
+      expect(stampOf(r)).toBe('ended-early');
+      expect(settledAsMissed(r.next)).toBe(false);
+    }
+  });
+
+  it.each(['waking', 'verified'] as const)(
+    'verify-failed:ended from %s with the read that showed an on-time close (ctx.endedRead): Missed',
+    (state) => {
+      const r = reduce(inState(state), E.verifyFailed('ended', AFTER_END), CAPS_OK, { ...CTX, endedRead: onTime() });
+      expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+      expect(vi.mocked(classifyOutcome).mock.calls[0]?.[3]).toMatchObject({ abort: 'asleep' });
+      expect(stampOf(r)).toBe('missed');
+      expect(money(r.effects)).toEqual([]);
+      expect(settledAsMissed(r.next)).toBe(true);
+    },
+  );
+
+  it('preflight-failed:ended with an on-time read: Missed; with an early read: Ended early', () => {
+    const missed = reduce(inState('armed'), E.preflightFailed('ended', AFTER_END), CAPS_OK, { ...CTX, endedRead: onTime() });
+    expect(missed.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(stampOf(missed)).toBe('missed');
+    const early = reduce(inState('armed'), E.preflightFailed('ended'), CAPS_OK, { ...CTX, endedRead: closedEarly() });
+    expect(early.next).toMatchObject({ state: 'resolved', outcome: 'ended' });
+    expect(stampOf(early)).toBe('ended-early');
+  });
+
+  it('not provable, so Ended early stays: no read, or a read of another item', () => {
+    for (const ctx of [CTX, { ...CTX, endedRead: onTime({ itemId: 1 }) }]) {
+      for (const [state, e] of [
+        ['waking', E.verifyFailed('ended', AFTER_END)],
+        ['armed', E.preflightFailed('ended', AFTER_END)],
+      ] as const) {
+        const r = reduce(inState(state), e, CAPS_OK, ctx);
+        expect(r.next).toMatchObject({ state: 'resolved', outcome: 'ended' });
+        expect(stampOf(r)).toBe('ended-early');
+      }
+    }
+  });
+
+  it('a dry run gets the same label, with dry-run wording', () => {
+    const r = reduce(inState('waking', { dryRun: true }), E.verified(onTime(), OFFSET, RTT, AFTER_END), CAPS_OK, CTX);
+    expect(r.next).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(titleOf(r)).toBe('Missed: Pyrex bowl');
+    expect(ofKind(r.effects, 'notify')[0]?.message).toMatch(/dry run did not run/);
+    expect(money(r.effects)).toEqual([]);
+  });
+
+  it('the endedRead context never changes the outcome of any other event', () => {
+    const ctx = { ...CTX, endedRead: onTime() };
+    const plain = reduce(inState('verified'), E.verifyFailed('price-over-max'), CAPS_OK, CTX);
+    const withRead = reduce(inState('verified'), E.verifyFailed('price-over-max'), CAPS_OK, ctx);
+    expect(withRead.next).toEqual(plain.next);
+    expect(withRead.effects).toEqual(plain.effects);
   });
 });

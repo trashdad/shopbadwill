@@ -6,7 +6,8 @@
 // Per tracked item (R2: only ones with a snipe or a calendar event; never again
 // once its outcome is recorded):
 //   - a T-84 snipe whose outcome already decided the result (won or outbid
-//     settled by its outcome read; below-minimum, late, ended) is recorded
+//     settled by its outcome read; below-minimum, late, ended; T-121: a skip
+//     the reducer settled as Missed) is recorded
 //     from the snipe's persisted outcome: no read, no stamp, no notification
 //     (the snipe path did them);
 //   - a calendar link carrying a `stamped:<outcome>` record (CalendarSink.stamp)
@@ -26,6 +27,7 @@
 // spending (R5).
 import type { AuditLog } from '../../domain/audit/types';
 import type { CalendarLink } from '../../domain/calendar/types';
+import { settledAsMissed } from '../../domain/snipe/outcome';
 import type { Snipe } from '../../domain/snipe/types';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import type { EpochMs, ItemId, TrackedItem } from '../../domain/types';
@@ -55,7 +57,7 @@ export const READ_RETRY_DELAYS_MS: readonly number[] = [15 * 60_000, 60 * 60_000
 
 const MID_FLIGHT: ReadonlySet<Snipe['state']> = new Set(['firing', 'sent', 'fallback-applied']);
 const PRE_FIRE: ReadonlySet<Snipe['state']> = new Set(['armed', 'waking', 'verified']);
-const DECIDED: ReadonlySet<TrackedItem['outcome']> = new Set(['won', 'lost', 'ended-early', 'unknown']);
+const DECIDED: ReadonlySet<TrackedItem['outcome']> = new Set(['won', 'lost', 'ended-early', 'missed', 'unknown']);
 
 /**
  * T-87 calls a win (or an outbid) final, and T-84 stamps it, only when the
@@ -80,6 +82,11 @@ export function decisiveOutcome(s: Pick<Snipe, 'outcome' | 'history'>): OutcomeK
       return 'lost';
     case 'ended':
       return 'ended-early';
+    case 'skipped':
+      // T-121: the reducer's "Missed" (an on-time close the snipe slept through)
+      // stamped and notified MISSED. Every other skip (price, already-high, a
+      // fire after the end) decided nothing: the item gets its read.
+      return settledAsMissed(s) ? 'missed' : undefined;
     default:
       return undefined;
   }
