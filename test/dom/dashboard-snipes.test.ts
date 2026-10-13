@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { badge as snipeLinkBadge } from '../../src/content/ui/badges/snipe-link';
 import { formatMoney } from '../../src/domain/money';
-import { reduce } from '../../src/domain/snipe/state-machine';
+import { reduce, type ReduceContext } from '../../src/domain/snipe/state-machine';
 import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
@@ -569,8 +569,8 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
     const closedRead = (over: Partial<ItemDetail> = {}): ItemDetail =>
       detail({ isClosed: true, serverTime: '2026-10-08T02:18:40.000Z', currentPrice: 1500, minimumBid: 1550, ...over });
     /** The stored snipe and the notification the reducer emitted when it settled. */
-    function settle(s: Snipe, e: SnipeEvent): { stored: Snipe; title: string; message: string } {
-      const r = reduce(s, e, OK_CAPS, { timeZone: TZ });
+    function settle(s: Snipe, e: SnipeEvent, ctx: ReduceContext = {}): { stored: Snipe; title: string; message: string } {
+      const r = reduce(s, e, OK_CAPS, { timeZone: TZ, ...ctx });
       expect(r.rejection).toBeNull();
       const n = r.effects.find((x) => x.kind === 'notify');
       if (n?.kind !== 'notify') throw new Error('the settle emitted no notification');
@@ -628,6 +628,65 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
         expect(within(row).getByText(DRY_RUN)).toBeTruthy();
       }
       expect(screen.queryByText(/could not be read, so the result is unknown/)).toBeNull();
+    });
+
+    describe('T-121: Missed, for a snipe that never woke before an on-time close', () => {
+      const AFTER = END_MS + 30_000;
+      /** The read on resume: SGW's end is the scheduled one, and its clock is past it. */
+      const onTime = detail({ isClosed: true, serverTime: new Date(AFTER).toISOString() });
+      const waking = (title: string, dryRun = false): Snipe =>
+        snipe({
+          id: title,
+          title,
+          dryRun,
+          state: 'waking',
+          fireAt: END_MS - 8000,
+          history: [
+            { at: NOW, from: 'draft', to: 'armed', why: 'arm' },
+            { at: AFTER, from: 'armed', to: 'waking', why: 'wake' },
+          ],
+        });
+      const verifiedAt = (d: ItemDetail, now: number): SnipeEvent => ({ type: 'verified', now, detail: d, offsetMs: 0, rttMs: 100 });
+
+      it('the row reads Missed with its plain reason (live and dry run); an early close still reads Ended early', async () => {
+        const missed = settle(waking('Slept bowl'), verifiedAt(onTime, AFTER));
+        // T-103's post-end path: an ended verify-failed, with the post-end read.
+        const viaPostEnd = settle(waking('Post-end slept bowl'), { type: 'verify-failed', now: AFTER, reason: 'ended' }, { endedRead: onTime });
+        const missedDry = settle(waking('Slept dry bowl', true), verifiedAt(onTime, AFTER));
+        // Withdrawn in the window: SGW closed it before its posted end.
+        const early = settle(waking('Withdrawn bowl'), verifiedAt(detail({ isClosed: true }), END_MS - 60_000));
+        expect(missed.title).toBe('Missed: Slept bowl');
+        expect(viaPostEnd.title).toBe('Missed: Post-end slept bowl');
+        expect(missedDry.title).toBe('Missed: Slept dry bowl');
+        expect(early.title).toBe('Ended early: Withdrawn bowl');
+
+        setup({ snipes: [missed.stored, viaPostEnd.stored, missedDry.stored, early.stored] });
+        for (const x of [missed, viaPostEnd, missedDry, early]) {
+          const row = await rowOf(x.stored.title);
+          expect(within(row).getByText(x.title)).toBeTruthy();
+          expect(within(row).getByText(x.message)).toBeTruthy();
+        }
+        for (const title of ['Slept bowl', 'Post-end slept bowl']) {
+          const row = await rowOf(title);
+          expect(row.textContent).toMatch(/The browser was not awake when the auction ended, so the snipe could not bid\. No bid was placed/);
+          expect(row.textContent).not.toMatch(/Ended early|closed before/i);
+          expect(within(row).queryByText(DRY_RUN)).toBeNull();
+        }
+        const dry = await rowOf('Slept dry bowl');
+        expect(within(dry).getByText(DRY_RUN)).toBeTruthy();
+        expect(dry.textContent).toMatch(/so the dry run did not run/);
+        expect(dry.textContent).not.toMatch(/No bid was placed/);
+        expect((await rowOf('Withdrawn bowl')).textContent).not.toMatch(/Missed/);
+      });
+
+      it('a Missed settle whose stored text no copy reproduces still reads Missed, with that text verbatim', async () => {
+        const missed = settle(waking('Old slept bowl'), verifiedAt(onTime, AFTER));
+        const older: Snipe = { ...missed.stored, outcomeDetail: 'Missed (an older wording).' };
+        setup({ snipes: [older] });
+        const row = await rowOf('Old slept bowl');
+        expect(within(row).getByText('Missed: Old slept bowl')).toBeTruthy();
+        expect(within(row).getByText('Missed (an older wording).')).toBeTruthy();
+      });
     });
 
     it('a win or a loss settled by the outcome read keeps its heading and never claims the item was not read', async () => {

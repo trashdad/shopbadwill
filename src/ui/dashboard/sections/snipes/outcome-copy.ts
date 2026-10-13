@@ -13,7 +13,7 @@
 // and the stored classifier text verbatim. Snipes settled through T-83's
 // fallback carry T-83's copy in outcomeDetail; it is shown verbatim with
 // T-83's own headings.
-import { classifyOutcome, type AbortReason, type Classification, type OutcomeContext } from '../../../../domain/snipe/outcome';
+import { classifyOutcome, settledAsMissed, type AbortReason, type Classification, type OutcomeContext } from '../../../../domain/snipe/outcome';
 import type { Snipe, SnipeOutcome } from '../../../../domain/snipe/types';
 
 export interface OutcomeDisplay {
@@ -26,7 +26,7 @@ export interface OutcomeDisplay {
   outcome: SnipeOutcome;
 }
 
-const ABORTS: readonly AbortReason[] = ['killed', 'cap', 'auth', 'ended', 'extended', 'price', 'already-high', 'missed', 'network'];
+const ABORTS: readonly AbortReason[] = ['killed', 'cap', 'auth', 'ended', 'extended', 'price', 'already-high', 'missed', 'asleep', 'network'];
 
 /** The reducer's `why` for a settle by the outcome read (src/domain/snipe/state-machine.ts onPostRead). */
 const READ_SETTLES: ReadonlySet<string> = new Set(['post-read', 'post-read: dry run measured']);
@@ -81,7 +81,8 @@ function heading(s: Snipe, outcome: SnipeOutcome, byRead: boolean): string {
     case 'fallback-proxy-placed':
       return 'Early bid';
     case 'skipped':
-      return 'Snipe skipped';
+      // T-121: the reducer's "Missed" (an on-time close the snipe slept through) is a skip too.
+      return settledAsMissed(s) ? 'Missed' : 'Snipe skipped';
   }
 }
 
