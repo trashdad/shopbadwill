@@ -180,6 +180,13 @@ const rows: Row[] = [
     check: (o) => { expect(o).toMatchObject({ outcome: 'ended-early' }); },
   },
   {
+    name: '18b outcome missed (T-121) -> stamp',
+    desired: [desired(101, { state: 'missed' })],
+    links: [synced(a)],
+    expectOp: 'stamp',
+    check: (o) => { expect(o).toMatchObject({ outcome: 'missed' }); },
+  },
+  {
     name: '19 already stamped -> noop',
     desired: [desired(101, { state: 'won' })],
     links: [synced(desired(101, { state: 'won' }))],
@@ -241,8 +248,8 @@ const rows: Row[] = [
 ];
 
 describe('reconcile table', () => {
-  it('has 25 cases', () => {
-    expect(rows).toHaveLength(25);
+  it('has 26 cases (T-121 added 18b)', () => {
+    expect(rows).toHaveLength(26);
   });
   it.each(rows)('$name', (row) => {
     const { ops } = reconcile(row.desired, row.links, NOW, opts(row.options));
@@ -386,7 +393,7 @@ describe('idempotence', () => {
       linkGen: fc.nat({ max: 3 }),
       linkEnd: fc.constantFrom(END, END2),
       end: fc.constantFrom(END, END2),
-      state: fc.constantFrom<SbwState>('open', 'won', 'lost', 'ended-early'),
+      state: fc.constantFrom<SbwState>('open', 'won', 'lost', 'ended-early', 'missed'),
       retryCount: fc.option(fc.integer({ min: 0, max: MAX_RETRIES + 1 }), { nil: undefined }),
       recent: fc.boolean(),
       extraGen: fc.boolean(),

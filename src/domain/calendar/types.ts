@@ -12,7 +12,8 @@ const EventIdSchema = z.string().regex(/^[a-v0-9]{5,1024}$/);
 const PrivatePropsSchema = z.object({
   sbwItemId: z.string(),
   sbwGen: z.string(),
-  sbwState: z.enum(['open', 'won', 'lost', 'ended-early']),
+  /** T-121 adds 'missed' (additive). */
+  sbwState: z.enum(['open', 'won', 'lost', 'ended-early', 'missed']),
 });
 
 export const DesiredEventSchema = z.object({

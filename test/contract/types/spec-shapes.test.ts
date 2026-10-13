@@ -147,7 +147,7 @@ interface SpecTrackedItem {
   reasons: Array<{ kind: 'watch' | 'favorite' | 'snipe' | 'manual'; id?: string }>;
   favoriteState: 'none' | 'queued' | 'favorited' | 'failed';
   calendar: boolean;
-  outcome?: 'won' | 'lost' | 'ended-early' | 'unknown';
+  outcome?: 'won' | 'lost' | 'ended-early' | 'missed' | 'unknown'; // T-121: + 'missed'
   addedAt: EpochMs;
   updatedAt: EpochMs;
 }
@@ -319,7 +319,7 @@ interface SpecDesiredEvent {
   durationMin: 15;
   sourceUrl: string;
   reminders: Array<{ method: 'popup' | 'email'; minutes: number }>;
-  privateProps: { sbwItemId: string; sbwGen: string; sbwState: 'open' | 'won' | 'lost' | 'ended-early' };
+  privateProps: { sbwItemId: string; sbwGen: string; sbwState: 'open' | 'won' | 'lost' | 'ended-early' | 'missed' }; // T-121: + 'missed'
 }
 interface SpecCalendarLink {
   itemId: ItemId;

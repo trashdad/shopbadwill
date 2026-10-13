@@ -37,7 +37,7 @@ import type { Storage } from '../../ports/storage';
 // Adapters may not import the reconciler or the Repo (PLAN §2.1), so the pure
 // domain pieces and the link store arrive through `deps` (wired in
 // src/background/jobs/calendar-sync.ts). The types below mirror T-66's.
-export type Outcome = 'won' | 'lost' | 'ended-early';
+export type Outcome = 'won' | 'lost' | 'ended-early' | 'missed';
 export type RecreateStrategy = 'bump-generation' | 'revive';
 export interface RetryState {
   count: number;
@@ -102,7 +102,7 @@ export const COOLDOWN_BASE_MS = 60_000;
 export const COOLDOWN_CAP_MS = 60 * 60_000;
 export const SYNC_STATE_KEY = 'sbw:calendarSync';
 /** Event title prefixes once the outcome is known. */
-export const OUTCOME_LABEL: Readonly<Record<Outcome, string>> = { won: 'WON', lost: 'LOST', 'ended-early': 'ENDED EARLY' };
+export const OUTCOME_LABEL: Readonly<Record<Outcome, string>> = { won: 'WON', lost: 'LOST', 'ended-early': 'ENDED EARLY', missed: 'MISSED' };
 const MAX_BUMPS = 3;
 
 /** T-119: the options page's "Send a test event". */
@@ -289,7 +289,7 @@ function alreadyMatches(ev: GcalEvent, body: GcalEventBody): boolean {
 }
 
 function stripLabel(summary: string): string {
-  return summary.replace(/^(WON|LOST|ENDED EARLY): /, '');
+  return summary.replace(/^(WON|LOST|ENDED EARLY|MISSED): /, '');
 }
 
 /** The patch that stamps an outcome: retitle, clear reminders, set sbwState. */

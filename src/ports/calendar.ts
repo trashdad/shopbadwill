@@ -11,7 +11,7 @@ export interface CalendarSink {
   upsert(e: DesiredEvent): Promise<{ op: 'insert' | 'patch' | 'noop' | 'recreated'; link: CalendarLink }>;
   remove(itemId: ItemId): Promise<{ op: 'delete' | 'noop' }>;
   /** Retitles and clears reminders. */
-  stamp(itemId: ItemId, outcome: 'won' | 'lost' | 'ended-early', finalPrice?: Cents): Promise<void>;
+  stamp(itemId: ItemId, outcome: 'won' | 'lost' | 'ended-early' | 'missed', finalPrice?: Cents): Promise<void>;
   reconcile(
     desired: DesiredEvent[],
     links: CalendarLink[],

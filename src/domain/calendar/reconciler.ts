@@ -36,7 +36,7 @@ export function retryBackoffMs(count: number): number {
  */
 export type IsLateAddFn = (item: { itemId: ItemId; endTime: IsoUtc }, now: EpochMs) => boolean;
 
-export type Outcome = 'won' | 'lost' | 'ended-early';
+export type Outcome = 'won' | 'lost' | 'ended-early' | 'missed';
 
 interface OpBase {
   itemId: ItemId;

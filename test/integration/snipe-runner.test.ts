@@ -53,6 +53,7 @@ import { bidAmount } from '../../src/domain/money';
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { exposure } from '../../src/domain/snipe/caps';
+import { settledAsMissed } from '../../src/domain/snipe/outcome';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import { formatPacificNaive } from '../../src/domain/time/pacific';
 import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
@@ -3329,5 +3330,79 @@ describe('T-118 F4: arming without the notifications permission warns and audits
     const armed = await arm(w);
     expect(armed.state).toBe('armed');
     expect(kinds(shared)).toContain('snipe.notify-off');
+  });
+});
+
+describe('T-121: a snipe the browser slept through an on-time end is Missed, not Ended early', () => {
+  /** Arms, lets the computer sleep from `sleepAt` until `wakeAt`, then starts a fresh worker (the browser coming back). */
+  async function sleepThrough(shared: Shared, sleepAt: number, resumeAt: number): Promise<{ stamps: string[] }> {
+    const first = await boot(shared);
+    await arm(first.w);
+    await runTo(shared, sleepAt);
+    first.w.kill();
+    // Asleep: no worker runs; whatever alarms fall due are lost with it.
+    await runTo(shared, resumeAt);
+    const { ctx } = await boot(shared);
+    const stamps: string[] = [];
+    snipeSeams(ctx).setCalendarStamper({
+      stamp: (_s, outcome) => {
+        stamps.push(outcome);
+        return Promise.resolve();
+      },
+    });
+    await runTo(shared, END + 2 * MIN);
+    return { stamps };
+  }
+
+  it('asleep from before the wake until after the end: the verify read on resume shows the on-time close; Missed, MISSED stamp, nothing sent', async () => {
+    const shared = makeShared();
+    const { stamps } = await sleepThrough(shared, END - 20 * MIN, END + 40 * SEC);
+
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(settledAsMissed(s)).toBe(true);
+    expect(s.outcomeDetail).toBe('Missed: the browser was not awake when the auction ended; no bid sent.');
+    expect(transitions(s)).toEqual(['draft>armed', 'armed>waking', 'waking>resolved']);
+    // Nothing on the wire, and no early proxy: the auction was already over.
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(kinds(shared)).not.toContain('snipe.fallback');
+    const titles = shared.notifier.sent.map((n) => n.notification.title);
+    expect(titles).toEqual([`Missed: ${s.title}`]);
+    expect(shared.notifier.sent[0]?.notification.message).toMatch(/^The browser was not awake when the auction ended/);
+    expect(titles.some((t) => /ended early/i.test(t))).toBe(false);
+    expect(stamps).toEqual(['missed']);
+  });
+
+  it('asleep after the verify, through the fire and the end: still the fire-after-end Missed copy (T-87c), unchanged', async () => {
+    const shared = makeShared();
+    await sleepThrough(shared, END - SKEW - 30 * SEC, END + 40 * SEC);
+
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.notifier.sent.map((n) => n.notification.title)).toContain(`Missed: the browser wasn't running at the end: ${s.title}`);
+  });
+
+  it('an auction SGW closed before its end, seen by an awake runner, stays Ended early', async () => {
+    const shared = makeShared();
+    const { w, ctx } = await boot(shared);
+    const stamps: string[] = [];
+    snipeSeams(ctx).setCalendarStamper({
+      stamp: (_s, outcome) => {
+        stamps.push(outcome);
+        return Promise.resolve();
+      },
+    });
+    await arm(w);
+    await runTo(shared, END - SKEW - 2 * MIN);
+    shared.sgw.item.closed = true; // withdrawn in the window, before the end
+    await runTo(shared, END + 2 * MIN);
+
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'ended' });
+    expect(settledAsMissed(s)).toBe(false);
+    expect(shared.notifier.sent.map((n) => n.notification.title)).toContain(`Ended early: ${s.title}`);
+    expect(stamps).toEqual(['ended-early']);
   });
 });

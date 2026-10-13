@@ -100,7 +100,7 @@ interface Rig {
   /** Rebuilds the job (a worker restart): same storage, new memory. */
   restart(wrap?: (api: CalendarApi) => CalendarApi): CalendarSync;
   track(opts?: { endsInMs?: number; calendar?: boolean; title?: string; outcome?: 'won' | 'lost' }): Promise<number>;
-  setTracked(itemId: number, patch: Partial<{ endTime: string; calendar: boolean; outcome: 'won' | 'lost' | 'unknown' }>): Promise<void>;
+  setTracked(itemId: number, patch: Partial<{ endTime: string; calendar: boolean; outcome: 'won' | 'lost' | 'missed' | 'unknown' }>): Promise<void>;
   settings(patch: (s: Settings) => void): Promise<void>;
   writes(): string[];
   calendarId(): string;
@@ -416,6 +416,38 @@ describe('changes', () => {
     const n = r.writes().length;
     await r.sync.syncNow('three');
     expect(r.writes().length).toBe(n);
+  });
+
+  it('T-121: a missed auction is stamped MISSED once (sync and the sink port), never ENDED EARLY', async () => {
+    const r = await rig();
+    const id = await r.track({ title: 'Pyrex bowl' });
+    await r.sync.syncNow('one');
+    await r.sync.sink.stamp(id, 'missed');
+    let ev = must(r.events()[0]);
+    expect(ev.summary).toBe('MISSED: Pyrex bowl');
+    expect(ev.reminders.overrides).toEqual([]);
+    expect(ev.extendedProperties.private.sbwState).toBe('missed');
+    expect(ev.description).not.toContain('Final price');
+    const n = r.writes().length;
+    await r.sync.sink.stamp(id, 'missed');
+    // The recorded outcome: the sync settles on the stamp with no second write.
+    await r.setTracked(id, { outcome: 'missed' });
+    await r.sync.syncNow('two');
+    await r.sync.syncNow('three');
+    expect(r.writes().length).toBe(n);
+    ev = must(r.events()[0]);
+    expect(ev.summary).toBe('MISSED: Pyrex bowl');
+  });
+
+  it('T-121: a recorded MISSED outcome alone is stamped by the sync', async () => {
+    const r = await rig();
+    const id = await r.track({ title: 'Lamp' });
+    await r.sync.syncNow('one');
+    await r.setTracked(id, { outcome: 'missed' });
+    await r.sync.syncNow('two');
+    const ev = must(r.events()[0]);
+    expect(ev.summary).toBe('MISSED: Lamp');
+    expect(ev.extendedProperties.private.sbwState).toBe('missed');
   });
 
   it('the sink port stamps with the final price, once', async () => {

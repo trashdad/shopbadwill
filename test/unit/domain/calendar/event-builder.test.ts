@@ -59,6 +59,10 @@ describe('buildDesiredEvent', () => {
   });
   it('maps outcome to state and rejects mismatched items', () => {
     expect(buildDesiredEvent({ ...tracked, outcome: 'won' }, listing, settings).privateProps.sbwState).toBe('won');
+    expect(buildDesiredEvent({ ...tracked, outcome: 'ended-early' }, listing, settings).privateProps.sbwState).toBe('ended-early');
+    // T-121: a snipe that slept through an on-time close.
+    expect(buildDesiredEvent({ ...tracked, outcome: 'missed' }, listing, settings).privateProps.sbwState).toBe('missed');
+    expect(buildDesiredEvent({ ...tracked, outcome: 'unknown' }, listing, settings).privateProps.sbwState).toBe('open');
     expect(() => buildDesiredEvent({ ...tracked, itemId: 9 }, listing, settings)).toThrow(RangeError);
   });
 });

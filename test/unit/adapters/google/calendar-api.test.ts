@@ -124,6 +124,12 @@ describe('normalizeEvent (lenient)', () => {
     });
   });
 
+  it("keeps every outcome state, T-121's 'missed' included", () => {
+    for (const sbwState of ['open', 'won', 'lost', 'ended-early', 'missed'] as const) {
+      expect(normalizeEvent(rawEvent({ extendedProperties: { private: { sbwItemId: '1', sbwGen: '0', sbwState } } }))?.extendedProperties.private.sbwState).toBe(sbwState);
+    }
+  });
+
   it('caps reminders at 5 and rejects a body with no id', () => {
     const many = Array.from({ length: 8 }, (_, i) => ({ method: 'popup', minutes: i }));
     expect(normalizeEvent(rawEvent({ reminders: { overrides: many } }))?.reminders.overrides).toHaveLength(5);

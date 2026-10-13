@@ -147,7 +147,7 @@ function normalizePrivate(raw: RawEvent['extendedProperties']): GcalEvent['exten
   return {
     sbwItemId: str(p['sbwItemId']),
     sbwGen: str(p['sbwGen']),
-    sbwState: state === 'open' || state === 'won' || state === 'lost' || state === 'ended-early' ? state : 'open',
+    sbwState: state === 'open' || state === 'won' || state === 'lost' || state === 'ended-early' || state === 'missed' ? state : 'open',
   };
 }
 

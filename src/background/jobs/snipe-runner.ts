@@ -230,7 +230,7 @@ export interface ArmHooks {
 
 /** Where `stampCalendar` goes (the CalendarSink owner registers it). Default: nothing is stamped. */
 export interface CalendarStamper {
-  stamp(snipe: Snipe, outcome: 'won' | 'lost' | 'ended-early', finalPrice?: Cents): Promise<void>;
+  stamp(snipe: Snipe, outcome: 'won' | 'lost' | 'ended-early' | 'missed', finalPrice?: Cents): Promise<void>;
 }
 
 export interface SnipeSeams {
@@ -402,7 +402,12 @@ function atRiskKey(which: 'health24' | 'health1', reason: string): string {
 interface CommitOptions {
   /** Outbox effects this event completes; removed in the same write (even when the event is refused). */
   consume?: readonly Effect[];
-  /** The freshest ItemDetail for the caps check (default: the last one read for this snipe). */
+  /**
+   * The freshest ItemDetail for the caps check (default: the last one read for
+   * this snipe). For an `ended` preflight-failed / verify-failed it is also the
+   * read that showed the close (T-121: ReduceContext.endedRead, Missed vs Ended
+   * early); only an explicitly passed read counts there, never the default.
+   */
   detail?: ItemDetail;
   /** The history.length the caller reduced from (compare-and-set). */
   expectVersion?: number;
@@ -695,13 +700,16 @@ export class SnipeRunner {
 
   /**
    * T-103's ended-early path (post-end): its read proved the auction closed
-   * before this snipe could fire. Takes ONLY `preflight-failed` or
+   * before this snipe could fire (T-121: pass that read, so an on-time close
+   * the snipe slept through settles as Missed). Takes ONLY `preflight-failed` or
    * `verify-failed` with reason `ended`; anything else is refused with
    * `invalid-event`, unreduced (T-84c). It cannot fire, send or settle a bid,
    * and the reducer still judges whether the snipe's state allows the event.
    */
-  async endedEarly(id: string, event: SnipeEvent): Promise<CommitResult> {
-    const r = await this.commit(id, event, { external: 'ended-early' });
+  async endedEarly(id: string, event: SnipeEvent, read?: ItemDetail): Promise<CommitResult> {
+    // T-121: `read` is the post-end read that proved the close; with it the
+    // reducer tells an on-time close the snipe slept through (Missed) from an early one.
+    const r = await this.commit(id, event, { external: 'ended-early', ...(read === undefined ? {} : { detail: read }) });
     if (r.kind === 'accepted') void this.drive(id);
     return r;
   }
@@ -755,7 +763,8 @@ export class SnipeRunner {
         timeZone: settings.locale.timeZone,
         ...(detail === undefined ? {} : { detail }),
       });
-      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable, opts.preflightDetail));
+      const endedRead = isEndedEvent(e) ? opts.detail : undefined;
+      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable, opts.preflightDetail, endedRead));
       if (red.rejection !== null) {
         if (outbox !== entry.outbox) {
           rec.entries[id] = { ...entry, outbox };
@@ -783,13 +792,14 @@ export class SnipeRunner {
     return r;
   }
 
-  private reduceContext(s: Snipe, settings: Settings, sessionUsable: boolean, preflightDetail?: string): ReduceContext {
+  private reduceContext(s: Snipe, settings: Settings, sessionUsable: boolean, preflightDetail?: string, endedRead?: ItemDetail): ReduceContext {
     return {
       timeZone: settings.locale.timeZone,
       sessionUsable,
       // C4: a dry run asks with the dry-run condition ignored (it still never sends).
       writesAllowed: this.biddingVerdict(s).ok,
       ...(preflightDetail === undefined ? {} : { preflightDetail }),
+      ...(endedRead === undefined ? {} : { endedRead }),
     };
   }
 

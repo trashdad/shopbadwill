@@ -120,7 +120,7 @@ export function buildDesired(
     const link = links[t.itemId];
     const live = link !== undefined && link.status !== 'deleted';
     const ended = new Date(t.endTime).getTime() <= now;
-    const decided = t.outcome === 'won' || t.outcome === 'lost' || t.outcome === 'ended-early';
+    const decided = t.outcome === 'won' || t.outcome === 'lost' || t.outcome === 'ended-early' || t.outcome === 'missed';
     if (ended && !decided && !live && only === undefined) continue;
     const e = buildDesiredEvent(t, asListing(t, now), settings, { generation: link?.generation ?? 0 });
     out.push(opts.withPrice === true ? e : { ...e, description: dropPrice(e.description) });
