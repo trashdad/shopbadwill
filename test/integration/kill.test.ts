@@ -87,8 +87,12 @@ const flush = async (rounds = 3): Promise<void> => {
   }
 };
 
-/** Waits until `cond` holds, draining the microtask/macrotask queues (fake time never advances). */
-async function waitUntil(cond: () => boolean | Promise<boolean>, rounds = 400): Promise<void> {
+/**
+ * Waits until `cond` holds, draining the microtask/macrotask queues (fake time
+ * never advances). 400 rounds was too few once on a loaded CI runner (the
+ * live-send control, PR run of 46eeab0); rounds only cost time on a failure.
+ */
+async function waitUntil(cond: () => boolean | Promise<boolean>, rounds = 4000): Promise<void> {
   for (let i = 0; i < rounds; i++) {
     if (await cond()) return;
     await flush(1);
