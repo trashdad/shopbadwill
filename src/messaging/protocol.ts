@@ -290,6 +290,14 @@ export const MsgReplySchemas = Object.freeze({
   'tracked.list': z.array(TrackedItemSchema),
   'calendar.connect': AuthStatusSchema,
   'calendar.status': AuthStatusSchema,
+  /** What the sync did. `detail` carries Google's answer when it stopped or an item failed. */
+  'calendar.syncNow': z.object({
+    status: z.enum(['disabled', 'synced', 'pending', 'blocked', 'cooling-down', 'needs-reconnect', 'offline', 'error']),
+    changed: z.number().int().nonnegative(),
+    pending: z.number().int().nonnegative(),
+    errors: z.number().int().nonnegative(),
+    detail: z.string().optional(),
+  }),
   'calendar.ics': z.object({ ics: z.string() }),
   'calendar.testEvent': z.object({ result: z.enum(['created-and-deleted', 'dry-run']) }),
   'snipe.prepare': z.object({ detail: ItemDetailSchema, estAllIn: CentsSchema.nullable(), caps: CapsResultSchema }),

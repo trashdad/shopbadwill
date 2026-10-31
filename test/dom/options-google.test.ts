@@ -253,7 +253,7 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
       settings = { ...settings, ...(p as Partial<Settings>) };
       return undefined;
     });
-    fake.handle('calendar.syncNow', () => undefined);
+    fake.handle('calendar.syncNow', () => ({ status: 'synced', changed: 0, pending: 0, errors: 0 }));
     render(
       h(GoogleSection, {
         client: fake,
@@ -510,7 +510,7 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
     fake.handle('calendar.connect', () => status({ connected: true, grantedScopes: [SCOPE], account: 'me@example.com' }));
     fake.handle('settings.get', () => gate);
     fake.handle('settings.set', () => undefined);
-    fake.handle('calendar.syncNow', () => undefined);
+    fake.handle('calendar.syncNow', () => ({ status: 'synced', changed: 0, pending: 0, errors: 0 }));
     render(
       h(GoogleSection, {
         client: fake,
@@ -554,7 +554,7 @@ describe('calendar enabled toggle and connect prompt (T-70b)', () => {
       settings = { ...settings, ...(p as Partial<Settings>) };
       return undefined;
     });
-    fake.handle('calendar.syncNow', () => undefined);
+    fake.handle('calendar.syncNow', () => ({ status: 'synced', changed: 0, pending: 0, errors: 0 }));
     const store = new MemStore({ clientId: GOOD_ID, secretTail: 'abcd' });
     const mount = (): void => {
       render(h(GoogleSection, { client: fake, store, now: () => NOW, permissions: new FakePermissions() }));

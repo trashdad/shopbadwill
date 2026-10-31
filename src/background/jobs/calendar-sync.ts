@@ -253,12 +253,15 @@ export class CalendarSync {
       const changed = run.results.filter((r) => r.op !== 'noop' && r.error === undefined).length;
       const after = await repo.get(STORAGE_KEYS.calendar);
       const pending = Object.values(after.links).filter((l) => l.status === 'pending').length;
-      if (run.halted === undefined) return { status: errors > 0 ? 'error' : 'synced', changed, pending, errors };
+      if (run.halted === undefined) {
+        const first = run.results.find((r) => r.error !== undefined)?.error;
+        return { status: errors > 0 ? 'error' : 'synced', changed, pending, errors, ...(first === undefined ? {} : { detail: first }) };
+      }
       const detail = `${reason}: ${run.halted.message}`;
       switch (run.halted.reason) {
         case 'auth':
           this.deps.badge.set(true);
-          await this.reconnectNotice(settings, now);
+          await this.reconnectNotice(settings, now, run.halted.message);
           return { status: 'needs-reconnect', changed, pending, errors, detail };
         case 'rate-limited':
           return { status: 'cooling-down', changed, pending, errors, detail };
@@ -288,11 +291,12 @@ export class CalendarSync {
   }
 
   /** One notice per local day, not per item (invalid_grant, a lapsed Testing-mode token, a lost scope). */
-  private async reconnectNotice(settings: Settings, now: EpochMs): Promise<void> {
+  private async reconnectNotice(settings: Settings, now: EpochMs, why?: string): Promise<void> {
     const day = localDay(now, settings.locale.timeZone);
     if ((await this.sink.state.read()).noticeDay === day) return;
     await this.sink.state.update((s) => ({ ...s, noticeDay: day }));
-    await this.deps.audit.append({ actor: 'calendar', kind: 'calendar.needs-reconnect', details: { day } });
+    const details: Record<string, string> = why === undefined ? { day } : { day, why: why.slice(0, 200) };
+    await this.deps.audit.append({ actor: 'calendar', kind: 'calendar.needs-reconnect', details });
     if (!(await this.canNotify(settings))) return;
     try {
       await this.deps.notifier.notify({

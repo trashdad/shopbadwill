@@ -121,6 +121,7 @@ const WITH_REPLY = [
   'tracked.list',
   'calendar.connect',
   'calendar.status',
+  'calendar.syncNow',
   'calendar.ics',
   'calendar.testEvent',
   'snipe.prepare',

@@ -48,8 +48,8 @@ export function createCalendarHandlers(ctx: BackgroundContext): CalendarHandlers
     },
     'calendar.status': () => ctx.google.status(),
     'calendar.syncNow': async () => {
-      await syncFor(ctx).syncNow('user');
-      return undefined;
+      const r = await syncFor(ctx).syncNow('user');
+      return { status: r.status, changed: r.changed, pending: r.pending, errors: r.errors, ...(r.detail === undefined ? {} : { detail: r.detail }) };
     },
     'calendar.ics': async (p) => {
       const [settings, tracked, calendar] = await Promise.all([

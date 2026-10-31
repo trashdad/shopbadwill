@@ -19,6 +19,15 @@ import { PacificTime } from '../../../time';
 import { ErrorAlert, LoadNotice, useLoad } from '../../parts';
 import type { SectionDef, SectionProps } from '../../registry';
 
+const SYNC_FAILED: Record<'pending' | 'blocked' | 'cooling-down' | 'needs-reconnect' | 'offline' | 'error', string> = {
+  pending: 'Google is not connected, so nothing went on the calendar.',
+  blocked: 'Calendar writes are blocked right now (the kill switch or a safety check).',
+  'cooling-down': 'Google asked ShopBadwill to slow down. It will try again later.',
+  'needs-reconnect': 'Google refused the calendar write.',
+  offline: 'Could not reach Google. Check the connection and try again.',
+  error: 'Some calendar writes failed.',
+};
+
 export function describeStatus(s: AuthStatus): string {
   if (!s.configured && !s.connected) return 'Google Calendar is not set up. Add your OAuth client in the options page first.';
   if (!s.connected) return 'Not connected. Events are queued as pending and are added after you connect.';
@@ -61,6 +70,25 @@ export function CalendarSection(props: SectionProps): VNode {
     try {
       await fn();
       setNote(label);
+    } catch (e) {
+      setError(describeError(e));
+    } finally {
+      setBusy(false);
+      refresh();
+    }
+  };
+
+  /** Sync now: says what happened, with Google's answer when the sync stopped or an item failed. */
+  const sync = async (): Promise<void> => {
+    setBusy(true);
+    setError('');
+    setNote('');
+    try {
+      const r = await client.send('calendar.syncNow', undefined);
+      const why = r.detail === undefined ? '' : ` Google said: ${r.detail}`;
+      if (r.status === 'synced') setNote(r.changed === 0 ? 'Sync finished: the calendar was already up to date.' : `Sync finished: ${String(r.changed)} event(s) updated.`);
+      else if (r.status === 'disabled') setNote('Calendar events are off, so nothing was synced.');
+      else setError(`${SYNC_FAILED[r.status]}${r.pending > 0 ? ` ${String(r.pending)} item(s) still waiting.` : ''}${why}`);
     } catch (e) {
       setError(describeError(e));
     } finally {
@@ -122,7 +150,7 @@ export function CalendarSection(props: SectionProps): VNode {
         <button
           type="button"
           disabled={busy}
-          onClick={() => void act('Sync finished.', () => client.send('calendar.syncNow', undefined).then(() => undefined))}
+          onClick={() => void sync()}
         >
           Sync now
         </button>{' '}
