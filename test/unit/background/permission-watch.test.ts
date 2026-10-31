@@ -35,17 +35,17 @@ class FakeGoogle {
   }
 }
 
-async function world(opts: { ntfyEnabled?: boolean; connected?: boolean } = {}) {
+async function world(opts: { ntfyEnabled?: boolean; connected?: boolean; server?: string; granted?: string[] } = {}) {
   const clock = new FakeClock(T0);
   const repo = new Repo(new FakeStorageAreas(), clock);
   const audit = new FakeAuditLog(clock);
-  const permissions = new FakePermissions({ permissions: ['identity'], origins: [...GOOGLE_HOSTS, NTFY_ORIGIN] });
+  const permissions = new FakePermissions({ permissions: ['identity'], origins: [...GOOGLE_HOSTS, ...(opts.granted ?? [NTFY_ORIGIN])] });
   const google = new FakeGoogle();
   google.connected = opts.connected ?? true;
   if (opts.ntfyEnabled === true) {
     await repo.set(STORAGE_KEYS.settings, {
       ...defaultSettings(),
-      ntfy: { enabled: true, server: 'https://ntfy.sh', topic: 'sbw-test-topic-0123456789' },
+      ntfy: { enabled: true, server: opts.server ?? 'https://ntfy.sh', topic: 'sbw-test-topic-0123456789' },
     });
   }
   const deps: PermissionWatchDeps = {
@@ -107,6 +107,18 @@ describe('permission watch (T-119)', () => {
     w.permissions.revoke({ origins: [GOOGLE_HOSTS[0] ?? ''] });
     await flush();
     expect(w.audit.kinds).toEqual(['ntfy.status']);
+  });
+
+  it('T-123: watches the configured server host, not ntfy.sh', async () => {
+    const host = 'https://ntfy.example.com/*';
+    const w = await world({ ntfyEnabled: true, server: 'https://ntfy.example.com:8443', granted: [host] });
+    const watch = startPermissionWatch(w.deps);
+    await watch.check();
+    expect(await w.repo.find(STORAGE_KEYS.ntfy)).toBeUndefined(); // granted: nothing to mark
+
+    w.permissions.revoke({ origins: [host] });
+    await flush();
+    expect((await w.repo.find(STORAGE_KEYS.ntfy))?.status).toBe('needs-permission');
   });
 
   it('keeps the scheduled ntfy entries when marking', async () => {

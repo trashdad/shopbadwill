@@ -110,6 +110,14 @@ export const STORAGE_KEYS = {
    * migration; `schemaVersion` stays 1. Invalid data parses to empty.
    */
   snipeGroups: 'sbw:snipeGroups',
+  /**
+   * Optional (T-123): the ntfy access token for a self-hosted server that needs
+   * one. storage.local only, written only by the options page, read by the
+   * ntfy job. A secret: never logged, audited, put in an error or exported, and
+   * shown only as its last 4 characters. Absent means no token. No migration;
+   * `schemaVersion` stays 1. Invalid data reads as no token.
+   */
+  ntfyAuth: 'sbw:ntfyAuth',
 } as const;
 
 /** Audit chunks live at `sbw:audit:<chunk>` (AuditChunkSchema). */
@@ -226,6 +234,24 @@ export type NtfyState = z.infer<typeof NtfyStateSchema>;
 export function parseNtfyState(raw: unknown): NtfyState {
   const parsed = NtfyStateSchema.safeParse(raw);
   return parsed.success ? parsed.data : { items: {} };
+}
+
+/**
+ * `sbw:ntfyAuth` (T-123, optional): the ntfy access token. Module-private
+ * schema, like `NtfyStateSchema`. Readers use `parseNtfyAuth` on the raw value
+ * (never `Repo.find`, whose quarantine would copy the token to
+ * `sbw:quarantine:*`, a record the Health page lists).
+ */
+const NtfyAuthSchema = z.object({
+  token: z.string().min(1),
+  updatedAt: EpochMsSchema,
+});
+export type NtfyAuth = z.infer<typeof NtfyAuthSchema>;
+
+/** A valid `sbw:ntfyAuth` record, or undefined (missing or invalid: no token). */
+export function parseNtfyAuth(raw: unknown): NtfyAuth | undefined {
+  const parsed = NtfyAuthSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
 }
 
 /** `sbw:auditMeta`: ring bookkeeping. */
@@ -555,6 +581,7 @@ export const STORAGE_RECORDS = {
   [STORAGE_KEYS.jobRuns]: { area: 'local', schema: z.array(JobRunSchema) },
   [STORAGE_KEYS.calendar]: { area: 'local', schema: CalendarStateSchema },
   [STORAGE_KEYS.ntfy]: { area: 'local', schema: NtfyStateSchema },
+  [STORAGE_KEYS.ntfyAuth]: { area: 'local', schema: NtfyAuthSchema },
   [STORAGE_KEYS.snipes]: { area: 'local', schema: z.record(SnipeIdSchema, SnipeSchema) },
   [STORAGE_KEYS.auditMeta]: { area: 'local', schema: AuditMetaSchema },
   [STORAGE_KEYS.sgwSession]: { area: 'local', schema: SgwSessionRecordSchema },

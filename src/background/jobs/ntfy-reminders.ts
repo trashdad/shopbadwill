@@ -11,14 +11,19 @@
 //   - after every job run (R1's daily re-call: deferred reminders that came
 //     inside the 3-day window, and anything a 429/5xx cut short);
 //   - at browser start;
-//   - when the ntfy settings change (turned on, or a new topic after the
-//     options page cancelled and cleared the old one);
+//   - when the ntfy settings change (turned on, or a new topic or server after
+//     the options page cancelled and cleared the old one), or the access
+//     token in `sbw:ntfyAuth` changes (T-123);
 //   - on a scheduler tick, only while the sink last stopped for a missing host
 //     permission and the permission is now granted (there is no onAdded port).
 // A pass makes no request when nothing is owed, and none at all while the gate
 // (R2) is closed.
-import { EMPTY_NTFY_STATE, NTFY_ORIGIN, NtfySink, type NtfyStore } from '../../adapters/ntfy/ntfy-sink';
-import { STORAGE_KEYS } from '../../domain/storage/schema';
+//
+// T-123: the token is read raw and parsed here, never through `Repo.find`, so
+// a bad record is never copied into a quarantine record; it is never logged.
+import { EMPTY_NTFY_STATE, NtfySink, type NtfyStore } from '../../adapters/ntfy/ntfy-sink';
+import { isAllowedServer, serverPermissionPattern } from '../../adapters/ntfy/server';
+import { STORAGE_KEYS, parseNtfyAuth } from '../../domain/storage/schema';
 import type { BackgroundContext } from '../context';
 import { buildDesired, registerReminderSink } from './calendar-sync';
 
@@ -46,7 +51,8 @@ export function register(ctx: BackgroundContext): void {
     audit: ctx.audit,
     settings: async () => {
       const s = await ctx.repo.get(STORAGE_KEYS.settings);
-      return { ntfy: s.ntfy, timeZone: s.locale.timeZone };
+      const token = parseNtfyAuth(await ctx.repo.getRaw(STORAGE_KEYS.ntfyAuth))?.token;
+      return { ntfy: s.ntfy, ...(token === undefined ? {} : { token }), timeZone: s.locale.timeZone };
     },
     store,
   });
@@ -104,6 +110,9 @@ export function register(ctx: BackgroundContext): void {
   ctx.storage.local.onChanged((changes) => {
     const settings = changes[STORAGE_KEYS.settings];
     if (settings !== undefined && ntfyGroup(settings.oldValue) !== ntfyGroup(settings.newValue)) reconcile();
+    // T-123: a new or removed access token (compared, never logged).
+    const auth = changes[STORAGE_KEYS.ntfyAuth];
+    if (auth !== undefined && parseNtfyAuth(auth.oldValue)?.token !== parseNtfyAuth(auth.newValue)?.token) reconcile();
 
     // A job run reached done/failed (mirrors calendar-sync.register's own trigger).
     const runs = changes[STORAGE_KEYS.jobRuns]?.newValue;
@@ -129,7 +138,9 @@ export function register(ctx: BackgroundContext): void {
   ctx.ticks.onTick(async () => {
     try {
       if ((await ctx.repo.find(STORAGE_KEYS.ntfy))?.status !== 'needs-permission') return;
-      if (!(await ctx.permissions.contains({ origins: [NTFY_ORIGIN] }))) return;
+      const server = (await ctx.repo.get(STORAGE_KEYS.settings)).ntfy?.server;
+      if (server === undefined || !isAllowedServer(server)) return;
+      if (!(await ctx.permissions.contains({ origins: [serverPermissionPattern(server)] }))) return;
       reconcile();
     } catch {
       // Nothing for the tick hub to log.

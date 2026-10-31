@@ -16,6 +16,7 @@ import {
   parseCompanionWakes,
   parseRelistSeen,
   parseDryRunCounted,
+  parseNtfyAuth,
   parseSnipeGroups,
   SNIPE_GROUP_LIMITS,
   STORAGE_KEYS,
@@ -25,6 +26,7 @@ import {
   StorageMetaSchema,
   type RequestBudget,
 } from '../../../src/domain/storage/schema';
+import { SettingsSchema } from '../../../src/domain/settings/schema';
 import { GoogleCredentialsSchema, type Lane } from '../../../src/domain/types';
 
 const EXAMPLES_DIR = path.join(import.meta.dirname, 'examples');
@@ -64,6 +66,7 @@ const LOCAL_KEYS = [
   'sbw:deferredAlarms',
   'sbw:relistSeen',
   'sbw:snipeGroups',
+  'sbw:ntfyAuth',
 ];
 const SESSION_KEYS = ['sbw:clock', 'sbw:googleAccess', 'sbw:runtimeHealth'];
 
@@ -101,6 +104,8 @@ const SAMPLE_VALUES: Record<string, unknown> = {
   'sbw:sgwSession': example('SgwSessionRecord'),
   'sbw:sgwSessionRejection': { ids: ['jti:' + 'a'.repeat(64)], at: 1791400000000 },
   'sbw:google': example('GoogleCredentials'),
+  // T-123: the optional ntfy access token (placeholder value).
+  'sbw:ntfyAuth': { token: 'tk_placeholder', updatedAt: 1791400000000 },
   'sbw:googleClient': { clientId: '123456789012-abc.apps.googleusercontent.com', clientSecret: 'x', updatedAt: 1791400000000 },
   'sbw:requestBudget': example('RequestBudget'),
   'sbw:requestSchedulerState': example('RequestSchedulerState'),
@@ -178,6 +183,19 @@ describe('storage schema v1', () => {
     expect(schema.safeParse({ clientId: 'a', updatedAt: 1 }).success).toBe(true);
     expect(schema.safeParse({ clientId: '', updatedAt: 1 }).success).toBe(false);
     expect(schema.safeParse({ clientId: 'a' }).success).toBe(false);
+  });
+
+  it('keeps the ntfy access token in its own optional local record, never in settings (T-123)', () => {
+    expect(STORAGE_RECORDS[STORAGE_KEYS.ntfyAuth].area).toBe('local');
+    const schema = STORAGE_RECORDS[STORAGE_KEYS.ntfyAuth].schema;
+    expect(schema.safeParse({ token: 'tk_x', updatedAt: 1 }).success).toBe(true);
+    expect(schema.safeParse({ token: '', updatedAt: 1 }).success).toBe(false);
+    expect(schema.safeParse({ token: 'tk_x' }).success).toBe(false);
+    expect(parseNtfyAuth({ token: 'tk_x', updatedAt: 1 })).toEqual({ token: 'tk_x', updatedAt: 1 });
+    expect(parseNtfyAuth({ token: 7 })).toBeUndefined();
+    expect(parseNtfyAuth(undefined)).toBeUndefined();
+    // Settings (and so settings.get, which every page reads) never carry the token.
+    expect(Object.keys(SettingsSchema.shape.ntfy.unwrap().shape).sort()).toEqual(['enabled', 'server', 'topic']);
   });
 
   it('keys ItemId records by positive integer ids', () => {

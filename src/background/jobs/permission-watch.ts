@@ -8,13 +8,15 @@
 //   marked as needing a reconnect (the same flag invalid_grant raises), so the
 //   action badge, the options page and the dashboard show it. Reconnecting asks
 //   for the permissions again.
-// - the ntfy host gone while phone push is on: `sbw:ntfy.status` becomes
-//   `needs-permission` (what the ntfy sink itself records), and the ntfy job's
-//   tick re-publishes once the permission is granted again.
+// - the ntfy host (T-123: the configured server's host) gone while phone push
+//   is on: `sbw:ntfy.status` becomes `needs-permission` (what the ntfy sink
+//   itself records), and the ntfy job's tick re-publishes once the permission
+//   is granted again.
 //
 // `onRemoved` carries no reliable detail across browsers, so each event
 // re-checks with `contains`. Checks run one at a time and never throw.
-import { NTFY_ORIGIN, EMPTY_NTFY_STATE } from '../../adapters/ntfy/ntfy-sink';
+import { EMPTY_NTFY_STATE } from '../../adapters/ntfy/ntfy-sink';
+import { isAllowedServer, serverPermissionPattern } from '../../adapters/ntfy/server';
 import type { PkceRefreshProvider } from '../../adapters/google/auth-pkce';
 import type { AuditLog } from '../../domain/audit/types';
 import type { Repo } from '../../domain/storage/repo';
@@ -65,8 +67,10 @@ async function checkGoogle(deps: PermissionWatchDeps): Promise<void> {
 
 async function checkNtfy(deps: PermissionWatchDeps): Promise<void> {
   const settings = await deps.repo.get(STORAGE_KEYS.settings);
-  if (settings.ntfy?.enabled !== true) return;
-  if (await deps.permissions.contains({ origins: [NTFY_ORIGIN] })) return;
+  const ntfy = settings.ntfy;
+  // An invalid server is the sink's `disabled`, not a missing permission.
+  if (ntfy?.enabled !== true || !isAllowedServer(ntfy.server)) return;
+  if (await deps.permissions.contains({ origins: [serverPermissionPattern(ntfy.server)] })) return;
   const changed = await deps.repo.withLock(STORAGE_KEYS.ntfy, async () => {
     const cur = (await deps.repo.find(STORAGE_KEYS.ntfy)) ?? structuredClone(EMPTY_NTFY_STATE);
     if (cur.status === 'needs-permission') return false;
