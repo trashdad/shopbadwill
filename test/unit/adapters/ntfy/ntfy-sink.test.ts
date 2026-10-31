@@ -207,7 +207,7 @@ afterEach(() => {
 
 describe('ntfyRequest (provisional wire shape)', () => {
   it('builds the publish request: POST https://ntfy.sh/<topic>, plain text, the five headers', () => {
-    const req = ntfyRequest('publish', 'sbw-abc', {
+    const req = ntfyRequest('publish', { server: NTFY_SERVER, topic: 'sbw-abc' }, {
       seq: 'sbw-1-15-0',
       title: 'Pyrex bowl',
       body: 'Ends in 15 min',
@@ -229,11 +229,11 @@ describe('ntfyRequest (provisional wire shape)', () => {
 
   it('keeps a printable-ASCII title as-is, and RFC 2047-encodes any other title so fetch neither throws nor garbles it', () => {
     const message = { seq: 'sbw-1-15-0', body: 'Ends in 15 min', clickUrl: 'https://shopgoodwill.com/item/1', fireAt: T0 + 15 * MIN };
-    expect(ntfyRequest('publish', 'sbw-abc', { ...message, title: 'Pyrex bowl (4 pc) #2' }).headers?.['X-Title']).toBe(
+    expect(ntfyRequest('publish', { server: NTFY_SERVER, topic: 'sbw-abc' }, { ...message, title: 'Pyrex bowl (4 pc) #2' }).headers?.['X-Title']).toBe(
       'Pyrex bowl (4 pc) #2',
     );
     for (const title of [UNICODE_TITLE, 'Café', 'A =?UTF-8?B?eA==?= lookalike', `${'é'.repeat(199)}…`]) {
-      const header = ntfyRequest('publish', 'sbw-abc', { ...message, title }).headers?.['X-Title'] ?? '';
+      const header = ntfyRequest('publish', { server: NTFY_SERVER, topic: 'sbw-abc' }, { ...message, title }).headers?.['X-Title'] ?? '';
       expect(header, title).toMatch(/^[\x20-\x7e]+$/);
       for (const word of header.split(' ')) expect(word.length, word).toBeLessThanOrEqual(75);
       expect(decodeRfc2047(header), title).toBe(title);
@@ -249,7 +249,7 @@ describe('ntfyRequest (provisional wire shape)', () => {
   });
 
   it('builds the cancel request: DELETE https://ntfy.sh/<topic>/<seq>', () => {
-    const req = ntfyRequest('cancel', 'sbw-abc', { seq: 'sbw-1-15-0' });
+    const req = ntfyRequest('cancel', { server: NTFY_SERVER, topic: 'sbw-abc' }, { seq: 'sbw-1-15-0' });
     expect(req.url).toBe(`${NTFY_SERVER}/sbw-abc/sbw-1-15-0`);
     expect(req.method).toBe('DELETE');
     expect(req.headers).toBeUndefined();
@@ -301,11 +301,18 @@ describe('opt-in gate (R2)', () => {
     expect(r.audit.entries.find((x) => x.kind === 'ntfy.status')?.details).toEqual({ status: 'needs-permission' });
   });
 
-  it('a server other than https://ntfy.sh is refused (v1 supports only ntfy.sh)', async () => {
-    const r = rig({ server: 'https://evil.example' });
+  it('a server that is not an https origin is refused (T-123: any https origin may be configured)', async () => {
+    const r = rig({ server: 'http://ntfy.example.com' });
     await r.sink.upsert(desiredEvent(1, 2 * HOUR));
     expect(r.requests).toHaveLength(0);
     expect(r.store.state.status).toBe('disabled');
+  });
+
+  it('another https server needs its own host permission: the ntfy.sh grant does not cover it', async () => {
+    const r = rig({ server: 'https://ntfy.example.com' });
+    await r.sink.upsert(desiredEvent(1, 2 * HOUR));
+    expect(r.requests).toHaveLength(0);
+    expect(r.store.state.status).toBe('needs-permission');
   });
 
   it('an invalid topic is refused', async () => {
@@ -988,6 +995,59 @@ describe('reconcile (the job module)', () => {
     expect((await h.repo.find(STORAGE_KEYS.ntfy))?.items['7']).toBeUndefined();
   });
 
+  it('T-123: sends the saved access token, and a new token re-runs the pass', async () => {
+    const h = harness();
+    await h.areas.local.set({ [STORAGE_KEYS.ntfyAuth]: { token: 'tk_placeholderone', updatedAt: T0 } });
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync();
+    await pump(h.clock, 20);
+    expect(h.requests.map((x) => x.headers.authorization)).toEqual(Array(3).fill('Bearer tk_placeholderone'));
+
+    // The options page cancelled with the old token and cleared sbw:ntfy, then saved the new token.
+    await h.repo.set(STORAGE_KEYS.ntfy, { items: {} });
+    await h.areas.local.set({ [STORAGE_KEYS.ntfyAuth]: { token: 'tk_placeholdertwo', updatedAt: T0 + 1 } });
+    await until(h.clock, () => (h.requests.length >= 6 ? true : undefined));
+    expect(h.requests.slice(3).map((x) => x.headers.authorization)).toEqual(Array(3).fill('Bearer tk_placeholdertwo'));
+  });
+
+  it('T-123: no or an invalid sbw:ntfyAuth means no Authorization header, and the record is never quarantined', async () => {
+    const h = harness();
+    await h.areas.local.set({ [STORAGE_KEYS.ntfyAuth]: { token: 42 } });
+    await h.setNtfy({ enabled: true, server: NTFY_SERVER, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync();
+    await pump(h.clock, 20);
+    expect(h.requests).toHaveLength(3);
+    expect(h.requests.every((x) => x.headers.authorization === undefined)).toBe(true);
+    expect(Object.keys(h.areas.local.dump()).filter((k) => k.startsWith('sbw:quarantine:'))).toEqual([]);
+  });
+
+  it('T-123: a tick looks for the configured server host permission, not ntfy.sh', async () => {
+    const h = harness();
+    h.permissions.revoke({ origins: ['https://ntfy.sh/*'] }); // only the configured host counts
+    const server = 'https://ntfy.example.com';
+    const seen: string[] = [];
+    mswServer.use(
+      http.post(`${server}/:topic`, ({ request }) => {
+        seen.push(request.url);
+        return new HttpResponse(null, { status: 200 });
+      }),
+    );
+    await h.setNtfy({ enabled: true, server, topic: TOPIC });
+    await h.track(7, T0 + 2 * HOUR);
+    await h.sync();
+    await pump(h.clock, 20);
+    expect((await h.repo.find(STORAGE_KEYS.ntfy))?.status).toBe('needs-permission');
+    expect(seen).toHaveLength(0);
+
+    await h.permissions.request({ origins: ['https://ntfy.example.com/*'] });
+    await h.tick();
+    await until(h.clock, () => (seen.length >= 3 ? true : undefined));
+    expect(seen.every((u) => u === `${server}/${TOPIC}`)).toBe(true);
+    expect(h.requests).toHaveLength(0); // nothing went to ntfy.sh
+  });
+
   it('never retries from a tick: a publish that keeps failing is tried again only at the next job run', async () => {
     const h = harness();
     installNtfy(h.requests, h.clock, () => ({ status: 400 }));
@@ -1008,6 +1068,7 @@ describe('reconcile (the job module)', () => {
 
 interface Harness {
   repo: Repo;
+  areas: FakeStorageAreas;
   clock: FakeClock;
   requests: Captured[];
   permissions: FakePermissions;
@@ -1151,6 +1212,7 @@ function harness(): Harness {
 
   return {
     repo,
+    areas,
     clock,
     requests,
     permissions,

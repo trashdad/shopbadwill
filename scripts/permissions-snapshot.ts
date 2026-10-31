@@ -9,6 +9,12 @@
 // Snapshots are taken from a build with SBW_GOOGLE_CLIENT_ID set (CI sets a dummy
 // one); a build without it has no `oauth2` key, which is tolerated, with a note.
 // The client id itself is never part of a snapshot.
+//
+// T-123: `optional_host_permissions` includes `https://*/*` on both browsers so
+// the options page can ask for a self-hosted ntfy server's exact host
+// (`https://<host>/*`) at runtime. It is optional (no install prompt) and never
+// requested whole; a snapshot diff that adds it anywhere else, or adds
+// `http://*/*` / `*://*/*`, is a real permission change and must be reviewed.
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

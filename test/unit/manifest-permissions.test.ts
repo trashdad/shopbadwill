@@ -61,6 +61,9 @@ const OPTIONAL_HOSTS = [
   'https://oauth2.googleapis.com/*',
   'https://www.googleapis.com/*',
   'https://ntfy.sh/*',
+  // T-123: any https origin, so a self-hosted ntfy server's exact host can be
+  // requested at runtime. Never requested whole; optional, so no install prompt.
+  'https://*/*',
 ];
 const NOT_REQUESTED = [
   'scripting',
@@ -180,6 +183,14 @@ describe.each(TARGETS)('%s production manifest', (target) => {
 
   it('asks for Google and ntfy hosts only as optional', () => {
     expect(manifestOf(target).optional_host_permissions).toEqual(OPTIONAL_HOSTS);
+  });
+
+  it('T-123: the any-https optional host is optional only, never required, and no broader than https', () => {
+    const m = manifestOf(target);
+    expect(m.host_permissions).not.toContain('https://*/*');
+    expect(allRequested(m)).not.toContain('*://*/*');
+    expect(allRequested(m)).not.toContain('http://*/*');
+    expect((m.content_scripts ?? []).flatMap((s) => s.matches ?? [])).not.toContain('https://*/*');
   });
 
   it('never requests permissions outside the table', () => {

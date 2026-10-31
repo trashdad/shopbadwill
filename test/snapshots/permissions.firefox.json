@@ -16,7 +16,8 @@
   "optional_host_permissions": [
     "https://oauth2.googleapis.com/*",
     "https://www.googleapis.com/*",
-    "https://ntfy.sh/*"
+    "https://ntfy.sh/*",
+    "https://*/*"
   ],
   "content_script_matches": [
     [

@@ -68,6 +68,7 @@ describe('cancelScheduledMessages', () => {
     const requests: Captured[] = [];
     install(requests, clock);
     const result = await cancelScheduledMessages({
+      server: NTFY_SERVER,
       topic: TOPIC,
       state: state(),
       http: new BrowserHttp({ now: () => clock.now() }),
@@ -89,6 +90,7 @@ describe('cancelScheduledMessages', () => {
     install(requests, clock);
     const http = new BrowserHttp({ now: () => clock.now() });
     const empty = await cancelScheduledMessages({
+      server: NTFY_SERVER,
       topic: TOPIC,
       state: { items: { 7: { fingerprint: 'fp', entries: [{ seq: 'sbw-7-60-0', leadMin: 60, fireAt: T0, status: 'deferred' }] } } },
       http,
@@ -96,6 +98,7 @@ describe('cancelScheduledMessages', () => {
       minIntervalMs: 0,
     });
     const invalid = await cancelScheduledMessages({
+      server: NTFY_SERVER,
       topic: 'not a topic',
       state: state(),
       http,
@@ -112,6 +115,7 @@ describe('cancelScheduledMessages', () => {
     const requests: Captured[] = [];
     install(requests, clock, () => 429);
     const result = await cancelScheduledMessages({
+      server: NTFY_SERVER,
       topic: TOPIC,
       state: state(),
       http: new BrowserHttp({ now: () => clock.now() }),
@@ -124,6 +128,7 @@ describe('cancelScheduledMessages', () => {
     const again: Captured[] = [];
     install(again, clock, () => 503);
     const second = await cancelScheduledMessages({
+      server: NTFY_SERVER,
       topic: TOPIC,
       state: state(),
       http: new BrowserHttp({ now: () => clock.now() }),
@@ -139,6 +144,7 @@ describe('cancelScheduledMessages', () => {
     const requests: Captured[] = [];
     install(requests, clock, (n) => (n === 1 ? 404 : 200));
     const result = await cancelScheduledMessages({
+      server: NTFY_SERVER,
       topic: TOPIC,
       state: state(),
       http: new BrowserHttp({ now: () => clock.now() }),
@@ -154,6 +160,7 @@ describe('cancelScheduledMessages', () => {
     const requests: Captured[] = [];
     install(requests, clock, () => 'error');
     const pending = cancelScheduledMessages({
+      server: NTFY_SERVER,
       topic: TOPIC,
       state: state(),
       http: new BrowserHttp({ now: () => clock.now() }),

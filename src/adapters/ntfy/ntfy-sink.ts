@@ -4,9 +4,11 @@
 // X-Delay header so ntfy, not the extension, fires them at the right moment.
 //
 // - Opt-in (R2): zero requests unless the settings toggle is on, the topic is
-//   valid, the server is https://ntfy.sh (the only optional host v1 declares)
-//   and the optional host permission is granted. Otherwise it records a status
-//   (`disabled` / `needs-permission`) and sends nothing.
+//   valid, the server is a normalized https origin (T-123: https://ntfy.sh by
+//   default, or a self-hosted server) and the optional host permission for
+//   exactly that host is granted. Otherwise it records a status (`disabled` /
+//   `needs-permission`) and sends nothing. Every request goes to the configured
+//   origin, with `Authorization: Bearer <token>` when an access token is set.
 // - Deferral (R6): leads whose fire time is more than 3 days away are stored as
 //   `deferred`, not sent; the next upsert (calendar sync re-feeds after every
 //   daily job run) publishes them once they are inside the window.
@@ -20,7 +22,8 @@
 //   topic.
 //
 // The topic is a secret (R3): it never appears in the audit log, console
-// output or an error message, and this module never throws it.
+// output or an error message, and this module never throws it. The access
+// token (T-123) is a secret the same way.
 import type { AuditLog } from '../../domain/audit/types';
 import type { DesiredEvent } from '../../domain/calendar/types';
 import type { NtfyState } from '../../domain/storage/schema';
@@ -30,9 +33,12 @@ import type { Clock } from '../../ports/clock';
 import { HttpNetworkError, HttpTimeoutError } from '../../ports/errors';
 import type { Http, HttpRequest } from '../../ports/http';
 import type { Permissions } from '../../ports/permissions';
+import { DEFAULT_NTFY_SERVER, authHeaders, isAllowedServer, serverPermissionPattern } from './server';
 import { isValidTopic } from './topic';
 
-export const NTFY_SERVER = 'https://ntfy.sh';
+/** The default server (T-123: any https origin may be configured instead). */
+export const NTFY_SERVER = DEFAULT_NTFY_SERVER;
+/** The default server's host permission. A configured server uses `serverPermissionPattern(server)`. */
 export const NTFY_ORIGIN = 'https://ntfy.sh/*';
 /** R6: reminders more than 3 days out are deferred, not sent. */
 export const DEFER_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
@@ -53,6 +59,8 @@ export type NtfyEntry = NtfyItem['entries'][number];
 /** What the sink needs from Settings; the background wires the repo reads. */
 export interface NtfySettingsView {
   ntfy?: { enabled: boolean; server: string; topic: string };
+  /** T-123: the access token from `sbw:ntfyAuth`, when one is saved. A secret. */
+  token?: string;
   /** The user's IANA zone, for the end time in the message (R4). */
   timeZone: string;
 }
@@ -74,6 +82,13 @@ export interface NtfySinkDeps {
   minIntervalMs?: number;
 }
 
+/** Where a request goes (T-123): the configured origin and topic, plus the optional token. */
+export interface NtfyTarget {
+  server: string;
+  topic: string;
+  token?: string | undefined;
+}
+
 export interface NtfyMessage {
   seq: string;
   title: string;
@@ -83,14 +98,18 @@ export interface NtfyMessage {
 }
 
 /**
- * The ONE place that knows ntfy.sh's wire shape. PROVISIONAL — the shapes below
- * come from the ntfy.sh documentation and MUST BE CHECKED LIVE against the real
+ * The ONE place that knows ntfy's wire shape. PROVISIONAL — the shapes below
+ * come from the ntfy documentation and MUST BE CHECKED LIVE against the real
  * server before v1 ships:
  *
- *   publish: POST   https://ntfy.sh/<topic>   body = plain text
+ *   publish: POST   <server>/<topic>   body = plain text
  *            headers: X-Title, X-Click, X-Tags: hourglass,
  *                     X-Delay: <unix seconds>, X-Sequence-ID: <seq>
- *   cancel:  DELETE https://ntfy.sh/<topic>/<seq>
+ *   cancel:  DELETE <server>/<topic>/<seq>
+ *   both:    Authorization: Bearer <token>, only when a token is set (T-123)
+ *
+ * `<server>` must be a normalized https origin (`isAllowedServer`); anything
+ * else throws an error that names neither the topic nor the token.
  *
  * HTTP header values are bytes: fetch throws on a character above U+00FF (curly
  * quotes, emoji, the "…" sanitizeTitle appends) and sends U+0080-U+00FF as raw
@@ -98,16 +117,25 @@ export interface NtfyMessage {
  * therefore goes as RFC 2047 encoded-words (`=?UTF-8?B?...?=`), which the ntfy
  * server decodes. Also check that live.
  */
-export function ntfyRequest(kind: 'publish', topic: string, message: NtfyMessage): HttpRequest;
-export function ntfyRequest(kind: 'cancel', topic: string, message: Pick<NtfyMessage, 'seq'>): HttpRequest;
-export function ntfyRequest(kind: 'publish' | 'cancel', topic: string, message: NtfyMessage | Pick<NtfyMessage, 'seq'>): HttpRequest {
+export function ntfyRequest(kind: 'publish', target: NtfyTarget, message: NtfyMessage): HttpRequest;
+export function ntfyRequest(kind: 'cancel', target: NtfyTarget, message: Pick<NtfyMessage, 'seq'>): HttpRequest;
+export function ntfyRequest(kind: 'publish' | 'cancel', target: NtfyTarget, message: NtfyMessage | Pick<NtfyMessage, 'seq'>): HttpRequest {
+  const base = topicUrl(target);
+  const auth = authHeaders(target.token);
   if (kind === 'cancel' || !('title' in message)) {
-    return { url: `${NTFY_SERVER}/${topic}/${message.seq}`, method: 'DELETE', timeoutMs: REQUEST_TIMEOUT_MS, credentials: 'omit' };
+    return {
+      url: `${base}/${message.seq}`,
+      method: 'DELETE',
+      ...(Object.keys(auth).length === 0 ? {} : { headers: auth }),
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      credentials: 'omit',
+    };
   }
   return {
-    url: `${NTFY_SERVER}/${topic}`,
+    url: base,
     method: 'POST',
     headers: {
+      ...auth,
       'X-Title': headerText(message.title),
       'X-Click': message.clickUrl,
       'X-Tags': 'hourglass',
@@ -118,6 +146,27 @@ export function ntfyRequest(kind: 'publish' | 'cancel', topic: string, message: 
     timeoutMs: REQUEST_TIMEOUT_MS,
     credentials: 'omit',
   };
+}
+
+/**
+ * T-123: the options page's "Send a test push": one immediate message (no
+ * X-Delay, no sequence id) to the configured server and topic.
+ */
+export function testPushRequest(target: NtfyTarget): HttpRequest {
+  return {
+    url: topicUrl(target),
+    method: 'POST',
+    headers: { ...authHeaders(target.token), 'X-Title': 'ShopBadwill test push', 'X-Tags': 'white_check_mark' },
+    body: 'If you can read this on your phone, ShopBadwill phone push works.',
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    credentials: 'omit',
+  };
+}
+
+/** `<server>/<topic>`, only for an allowed origin (the "configured origin only" guard). */
+function topicUrl(target: NtfyTarget): string {
+  if (!isAllowedServer(target.server)) throw new Error('the ntfy server is not a valid https origin');
+  return `${target.server}/${target.topic}`;
 }
 
 /** Bytes per encoded-word: 45 bytes → 60 base64 chars → 72 with the `=?UTF-8?B?` / `?=` frame (RFC 2047 caps a word at 75). */
@@ -161,11 +210,17 @@ export function fingerprintOf(e: DesiredEvent): string {
  * T-118 (L4): which topic a stored item's entries were published on, without
  * storing the topic (R3): 32-bit FNV-1a, hex. A record written by a publish
  * that raced a topic rotation then no longer reads as "already scheduled".
+ *
+ * T-123: the tag covers the server too, so entries from another server never
+ * count as scheduled. The default server keeps T-118's tag of the topic alone,
+ * so records written before T-123 stay valid; any other server hashes
+ * `<server> <topic>` (a space cannot occur in an origin or a topic).
  */
-export function topicTag(topic: string): string {
+export function topicTag(server: string, topic: string): string {
+  const text = server === NTFY_SERVER ? topic : `${server} ${topic}`;
   let h = 0x811c9dc5;
-  for (let i = 0; i < topic.length; i++) {
-    h ^= topic.charCodeAt(i);
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
     h = Math.imul(h, 0x01000193) >>> 0;
   }
   return h.toString(16).padStart(8, '0');
@@ -238,12 +293,15 @@ function scheduledSeqs(state: NtfyState): string[] {
 }
 
 /**
- * DELETE every stored scheduled message on the old topic. Deferred entries were
- * never published. Stops on 429/5xx (the caller does not retry in this click).
- * Never throws, and never puts the topic into an error.
+ * DELETE every stored scheduled message on the old server and topic, with the
+ * old token. Deferred entries were never published. Stops on 429/5xx (the
+ * caller does not retry in this click). Never throws, and never puts the topic
+ * or the token into an error.
  */
 export async function cancelScheduledMessages(opts: {
+  server: string;
   topic: string;
+  token?: string | undefined;
   state: NtfyState;
   http: Http;
   clock: Clock;
@@ -251,11 +309,12 @@ export async function cancelScheduledMessages(opts: {
 }): Promise<{ ok: boolean }> {
   const seqs = scheduledSeqs(opts.state);
   if (seqs.length === 0) return { ok: true };
-  if (!isValidTopic(opts.topic)) return { ok: false };
+  if (!isValidTopic(opts.topic) || !isAllowedServer(opts.server)) return { ok: false };
+  const target: NtfyTarget = { server: opts.server, topic: opts.topic, token: opts.token };
   const pacer = new Pacer(opts.clock, opts.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS);
   let ok = true;
   for (const seq of seqs) {
-    const request = ntfyRequest('cancel', opts.topic, { seq });
+    const request = ntfyRequest('cancel', target, { seq });
     let response;
     try {
       response = await pacer.run(() => opts.http.send(request));
@@ -299,21 +358,29 @@ export class NtfySink {
     return run;
   }
 
-  /** R2: the three conditions, plus the v1 server allow-list. Reads settings once per call. */
+  /** R2: the three conditions, plus a valid https origin (T-123). Reads settings once per call. */
   private async prepare(): Promise<
-    { status: 'ok'; topic: string; timeZone: string } | { status: 'disabled' | 'needs-permission' }
+    { status: 'ok'; target: NtfyTarget; tag: string; timeZone: string } | { status: 'disabled' | 'needs-permission' }
   > {
     const view = await this.deps.settings();
     const n = view.ntfy;
-    if (n === undefined || !n.enabled || !isValidTopic(n.topic) || n.server !== NTFY_SERVER) {
+    if (n === undefined || !n.enabled || !isValidTopic(n.topic) || !isAllowedServer(n.server)) {
       return { status: 'disabled' };
     }
     try {
-      if (!(await this.deps.permissions.contains({ origins: [NTFY_ORIGIN] }))) return { status: 'needs-permission' };
+      if (!(await this.deps.permissions.contains({ origins: [serverPermissionPattern(n.server)] }))) {
+        return { status: 'needs-permission' };
+      }
     } catch {
       return { status: 'needs-permission' };
     }
-    return { status: 'ok', topic: n.topic, timeZone: view.timeZone };
+    const token = view.token === undefined || view.token === '' ? undefined : view.token;
+    return {
+      status: 'ok',
+      target: { server: n.server, topic: n.topic, ...(token === undefined ? {} : { token }) },
+      tag: topicTag(n.server, n.topic),
+      timeZone: view.timeZone,
+    };
   }
 
   /** Records the R2 status in `sbw:ntfy`, auditing only on a change. */
@@ -374,9 +441,9 @@ export class NtfySink {
       }
       const now = this.deps.clock.now();
       const state = await this.deps.store.load();
-      const tag = topicTag(prep.topic);
+      const tag = prep.tag;
       const stored = state.items[event.itemId];
-      // T-118 (L4): entries stored for another topic are not scheduled on this one.
+      // T-118 (L4), T-123: entries stored for another topic or server are not scheduled on this one.
       const prev = stored !== undefined && (stored.topicTag ?? tag) === tag ? stored : undefined;
       const fingerprint = fingerprintOf(event);
 
@@ -387,7 +454,7 @@ export class NtfySink {
         // (429/5xx or a failed DELETE), keep the old fingerprint and every seq
         // not yet cancelled so the next upsert retries. Publishing now would
         // forget a seq whose generation changed and leave it live on ntfy.
-        const remaining = await this.cancelEntries(event.itemId, prep.topic, prev.entries);
+        const remaining = await this.cancelEntries(event.itemId, prep.target, prev.entries);
         if (remaining.some((entry) => entry.status === 'scheduled')) {
           await this.deps.store.update((s) => ({
             ...(s.status === undefined ? {} : { status: s.status }),
@@ -408,7 +475,7 @@ export class NtfySink {
         if (lead.status === 'deferred') {
           if (cur !== undefined && cur.status === 'scheduled') {
             // Defensive: cannot normally happen (fireAt derives from the fingerprint).
-            await this.cancelEntries(event.itemId, prep.topic, [cur]);
+            await this.cancelEntries(event.itemId, prep.target, [cur]);
           }
           byLead.set(lead.leadMin, { seq: lead.seq, leadMin: lead.leadMin, fireAt: lead.fireAt, status: 'deferred' });
           if (cur === undefined || cur.fireAt !== lead.fireAt) {
@@ -417,7 +484,7 @@ export class NtfySink {
           continue;
         }
         if (cur !== undefined && cur.status === 'scheduled' && cur.seq === lead.seq && cur.fireAt === lead.fireAt) continue;
-        const result = await this.publish(event.itemId, prep.topic, prep.timeZone, event, lead);
+        const result = await this.publish(event.itemId, prep.target, prep.timeZone, event, lead);
         if (result === 'ok') {
           const entry: NtfyEntry = { seq: lead.seq, leadMin: lead.leadMin, fireAt: lead.fireAt, status: 'scheduled' };
           byLead.set(lead.leadMin, entry);
@@ -429,12 +496,13 @@ export class NtfySink {
         }
       }
 
-      // T-118 (L4): the options page may have rotated the topic, or turned phone
-      // push off, while this pass published (it clears `sbw:ntfy` outside this
-      // sink's queue). Take this pass's pushes back off the old topic and record
-      // nothing: the next upsert publishes on the new topic.
-      if (published.length > 0 && (await this.topicMoved(prep.topic))) {
-        await this.cancelEntries(event.itemId, prep.topic, published);
+      // T-118 (L4): the options page may have rotated the topic (T-123: or
+      // changed the server), or turned phone push off, while this pass
+      // published (it clears `sbw:ntfy` outside this sink's queue). Take this
+      // pass's pushes back off the old topic and record nothing: the next
+      // upsert publishes on the new one.
+      if (published.length > 0 && (await this.topicMoved(tag))) {
+        await this.cancelEntries(event.itemId, prep.target, published);
         return;
       }
 
@@ -460,8 +528,8 @@ export class NtfySink {
       const state = await this.deps.store.load();
       const item = state.items[itemId];
       if (item === undefined) return;
-      if (item.topicTag !== undefined && item.topicTag !== topicTag(prep.topic)) {
-        // T-118 (L4): published on another topic; nothing of it is on this one to cancel.
+      if (item.topicTag !== undefined && item.topicTag !== prep.tag) {
+        // T-118 (L4), T-123: published on another topic or server; nothing of it is here to cancel.
         await this.deps.store.update((s) => ({
           ...(s.status === undefined ? {} : { status: s.status }),
           items: Object.fromEntries(Object.entries(s.items).filter(([key]) => key !== String(itemId))),
@@ -473,7 +541,7 @@ export class NtfySink {
       for (let i = 0; i < live.length; i++) {
         const entry = live[i];
         if (entry === undefined) continue;
-        const result = await this.cancel(itemId, prep.topic, entry);
+        const result = await this.cancel(itemId, prep.target, entry);
         if (result === 'ok') continue;
         kept.push(entry); // retried by a later remove (calendar sync re-feeds the item)
         if (result === 'rate-limited') {
@@ -500,11 +568,11 @@ export class NtfySink {
 
   // ── internals ─────────────────────────────────────────────────────────────
 
-  /** T-118 (L4): phone push is now off, or on another topic, than when this pass started. */
-  private async topicMoved(topic: string): Promise<boolean> {
+  /** T-118 (L4): phone push is now off, or on another topic or server (T-123), than when this pass started. */
+  private async topicMoved(tag: string): Promise<boolean> {
     try {
       const n = (await this.deps.settings()).ntfy;
-      return n === undefined || !n.enabled || n.topic !== topic;
+      return n === undefined || !n.enabled || topicTag(n.server, n.topic) !== tag;
     } catch {
       return false;
     }
@@ -527,12 +595,12 @@ export class NtfySink {
    * deferred ones (never published), failed cancels, and anything not attempted
    * because a 429/5xx stopped this sync.
    */
-  private async cancelEntries(itemId: ItemId, topic: string, entries: readonly NtfyEntry[]): Promise<NtfyEntry[]> {
+  private async cancelEntries(itemId: ItemId, target: NtfyTarget, entries: readonly NtfyEntry[]): Promise<NtfyEntry[]> {
     const cancelled = new Set<string>();
     let stop = false;
     for (const entry of entries) {
       if (stop || entry.status === 'deferred') continue;
-      const result = await this.cancel(itemId, topic, entry);
+      const result = await this.cancel(itemId, target, entry);
       if (result === 'ok') cancelled.add(entry.seq);
       else if (result === 'rate-limited') stop = true;
     }
@@ -541,14 +609,14 @@ export class NtfySink {
 
   private async publish(
     itemId: ItemId,
-    topic: string,
+    target: NtfyTarget,
     timeZone: string,
     event: DesiredEvent,
     lead: Lead,
   ): Promise<RequestResult> {
     if (this.deps.clock.now() < this.rateLimitedUntil) return 'rate-limited';
     const message = buildMessage(event, lead.leadMin, timeZone);
-    const request = ntfyRequest('publish', topic, { seq: lead.seq, ...message, fireAt: lead.fireAt });
+    const request = ntfyRequest('publish', target, { seq: lead.seq, ...message, fireAt: lead.fireAt });
     let response;
     try {
       response = await this.pacer.run(() => this.deps.http.send(request));
@@ -569,9 +637,9 @@ export class NtfySink {
     return 'failed';
   }
 
-  private async cancel(itemId: ItemId, topic: string, entry: NtfyEntry): Promise<RequestResult> {
+  private async cancel(itemId: ItemId, target: NtfyTarget, entry: NtfyEntry): Promise<RequestResult> {
     if (this.deps.clock.now() < this.rateLimitedUntil) return 'rate-limited';
-    const request = ntfyRequest('cancel', topic, { seq: entry.seq });
+    const request = ntfyRequest('cancel', target, { seq: entry.seq });
     let response;
     try {
       response = await this.pacer.run(() => this.deps.http.send(request));
@@ -599,7 +667,7 @@ export class NtfySink {
     return BACKOFF_MS;
   }
 
-  /** A label safe to audit: never the message, which may contain the topic (R3). */
+  /** A label safe to audit: never the message, which may contain the topic (R3) or the token. */
   private errorLabel(e: unknown): string {
     if (e instanceof HttpTimeoutError) return 'timeout';
     if (e instanceof HttpNetworkError) return 'network';

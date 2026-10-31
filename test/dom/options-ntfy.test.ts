@@ -148,7 +148,7 @@ describe('NtfySection', () => {
 
   it('turns phone push on and sends the whole ntfy group (server stays for later)', async () => {
     const { saved } = app();
-    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
     await waitFor(() => {
       expect(saved).toHaveLength(1);
     });
@@ -216,9 +216,9 @@ describe('NtfySection', () => {
     expect(await screen.findByText(/technicalAndInteraction/)).toBeTruthy();
   });
 
-  it('refuses a server other than https://ntfy.sh with a short explanation', async () => {
-    app({ settings: { ...defaultSettings(), ntfy: { enabled: true, server: 'https://evil.example', topic: TOPIC } } });
-    expect(await screen.findByText(/only https:\/\/ntfy\.sh/)).toBeTruthy();
+  it('flags a saved server that is not an https origin with a short explanation (T-123)', async () => {
+    app({ settings: { ...defaultSettings(), ntfy: { enabled: true, server: 'http://ntfy.example.com', topic: TOPIC } } });
+    expect(await screen.findByText(/not a valid https address/)).toBeTruthy();
   });
 
   it('turning phone push off DELETEs each stored scheduled seq, then clears sbw:ntfy, then saves off', async () => {
@@ -234,7 +234,7 @@ describe('NtfySection', () => {
       minIntervalMs: 0,
       order,
     });
-    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
     await waitFor(() => {
       expect(saved).toHaveLength(1);
     });
@@ -269,7 +269,7 @@ describe('NtfySection', () => {
       scheduled: memoryStore(storedSeqs(), []),
       minIntervalMs: 1000,
     });
-    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
     await flush(clock);
     await waitFor(() => {
       expect(saved).toHaveLength(1);
@@ -321,7 +321,7 @@ describe('NtfySection', () => {
       minIntervalMs: 0,
       order,
     });
-    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
     const status = await screen.findByText(/already-scheduled pushes may still arrive/i);
     expect(saved).toHaveLength(1);
     expect(saved[0]).toEqual({ ntfy: { enabled: false, server: NTFY_SERVER, topic: TOPIC } });
@@ -369,7 +369,7 @@ describe('NtfySection', () => {
         minIntervalMs: 0,
         order,
       });
-      fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+      fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
       await screen.findByText(/already-scheduled pushes may still arrive/i);
       expect(order.filter((x) => x.startsWith('DELETE'))).toHaveLength(0);
       expect(saved).toHaveLength(1);
@@ -385,7 +385,7 @@ describe('NtfySection', () => {
       scheduled: memoryStore(storedSeqs(), []),
       minIntervalMs: 0,
     });
-    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
     const status = await screen.findByText(/already-scheduled pushes may still arrive/i);
     expect(saved).toHaveLength(1);
     expect(status.textContent).toMatch(/phone push is off/i);
@@ -400,7 +400,7 @@ describe('NtfySection', () => {
       minIntervalMs: 0,
       saveFails: true,
     });
-    const toggle = await screen.findByLabelText<HTMLInputElement>('Phone push (ntfy.sh)');
+    const toggle = await screen.findByLabelText<HTMLInputElement>('Phone push (ntfy)');
     fireEvent.click(toggle);
     // Settled: the button is usable again and the toggle went back on.
     await waitFor(() => {
@@ -438,7 +438,7 @@ describe('NtfySection', () => {
   it('turning phone push on, or off with nothing scheduled, makes no request', async () => {
     const order: string[] = [];
     const { saved } = app({ http: recordingHttp(order), minIntervalMs: 0, order, scheduled: memoryStore(undefined, order) });
-    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
     await waitFor(() => {
       expect(saved).toHaveLength(1);
     });
@@ -457,7 +457,7 @@ describe('NtfySection', () => {
       minIntervalMs: 0,
       order: offOrder,
     });
-    fireEvent.click(await screen.findByLabelText('Phone push (ntfy.sh)'));
+    fireEvent.click(await screen.findByLabelText('Phone push (ntfy)'));
     await waitFor(() => {
       expect(second.saved).toHaveLength(1);
     });
