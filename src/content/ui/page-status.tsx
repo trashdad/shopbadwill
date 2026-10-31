@@ -15,7 +15,7 @@ export type PageView =
   /** settings.overlay.enabled is off: nothing visible. */
   | { kind: 'off' }
   | { kind: 'idle'; text: string }
-  /** T-120: an item page: the status plus the "Snipe…" deep link (ui.openSnipe only, never arms). */
+  /** An item page: the pill renders nothing; T-124's action panel (item-panel.ts) stands in for it. */
   | { kind: 'item'; text: string; itemId: ItemId }
   | { kind: 'hidden'; count: number }
   | { kind: 'shown'; count: number }
@@ -26,16 +26,15 @@ export interface PageStatusProps {
   collapsed: boolean;
   onShowAll: () => void;
   onHideAgain: () => void;
-  /** Trusted clicks only. */
-  onSnipe: (itemId: ItemId) => void;
   onCollapse: () => void;
   onExpand: () => void;
 }
 
-function summary(view: Exclude<PageView, { kind: 'off' }>): string {
+type Shown = Exclude<PageView, { kind: 'off' } | { kind: 'item' }>;
+
+function summary(view: Shown): string {
   switch (view.kind) {
     case 'idle':
-    case 'item':
       return view.text;
     case 'hidden':
       return `ShopBadwill: ${String(view.count)} hidden`;
@@ -46,27 +45,10 @@ function summary(view: Exclude<PageView, { kind: 'off' }>): string {
   }
 }
 
-function body(view: Exclude<PageView, { kind: 'off' }>, p: PageStatusProps): VNode {
+function body(view: Shown, p: PageStatusProps): VNode {
   switch (view.kind) {
     case 'idle':
       return <div role="status">{view.text}</div>;
-    case 'item':
-      return (
-        <>
-          <div role="status">{view.text}</div>
-          <button
-            type="button"
-            data-action="snipe"
-            title="Open the dashboard to arm a snipe (never arms from here)"
-            onClick={(e) => {
-              if (!e.isTrusted) return;
-              p.onSnipe(view.itemId);
-            }}
-          >
-            Snipe…
-          </button>
-        </>
-      );
     case 'hidden':
       return (
         <div role="status">
@@ -94,7 +76,7 @@ function body(view: Exclude<PageView, { kind: 'off' }>, p: PageStatusProps): VNo
 
 export function PageStatus(p: PageStatusProps): VNode | null {
   const { view } = p;
-  if (view.kind === 'off') return null;
+  if (view.kind === 'off' || view.kind === 'item') return null;
   if (p.collapsed) {
     const count = view.kind === 'hidden' || view.kind === 'shown' ? String(view.count) : '';
     return (

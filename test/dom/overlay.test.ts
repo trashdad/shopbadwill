@@ -258,6 +258,8 @@ interface SetupOpts {
   storageGetThrows?: boolean;
   /** Runs on the loaded fixture before the overlay starts. */
   prepare?: () => void;
+  /** More storage.local records to seed (e.g. `sbw:tracked`, `sbw:snipes`). */
+  seed?: Record<string, unknown>;
 }
 
 async function setup(opts: SetupOpts = {}) {
@@ -268,6 +270,7 @@ async function setup(opts: SetupOpts = {}) {
   storage.seed({
     'sbw:settings': 'rawSettings' in opts ? opts.rawSettings : (opts.settings ?? defaultSettings()),
     'sbw:rules': opts.rules ?? [HIDE, HL],
+    ...opts.seed,
   });
   const decisions = new Map<number, MatchResult>();
   /** Message types whose background handler throws. */
@@ -291,6 +294,8 @@ async function setup(opts: SetupOpts = {}) {
   m.handle('rules.disable', ack('rules.disable'));
   m.handle('page.detail', ack('page.detail'));
   m.handle('ui.openSnipe', ack('ui.openSnipe'));
+  m.handle('tracked.add', ack('tracked.add'));
+  m.handle('tracked.remove', ack('tracked.remove'));
   const overlay = startOverlay({
     win: window,
     messaging: m,
@@ -486,7 +491,9 @@ describe('decorations', () => {
     expect(count('[data-sbw-stub], [data-sbw-label], [data-sbw-tools]')).toBe(0);
     expect(sentOf(s.m, 'rules.evaluate')).toEqual([]);
     expect(sentOf(s.m, 'page.domHealth')).toEqual([]);
-    expect(barText()).toBe('ShopBadwill ready');
+    // T-124: the item page shows the action panel instead of the pill.
+    expect(barText()).toBe('');
+    expect(count('sbw-item-panel')).toBe(1);
   });
 
   it('a card without tap data is never hidden (unknown never holds)', async () => {
@@ -883,7 +890,8 @@ describe('page lifecycle', () => {
     s.overlay.onLocationChange(ITEM_URL);
     await s.overlay.scan();
     expect(count('[data-sbw-stub], [data-sbw-label], [data-sbw-tools]')).toBe(0);
-    expect(barText()).toBe('ShopBadwill ready');
+    expect(barText()).toBe(''); // T-124: the item page panel stands in for the pill
+    expect(count('sbw-item-panel')).toBe(1);
     s.loc.href = `${SEARCH_URL}&p=2`;
     s.overlay.onLocationChange(s.loc.href);
     await s.overlay.scan();
@@ -1519,7 +1527,6 @@ describe('T-120: item pages', () => {
     post({ source: TAP_SOURCE, nonce: o.nonce, kind: 'response', url, status, body });
   }
   const itemSetup = (opts: SetupOpts = {}) => setup({ fixture: 'item-page-logged-in', url: ITEM_URL, ...opts });
-  const snipeButton = (): HTMLButtonElement => button(pageRoot(), 'snipe');
 
   it('reports the item detail the page itself loaded (page.detail), once per reply', async () => {
     const s = await itemSetup();
@@ -1547,30 +1554,11 @@ describe('T-120: item pages', () => {
     expect(sentOf(s.m, 'page.detail')).toEqual([]);
   });
 
-  it('shows the Snipe… deep link; a trusted click sends ONLY ui.openSnipe for the page item', async () => {
-    const s = await itemSetup();
-    expect(barText()).toBe('ShopBadwill ready');
-    const before = s.m.sent.length;
-    click(snipeButton(), false); // synthetic: nothing
-    await tick();
-    expect(s.m.sent.length).toBe(before);
-    click(snipeButton(), true);
-    await tick();
-    expect(s.m.sent.slice(before)).toEqual([{ type: 'ui.openSnipe', payload: { itemId: ITEM_ID } }]);
-  });
-
-  it('no Snipe… link on a search page, with the kill switch on, or with the overlay off', async () => {
-    await setup();
+  it('T-124: the corner pill renders nothing on an item page (the action panel stands in for it)', async () => {
+    await itemSetup();
+    expect(pageRoot().querySelector('[role="status"]')).toBeNull();
     expect(pageRoot().querySelector('[data-action="snipe"]')).toBeNull();
-    current?.stop();
-    document.body.replaceChildren();
-    await itemSetup({ settings: { ...defaultSettings(), killSwitch: true } });
-    expect(pageRoot().querySelector('[data-action="snipe"]')).toBeNull();
-    current?.stop();
-    document.body.replaceChildren();
-    const off = defaultSettings();
-    await itemSetup({ settings: { ...off, overlay: { ...off.overlay, enabled: false } } });
-    expect(pageRoot().querySelector('[data-action="snipe"]')).toBeNull();
+    expect(count('sbw-item-panel')).toBe(1);
   });
 
   it('makes zero requests to SGW on an item page (no fetch, no XHR)', async () => {
@@ -1579,10 +1567,347 @@ describe('T-120: item pages', () => {
     const s = await itemSetup({ badges: BADGES });
     tapDetail(s.overlay, DETAIL_JSON);
     await s.overlay.scan();
-    click(snipeButton(), true);
     await tick();
+    for (const action of ['panel-snipe', 'panel-track']) click(button(panelRoot(), action), true);
+    await tick();
+    expect(sentOf(s.m, 'ui.openSnipe')).toHaveLength(1);
+    expect(sentOf(s.m, 'tracked.add')).toHaveLength(1);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(xhrSpy).not.toHaveBeenCalled();
     expect(sentOf(s.m, 'page.detail')).toHaveLength(1);
+  });
+});
+
+// ── T-124: the item page action panel ─────────────────────────────────────────
+
+function panelHost(): Element {
+  const host = document.querySelector('sbw-item-panel');
+  if (host === null) throw new Error('no item panel');
+  return host;
+}
+const panelRoot = (): ShadowRoot => closedRoot(panelHost());
+const panelText = (): string =>
+  Array.from(panelRoot().querySelectorAll('[role="status"] li'))
+    .map((li) => norm(li.textContent))
+    .join(' ');
+const panelMsg = (): string => norm(panelRoot().querySelector('.msg')?.textContent);
+const panelActions = (): string[] =>
+  Array.from(panelRoot().querySelectorAll('button')).map((b) => b.getAttribute('data-action') ?? '');
+
+describe('T-124: item page action panel', () => {
+  const ITEM_ID = 694349278;
+  const DETAIL_API = `https://buyerapi.shopgoodwill.com/api/ItemDetail/GetItemDetailModelByItemId/${String(ITEM_ID)}`;
+  const CLOSED_JSON = JSON.parse(readFileSync(resolve(FIX, 'json/item-detail-closed.json'), 'utf8')) as Record<string, unknown>;
+  const OTHER_ID = 702801256; // item-detail-open / -closed
+  const itemUrl = (id: number): string => `https://shopgoodwill.com/item/${String(id)}`;
+  function tapDetail(o: Overlay, body: unknown, itemId = ITEM_ID): void {
+    const url = DETAIL_API.replace(String(ITEM_ID), String(itemId));
+    post({ source: TAP_SOURCE, nonce: o.nonce, kind: 'response', url, status: 200, body });
+  }
+  const itemSetup = (opts: SetupOpts = {}) => setup({ fixture: 'item-page-logged-in', url: ITEM_URL, ...opts });
+  const trackedItem = (over: Record<string, unknown> = {}) => ({
+    itemId: ITEM_ID,
+    title: 'Fixture item',
+    endTime: '2026-10-08T22:00:00.000Z',
+    sellerId: 1,
+    reasons: [{ kind: 'manual' }],
+    favoriteState: 'none',
+    calendar: false,
+    addedAt: 1,
+    updatedAt: 1,
+    ...over,
+  });
+  const armedSnipe = (over: Record<string, unknown> = {}) => ({
+    id: 's-1',
+    itemId: ITEM_ID,
+    title: 'Fixture item',
+    endTime: '2026-10-08T22:00:00.000Z',
+    endTimeAtArm: '2026-10-08T22:00:00.000Z',
+    maxBid: 2500,
+    leadMs: 6000,
+    fallback: 'skip',
+    dryRun: true,
+    state: 'armed',
+    armedAt: 5,
+    attempt: {},
+    history: [],
+    ...over,
+  });
+  /** Lets the panel's storage read land and re-render. */
+  const settle = async (): Promise<void> => {
+    await tick();
+    await tick();
+  };
+
+  it("renders right after SGW's bidding control (a sibling: SGW's own component content is untouched)", async () => {
+    await itemSetup();
+    await settle();
+    const host = panelHost();
+    expect(host.previousElementSibling?.tagName.toLowerCase()).toBe('app-bidding-control');
+    expect(host.getAttribute('data-sbw-placement')).toBe('inline');
+    expect(host.getAttribute('data-sbw-item-panel')).toBe(String(ITEM_ID));
+    expect(document.querySelector('app-bidding-control sbw-item-panel')).toBeNull();
+    // Isolated: a closed shadow root with its own stylesheet (no page CSS in, none out).
+    expect(host.shadowRoot).toBeNull();
+    expect(panelRoot().querySelector('style')?.textContent).toContain('min-height: 44px');
+    expect(panelText()).toBe('Not tracked No snipe set Dry run: a snipe set now will not bid');
+    expect(panelActions()).toEqual(['panel-snipe', 'panel-track']);
+  });
+
+  it('floats bottom-right without an anchor, and moves next to the bid area once SGW renders it', async () => {
+    const held: { control: Element | null } = { control: null };
+    const s = await itemSetup({
+      prepare: () => {
+        held.control = document.querySelector('app-bidding-control');
+        held.control?.remove();
+      },
+    });
+    const { control } = held;
+    await settle();
+    expect(panelHost().parentElement).toBe(document.body);
+    expect(panelHost().getAttribute('data-sbw-placement')).toBe('fixed');
+    expect(panelActions()).toEqual(['panel-snipe', 'panel-track']);
+    // SGW (Angular) renders its bidding control later: the mutation re-scan moves the panel there.
+    const block = document.querySelector('#itemblock > div');
+    if (control === null || block === null) throw new Error('fixture changed');
+    block.append(control);
+    await sleep(40);
+    await s.overlay.scan();
+    expect(panelHost().previousElementSibling).toBe(control);
+    expect(panelHost().getAttribute('data-sbw-placement')).toBe('inline');
+    expect(count('sbw-item-panel')).toBe(1);
+  });
+
+  it('is put back when an SGW re-render drops it, never duplicated', async () => {
+    const s = await itemSetup();
+    await settle();
+    panelHost().remove(); // e.g. Angular rebuilt #itemblock
+    document.querySelector('app-bidding-control')?.setAttribute('id', 'rerendered');
+    await sleep(40);
+    await s.overlay.scan();
+    expect(count('sbw-item-panel')).toBe(1);
+    expect(panelHost().previousElementSibling?.tagName.toLowerCase()).toBe('app-bidding-control');
+  });
+
+  it('Snipe… sends ONLY ui.openSnipe for the page item, on a trusted click only', async () => {
+    const s = await itemSetup();
+    await settle();
+    const before = s.m.sent.length;
+    click(button(panelRoot(), 'panel-snipe'), false);
+    await tick();
+    expect(s.m.sent.length).toBe(before);
+    click(button(panelRoot(), 'panel-snipe'), true);
+    await tick();
+    expect(s.m.sent.slice(before)).toEqual([{ type: 'ui.openSnipe', payload: { itemId: ITEM_ID } }]);
+  });
+
+  it('Track sends tracked.add (trusted only); the stored item then reads Tracked', async () => {
+    const s = await itemSetup();
+    await settle();
+    click(button(panelRoot(), 'panel-track'), false);
+    await tick();
+    expect(sentOf(s.m, 'tracked.add')).toEqual([]);
+    click(button(panelRoot(), 'panel-track'), true);
+    await settle();
+    expect(sentOf(s.m, 'tracked.add')).toEqual([{ itemId: ITEM_ID }]);
+    expect(panelMsg()).toBe('Tracking this item.');
+    // The background writes sbw:tracked; the panel follows storage.
+    await s.storage.set({ 'sbw:tracked': { [ITEM_ID]: trackedItem() } });
+    await settle();
+    expect(panelText()).toContain('Tracked');
+    expect(panelActions()).toEqual(['panel-snipe', 'panel-stop']);
+  });
+
+  it('a refused Track says to reload the page (the background holds no detail)', async () => {
+    const s = await itemSetup();
+    await settle();
+    s.fail.add('tracked.add');
+    click(button(panelRoot(), 'panel-track'), true);
+    await settle();
+    expect(panelMsg()).toBe('Could not track this item. Reload the page and try again.');
+    expect(panelRoot().querySelector('[role="alert"]')).not.toBeNull();
+  });
+
+  it('Stop tracking asks first; Cancel sends nothing; Yes sends tracked.remove once (trusted clicks only)', async () => {
+    const s = await itemSetup({ seed: { 'sbw:tracked': { [ITEM_ID]: trackedItem() } } });
+    await settle();
+    expect(panelText()).toBe('Tracked No snipe set Dry run: a snipe set now will not bid');
+    click(button(panelRoot(), 'panel-stop'), false);
+    await tick();
+    expect(panelActions()).toEqual(['panel-snipe', 'panel-stop']);
+    click(button(panelRoot(), 'panel-stop'), true);
+    await tick();
+    expect(sentOf(s.m, 'tracked.remove')).toEqual([]);
+    expect(norm(panelRoot().querySelector('.confirm')?.textContent)).toBe('Stop tracking this item?');
+    expect(panelActions()).toEqual(['panel-snipe', 'panel-stop-yes', 'panel-stop-cancel']);
+    click(button(panelRoot(), 'panel-stop-cancel'), true);
+    await tick();
+    expect(panelActions()).toEqual(['panel-snipe', 'panel-stop']);
+    click(button(panelRoot(), 'panel-stop'), true);
+    await tick();
+    click(button(panelRoot(), 'panel-stop-yes'), false);
+    await tick();
+    expect(sentOf(s.m, 'tracked.remove')).toEqual([]);
+    click(button(panelRoot(), 'panel-stop-yes'), true);
+    await settle();
+    expect(sentOf(s.m, 'tracked.remove')).toEqual([{ itemId: ITEM_ID }]);
+    expect(panelMsg()).toBe('Stopped tracking.');
+    expect(s.m.sent.filter((x) => x.type !== 'page.domHealth').map((x) => x.type)).toEqual(['tracked.remove']);
+  });
+
+  it('"On your calendar" only when our event is really synced there; calendar words in the confirm then', async () => {
+    const settings = { ...defaultSettings(), calendar: { ...defaultSettings().calendar, enabled: true }, dryRun: { favorites: true, calendar: false, bidding: false } };
+    const link = { itemId: ITEM_ID, eventId: 'sbwevt1', generation: 1, calendarId: 'cal', lastSyncedHash: 'h', status: 'synced' };
+    const s = await itemSetup({ settings, seed: { 'sbw:tracked': { [ITEM_ID]: trackedItem({ calendar: true }) }, 'sbw:calendar': { links: {} } } });
+    await settle();
+    expect(panelText()).toBe('Tracked No snipe set');
+    await s.storage.set({ 'sbw:calendar': { links: { [ITEM_ID]: { ...link, status: 'pending' } } } });
+    await settle();
+    expect(panelText()).toBe('Tracked No snipe set');
+    await s.storage.set({ 'sbw:calendar': { links: { [ITEM_ID]: link } } });
+    await settle();
+    expect(panelText()).toBe('Tracked · On your calendar No snipe set');
+    click(button(panelRoot(), 'panel-stop'), true);
+    await tick();
+    expect(norm(panelRoot().querySelector('.confirm')?.textContent)).toBe('Stop tracking this item? Its event leaves your calendar at the next sync.');
+    click(button(panelRoot(), 'panel-stop-yes'), true);
+    await settle();
+    expect(panelMsg()).toBe('Stopped tracking. Its event leaves your calendar at the next sync.');
+  });
+
+  it('shows the calendar dry run for an item tracked for the calendar', async () => {
+    const settings = { ...defaultSettings(), calendar: { ...defaultSettings().calendar, enabled: true } };
+    await itemSetup({ settings, seed: { 'sbw:tracked': { [ITEM_ID]: trackedItem({ calendar: true }) } } });
+    await settle();
+    expect(panelText()).toBe('Tracked No snipe set Dry run: a snipe set now will not bid Calendar dry run: nothing is written to your calendar');
+  });
+
+  it('an open snipe reads "Snipe armed: max $X · Open" and opens it (ui.openSnipe only); Stop waits for the snipe', async () => {
+    const s = await itemSetup({
+      seed: {
+        'sbw:tracked': { [ITEM_ID]: trackedItem({ reasons: [{ kind: 'snipe', id: 's-1' }] }) },
+        'sbw:snipes': { 's-0': armedSnipe({ id: 's-0', state: 'resolved', maxBid: 100, armedAt: 9 }), 's-1': armedSnipe() },
+      },
+    });
+    await settle();
+    expect(panelText()).toBe('Tracked Snipe armed: max $25.00 (dry run)');
+    const open = button(panelRoot(), 'panel-snipe');
+    expect(norm(open.textContent)).toBe('Snipe armed: max $25.00 (dry run) · Open');
+    expect(button(panelRoot(), 'panel-stop').disabled).toBe(true);
+    expect(norm(panelRoot().querySelector('.note')?.textContent)).toBe('Cancel the snipe first (in the dashboard).');
+    const before = s.m.sent.length;
+    click(open, true);
+    await tick();
+    expect(s.m.sent.slice(before)).toEqual([{ type: 'ui.openSnipe', payload: { itemId: ITEM_ID } }]);
+    // A live snipe: no dry-run words.
+    await s.storage.set({ 'sbw:snipes': { 's-1': armedSnipe({ dryRun: false, maxBid: 123456 }) } });
+    await settle();
+    expect(norm(button(panelRoot(), 'panel-snipe').textContent)).toBe('Snipe armed: max $1,234.56 · Open');
+  });
+
+  it('an ended auction shows the status only: SGW says closed (the tap detail)', async () => {
+    const s = await itemSetup({ url: itemUrl(OTHER_ID) });
+    await settle();
+    expect(panelActions()).toEqual(['panel-snipe', 'panel-track']);
+    tapDetail(s.overlay, CLOSED_JSON, OTHER_ID);
+    await settle();
+    expect(panelActions()).toEqual([]);
+    expect(panelText()).toBe('This auction has ended Not tracked No snipe set');
+  });
+
+  it('an ended auction shows the status only: past its end, with no Stop tracking either', async () => {
+    await itemSetup({ seed: { 'sbw:tracked': { [ITEM_ID]: trackedItem({ endTime: '2026-10-07T18:00:00.000Z' }) } } });
+    await settle();
+    expect(panelActions()).toEqual([]);
+    expect(panelText()).toBe('This auction has ended Tracked No snipe set');
+  });
+
+  it('no panel with the kill switch on, the overlay off, or unreadable settings; the kill switch removes a shown one', async () => {
+    await itemSetup({ settings: { ...defaultSettings(), killSwitch: true } });
+    await settle();
+    expect(count('sbw-item-panel')).toBe(0);
+    expect(barText()).toBe('ShopBadwill paused (kill switch)');
+    current?.stop();
+    document.body.replaceChildren();
+    const off = defaultSettings();
+    await itemSetup({ settings: { ...off, overlay: { ...off.overlay, enabled: false } } });
+    await settle();
+    expect(count('sbw-item-panel')).toBe(0);
+    current?.stop();
+    document.body.replaceChildren();
+    await itemSetup({ rawSettings: { garbage: true } });
+    await settle();
+    expect(count('sbw-item-panel')).toBe(0);
+    current?.stop();
+    document.body.replaceChildren();
+    const s = await itemSetup();
+    await settle();
+    expect(count('sbw-item-panel')).toBe(1);
+    await s.storage.set({ 'sbw:settings': { ...defaultSettings(), killSwitch: true } });
+    await s.overlay.scan();
+    expect(count('sbw-item-panel')).toBe(0);
+  });
+
+  it('SPA navigation: item to item updates the one panel; to a search page removes it; back shows one again', async () => {
+    const s = await itemSetup({ seed: { 'sbw:tracked': { [ITEM_ID]: trackedItem() } } });
+    await settle();
+    expect(panelText()).toContain('Tracked');
+    click(button(panelRoot(), 'panel-stop'), true); // a confirm step open on the old item...
+    await tick();
+    s.loc.href = itemUrl(OTHER_ID);
+    s.overlay.onLocationChange(s.loc.href);
+    await s.overlay.scan();
+    await settle();
+    expect(count('sbw-item-panel')).toBe(1);
+    expect(panelHost().getAttribute('data-sbw-item-panel')).toBe(String(OTHER_ID));
+    expect(panelText()).toBe('Not tracked No snipe set Dry run: a snipe set now will not bid'); // ...is gone
+    click(button(panelRoot(), 'panel-snipe'), true);
+    await tick();
+    expect(sentOf(s.m, 'ui.openSnipe')).toEqual([{ itemId: OTHER_ID }]);
+    s.loc.href = SEARCH_URL;
+    s.overlay.onLocationChange(SEARCH_URL);
+    await s.overlay.scan();
+    expect(count('sbw-item-panel')).toBe(0);
+    s.loc.href = ITEM_URL;
+    s.overlay.onLocationChange(ITEM_URL);
+    await s.overlay.scan();
+    await settle();
+    expect(count('sbw-item-panel')).toBe(1);
+    expect(panelText()).toContain('Tracked');
+  });
+
+  it("removes a stray panel host (an older script's) so there is only ever one, and stop() removes ours", async () => {
+    const stray = document.createElement('sbw-item-panel');
+    stray.setAttribute('data-sbw-item-panel', '1');
+    const s = await itemSetup({
+      prepare: () => {
+        document.body.append(stray);
+      },
+    });
+    await settle();
+    expect(stray.isConnected).toBe(false);
+    expect(count('sbw-item-panel')).toBe(1);
+    s.overlay.stop();
+    expect(count('[data-sbw-item-panel]')).toBe(0);
+  });
+
+  it('SPA from a search page with the Navigation API order (event before the URL commit): the panel still appears, on its own', async () => {
+    const s = await setup();
+    await settle();
+    expect(count('sbw-item-panel')).toBe(0);
+    s.overlay.onLocationChange(ITEM_URL); // the event fires first...
+    s.loc.href = ITEM_URL; // ...then the URL commits, and SGW swaps the page in
+    loadFixture('item-page-logged-in');
+    await sleep(80); // only the overlay's own debounce and observer: no explicit scan
+    await settle();
+    expect(count('sbw-item-panel')).toBe(1);
+    expect(panelHost().previousElementSibling?.tagName.toLowerCase()).toBe('app-bidding-control');
+  });
+
+  it('no panel on a search page (the pill stays as it was)', async () => {
+    await setup();
+    await settle();
+    expect(count('sbw-item-panel')).toBe(0);
+    expect(barText()).not.toBe('');
   });
 });
