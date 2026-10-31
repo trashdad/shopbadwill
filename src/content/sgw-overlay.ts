@@ -4,7 +4,9 @@
 // `page.token`, `page.listings`, `page.detail` (T-120: item pages), `page.domHealth`,
 // `rules.evaluate` and the user's `quick.*` and `ui.openSnipe` intents, all to
 // the background. The overlay itself never
-// talks to SGW: zero extra requests.
+// talks to SGW: zero extra requests. On item pages the T-124 action panel
+// (item-panel.ts) stands in for the corner pill, under the same overlay-off,
+// kill-switch and unreadable-settings checks (view()).
 //
 // Rules this file keeps:
 //  - The nonce goes on <html> synchronously at start (document_start), so the
@@ -45,12 +47,13 @@ import { RuleSchema, type MatchResult, type Rule } from '../domain/rules/schema'
 import { defaultSettings } from '../domain/settings/defaults';
 import { SettingsSchema, type Settings } from '../domain/settings/schema';
 import { STORAGE_KEYS } from '../domain/storage/schema';
-import type { ItemId, Listing } from '../domain/types';
+import type { ItemDetail, ItemId, Listing } from '../domain/types';
 import type { MsgPayload } from '../messaging/protocol';
 import type { MessagingClient } from '../ports/messaging';
 import type { Decoration } from '../ports/sgw-dom';
 import type { Storage } from '../ports/storage';
 import { NONCE_ATTR } from './api-tap.main';
+import { createItemPanel } from './item-panel';
 import { parseTapMessage } from './tap-message';
 import { BADGES, type CardBadge } from './ui/badge-registry';
 import { CardTools } from './ui/card-tools';
@@ -77,7 +80,7 @@ const SEARCH_PATH = new URL(SGW_ENDPOINTS.search.path, SGW_API_BASE).pathname.to
 const ITEM_PAGE_RE = new RegExp(SGW_PAGE_PATTERNS.item);
 /** Elements we insert: our tags, and the markers the DomAdapter and we put on our own nodes. */
 const OUR_TAG = /^(sbw-|shopbadwill-)/i;
-const OUR_ATTRS = ['data-sbw-stub', 'data-sbw-label', 'data-sbw-tools', 'data-sbw-why'] as const;
+const OUR_ATTRS = ['data-sbw-stub', 'data-sbw-label', 'data-sbw-tools', 'data-sbw-why', 'data-sbw-item-panel'] as const;
 const NONE: Decoration = { kind: 'none' };
 const RulesSchema = z.array(RuleSchema);
 
@@ -321,6 +324,9 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   let applying: AdapterCardHandle | null = null;
   let pageUi: { remove(): void } | null = null;
   let pageContainer: HTMLElement | null = null;
+  /** T-124: the item page's own detail, as the tap relayed it (for the panel's ended state). */
+  let pageDetail: ItemDetail | null = null;
+  const itemPanel = createItemPanel({ doc, storage, client, now });
 
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   let firstPendingAt = 0;
@@ -375,7 +381,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     return p.lastSearchCount !== null || p.replyWaitOver;
   }
 
-  function send<K extends 'page.token' | 'page.listings' | 'page.detail' | 'page.domHealth' | 'ui.openSnipe'>(type: K, payload: MsgPayload<K>): void {
+  function send<K extends 'page.token' | 'page.listings' | 'page.detail' | 'page.domHealth'>(type: K, payload: MsgPayload<K>): void {
     try {
       void client.send(type, payload).catch(() => undefined);
     } catch {
@@ -707,17 +713,22 @@ export function startOverlay(deps: OverlayDeps): Overlay {
   }
 
   function renderPage(): void {
+    if (stopped) return;
+    const v = view();
+    // T-124: on an item page the panel stands in for the pill (which renders nothing there).
+    if (initialized) {
+      safe(() => {
+        itemPanel.update(v.kind === 'item' ? { itemId: v.itemId, detail: pageDetail, settings } : null);
+      });
+    }
     const container = pageContainer;
-    if (container === null || stopped) return;
+    if (container === null) return;
     safe(() => {
       render(
         h(PageStatus, {
-          view: view(),
+          view: v,
           collapsed: pillCollapsed,
           onShowAll: showAll,
-          onSnipe: (itemId: ItemId) => {
-            send('ui.openSnipe', { itemId });
-          },
           onHideAgain: hideAgain,
           onCollapse: () => {
             pillCollapsed = true;
@@ -913,7 +924,10 @@ export function startOverlay(deps: OverlayDeps): Overlay {
     } catch {
       return; // not a detail reply we understand: ignore it
     }
-    if (detail.itemId === itemId) send('page.detail', { detail });
+    if (detail.itemId !== itemId) return;
+    send('page.detail', { detail });
+    pageDetail = detail;
+    renderPage();
   }
 
   function onMessage(ev: MessageEvent): void {
@@ -1064,6 +1078,7 @@ export function startOverlay(deps: OverlayDeps): Overlay {
       offRules();
       offSwitches();
       clearAll();
+      itemPanel.destroy();
       const ui = pageUi;
       pageUi = null;
       safe(() => ui?.remove());

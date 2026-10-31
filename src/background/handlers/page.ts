@@ -1,7 +1,7 @@
 // T-36: what content scripts report from SGW pages (`page.*`).
 //
 // - page.listings and page.detail are kept in memory per tab (ctx.pages) for
-//   rules.preview and quick.track. Tap data is untrusted: the router has
+//   rules.preview, quick.track and (T-124, per tab) tracked.add. Tap data is untrusted: the router has
 //   already schema-validated it, and it is only ever rendered as text.
 // - page.token goes to the one SessionAdapter (T-28 validates the JWT, the
 //   BuyerId and the rejection history), as `source: 'tap'`.
@@ -24,7 +24,7 @@ export function register(ctx: BackgroundContext): void {
 
   router.register('page.detail', ({ detail }, hctx) => {
     requireContent('page.detail', hctx);
-    pages.recordDetail(detail);
+    pages.recordDetail(detail, tabIdOf(hctx.sender));
     return undefined;
   });
 

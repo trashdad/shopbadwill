@@ -125,6 +125,20 @@ function firstMatch(root: ParentNode, selectors: readonly string[]): Element | n
   return null;
 }
 
+/**
+ * T-124: the item page's bid area (SGW's bidding control), where the overlay's
+ * action panel goes (right after it, as a sibling, so SGW's own component
+ * content is never touched). Ranked selectors from config.ts; null when none
+ * matches or the match has no parent, and the panel then floats instead.
+ */
+export function findItemBidArea(root: ParentNode): Element | null {
+  for (const s of SGW_SELECTORS.item.biddingControl) {
+    const el = root.querySelector(s);
+    if (el?.parentElement != null) return el;
+  }
+  return null;
+}
+
 function styleBase(el: Element): string | null {
   const saved = el.getAttribute(A_STYLE0);
   if (saved === null) return el.getAttribute('style');

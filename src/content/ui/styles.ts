@@ -61,3 +61,30 @@ export const PAGE_CSS = `
 .dot.warn { background: #b35c00; }
 .pill button:focus-visible, .dot:focus-visible { outline: 2px solid #93c5fd; outline-offset: 1px; }
 `;
+
+/**
+ * T-124: the item page action panel (closed shadow root). Inline right after
+ * SGW's bidding control; with no anchor found it floats bottom-right
+ * (`data-sbw-placement="fixed"`). Big, full-width buttons, at least 44px tall.
+ */
+export const PANEL_CSS = `
+:host { display: block; margin: 12px 0 16px; text-align: left; }
+:host([data-sbw-placement="fixed"]) { position: fixed; right: 12px; bottom: 12px; z-index: 2147483647; margin: 0;
+  width: min(320px, calc(100vw - 24px)); max-height: calc(100vh - 24px); overflow: auto; }
+.panel { box-sizing: border-box; padding: 12px; border: 2px solid #1f2937; border-radius: 8px; background: #fff; color: #1f2937;
+  font: 14px/1.4 system-ui, sans-serif; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15); }
+.head { margin: 0 0 6px; font-weight: 700; font-size: 15px; }
+.lines { margin: 0 0 4px; padding: 0; list-style: none; }
+.lines li { margin: 2px 0; overflow-wrap: anywhere; }
+.lines .dry, .note { color: #6b4e00; }
+.note, .confirm, .msg { margin: 8px 0 0; }
+.confirm { font-weight: 600; }
+.msg { color: #1e5e2e; } .msg.alert { color: #a50e0e; }
+button.big { display: block; box-sizing: border-box; width: 100%; min-height: 44px; margin: 8px 0 0; padding: 10px 12px;
+  border: 2px solid #1f2937; border-radius: 6px; background: #1f2937; color: #fff; font: 600 16px/1.25 system-ui, sans-serif;
+  text-align: center; cursor: pointer; }
+button.big.secondary { background: #fff; color: #1f2937; }
+button.big.danger { border-color: #a50e0e; background: #a50e0e; }
+button.big[disabled] { opacity: 0.55; cursor: default; }
+button.big:focus-visible { outline: 3px solid #1a5fb4; outline-offset: 2px; }
+`;

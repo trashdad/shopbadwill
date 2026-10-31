@@ -425,6 +425,8 @@ export class PageStore {
   private readonly pages = new Map<number | undefined, PageSnapshot>();
   private readonly dom = new Map<number | undefined, DomHealthReport>();
   private readonly details = new Map<ItemId, ItemDetail>();
+  /** T-124: the last detail each tab reported (its own item page), for `tracked.add`. */
+  private readonly tabDetails = new Map<number | undefined, ItemDetail>();
 
   recordListings(snapshot: PageSnapshot): void {
     remember(this.pages, snapshot.tabId, snapshot, PAGE_STORE_MAX_TABS);
@@ -439,8 +441,17 @@ export class PageStore {
     return last(this.pages);
   }
 
-  recordDetail(detail: ItemDetail): void {
+  /** `tabId`: the reporting tab (T-124); omitted, the detail is kept for findItem only. */
+  recordDetail(detail: ItemDetail, tabId?: number): void {
     remember(this.details, detail.itemId, detail, PAGE_STORE_MAX_DETAILS);
+    if (tabId !== undefined) remember(this.tabDetails, tabId, detail, PAGE_STORE_MAX_TABS);
+  }
+
+  /** T-124: the detail of `itemId` that tab `tabId` itself reported last, or undefined. Never another tab's. */
+  detailFor(tabId: number | undefined, itemId: ItemId): ItemDetail | undefined {
+    if (tabId === undefined) return undefined;
+    const d = this.tabDetails.get(tabId);
+    return d?.itemId === itemId ? d : undefined;
   }
 
   /** The newest data seen for an item: its detail, else a listing (most recent page first). */
