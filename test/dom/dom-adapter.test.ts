@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
-import { createDomAdapter, type DiscoveryReport, type StubSpec } from '../../src/adapters/sgw/dom-adapter';
+import { createDomAdapter, findItemBidArea, type DiscoveryReport, type StubSpec } from '../../src/adapters/sgw/dom-adapter';
 import { SGW_CONFIG_VERSION } from '../../src/adapters/sgw/config';
 import type { Decoration } from '../../src/ports/sgw-dom';
 import { decorationUi, shadowRootForTest } from '../../src/content/ui/stub';
@@ -150,6 +150,23 @@ describe('item page', () => {
       expect(cards.length).toBe(5);
       for (const c of cards) expect(hrefIds(c.root)).toEqual([c.itemId]);
     }
+  });
+});
+
+describe('T-124: item page bid area (the action panel anchor)', () => {
+  it("finds SGW's bidding control on both item fixtures", () => {
+    for (const name of ['item-page-logged-out', 'item-page-logged-in']) {
+      const el = findItemBidArea(load(name));
+      expect(el?.tagName.toLowerCase()).toBe('app-bidding-control');
+      expect(el?.parentElement).not.toBeNull();
+    }
+  });
+
+  it('is null on a search page, and when the bidding control is gone (the panel falls back)', () => {
+    expect(findItemBidArea(load('search-grid-logged-out'))).toBeNull();
+    const doc = load('item-page-logged-in');
+    doc.querySelector('app-bidding-control')?.remove();
+    expect(findItemBidArea(doc)).toBeNull();
   });
 });
 

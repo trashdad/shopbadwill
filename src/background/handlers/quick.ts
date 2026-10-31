@@ -18,7 +18,7 @@
 // on top of the router's checks (requireContent).
 import type { Rule } from '../../domain/rules/schema';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
-import type { ItemId, TrackedItem } from '../../domain/types';
+import type { ItemId, Listing, TrackedItem } from '../../domain/types';
 import { requireContent, type BackgroundContext } from '../context';
 import { unfavoriteRef } from '../jobs/steps/favorite';
 import { saveRule } from './rules';
@@ -102,15 +102,30 @@ async function quickFavorite(ctx: BackgroundContext, itemId: ItemId): Promise<vo
 }
 
 async function quickTrack(ctx: BackgroundContext, itemId: ItemId): Promise<void> {
-  const seen = ctx.pages.findItem(itemId);
+  await trackManually(ctx, itemId, ctx.pages.findItem(itemId), 'That item has not been seen on a ShopGoodwill page yet; reload the page and try again.');
+}
+
+/**
+ * Tracks `itemId` by hand (reason 'manual'), shared by quick.track and T-124's
+ * tracked.add. An item already tracked only gains the reason (nothing else
+ * changes); a new one is built from `seen` (calendar wanted, not favorited,
+ * like every other tracked item: the calendar sync and favorites follow the
+ * user's settings). Without `seen`, a new item is refused with `refusal`.
+ * Returns whether anything changed.
+ */
+export async function trackManually(ctx: BackgroundContext, itemId: ItemId, seen: Listing | undefined, refusal: string): Promise<boolean> {
   const now = ctx.clock.now();
+  let changed = false;
   await ctx.repo.update(STORAGE_KEYS.tracked, (cur) => {
+    changed = false;
     const t = cur[itemId];
     if (t !== undefined) {
       if (t.reasons.some((r) => r.kind === 'manual')) return cur;
+      changed = true;
       return { ...cur, [itemId]: { ...t, reasons: [...t.reasons, { kind: 'manual' }], updatedAt: now } };
     }
-    if (seen === undefined) throw new Error('That item has not been seen on a ShopGoodwill page yet; reload the page and try again.');
+    if (seen === undefined) throw new Error(refusal);
+    changed = true;
     const item: TrackedItem = {
       itemId,
       title: seen.title,
@@ -124,4 +139,5 @@ async function quickTrack(ctx: BackgroundContext, itemId: ItemId): Promise<void>
     };
     return { ...cur, [itemId]: item };
   });
+  return changed;
 }

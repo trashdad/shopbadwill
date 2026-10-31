@@ -45,8 +45,9 @@ const MSG_DIR = path.join(import.meta.dirname, 'examples', 'Msg');
 
 // §3.12, grouped by its comments. §2.4 rule 3: content scripts may send only
 // the `content` group (page.*, ui.openSnipe, rules.evaluate, rules.disable,
-// landedCost.get, relist.lookup, quick.*). `rules.disable` is the T-32 contract change;
-// `relist.lookup` is the T-113 one; `calendar.testEvent` (ui) the T-119 one
+// landedCost.get, relist.lookup, quick.*, tracked.add, tracked.remove). `rules.disable` is the T-32 contract change;
+// `relist.lookup` is the T-113 one; `calendar.testEvent` (ui) the T-119 one;
+// `tracked.add` (new) and `tracked.remove` (was ui) the T-124 one
 // (docs/CONTRACT-DECISIONS.md); extension pages may send content types too.
 const EXPECTED = {
   content: [
@@ -63,6 +64,9 @@ const EXPECTED = {
     'quick.hideKeyword',
     'quick.favorite',
     'quick.track',
+    // T-124: the item page panel's Track / Stop tracking.
+    'tracked.add',
+    'tracked.remove',
   ],
   ui: [
     'settings.get',
@@ -78,7 +82,6 @@ const EXPECTED = {
     'job.runNow',
     'job.status',
     'tracked.list',
-    'tracked.remove',
     'favorites.sync',
     'calendar.connect',
     'calendar.disconnect',
@@ -310,6 +313,7 @@ type SpecMsg =
   | { type: 'quick.hideKeyword'; payload: { term: string } }
   | { type: 'quick.favorite'; payload: { itemId: ItemId } }
   | { type: 'quick.track'; payload: { itemId: ItemId } }
+  | { type: 'tracked.add'; payload: { itemId: ItemId } }
   | { type: 'settings.get' }
   | { type: 'settings.set'; payload: Partial<Settings> }
   | { type: 'rules.list' }

@@ -38,7 +38,7 @@ import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import type { SgwEndpointKey } from '../../src/adapters/sgw/config';
-import type { HealthReport, Listing, SgwSessionRecord } from '../../src/domain/types';
+import type { HealthReport, ItemDetail, Listing, SgwSessionRecord, TrackedItem } from '../../src/domain/types';
 import type { AuditEntry } from '../../src/domain/audit/types';
 import type { Watch } from '../../src/domain/watches/schema';
 import { normalizeItemDetail } from '../../src/adapters/sgw/normalize';
@@ -1084,6 +1084,94 @@ describe('wiring', () => {
     expect(h.http.requests).toEqual([]);
   });
 
+  describe('T-124: tracked.add (the item page panel Track) and tracked.remove from content', () => {
+    const ITEM_PAGE: RouterSender = { id: EXT_ID, url: 'https://shopgoodwill.com/item/694349278', tab: { id: 7 } };
+    const OTHER_TAB: RouterSender = { ...ITEM_PAGE, tab: { id: 8 } };
+    const detail = (): ItemDetail => normalizeItemDetail(loadFixture('item-detail-logged-in'), { observedAt: T0, authenticated: true });
+    const tracked = (h: ReturnType<typeof boot>): Record<string, TrackedItem> =>
+      (h.areas.local.dump()[STORAGE_KEYS.tracked] ?? {}) as Record<string, TrackedItem>;
+
+    it('builds the TrackedItem from the detail this tab reported (reason manual, calendar wanted), audited, with zero SGW requests', async () => {
+      const h = boot();
+      await h.handle.ready;
+      const d = detail();
+      await h.ok('page.detail', { detail: d }, ITEM_PAGE);
+      await h.ok('tracked.add', { itemId: d.itemId }, ITEM_PAGE);
+      expect(tracked(h)[String(d.itemId)]).toEqual({
+        itemId: d.itemId,
+        title: d.title,
+        endTime: d.endTime,
+        sellerId: d.sellerId,
+        reasons: [{ kind: 'manual' }],
+        favoriteState: 'none',
+        calendar: true,
+        addedAt: T0,
+        updatedAt: T0,
+      });
+      expect(h.audit()).toContainEqual(expect.objectContaining({ actor: 'user', kind: 'tracked.add', itemId: d.itemId }));
+      // A second Track changes nothing and audits nothing more.
+      await h.ok('tracked.add', { itemId: d.itemId }, ITEM_PAGE);
+      expect(h.audit().filter((e) => e.kind === 'tracked.add')).toHaveLength(1);
+      expect(h.http.requests).toEqual([]);
+    });
+
+    it('refuses without a held detail for that tab ("Reload the page and try again"), even when a listing or another tab saw the item', async () => {
+      const h = boot();
+      const ctx = await h.handle.ready;
+      const d = detail();
+      const detailFor = vi.spyOn(ctx.pages, 'detailFor');
+      // No detail at all.
+      expect(await h.send('tracked.add', { itemId: d.itemId }, ITEM_PAGE)).toMatchObject({ ok: false, error: { code: 'handler_error' } });
+      // Only a search listing of it, and the detail reported by another tab.
+      await h.ok('page.listings', { url: 'https://shopgoodwill.com/a', listings: [listing(d.itemId)], capturedAt: T0 }, CONTENT);
+      await h.ok('page.detail', { detail: d }, OTHER_TAB);
+      expect((await h.send('tracked.add', { itemId: d.itemId }, ITEM_PAGE)).ok).toBe(false);
+      expect(detailFor).toHaveBeenCalled();
+      expect(h.log).toHaveBeenCalledWith(
+        'router: handler for "tracked.add" threw',
+        expect.objectContaining({ message: expect.stringContaining('Reload the page and try again') as unknown }),
+      );
+      expect(tracked(h)[String(d.itemId)]).toBeUndefined();
+      // This tab's own detail is for another item: still refused.
+      await h.ok('page.detail', { detail: { ...d, itemId: d.itemId + 1 } }, ITEM_PAGE);
+      expect((await h.send('tracked.add', { itemId: d.itemId }, ITEM_PAGE)).ok).toBe(false);
+      expect(h.http.requests).toEqual([]);
+    });
+
+    it('adds the manual reason to an item already tracked for another reason, keeping its fields', async () => {
+      const h = boot();
+      await h.handle.ready;
+      const d = detail();
+      const existing: TrackedItem = {
+        itemId: d.itemId,
+        title: 'Old title',
+        endTime: d.endTime,
+        sellerId: d.sellerId,
+        reasons: [{ kind: 'watch', id: 'w1' }],
+        favoriteState: 'favorited',
+        calendar: false,
+        addedAt: 1,
+        updatedAt: 1,
+      };
+      await h.areas.local.set({ [STORAGE_KEYS.tracked]: { [d.itemId]: existing } });
+      await h.ok('page.detail', { detail: d }, ITEM_PAGE);
+      await h.ok('tracked.add', { itemId: d.itemId }, ITEM_PAGE);
+      expect(tracked(h)[String(d.itemId)]).toEqual({ ...existing, reasons: [{ kind: 'watch', id: 'w1' }, { kind: 'manual' }], updatedAt: T0 });
+    });
+
+    it('a content script may now send tracked.remove (the same audited removal the dashboard uses)', async () => {
+      const h = boot();
+      await h.handle.ready;
+      const d = detail();
+      await h.ok('page.detail', { detail: d }, ITEM_PAGE);
+      await h.ok('tracked.add', { itemId: d.itemId }, ITEM_PAGE);
+      await h.ok('tracked.remove', { itemId: d.itemId }, ITEM_PAGE);
+      expect(tracked(h)[String(d.itemId)]).toBeUndefined();
+      expect(h.audit()).toContainEqual(expect.objectContaining({ actor: 'user', kind: 'tracked.remove', itemId: d.itemId }));
+      expect(h.http.requests).toEqual([]);
+    });
+  });
+
   it('quick.favorite in dry-run audits the intent and sends nothing', async () => {
     const h = boot({ seed: { [STORAGE_KEYS.settings]: { ...liveSettings({ dryRun: { favorites: true, calendar: true, bidding: true } }), overlay: { ...defaultSettings().overlay, quickFavorite: true } } } });
     await h.handle.ready;
@@ -1302,6 +1390,7 @@ describe('fix round 1: defence in depth for content-only handlers', () => {
     ['quick.hideKeyword', { term: 'lot' }],
     ['quick.favorite', { itemId: 1 }],
     ['quick.track', { itemId: 1 }],
+    ['tracked.add', { itemId: 1 }],
   ])('%s from an extension page (UI) is refused by the handler itself', async (type, payload) => {
     const h = boot();
     const ctx = await h.handle.ready;

@@ -83,6 +83,13 @@ export const MsgSchema = z.discriminatedUnion('type', [
   msg('quick.hideKeyword', z.object({ term: z.string().min(1) })),
   msg('quick.favorite', ItemIdPayload),
   msg('quick.track', ItemIdPayload),
+  /**
+   * T-124 contract change (docs/CONTRACT-DECISIONS.md): the item page panel's
+   * Track. The background builds the TrackedItem (reason 'manual') from the
+   * detail the SENDING TAB reported (`page.detail`); no SGW request. Without
+   * that detail it refuses. Content only (the handler refuses extension pages).
+   */
+  msg('tracked.add', ItemIdPayload),
 
   // ── UI → background ──
   signal('settings.get'),
@@ -100,6 +107,7 @@ export const MsgSchema = z.discriminatedUnion('type', [
   msg('job.runNow', z.object({ watchIds: z.array(z.string().min(1)).optional() })),
   signal('job.status'),
   signal('tracked.list'),
+  /** T-124 contract change: content may send it too (the item page panel's Stop tracking); extension pages still can. */
   msg('tracked.remove', ItemIdPayload),
   signal('favorites.sync'),
   /** User gesture. */
@@ -185,6 +193,9 @@ export const MSG_SENDER = Object.freeze({
   'quick.hideKeyword': 'content',
   'quick.favorite': 'content',
   'quick.track': 'content',
+  'tracked.add': 'content',
+  /** T-124: was 'ui'. The router lets extension pages send content types, so the dashboard is unchanged. */
+  'tracked.remove': 'content',
   'settings.get': 'ui',
   'settings.set': 'ui',
   'rules.list': 'ui',
@@ -198,7 +209,6 @@ export const MSG_SENDER = Object.freeze({
   'job.runNow': 'ui',
   'job.status': 'ui',
   'tracked.list': 'ui',
-  'tracked.remove': 'ui',
   'favorites.sync': 'ui',
   'calendar.connect': 'ui',
   'calendar.disconnect': 'ui',

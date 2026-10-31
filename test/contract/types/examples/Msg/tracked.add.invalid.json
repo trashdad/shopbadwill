@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "itemId must be a positive integer",
+  "path": [
+    "payload",
+    "itemId"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-124",
+    "type": "tracked.add",
+    "payload": {
+      "itemId": "279250057"
+    }
+  }
+}
