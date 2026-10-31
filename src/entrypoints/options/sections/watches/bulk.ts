@@ -80,6 +80,8 @@ export function parseBulkWatches(text: string, existing: ReadonlyArray<{ query: 
 /** The choices made once for the whole batch. */
 export interface BulkOptions {
   notify: boolean;
+  /** Put each watch's matches on the Google Calendar (the watch's `calendar`). */
+  calendar: boolean;
   favoriteMode: FavoriteMode;
   /** Give each watch the shared match-everything rule. */
   matchAll: boolean;
@@ -91,6 +93,7 @@ export function bulkDraft(entry: BulkEntry, id: string, opts: BulkOptions): Watc
     ...newDraft(id, entry.query),
     name: entry.name,
     notify: opts.notify,
+    calendar: opts.calendar,
     favoriteMode: opts.favoriteMode,
     ruleIds: opts.matchAll ? [MATCH_ALL_RULE_ID] : [],
   };

@@ -30,6 +30,7 @@ const plural = (n: number, one: string, many: string): string => `${String(n)} $
 export function BulkAdd(props: BulkAddProps): VNode {
   const [text, setText] = useState('');
   const [notify, setNotify] = useState(true);
+  const [calendar, setCalendar] = useState(true);
   const [matchAll, setMatchAll] = useState(true);
   const [favoriteMode, setFavoriteMode] = useState<FavoriteMode>(DEFAULT_WATCH_FAVORITE_MODE);
   const [busy, setBusy] = useState(false);
@@ -48,7 +49,7 @@ export function BulkAdd(props: BulkAddProps): VNode {
       }
     }
     const at = props.nextRunAt();
-    const opts = { notify, favoriteMode, matchAll };
+    const opts = { notify, calendar, favoriteMode, matchAll };
     const failed: string[] = [];
     let firstError: unknown;
     let added = 0;
@@ -108,6 +109,19 @@ export function BulkAdd(props: BulkAddProps): VNode {
             }}
           />{' '}
           Notify me about new matches
+        </label>
+      </div>
+      <div>
+        <label>
+          <input
+            id="watch-bulk-calendar"
+            type="checkbox"
+            checked={calendar}
+            onChange={(e) => {
+              setCalendar(e.currentTarget.checked);
+            }}
+          />{' '}
+          Put matches on my Google Calendar
         </label>
       </div>
       <div>

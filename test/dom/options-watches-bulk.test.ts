@@ -123,7 +123,7 @@ describe('options: Watches bulk add', () => {
     const next = nextRunAtFor(defaultSettings(), NOW, TZ);
     for (const w of saves) {
       expect(WatchSchema.safeParse(w).success).toBe(true);
-      expect(w).toMatchObject({ enabled: true, ruleIds: [MATCH_ALL_RULE_ID], maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: next, seenItemIds: [] });
+      expect(w).toMatchObject({ enabled: true, ruleIds: [MATCH_ALL_RULE_ID], maxPages: 1, favoriteMode: 'sgw', calendar: true, notify: true, nextRunAt: next, seenItemIds: [] });
     }
     expect(saves.map((w) => w.id)).toEqual(['b1', 'b2']);
     expect(saves[1]?.query.page).toBe(1);
@@ -154,6 +154,17 @@ describe('options: Watches bulk add', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
     await screen.findByText('Added 2 watches; skipped 0.');
     expect(saves.map((w) => w.notify)).toEqual([false, false]);
+  });
+
+  it('the batch calendar checkbox is on by default and applies to every new watch', async () => {
+    const { saves } = app();
+    await openBulk([`${SGW}?st=teapot`, `${SGW}?st=vase`].join('\n'));
+    const box = screen.getByLabelText<HTMLInputElement>('Put matches on my Google Calendar');
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
+    await screen.findByText('Added 2 watches; skipped 0.');
+    expect(saves.map((w) => w.calendar)).toEqual([false, false]);
   });
 
   it('disables Add when nothing is valid', async () => {
