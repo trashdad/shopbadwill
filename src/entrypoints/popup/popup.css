@@ -216,3 +216,13 @@ kbd {
 .kill-confirm .keep {
   border: 2px solid var(--accent);
 }
+.sync {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+}
+.sync [role='status'] {
+  display: grid;
+  gap: 4px;
+  justify-self: stretch;
+}

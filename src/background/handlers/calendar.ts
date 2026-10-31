@@ -7,7 +7,8 @@
 // items with T-68's buildIcs, and needs no Google at all.
 // calendar.testEvent (T-119) is the options page's "Send a test event": only
 // while connected with calendar events on; the sink writes one test event and
-// deletes it (or, in calendar dry run, writes nothing).
+// deletes it (or, in calendar dry run, writes nothing). After a real one it
+// starts a sync in the background (T-126), so pending items go on right away.
 //
 // Undo ref format (documented in docs/CONTRACT-DECISIONS.md): an audit entry
 // `calendar.insert` carries `undo: { kind: 'deleteEvent', ref: 'deleteEvent:<itemId>:<eventId>' }`.
@@ -67,9 +68,12 @@ export function createCalendarHandlers(ctx: BackgroundContext): CalendarHandlers
       if (auth.needsInteraction) throw new Error('Google needs you to sign in again. Reconnect Google first.');
       const settings = await ctx.repo.get(STORAGE_KEYS.settings);
       if (!settings.calendar.enabled) throw new Error('Calendar events are off. Turn on "Add auction ends to Google Calendar" first.');
-      const sink = syncFor(ctx).sink;
-      sink.setTimeZone(settings.locale.timeZone);
-      return { result: await sink.sendTestEvent() };
+      const sync = syncFor(ctx);
+      sync.sink.setTimeZone(settings.locale.timeZone);
+      const result = await sync.sink.sendTestEvent();
+      // T-126: Google works now, so items left pending by an earlier failure go on at once.
+      if (result === 'created-and-deleted') void sync.syncNow('test-event').catch(() => undefined);
+      return { result };
     },
   };
 }
