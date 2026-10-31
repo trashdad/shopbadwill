@@ -3,7 +3,7 @@
 // PkceRefreshProvider) against the in-process fake Google server on loopback.
 // Ruling R5: nothing here reaches a real Google host (MSW refuses unhandled
 // non-loopback requests, test/setup/vitest.setup.ts).
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { browser } from 'wxt/browser';
 
 import { BrowserClock } from '../../src/adapters/browser/clock';
@@ -23,7 +23,7 @@ import {
 } from '../../src/adapters/google/calendar-sink';
 import { createCalendarHandlers, createCalendarUndoExecutors } from '../../src/background/handlers/calendar';
 import type { BackgroundContext } from '../../src/background/context';
-import { CalendarSync, buildDesired, registerReminderSink, type ReminderSink } from '../../src/background/jobs/calendar-sync';
+import { CalendarSync, buildDesired, registerReminderSink, syncFor, type ReminderSink } from '../../src/background/jobs/calendar-sync';
 import { executeCalendarUpsert } from '../../src/background/jobs/steps/calendar-upsert';
 import step from '../../src/background/jobs/steps/calendar-upsert';
 import { eventIdFor } from '../../src/domain/calendar/event-id';
@@ -960,6 +960,36 @@ describe('late add, reminder sinks, undo, handlers', () => {
     expect(r.audit.entries.filter((e) => e.kind === 'calendar.testEvent')).toEqual([
       expect.objectContaining({ actor: 'user', dryRun: true }),
     ]);
+  });
+
+  // T-126: a good test event means Google works now, so items left pending by an earlier failure go on at once.
+  it('after a successful test event, a calendar sync starts in the background and the pending item goes on', async () => {
+    const r = await rig({ connect: false });
+    const a = await r.track();
+    await r.sync.syncNow('while disconnected');
+    expect((await links(r))[a]?.status).toBe('pending');
+    await r.provider.connect();
+    const ctx = fakeCtx(r);
+    const spy = vi.spyOn(syncFor(ctx), 'syncNow');
+    const out = await createCalendarHandlers(ctx)['calendar.testEvent'](undefined, {} as never);
+    expect(out).toEqual({ result: 'created-and-deleted' });
+    expect(spy).toHaveBeenCalledWith('test-event');
+    // Wait for that background run itself (the request limiter spaces Google calls 1 s apart).
+    await expect(spy.mock.results[0]?.value).resolves.toMatchObject({ status: 'synced', changed: 1, pending: 0 });
+    expect((await links(r))[a]).toMatchObject({ status: 'synced', calendarId: r.calendarId() });
+    expect(r.events().filter((e) => e.status === 'confirmed').map((e) => e.id)).toEqual([eventIdFor(a, 0)]);
+  });
+
+  it('a test event in calendar dry run starts no sync', async () => {
+    const r = await rig();
+    await r.settings((s) => {
+      s.dryRun.calendar = true;
+    });
+    r.switches.block('calendar', 'dry run');
+    const ctx = fakeCtx(r);
+    const spy = vi.spyOn(syncFor(ctx), 'syncNow');
+    expect(await createCalendarHandlers(ctx)['calendar.testEvent'](undefined, {} as never)).toEqual({ result: 'dry-run' });
+    expect(spy).not.toHaveBeenCalled();
   });
 
   it('calendar.testEvent is refused, with no Google request, when Google is not connected', async () => {
