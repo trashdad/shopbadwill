@@ -8,6 +8,8 @@ import { nextRunAtFor } from '../../src/domain/watches/helpers';
 import { WatchSchema, type Watch } from '../../src/domain/watches/schema';
 import { WatchesSection } from '../../src/entrypoints/options/sections/watches';
 import { parseBulkWatches } from '../../src/entrypoints/options/sections/watches/bulk';
+import { MATCH_ALL_RULE_ID, matchEverythingRule } from '../../src/entrypoints/options/sections/watches/draft';
+import type { Rule } from '../../src/domain/rules/schema';
 import { FakeMessaging } from '../fakes/ports/fake-messaging';
 
 afterEach(cleanup);
@@ -31,14 +33,22 @@ const existing = (id: string, st: string): Watch =>
     seenItemIds: [],
   });
 
-function app(watches: Watch[] = [], failSaveOf?: string) {
+function app(watches: Watch[] = [], failSaveOf?: string, initialRules: Rule[] = [], failRuleSave = false) {
   const fake = new FakeMessaging();
+  const rules: Rule[] = [...initialRules];
+  const ruleSaves: Rule[] = [];
   const store: Watch[] = [...watches];
   const saves: Watch[] = [];
   const sgwCalls: string[] = [];
   fake.handle('settings.get', () => defaultSettings());
   fake.handle('calendar.status', () => ({ connected: true, provider: 'pkce', grantedScopes: [], needsInteraction: false, configured: true }));
-  fake.handle('rules.list', () => []);
+  fake.handle('rules.list', () => [...rules]);
+  fake.handle('rules.save', (r) => {
+    if (failRuleSave) throw new Error('disk full');
+    ruleSaves.push(r);
+    rules.push(r);
+    return undefined;
+  });
   fake.handle('watches.list', () => [...store]);
   fake.handle('watches.save', (w) => {
     if (w.name === failSaveOf) throw new Error('disk full');
@@ -60,7 +70,7 @@ function app(watches: Watch[] = [], failSaveOf?: string) {
       getActiveTabUrl: () => Promise.resolve(undefined),
     }),
   );
-  return { fake, store, saves, sgwCalls };
+  return { fake, store, saves, sgwCalls, ruleSaves };
 }
 
 async function openBulk(text: string): Promise<void> {
@@ -113,7 +123,7 @@ describe('options: Watches bulk add', () => {
     const next = nextRunAtFor(defaultSettings(), NOW, TZ);
     for (const w of saves) {
       expect(WatchSchema.safeParse(w).success).toBe(true);
-      expect(w).toMatchObject({ enabled: true, ruleIds: [], maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: next, seenItemIds: [] });
+      expect(w).toMatchObject({ enabled: true, ruleIds: [MATCH_ALL_RULE_ID], maxPages: 1, favoriteMode: 'sgw', calendar: false, notify: true, nextRunAt: next, seenItemIds: [] });
     }
     expect(saves.map((w) => w.id)).toEqual(['b1', 'b2']);
     expect(saves[1]?.query.page).toBe(1);
@@ -158,6 +168,72 @@ describe('options: Watches bulk add', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
     await screen.findByText(/Added 1 watch; skipped 0\. 1 could not be saved: "teapot"/);
     expect(saves.map((w) => w.name)).toEqual(['vase']);
+  });
+});
+
+describe('options: Watches bulk add, batch rule and favorite mode', () => {
+  const two = [`${SGW}?st=teapot`, `${SGW}?st=vase`].join('\n');
+  it('creates the match-everything rule once, before saving, and gives every watch it', async () => {
+    const { saves, ruleSaves } = app();
+    await openBulk(two);
+    const box = screen.getByLabelText<HTMLInputElement>('Alert on every new item in each search');
+    expect(box.checked).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
+    await screen.findByText('Added 2 watches; skipped 0.');
+    expect(ruleSaves).toHaveLength(1);
+    expect(ruleSaves[0]).toMatchObject({ id: MATCH_ALL_RULE_ID, all: [{ kind: 'price', min: 0 }] });
+    expect(saves.map((w) => w.ruleIds)).toEqual([[MATCH_ALL_RULE_ID], [MATCH_ALL_RULE_ID]]);
+  });
+
+  it('does not create the rule when it already exists', async () => {
+    const { saves, ruleSaves } = app([], undefined, [matchEverythingRule(1)]);
+    await openBulk(two);
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
+    await screen.findByText('Added 2 watches; skipped 0.');
+    expect(ruleSaves).toHaveLength(0);
+    expect(saves.map((w) => w.ruleIds)).toEqual([[MATCH_ALL_RULE_ID], [MATCH_ALL_RULE_ID]]);
+  });
+
+  it('unchecked: no rule is created, watches have no rules, and the add-rules hint shows', async () => {
+    const { saves, ruleSaves } = app();
+    await openBulk(two);
+    expect(screen.queryByText(/without rules a watch never matches/)).toBeNull();
+    fireEvent.click(screen.getByLabelText('Alert on every new item in each search'));
+    screen.getByText(/without rules a watch never matches/);
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
+    await screen.findByText('Added 2 watches; skipped 0.');
+    expect(ruleSaves).toHaveLength(0);
+    expect(saves.map((w) => w.ruleIds)).toEqual([[], []]);
+  });
+
+  it('applies the batch favorite mode to every watch; defaults to the single-add default', async () => {
+    const { saves } = app();
+    await openBulk(two);
+    const select = screen.getByLabelText<HTMLSelectElement>('Favorites for these watches');
+    expect(select.value).toBe('sgw');
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(['sgw', 'sgw-late', 'local']);
+    screen.getByRole('option', { name: 'Track in ShopBadwill only' });
+    fireEvent.change(select, { target: { value: 'local' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
+    await screen.findByText('Added 2 watches; skipped 0.');
+    expect(saves.map((w) => w.favoriteMode)).toEqual(['local', 'local']);
+  });
+
+  it('sgw-late uses the single-add default hours', async () => {
+    const { saves } = app();
+    await openBulk(two);
+    fireEvent.change(screen.getByLabelText('Favorites for these watches'), { target: { value: 'sgw-late' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
+    await screen.findByText('Added 2 watches; skipped 0.');
+    expect(saves.map((w) => [w.favoriteMode, w.favoriteWithinHours])).toEqual([['sgw-late', 6], ['sgw-late', 6]]);
+  });
+
+  it('does not save any watch when the rule cannot be created', async () => {
+    const { saves } = app([], undefined, [], true);
+    await openBulk(two);
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 watches' }));
+    await screen.findByText(/Could not create the rule/);
+    expect(saves).toHaveLength(0);
   });
 });
 
