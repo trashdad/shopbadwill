@@ -17,7 +17,12 @@ const GOOGLE_HOSTS = ['https://oauth2.googleapis.com/*', 'https://www.googleapis
 const OPTIONAL_HOSTS = [
   'https://oauth2.googleapis.com/*', // "Connect Google": token endpoint
   'https://www.googleapis.com/*', // "Connect Google": Calendar API
-  'https://ntfy.sh/*', // "Enable phone push"
+  'https://ntfy.sh/*', // "Enable phone push" (kept so a grant made before T-123 survives an update as-is)
+  // T-123: a self-hosted ntfy server can be any https origin. Declared so the
+  // options page can ask for exactly the configured host (`https://<host>/*`)
+  // at runtime; this pattern is NEVER requested whole. Optional, so it shows no
+  // install prompt.
+  'https://*/*',
 ];
 const REQUIRED_PERMISSIONS = {
   chrome: ['storage', 'alarms'],
