@@ -2,7 +2,8 @@
 // Each line is `Name | <search address>` or just the address. No SGW request.
 import type { SearchQuery } from '../../../../domain/types';
 import { searchKey } from '../../../onboarding/steps';
-import { defaultWatchName, newDraft, queryFromUrl, type WatchDraft } from './draft';
+import type { FavoriteMode } from '../../../../domain/watches/schema';
+import { MATCH_ALL_RULE_ID, defaultWatchName, newDraft, queryFromUrl, type WatchDraft } from './draft';
 
 export interface BulkEntry {
   lineNo: number;
@@ -76,7 +77,21 @@ export function parseBulkWatches(text: string, existing: ReadonlyArray<{ query: 
   return { add, skip };
 }
 
-/** A new watch draft for one entry: the single-add defaults, the batch's notify choice. */
-export function bulkDraft(entry: BulkEntry, id: string, notify: boolean): WatchDraft {
-  return { ...newDraft(id, entry.query), name: entry.name, notify };
+/** The choices made once for the whole batch. */
+export interface BulkOptions {
+  notify: boolean;
+  favoriteMode: FavoriteMode;
+  /** Give each watch the shared match-everything rule. */
+  matchAll: boolean;
+}
+
+/** A new watch draft for one entry: the single-add defaults, with the batch's choices. */
+export function bulkDraft(entry: BulkEntry, id: string, opts: BulkOptions): WatchDraft {
+  return {
+    ...newDraft(id, entry.query),
+    name: entry.name,
+    notify: opts.notify,
+    favoriteMode: opts.favoriteMode,
+    ruleIds: opts.matchAll ? [MATCH_ALL_RULE_ID] : [],
+  };
 }

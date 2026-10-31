@@ -9,7 +9,7 @@ import type { Rule } from '../../../../domain/rules/schema';
 import type { Settings } from '../../../../domain/settings/schema';
 import type { SearchQuery } from '../../../../domain/types';
 import { nextRunAtFor } from '../../../../domain/watches/helpers';
-import type { FavoriteMode, Watch } from '../../../../domain/watches/schema';
+import type { Watch } from '../../../../domain/watches/schema';
 import { MessagingError } from '../../../../messaging/errors';
 import { describeError } from '../../../../ui/components/describeError';
 import { Card, Field } from '../../../../ui/components/Field';
@@ -19,6 +19,7 @@ import { BulkAdd } from './BulkAdd';
 import {
   IMPORT_STATUS_NOTE,
   MATCH_ALL_RULE_ID,
+  MODE_COPY,
   buildWatch,
   draftFromWatch,
   importedWatchNote,
@@ -56,21 +57,6 @@ function problem(what: string, e: unknown): string {
   }
   return `${what} ${describeError(e)}`;
 }
-
-const MODE_COPY: Record<FavoriteMode, { label: string; text: string }> = {
-  sgw: {
-    label: 'Favorite on ShopGoodwill right away (recommended)',
-    text: 'Matches are added to your ShopGoodwill favorites as soon as they are found, so you see them in your account.',
-  },
-  'sgw-late': {
-    label: 'Favorite on ShopGoodwill shortly before the auction ends',
-    text: 'Matches are favorited only in the last hours before they end.',
-  },
-  local: {
-    label: 'Track in ShopBadwill only',
-    text: 'Matches are tracked here and nothing is written to your ShopGoodwill account.',
-  },
-};
 
 /** Plain text summary of a query; search terms are only ever rendered as text. */
 export function summarizeQuery(q: SearchQuery): string {
@@ -241,14 +227,19 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
     }
   };
 
+  /** Creates the shared match-everything rule unless it exists (shared by the form and bulk add). */
+  const ensureMatchAll = async (): Promise<void> => {
+    if (!rules.some((r) => r.id === MATCH_ALL_RULE_ID)) {
+      const rule = matchEverythingRule(now());
+      await client.send('rules.save', rule);
+      setRules((l) => [...l, rule]);
+    }
+  };
+
   const addMatchAll = async (): Promise<void> => {
     if (draft === null) return;
     try {
-      if (!rules.some((r) => r.id === MATCH_ALL_RULE_ID)) {
-        const rule = matchEverythingRule(now());
-        await client.send('rules.save', rule);
-        setRules((l) => [...l, rule]);
-      }
+      await ensureMatchAll();
       setDraft((d) =>
         d === null || d.ruleIds.includes(MATCH_ALL_RULE_ID) ? d : { ...d, ruleIds: [...d.ruleIds, MATCH_ALL_RULE_ID] },
       );
@@ -380,6 +371,7 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
           saveWatch={(w) => client.send('watches.save', w)}
           newId={newId}
           nextRunAt={newRunAt}
+          ensureMatchAll={ensureMatchAll}
           summarize={summarizeQuery}
           describe={(e) => problem('', e).trim()}
           onDone={(message, tone) => {
