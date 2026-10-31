@@ -15,6 +15,7 @@ import { describeError } from '../../../../ui/components/describeError';
 import { Card, Field } from '../../../../ui/components/Field';
 import { Status } from '../../../../ui/components/Status';
 import type { SectionDef, SectionProps } from '../../registry';
+import { BulkAdd } from './BulkAdd';
 import {
   IMPORT_STATUS_NOTE,
   MATCH_ALL_RULE_ID,
@@ -99,6 +100,7 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   const [status, setStatus] = useState<Msg>({ message: '', tone: 'ok' });
   const [pasteUrl, setPasteUrl] = useState('');
   const [showPaste, setShowPaste] = useState(false);
+  const [showBulk, setShowBulk] = useState(false);
   const [sourceError, setSourceError] = useState<string | undefined>(undefined);
   const [draft, setDraft] = useState<WatchDraft | null>(null);
   const [editingBase, setEditingBase] = useState<Watch | undefined>(undefined);
@@ -208,16 +210,19 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   const enabledSelected = (d: WatchDraft): number =>
     d.ruleIds.filter((id) => rules.some((r) => r.id === id && r.enabled)).length;
 
+  /** A new watch's first run: the next daily slot (now() when settings are unknown; the scheduler recomputes). */
+  const newRunAt = (): number => {
+    if (settings === null) return now();
+    try {
+      return nextRunAtFor(settings, now(), timeZone);
+    } catch {
+      return now();
+    }
+  };
+
   const save = async (): Promise<void> => {
     if (draft === null) return;
-    let nextRunAt = editingBase?.nextRunAt ?? now();
-    if (editingBase === undefined && settings !== null) {
-      try {
-        nextRunAt = nextRunAtFor(settings, now(), timeZone);
-      } catch {
-        /* keep now(): the scheduler recomputes */
-      }
-    }
+    const nextRunAt = editingBase?.nextRunAt ?? newRunAt();
     const built = buildWatch(draft, nextRunAt, editingBase);
     if (!built.ok) {
       setErrors(built.errors);
@@ -325,6 +330,16 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
         >
           Paste a search address
         </button>
+        <button
+          type="button"
+          class="sbw-secondary"
+          aria-expanded={showBulk}
+          onClick={() => {
+            setShowBulk((v) => !v);
+          }}
+        >
+          Add several watches
+        </button>
         <button type="button" class="sbw-secondary" disabled={busy} onClick={importSaved}>
           Import my saved searches from ShopGoodwill
         </button>
@@ -357,6 +372,21 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
             </div>
           )}
         </Field>
+      ) : null}
+
+      {showBulk ? (
+        <BulkAdd
+          watches={watches}
+          saveWatch={(w) => client.send('watches.save', w)}
+          newId={newId}
+          nextRunAt={newRunAt}
+          summarize={summarizeQuery}
+          describe={(e) => problem('', e).trim()}
+          onDone={(message, tone) => {
+            setStatus({ message, tone });
+            loadWatches();
+          }}
+        />
       ) : null}
 
       {draft === null ? null : (
