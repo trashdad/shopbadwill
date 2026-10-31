@@ -123,7 +123,7 @@ Firefox asks for the others only when you turn on the feature:
 |---|---|
 | `notifications` | Options → **Notifications** → **Allow notifications**, or the setup tab's dry-run step |
 | `oauth2.googleapis.com`, `www.googleapis.com` | Google Calendar. **Connect to Google Calendar** asks for them (`docs/SETUP-GOOGLE.md`, step 11) |
-| `ntfy.sh` | Options → **Phone push** → **Allow ntfy.sh** |
+| `ntfy.sh`, or your own ntfy server's host | Options → **Phone push** → **Allow ntfy.sh** (or **Allow** your server). Only that one host is asked for; see `docs/SETUP-NTFY.md` |
 | `nativeMessaging` | Options → **Sniping** → **Wake the computer (T2)** → **Connect the companion** |
 
 ## Limits on Firefox
