@@ -9,15 +9,17 @@ import type { Rule } from '../../../../domain/rules/schema';
 import type { Settings } from '../../../../domain/settings/schema';
 import type { SearchQuery } from '../../../../domain/types';
 import { nextRunAtFor } from '../../../../domain/watches/helpers';
-import type { FavoriteMode, Watch } from '../../../../domain/watches/schema';
+import type { Watch } from '../../../../domain/watches/schema';
 import { MessagingError } from '../../../../messaging/errors';
 import { describeError } from '../../../../ui/components/describeError';
 import { Card, Field } from '../../../../ui/components/Field';
 import { Status } from '../../../../ui/components/Status';
 import type { SectionDef, SectionProps } from '../../registry';
+import { BulkAdd } from './BulkAdd';
 import {
   IMPORT_STATUS_NOTE,
   MATCH_ALL_RULE_ID,
+  MODE_COPY,
   buildWatch,
   draftFromWatch,
   importedWatchNote,
@@ -56,21 +58,6 @@ function problem(what: string, e: unknown): string {
   return `${what} ${describeError(e)}`;
 }
 
-const MODE_COPY: Record<FavoriteMode, { label: string; text: string }> = {
-  sgw: {
-    label: 'Favorite on ShopGoodwill right away (recommended)',
-    text: 'Matches are added to your ShopGoodwill favorites as soon as they are found, so you see them in your account.',
-  },
-  'sgw-late': {
-    label: 'Favorite on ShopGoodwill shortly before the auction ends',
-    text: 'Matches are favorited only in the last hours before they end.',
-  },
-  local: {
-    label: 'Track in ShopBadwill only',
-    text: 'Matches are tracked here and nothing is written to your ShopGoodwill account.',
-  },
-};
-
 /** Plain text summary of a query; search terms are only ever rendered as text. */
 export function summarizeQuery(q: SearchQuery): string {
   const parts: string[] = [q.searchText === '' ? 'Any text' : `"${q.searchText}"`];
@@ -99,6 +86,7 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   const [status, setStatus] = useState<Msg>({ message: '', tone: 'ok' });
   const [pasteUrl, setPasteUrl] = useState('');
   const [showPaste, setShowPaste] = useState(false);
+  const [showBulk, setShowBulk] = useState(false);
   const [sourceError, setSourceError] = useState<string | undefined>(undefined);
   const [draft, setDraft] = useState<WatchDraft | null>(null);
   const [editingBase, setEditingBase] = useState<Watch | undefined>(undefined);
@@ -208,16 +196,19 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
   const enabledSelected = (d: WatchDraft): number =>
     d.ruleIds.filter((id) => rules.some((r) => r.id === id && r.enabled)).length;
 
+  /** A new watch's first run: the next daily slot (now() when settings are unknown; the scheduler recomputes). */
+  const newRunAt = (): number => {
+    if (settings === null) return now();
+    try {
+      return nextRunAtFor(settings, now(), timeZone);
+    } catch {
+      return now();
+    }
+  };
+
   const save = async (): Promise<void> => {
     if (draft === null) return;
-    let nextRunAt = editingBase?.nextRunAt ?? now();
-    if (editingBase === undefined && settings !== null) {
-      try {
-        nextRunAt = nextRunAtFor(settings, now(), timeZone);
-      } catch {
-        /* keep now(): the scheduler recomputes */
-      }
-    }
+    const nextRunAt = editingBase?.nextRunAt ?? newRunAt();
     const built = buildWatch(draft, nextRunAt, editingBase);
     if (!built.ok) {
       setErrors(built.errors);
@@ -236,14 +227,19 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
     }
   };
 
+  /** Creates the shared match-everything rule unless it exists (shared by the form and bulk add). */
+  const ensureMatchAll = async (): Promise<void> => {
+    if (!rules.some((r) => r.id === MATCH_ALL_RULE_ID)) {
+      const rule = matchEverythingRule(now());
+      await client.send('rules.save', rule);
+      setRules((l) => [...l, rule]);
+    }
+  };
+
   const addMatchAll = async (): Promise<void> => {
     if (draft === null) return;
     try {
-      if (!rules.some((r) => r.id === MATCH_ALL_RULE_ID)) {
-        const rule = matchEverythingRule(now());
-        await client.send('rules.save', rule);
-        setRules((l) => [...l, rule]);
-      }
+      await ensureMatchAll();
       setDraft((d) =>
         d === null || d.ruleIds.includes(MATCH_ALL_RULE_ID) ? d : { ...d, ruleIds: [...d.ruleIds, MATCH_ALL_RULE_ID] },
       );
@@ -325,6 +321,16 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
         >
           Paste a search address
         </button>
+        <button
+          type="button"
+          class="sbw-secondary"
+          aria-expanded={showBulk}
+          onClick={() => {
+            setShowBulk((v) => !v);
+          }}
+        >
+          Add several watches
+        </button>
         <button type="button" class="sbw-secondary" disabled={busy} onClick={importSaved}>
           Import my saved searches from ShopGoodwill
         </button>
@@ -357,6 +363,22 @@ export function WatchesSection(props: WatchesSectionProps): VNode {
             </div>
           )}
         </Field>
+      ) : null}
+
+      {showBulk ? (
+        <BulkAdd
+          watches={watches}
+          saveWatch={(w) => client.send('watches.save', w)}
+          newId={newId}
+          nextRunAt={newRunAt}
+          ensureMatchAll={ensureMatchAll}
+          summarize={summarizeQuery}
+          describe={(e) => problem('', e).trim()}
+          onDone={(message, tone) => {
+            setStatus({ message, tone });
+            loadWatches();
+          }}
+        />
       ) : null}
 
       {draft === null ? null : (

@@ -76,6 +76,22 @@ export function matchEverythingRule(now: number): Rule {
   };
 }
 
+/** The favorite-mode labels and explanations (single-add form and bulk add). */
+export const MODE_COPY: Record<FavoriteMode, { label: string; text: string }> = {
+  sgw: {
+    label: 'Favorite on ShopGoodwill right away (recommended)',
+    text: 'Matches are added to your ShopGoodwill favorites as soon as they are found, so you see them in your account.',
+  },
+  'sgw-late': {
+    label: 'Favorite on ShopGoodwill shortly before the auction ends',
+    text: 'Matches are favorited only in the last hours before they end.',
+  },
+  local: {
+    label: 'Track in ShopBadwill only',
+    text: 'Matches are tracked here and nothing is written to your ShopGoodwill account.',
+  },
+};
+
 export interface WatchDraft {
   id: string;
   name: string;
