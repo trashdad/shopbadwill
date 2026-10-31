@@ -169,11 +169,17 @@ export class GoogleCalendarApi implements CalendarApi {
     throw new CalendarApiError('other', `calendarList.list: more than ${String(MAX_LIST_PAGES)} pages`);
   }
 
-  async calendarListGet(calendarId: string): Promise<{ id: string } | null> {
-    const res = await this.request('GET', `/users/me/calendarList/${encodeURIComponent(calendarId)}`, { notFoundOk: true });
+  /**
+   * calendars.get, not calendarList.get: under `calendar.app.created` Google
+   * answers calendarList.get with 401 Invalid Credentials (seen live
+   * 2026-10-31), though its docs list the scope. calendars.get is allowed for
+   * a calendar this app created.
+   */
+  async calendarsGet(calendarId: string): Promise<{ id: string } | null> {
+    const res = await this.request('GET', `/calendars/${encodeURIComponent(calendarId)}`, { notFoundOk: true });
     if (res.status === 404 || res.status === 410) return null;
     const parsed = RawCalendarSchema.safeParse(this.json(res));
-    if (!parsed.success) throw new CalendarApiError('schema', 'calendarList.get: response has no id', { status: res.status });
+    if (!parsed.success) throw new CalendarApiError('schema', 'calendars.get: response has no id', { status: res.status });
     return { id: parsed.data.id };
   }
 

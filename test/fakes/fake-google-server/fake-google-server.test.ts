@@ -209,14 +209,16 @@ describe('calendar auth and scope enforcement', () => {
   it('calendar.app.created can use its own calendar but not others', async () => {
     const { f, call, calId } = await setup();
     f.seedCalendar('someone@example.com', 'Other');
-    expect((await call('GET', `/users/me/calendarList/${calId}`)).status).toBe(200);
+    expect((await call('GET', `/calendars/${calId}`)).status).toBe(200);
+    // Live Google: calendarList.get under calendar.app.created is 401 Invalid Credentials.
+    expect((await call('GET', `/users/me/calendarList/${calId}`)).status).toBe(401);
     for (const other of ['primary', encodeURIComponent('someone@example.com')]) {
       const res = await call('POST', `/calendars/${other}/events`, eventBody('abcde'));
       expect(res.status).toBe(403);
       expect(res.json['error'].errors[0].reason).toBe('insufficientPermissions');
       expect(res.json['error'].status).toBe('PERMISSION_DENIED');
     }
-    expect((await call('GET', '/users/me/calendarList/primary')).status).toBe(403);
+    expect((await call('GET', '/calendars/primary')).status).toBe(403);
   });
 
   it('calendar.events alone cannot insert calendars but can write the primary calendar', async () => {
@@ -229,13 +231,13 @@ describe('calendar auth and scope enforcement', () => {
 });
 
 describe('calendars', () => {
-  it('calendars.insert returns a calendar resource; calendarList.get finds it; unknown is 404', async () => {
+  it('calendars.insert returns a calendar resource; calendars.get finds it; unknown is 404', async () => {
     const { call, calId } = await setup();
-    const got = await call('GET', `/users/me/calendarList/${calId}`);
+    const got = await call('GET', `/calendars/${calId}`);
     expect(got.json['summary']).toBe('ShopGoodwill Auctions');
     const ins = await call('POST', '/calendars', { summary: 'Other', timeZone: 'America/Los_Angeles' });
     RawCalendarSchema.parse(ins.json);
-    const missing = await call('GET', `/users/me/calendarList/${encodeURIComponent('zzz@group.calendar.google.com')}`);
+    const missing = await call('GET', `/calendars/${encodeURIComponent('zzz@group.calendar.google.com')}`);
     expect(missing.status).toBe(404);
     expect(missing.json['error'].errors[0].reason).toBe('notFound');
   });

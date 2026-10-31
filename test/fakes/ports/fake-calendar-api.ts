@@ -44,8 +44,8 @@ export class FakeCalendarApi implements CalendarApi {
     });
   }
 
-  calendarListGet(calendarId: string): Promise<{ id: string } | null> {
-    return this.run('calendarListGet', [calendarId], () => (this.calendars.has(calendarId) ? { id: calendarId } : null));
+  calendarsGet(calendarId: string): Promise<{ id: string } | null> {
+    return this.run('calendarsGet', [calendarId], () => (this.calendars.has(calendarId) ? { id: calendarId } : null));
   }
 
   calendarListList(): Promise<CalendarListRow[]> {

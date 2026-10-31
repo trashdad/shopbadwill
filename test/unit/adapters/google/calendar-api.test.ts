@@ -150,15 +150,15 @@ describe('GoogleCalendarApi requests and responses', () => {
     expect(JSON.parse(req?.body ?? '')).toMatchObject({ id: 'sbv1g0abc', summary: 's' });
   });
 
-  it('calendarsInsert and calendarListGet return ids; list 404 is null', async () => {
+  it('calendarsInsert and calendarsGet return ids; list 404 is null', async () => {
     const { api, http } = setup();
     http.on(`${BASE}/calendars`, ok({ kind: 'calendar#calendar', id: 'c1@group.calendar.google.com', summary: 'x' }));
     expect(await api.calendarsInsert('ShopGoodwill Auctions', 'UTC')).toEqual({ id: 'c1@group.calendar.google.com' });
     expect(JSON.parse(http.requests[0]?.body ?? '')).toEqual({ summary: 'ShopGoodwill Auctions', timeZone: 'UTC' });
-    http.on(`${BASE}/users/me/calendarList/c1`, ok({ id: 'c1', accessRole: 'owner' }));
-    expect(await api.calendarListGet('c1')).toEqual({ id: 'c1' });
-    http.on(`${BASE}/users/me/calendarList/gone`, gerr(404, 'notFound'));
-    expect(await api.calendarListGet('gone')).toBeNull();
+    http.on(`${BASE}/calendars/c1`, ok({ id: 'c1', accessRole: 'owner' }));
+    expect(await api.calendarsGet('c1')).toEqual({ id: 'c1' });
+    http.on(`${BASE}/calendars/gone`, gerr(404, 'notFound'));
+    expect(await api.calendarsGet('gone')).toBeNull();
   });
 
   it('eventsGet returns cancelled events and null for 404/410', async () => {

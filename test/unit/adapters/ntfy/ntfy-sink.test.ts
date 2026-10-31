@@ -1250,7 +1250,7 @@ function stubCalendarApi(): CalendarApi {
   };
   return {
     calendarsInsert: never,
-    calendarListGet: never,
+    calendarsGet: never,
     calendarListList: never,
     eventsInsert: never,
     eventsGet: never,

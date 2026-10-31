@@ -505,7 +505,7 @@ describe('409 on insert', () => {
     // The worker dies right after the second event reached Google, before its link was saved.
     r.restart((api) => ({
       calendarsInsert: (s, tz, description) => api.calendarsInsert(s, tz, description),
-      calendarListGet: (c) => api.calendarListGet(c),
+      calendarsGet: (c) => api.calendarsGet(c),
       calendarListList: () => api.calendarListList(),
       eventsGet: (c, e) => api.eventsGet(c, e),
       eventsPatch: (c, e, p) => api.eventsPatch(c, e, p),
@@ -680,7 +680,7 @@ describe('dry run', () => {
     let inserts = 0;
     r.restart((api) => ({
       calendarsInsert: (s, tz, description) => api.calendarsInsert(s, tz, description),
-      calendarListGet: (c) => api.calendarListGet(c),
+      calendarsGet: (c) => api.calendarsGet(c),
       calendarListList: () => api.calendarListList(),
       eventsGet: (c, e) => api.eventsGet(c, e),
       eventsPatch: (c, e, p) => api.eventsPatch(c, e, p),

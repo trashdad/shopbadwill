@@ -288,10 +288,10 @@ describe('FakeCalendarApi', () => {
   it('creates calendars and looks them up', async () => {
     const api = new FakeCalendarApi();
     const { id } = await api.calendarsInsert('ShopGoodwill Auctions', 'UTC');
-    expect(await api.calendarListGet(id)).toEqual({ id });
-    expect(await api.calendarListGet('nope')).toBeNull();
+    expect(await api.calendarsGet(id)).toEqual({ id });
+    expect(await api.calendarsGet('nope')).toBeNull();
     api.seedCalendar('seeded');
-    expect(await api.calendarListGet('seeded')).toEqual({ id: 'seeded' });
+    expect(await api.calendarsGet('seeded')).toEqual({ id: 'seeded' });
   });
 
   it('inserts, conflicts on a duplicate id, gets, and patches', async () => {

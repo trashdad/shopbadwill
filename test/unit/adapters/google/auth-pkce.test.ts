@@ -897,9 +897,9 @@ describe('401 from Calendar → one refresh, then the error surfaces', () => {
     const { w, first, api } = connectedWithCalendar();
     const second = newAccess();
     w.http.on(TOKEN, tokenOk({ access: second }));
-    w.http.on(`${CAL}/users/me/calendarList/`, unauthorized, json({ id: 'c1' }));
+    w.http.on(`${CAL}/calendars/`, unauthorized, json({ id: 'c1' }));
 
-    expect(await api.calendarListGet('c1')).toEqual({ id: 'c1' });
+    expect(await api.calendarsGet('c1')).toEqual({ id: 'c1' });
     expect(forms(w, TOKEN)).toHaveLength(1);
     expect(calendarRequests(w).map(bearer)).toEqual([`Bearer ${first}`, `Bearer ${second}`]);
     expect(await w.provider.getAccessToken({ interactive: false })).toBe(second);
@@ -908,9 +908,9 @@ describe('401 from Calendar → one refresh, then the error surfaces', () => {
   it('a second 401 surfaces (CalendarApiError auth) after exactly one refresh', async () => {
     const { w, api } = connectedWithCalendar();
     w.http.on(TOKEN, tokenOk());
-    w.http.on(`${CAL}/users/me/calendarList/`, unauthorized);
+    w.http.on(`${CAL}/calendars/`, unauthorized);
 
-    const e = await api.calendarListGet('c1').catch((x: unknown) => x);
+    const e = await api.calendarsGet('c1').catch((x: unknown) => x);
     produced.push(e);
     expect(e).toBeInstanceOf(CalendarApiError);
     expect(e).toMatchObject({ code: 'auth', status: 401 });
@@ -923,9 +923,9 @@ describe('401 from Calendar → one refresh, then the error surfaces', () => {
   it('when the refresh itself fails, the original 401 surfaces without a resend', async () => {
     const { w, api } = connectedWithCalendar();
     w.http.on(TOKEN, oauthErr(400, 'invalid_grant'));
-    w.http.on(`${CAL}/users/me/calendarList/`, unauthorized);
+    w.http.on(`${CAL}/calendars/`, unauthorized);
 
-    const e = await api.calendarListGet('c1').catch((x: unknown) => x);
+    const e = await api.calendarsGet('c1').catch((x: unknown) => x);
     produced.push(e);
     expect(e).toMatchObject({ code: 'auth', status: 401 });
     expect(calendarRequests(w)).toHaveLength(1);

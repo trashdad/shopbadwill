@@ -93,7 +93,7 @@ describe('GoogleCalendarApi against the fake Google server', () => {
   it('every fake response validates: raw (fake + lenient schemas) and normalized', async () => {
     const { api } = await makeApi();
     const { id: calId } = await api.calendarsInsert('ShopGoodwill Auctions', 'UTC');
-    expect(await api.calendarListGet(calId)).toEqual({ id: calId });
+    expect(await api.calendarsGet(calId)).toEqual({ id: calId });
 
     const inserted = await api.eventsInsert(calId, bodyFor('sbv1g0abc'));
     expect(GcalEventSchema.safeParse(inserted).success).toBe(true);
@@ -150,7 +150,7 @@ describe('GoogleCalendarApi against the fake Google server', () => {
 
   it('missing calendar: calendarList.get -> null; events on it -> not-found', async () => {
     const { api } = await makeApi();
-    expect(await api.calendarListGet('nope@group.calendar.google.com')).toBeNull();
+    expect(await api.calendarsGet('nope@group.calendar.google.com')).toBeNull();
     expect((await failure(api.eventsInsert('nope@group.calendar.google.com', bodyFor('sbv1g0abc')))).code).toBe('not-found');
   });
 
@@ -170,14 +170,14 @@ describe('GoogleCalendarApi against the fake Google server', () => {
 
   it('rateLimitExceeded -> backoff honoring Retry-After: 1, then success', async () => {
     const { api, clock } = await makeApi(`${SCOPE}calendar`, { rateLimitNext: 2 });
-    expect(await api.calendarListGet('primary')).toEqual({ id: 'primary' });
+    expect(await api.calendarsGet('primary')).toEqual({ id: 'primary' });
     expect(clock.delays).toEqual([1000, 1000]);
     expect(fake.state.requests.filter((r) => r.status === 429)).toHaveLength(2);
   });
 
   it('rateLimitExceeded beyond the attempt cap -> rate-limited', async () => {
     const { api, clock } = await makeApi(`${SCOPE}calendar`, { rateLimitNext: 100 });
-    const e = await failure(api.calendarListGet('primary'));
+    const e = await failure(api.calendarsGet('primary'));
     expect(e).toMatchObject({ code: 'rate-limited', status: 429 });
     expect(clock.delays).toHaveLength(4); // 5 attempts, 4 sleeps
   });
@@ -192,13 +192,13 @@ describe('GoogleCalendarApi against the fake Google server', () => {
   it('an expired access token -> auth', async () => {
     const { api } = await makeApi();
     fake.advanceClock(2 * 3600_000);
-    expect((await failure(api.calendarListGet('primary'))).code).toBe('auth');
+    expect((await failure(api.calendarsGet('primary'))).code).toBe('auth');
   });
 
   it('a stopped server -> offline', async () => {
     const { api } = await makeApi();
     await fake.close();
-    expect((await failure(api.calendarListGet('primary'))).code).toBe('offline');
+    expect((await failure(api.calendarsGet('primary'))).code).toBe('offline');
     fake = await startFakeGoogle({ port: 0 }); // so afterEach has something to close
   });
 

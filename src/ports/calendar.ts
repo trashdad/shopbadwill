@@ -31,7 +31,7 @@ export interface CalendarListRow {
 /** Thin typed Calendar v3 subset. */
 export interface CalendarApi {
   calendarsInsert(summary: string, timeZone: string, description?: string): Promise<{ id: string }>;
-  calendarListGet(calendarId: string): Promise<{ id: string } | null>;
+  calendarsGet(calendarId: string): Promise<{ id: string } | null>;
   /**
    * Calendars this grant can see. `calendar.app.created` sees only calendars
    * this app created. An entry with no id is omitted. `accessRole` and

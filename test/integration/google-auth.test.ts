@@ -182,12 +182,12 @@ describe('against the fake Google server', () => {
 
     // calendar.app.created lets the app create and use its own calendar.
     const { id } = await r.calendar.calendarsInsert('ShopGoodwill Auctions', 'UTC');
-    expect(await r.calendar.calendarListGet(id)).toEqual({ id });
+    expect(await r.calendar.calendarsGet(id)).toEqual({ id });
     expect(tokenPosts()).toHaveLength(1); // the exchange only
 
     // Google expires the access token while our cache still trusts it: 401 → one refresh → resend.
     fake.advanceClock(HOUR);
-    expect(await r.calendar.calendarListGet(id)).toEqual({ id });
+    expect(await r.calendar.calendarsGet(id)).toEqual({ id });
     expect(tokenPosts()).toHaveLength(2);
     const fresh = (await session())[STORAGE_KEYS.googleAccess] as { token: string };
     expect(fresh.token).not.toBe(access.token);
@@ -196,7 +196,7 @@ describe('against the fake Google server', () => {
     r.clock.offset = 2 * HOUR;
     fake.advanceClock(HOUR);
     const before401s = fake.state.requests.filter((q) => q.status === 401).length;
-    await r.calendar.calendarListGet(id);
+    await r.calendar.calendarsGet(id);
     expect(tokenPosts()).toHaveLength(3);
     expect(fake.state.requests.filter((q) => q.status === 401)).toHaveLength(before401s);
 
@@ -211,7 +211,7 @@ describe('against the fake Google server', () => {
 
     // Reconnect with the same client config, nothing re-entered.
     await r.provider.connect();
-    expect(await r.calendar.calendarListGet(id)).toEqual({ id });
+    expect(await r.calendar.calendarsGet(id)).toEqual({ id });
   });
 
   it('Firefox: the loopback redirect works end to end', async () => {
@@ -284,7 +284,7 @@ describe('against the fake Google server', () => {
     fake.advanceClock(HOUR); // Google expires the access token
     const before = { local: await local(), session: await session() };
 
-    const e = await r.calendar.calendarListGet(id).catch((x: unknown) => x);
+    const e = await r.calendar.calendarsGet(id).catch((x: unknown) => x);
     produced.push(e);
     expect(e).toBeInstanceOf(CalendarApiError);
     expect(e).toMatchObject({ code: 'auth', status: 401 });
@@ -306,7 +306,7 @@ describe('against the fake Google server', () => {
     fake.setScenario({ invalidGrant: false });
     await r.provider.connect();
     expect(await r.provider.status()).toMatchObject({ connected: true, needsInteraction: false });
-    expect(await r.calendar.calendarListGet(id)).toEqual({ id });
+    expect(await r.calendar.calendarsGet(id)).toEqual({ id });
     expect(r.badge.at(-1)).toBe(false);
   });
 });
@@ -334,7 +334,7 @@ describe('against MSW on Google production hostnames', () => {
         expect(form.get('grant_type')).toBe('refresh_token');
         return HttpResponse.json({ access_token: 'ya29.msw-access-2', expires_in: 3599, scope: SCOPE, token_type: 'Bearer' });
       }),
-      http.get(`${PROD_CAL}/users/me/calendarList/:id`, ({ request }) => {
+      http.get(`${PROD_CAL}/calendars/:id`, ({ request }) => {
         hits.calendar.push(request.headers.get('authorization') ?? '');
         return HttpResponse.json({ error: { code: 401, message: 'Invalid Credentials', errors: [{ reason: 'authError' }] } }, { status: 401 });
       }),
@@ -342,7 +342,7 @@ describe('against MSW on Google production hostnames', () => {
     const r = rig();
     await seedConnected(r, r.clock.now() + HOUR);
 
-    const e = await r.calendar.calendarListGet('c1').catch((x: unknown) => x);
+    const e = await r.calendar.calendarsGet('c1').catch((x: unknown) => x);
     produced.push(e);
     expect(e).toBeInstanceOf(CalendarApiError);
     expect(e).toMatchObject({ code: 'auth', status: 401 });

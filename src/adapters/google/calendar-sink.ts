@@ -164,7 +164,7 @@ export class RequestLimiter {
 export function limitCalendarApi(api: CalendarApi, limiter: RequestLimiter): CalendarApi {
   return {
     calendarsInsert: (s, tz, description) => limiter.run(() => api.calendarsInsert(s, tz, description)),
-    calendarListGet: (id) => limiter.run(() => api.calendarListGet(id)),
+    calendarsGet: (id) => limiter.run(() => api.calendarsGet(id)),
     calendarListList: () => limiter.run(() => api.calendarListList()),
     eventsInsert: (c, b) => limiter.run(() => api.eventsInsert(c, b)),
     eventsGet: (c, e) => limiter.run(() => api.eventsGet(c, e)),
@@ -648,7 +648,7 @@ export class GoogleCalendarSink implements CalendarSink {
     const stored = await store.load();
     if (stored.calendarId !== undefined) {
       if (this.verified === stored.calendarId) return stored.calendarId;
-      const found = await api.calendarListGet(stored.calendarId);
+      const found = await api.calendarsGet(stored.calendarId);
       if (found !== null) {
         this.verified = stored.calendarId;
         return stored.calendarId;

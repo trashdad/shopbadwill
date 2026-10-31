@@ -571,7 +571,7 @@ test('calendar sync: connect, 60/15/5 events, patch, delete, invalid_grant, reco
       // once per worker; then the ownership read and the one DELETE.
       expect(show(await requestsSince(from), hold.calId)).toEqual([
         'POST /token 200',
-        'GET /calendar/v3/users/me/calendarList/<cal> 200',
+        'GET /calendar/v3/calendars/<cal> 200',
         `GET /calendar/v3/calendars/<cal>/events/${eventId(ITEM_B)} 200`,
         `DELETE /calendar/v3/calendars/<cal>/events/${eventId(ITEM_B)} 204`,
       ]);

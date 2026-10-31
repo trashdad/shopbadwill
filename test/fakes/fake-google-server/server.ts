@@ -260,7 +260,7 @@ export async function startFakeGoogle(opts: { port?: number; host?: string; scen
   const hasAny = (have: string[], want: string[]) => want.some((s) => have.includes(s));
 
   /** Returns the calendar, or null after having sent the error. */
-  function authCalendar(res: ServerResponse, calId: string, scopes: string[], op: 'calendarList' | 'events', write: boolean): FakeCalendar | null {
+  function authCalendar(res: ServerResponse, calId: string, scopes: string[], op: 'calendarList' | 'calendars' | 'events', write: boolean): FakeCalendar | null {
     const cal = calendars.get(calId);
     if (!cal) {
       gerr(res, 404, 'notFound', 'Not Found');
@@ -269,7 +269,9 @@ export async function startFakeGoogle(opts: { port?: number; host?: string; scen
     const broad =
       op === 'calendarList'
         ? hasAny(scopes, [S.calendar, S.calendarReadonly, S.calendarList, S.calendarListReadonly])
-        : write
+        : op === 'calendars'
+          ? hasAny(scopes, [S.calendar, S.calendarReadonly])
+          : write
           ? hasAny(scopes, [S.calendar, S.events])
           : hasAny(scopes, [S.calendar, S.calendarReadonly, S.events, S.eventsReadonly]);
     const narrow = scopes.includes(S.appCreated) && cal.appCreated;
@@ -387,11 +389,22 @@ export async function startFakeGoogle(opts: { port?: number; host?: string; scen
       send(res, 200, body); return;
     }
 
-    // calendarList.get
+    // calendarList.get. Live Google answers calendar.app.created alone with 401
+    // Invalid Credentials here (seen 2026-10-31), though its docs list the scope.
     if (m === 'GET' && segs.length === 4 && segs[0] === 'users' && segs[1] === 'me' && segs[2] === 'calendarList') {
+      if (!hasAny(scopes, [S.calendar, S.calendarReadonly, S.calendarList, S.calendarListReadonly])) {
+        gerr(res, 401, 'authError', 'Invalid Credentials'); return;
+      }
       const cal = authCalendar(res, segs[3] ?? '', scopes, 'calendarList', false);
       if (!cal) return;
       send(res, 200, { kind: 'calendar#calendarListEntry', etag: newEtag(), id: cal.id, summary: cal.summary, timeZone: cal.timeZone, accessRole: 'owner' }); return;
+    }
+
+    // calendars.get (calendar.app.created may read a calendar this app created)
+    if (m === 'GET' && segs.length === 2 && segs[0] === 'calendars') {
+      const cal = authCalendar(res, segs[1] ?? '', scopes, 'calendars', false);
+      if (!cal) return;
+      send(res, 200, { kind: 'calendar#calendar', etag: newEtag(), id: cal.id, summary: cal.summary, timeZone: cal.timeZone }); return;
     }
 
     if (segs[0] === 'calendars' && segs[2] === 'events' && segs.length >= 3 && segs.length <= 4) {
