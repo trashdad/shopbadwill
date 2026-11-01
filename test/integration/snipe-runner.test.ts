@@ -661,6 +661,14 @@ function wakeAt(): number {
   return END - LEAD - 5 * MIN;
 }
 
+/**
+ * The wake on the local clock for SGW skew `skew` (T-127: the wake alarm runs
+ * on the local clock, so with SGW ahead by SKEW it fires SKEW before wakeAt()).
+ */
+function wakeLocal(skew = SKEW): number {
+  return wakeAt() - skew;
+}
+
 beforeEach(() => {
   // The session adapter hashes token ids with crypto.subtle.digest, which settles on a real
   // thread-pool turn; a microtask-only digest keeps fake time deterministic.
@@ -688,7 +696,7 @@ describe('T-84 brief', () => {
 
     const s = stored(shared);
     const wake = s.history.find((h) => h.to === 'waking');
-    expect(wake?.at).toBeGreaterThanOrEqual(wakeAt() + ALARM_DELAY);
+    expect(wake?.at).toBeGreaterThanOrEqual(wakeLocal() + ALARM_DELAY);
     const fire = s.history.find((h) => h.to === 'firing');
     expect(fire).toBeDefined();
     expect(Math.abs((fire?.at ?? 0) - FIRE_LOCAL)).toBeLessThanOrEqual(5);
@@ -1053,7 +1061,7 @@ describe('money safety carries', () => {
     const shared = makeShared();
     const { w } = await boot(shared);
     await arm(w);
-    await runTo(shared, wakeAt() + ALARM_DELAY - SEC);
+    await runTo(shared, wakeLocal() + ALARM_DELAY - SEC);
     expect(stored(shared).state).toBe('armed');
     shared.sgw.detailFaults.push(net(), net(), net());
     await runTo(shared, END + 10 * MIN);
@@ -1076,7 +1084,7 @@ describe('money safety carries', () => {
     const shared = makeShared();
     const first = await boot(shared, { crashAfterSet: crashOn('fallback-applied') });
     await arm(first.w);
-    await runTo(shared, wakeAt() + ALARM_DELAY - SEC);
+    await runTo(shared, wakeLocal() + ALARM_DELAY - SEC);
     shared.sgw.detailFaults.push(net(), net(), net());
     await runTo(shared, wakeAt() + ALARM_DELAY + 50 * SEC);
     expect(first.w.life.dead).toBe(true);
@@ -1430,7 +1438,7 @@ describe('dry run (C4)', () => {
     const shared = makeShared({ settings: settingsWith() });
     const { w } = await boot(shared);
     await arm(w);
-    await runTo(shared, wakeAt() + ALARM_DELAY - SEC);
+    await runTo(shared, wakeLocal() + ALARM_DELAY - SEC);
     shared.sgw.detailFaults.push(net(), net(), net());
     await runTo(shared, END + 2 * MIN);
 
@@ -2500,7 +2508,7 @@ describe('auto-kill on anomalies (clock, latency, schema drift)', () => {
     const shared = makeShared();
     const { w } = await boot(shared);
     await arm(w);
-    await runTo(shared, wakeAt() + ALARM_DELAY - SEC);
+    await runTo(shared, wakeLocal() + ALARM_DELAY - SEC);
     shared.sgw.latency = 2500;
     await runTo(shared, END + 10 * MIN);
     const fb = audits(shared).find((a) => a.kind === 'snipe.fallback');
@@ -2525,7 +2533,7 @@ describe('auto-kill on anomalies (clock, latency, schema drift)', () => {
     const shared = makeShared();
     const { w } = await boot(shared);
     await arm(w);
-    await runTo(shared, wakeAt() + ALARM_DELAY - SEC);
+    await runTo(shared, wakeLocal() + ALARM_DELAY - SEC);
     shared.sgw.detailFaults.push({ status: 200, bodyText: JSON.stringify({ drifted: true }), latencyMs: LATENCY });
     await runTo(shared, END + 2 * MIN);
     const s = stored(shared);
@@ -3404,5 +3412,194 @@ describe('T-121: a snipe the browser slept through an on-time end is Missed, not
     expect(settledAsMissed(s)).toBe(false);
     expect(shared.notifier.sent.map((n) => n.notification.title)).toContain(`Ended early: ${s.title}`);
     expect(stamps).toEqual(['ended-early']);
+  });
+});
+
+// ── T-127: an armed snipe never loses its wake (live miss, 2026-10-31) ──────
+//
+// Live: a dry-run snipe passed its T-15 min preflight, then never woke at its
+// planned T-5 min wake and slept through the end. These tests run with the
+// live alarm latency (the worker is alive, so an alarm fires ~20 ms late, not
+// 45 s), where a wake alarm a few ms early, or an offset re-measured between
+// the alarm and its step, left the snipe armed with nothing pending.
+
+/** The live alarm latency with a live worker: the day's good wake fired 21 ms after its plan. */
+const LIVE_ALARM_DELAY = 21;
+
+function t1DryRunShared(): Shared {
+  return makeShared({ alarmDelayMs: LIVE_ALARM_DELAY, settings: settingsWith({ tier: 'T1' }) });
+}
+
+/** Settles `p` while fake time runs on in small steps (an SGW read needs its latency to pass). */
+async function settle<T>(shared: Shared, p: Promise<T>): Promise<T> {
+  const state = { done: false };
+  const mark = (): void => {
+    state.done = true;
+  };
+  p.then(mark, mark);
+  for (let i = 0; i < 400 && !state.done; i++) await runTo(shared, shared.clock.now() + 50);
+  return p;
+}
+
+/**
+ * SGW's clock moves to `skew` and a clock sample re-measures it (the path the
+ * T-15 min preflight takes): an ItemDetail read names the item, then
+ * `serverTimeSample` reads its ms-precision serverTime.
+ */
+async function remeasure(shared: Shared, ctx: BackgroundContext, skew: number): Promise<void> {
+  shared.sgw.skew = skew;
+  await settle(shared, ctx.api.itemDetail(ITEM, 'background', { maxAgeMs: 0 }));
+  await settle(shared, ctx.api.serverTimeSample());
+  expect(ctx.sgwClock.offset()?.offsetMs).toBe(skew);
+}
+
+/** The dry run fired once, at the planned fire time for SGW skew `skew`, and resolved as a dry run. */
+function expectOneDryRunFire(shared: Shared, skew: number): void {
+  const s = stored(shared);
+  expect(s).toMatchObject({ state: 'resolved', outcome: 'dry-run', dryRun: true });
+  expect(transitions(s).slice(0, 4)).toEqual(['draft>armed', 'armed>waking', 'waking>verified', 'verified>firing']);
+  expect(s.history.filter((h) => h.to === 'waking')).toHaveLength(1);
+  expect(s.history.filter((h) => h.to === 'firing')).toHaveLength(1);
+  expect(kinds(shared).filter((k) => k === 'bid.dry-run')).toHaveLength(1);
+  expect(s.fireAt).toBe(FIRE_SERVER);
+  expect(Math.abs((s.measured?.firedAt ?? 0) - FIRE_SERVER)).toBeLessThanOrEqual(5);
+  const fireLocal = FIRE_SERVER - skew;
+  expect(Math.abs((s.history.find((h) => h.to === 'firing')?.at ?? 0) - fireLocal)).toBeLessThanOrEqual(5);
+  expect(shared.sgw.details.filter((d) => d.auth && Math.abs(d.at - fireLocal) <= 5)).toHaveLength(1);
+  expect(shared.sgw.modals).toHaveLength(0);
+  expect(shared.sgw.placeBids).toHaveLength(0);
+}
+
+describe('T-127: an armed snipe never loses its wake', () => {
+  // `power` granted on tier T1 mirrors the live setup (keep-awake held from arm).
+  it('the live miss: SGW a little behind our clock and the wake alarm on time: the preflight runs, it wakes, verifies and fires its dry run once', async () => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const skew = -300;
+    shared.sgw.skew = skew;
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END + 5 * MIN);
+
+    expect(kinds(shared)).toContain('snipe.preflight');
+    const wake = stored(shared).history.find((h) => h.to === 'waking')?.at ?? Infinity;
+    expect(wake).toBeGreaterThanOrEqual(wakeLocal(skew) - 30 * SEC);
+    expect(wake).toBeLessThanOrEqual(wakeLocal(skew) + 1000);
+    expectOneDryRunFire(shared, skew);
+  });
+
+  it.each([
+    ['2 s later', 2 * SEC],
+    ['3 min later', 3 * MIN],
+    ['2 s earlier', -2 * SEC],
+    ['3 min earlier', -3 * MIN],
+  ])('the clock offset moves between the preflight and the wake alarm (the wake %s): it still wakes, verifies and fires its dry run once', async (_label, shift) => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    await runTo(shared, wakeLocal(SKEW) - 20 * SEC);
+    expect(kinds(shared)).toContain('snipe.preflight');
+    expect(stored(shared).state).toBe('armed');
+    // The armed step left a wake alarm at or before the local wake it knew (the preflight measured SKEW).
+    const pending = (await snipeAlarms(shared)).find((a) => a.name === snipeAlarmName('s1', 'wake'));
+    expect(pending?.scheduledTime).toBeLessThanOrEqual(wakeLocal(SKEW));
+
+    // The wake is now `shift` later (offset = server - local, so SGW's skew drops by `shift`).
+    const skew = SKEW - shift;
+    await remeasure(shared, ctx, skew);
+    await runTo(shared, END + 5 * MIN);
+
+    const wake = stored(shared).history.find((h) => h.to === 'waking')?.at ?? Infinity;
+    // Never late against the plan it knew at its last step, never more than the slack early.
+    expect(wake).toBeGreaterThanOrEqual(wakeLocal(skew) - 30 * SEC);
+    expect(wake).toBeLessThanOrEqual(Math.max(wakeLocal(skew), wakeLocal(SKEW)) + 1000);
+    expectOneDryRunFire(shared, skew);
+  });
+
+  it('a wake due within the slack wakes now (29 s early): the 3 clock samples and the verify still run before the fire', async () => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    await runTo(shared, wakeLocal(SKEW) - 20 * SEC);
+    const skew = SKEW - 29 * SEC;
+    await remeasure(shared, ctx, skew);
+    await runTo(shared, END + 5 * MIN);
+
+    const s = stored(shared);
+    const wake = s.history.find((h) => h.to === 'waking')?.at ?? Infinity;
+    expect(wake).toBeLessThanOrEqual(wakeLocal(skew) - 28 * SEC);
+    expect(wake).toBeGreaterThanOrEqual(wakeLocal(skew) - 30 * SEC);
+    const fireLocal = FIRE_SERVER - skew;
+    const windowReads = shared.sgw.details.filter((d) => d.auth && d.at >= wake && d.at < fireLocal - 5);
+    // 3 samples 20 s apart from the wake, then the T-60 s verify.
+    expect(windowReads.map((d) => d.at - wake)).toEqual([0, 20 * SEC, 40 * SEC, END - skew - 60 * SEC - wake]);
+    expectOneDryRunFire(shared, skew);
+  });
+
+  it('a wake alarm that fires with the wake just beyond the slack re-creates it, and a timer wakes on plan even when that alarm is late', async () => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const { w, ctx } = await boot(shared);
+    await arm(w);
+    await runTo(shared, wakeLocal(SKEW) - 20 * SEC);
+    const skew = SKEW - 45 * SEC;
+    await remeasure(shared, ctx, skew);
+    // Chrome delays an alarm due in under 30 s; here every alarm from now on is 45 s late.
+    shared.alarms.extraDelayMs = 45 * SEC;
+    await runTo(shared, wakeLocal(SKEW) + SEC);
+    expect(stored(shared).state).toBe('armed');
+    const again = (await snipeAlarms(shared)).find((a) => a.name === snipeAlarmName('s1', 'wake'));
+    expect(again?.scheduledTime).toBe(wakeLocal(skew));
+    await runTo(shared, END + 5 * MIN);
+
+    const wake = stored(shared).history.find((h) => h.to === 'waking')?.at ?? Infinity;
+    expect(Math.abs(wake - wakeLocal(skew))).toBeLessThanOrEqual(5);
+    expectOneDryRunFire(shared, skew);
+  });
+
+  it('a preflight alarm set while the offset was known still runs the preflight once that sample has expired', async () => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const { w, ctx } = await boot(shared);
+    // Measured at arm (SGW 1.3 s ahead), so the :preflight alarm lands 1.3 s before END - 15 min;
+    // the sample is long gone (30 min) by then, and the step judges with offset 0.
+    await remeasure(shared, ctx, SKEW);
+    await arm(w);
+    await flush(8);
+    const alarm = (await snipeAlarms(shared)).find((a) => a.name === snipeAlarmName('s1', 'preflight'));
+    expect(alarm?.scheduledTime).toBe(END - SKEW - 15 * MIN);
+    await runTo(shared, END + 5 * MIN);
+
+    const pre = audits(shared).filter((a) => a.kind === 'snipe.preflight');
+    expect(pre).toHaveLength(1);
+    expect(pre[0]?.at).toBeGreaterThanOrEqual(END - 15 * MIN - 30 * SEC);
+    expect(pre[0]?.at).toBeLessThanOrEqual(END - 15 * MIN + 1000);
+    expectOneDryRunFire(shared, SKEW);
+  });
+
+  it('a worker restart between the preflight and the wake still wakes, after the new worker re-measures SGW a little behind our clock', async () => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const skew = -300;
+    shared.sgw.skew = skew;
+    const first = await boot(shared);
+    await arm(first.w);
+    await runTo(shared, END - 15 * MIN + 2 * MIN);
+    expect(kinds(shared)).toContain('snipe.preflight');
+    first.w.kill();
+
+    // A new runner over the same storage and alarms; its clock knows nothing until SGW answers.
+    const second = await boot(shared);
+    await runTo(shared, wakeLocal(skew) - 20 * SEC);
+    expect(stored(shared).state).toBe('armed');
+    await remeasure(shared, second.ctx, skew);
+    await runTo(shared, END + 5 * MIN);
+
+    const wake = stored(shared).history.find((h) => h.to === 'waking')?.at ?? Infinity;
+    expect(wake).toBeGreaterThanOrEqual(wakeLocal(skew) - 30 * SEC);
+    expect(wake).toBeLessThanOrEqual(wakeLocal(skew) + 1000);
+    expectOneDryRunFire(shared, skew);
   });
 });
