@@ -125,6 +125,11 @@ export const WAKE_SLACK_MS = 30 * SEC;
  * as the backstop.
  */
 export const ARMED_TIMER_MAX_WAIT_MS = 60 * SEC;
+/**
+ * T-128: after a "not due" preflight, the next preflight (and its SGW read)
+ * comes no sooner than this.
+ */
+export const PREFLIGHT_RETRY_MIN_MS = 60 * SEC;
 /** The outcome read waits until this long after the end (server time), so it can be final. */
 export const POST_READ_AFTER_END_MS = 5 * SEC;
 /**
@@ -850,9 +855,12 @@ export class SnipeRunner {
   }
 
   private async updateEntry(id: string, patch: Partial<Entry>): Promise<void> {
+    // T-128: created when missing (an unreadable record fails closed to empty).
+    // Every caller runs for an open snipe, and a dropped write here (a
+    // preflight's `preflightAt`, an outcome read's failure count) made its step
+    // repeat the SGW read at once.
     await this.updateRecord((r) => {
-      const cur = r.entries[id];
-      if (cur !== undefined) r.entries[id] = { ...cur, ...patch };
+      r.entries[id] = { ...(r.entries[id] ?? { outbox: [] }), ...patch };
     });
   }
 
@@ -1106,9 +1114,12 @@ export class SnipeRunner {
       return 'continue';
     }
     // preflight() itself accepts a run up to 2 min early (PREFLIGHT_EARLY_SLACK_MS).
-    const preflightAt = Math.max(this.endLocal(s) - PREFLIGHT_LEAD_MS, entry.preflightNotBefore ?? 0);
+    // T-128: the slack is for the planned time only; a stored "not before" (after a
+    // "not due" answer) is honoured as it is, so no SGW read comes sooner.
+    const notBefore = entry.preflightNotBefore ?? 0;
+    const preflightAt = Math.max(this.endLocal(s) - PREFLIGHT_LEAD_MS, notBefore);
     const preflightDue = entry.preflightAt === undefined;
-    if (preflightDue && now >= preflightAt - WAKE_SLACK_MS) {
+    if (preflightDue && now >= Math.max(preflightAt - WAKE_SLACK_MS, notBefore)) {
       await this.runPreflight(s);
       return 'continue';
     }
@@ -1455,9 +1466,11 @@ export class SnipeRunner {
     const result = preflight(fresh, pctx);
     if (!result.ok && result.reason === 'not-armed') return;
     if (!result.ok && result.reason === 'not-due') {
-      // The end moved later: preflight again 15 min before the new end.
+      // The end moved later: preflight again 15 min before the new end (on the
+      // same clock preflight() used), and never sooner than PREFLIGHT_RETRY_MIN_MS
+      // from now (T-128: a "not due" answer never loops SGW reads).
       const end = Math.max(isoMs(fresh.endTime), detail === null ? 0 : isoMs(detail.endTime));
-      const when = end - this.offsetFor(fresh) - PREFLIGHT_LEAD_MS;
+      const when = Math.max(end - this.offsetFor(fresh) - PREFLIGHT_LEAD_MS, now + PREFLIGHT_RETRY_MIN_MS);
       await this.updateEntry(fresh.id, { preflightNotBefore: when });
       await this.ctx.alarms.create(snipeAlarmName(fresh.id, 'preflight'), { when });
       return;

@@ -343,9 +343,9 @@ function decide(snipe: Snipe, input: FallbackInput): FallbackDecision {
  * priority order: auction not over (closed, SGW's clock, our clock) and next
  * acceptable bid within the max (R2), session and token (R1), clock (R3),
  * keep-awake held, caps. On failure the fallback is applied (R4) unless there
- * is nothing to win. A run more than 17 min before the end is "not due" and
- * does nothing. Pure (R6): the result lists the effects for the runner; it
- * does not perform them.
+ * is nothing to win. A run more than 17 min before the end, on SGW's clock
+ * when it is known, is "not due" and does nothing. Pure (R6): the result
+ * lists the effects for the runner; it does not perform them.
  *
  * An unreadable ItemDetail (`detail` null) is not a failure by itself: the
  * price and per-item cap go unchecked here (a warning) and T-60's verify read
@@ -365,18 +365,20 @@ export function preflight(snipe: Snipe, ctx: PreflightContext): PreflightResult 
   const detail = ctx.detail !== null && ctx.detail.itemId === snipe.itemId ? ctx.detail : null;
   const endMs = Math.max(isoMs(snipe.endTime), detail === null ? Number.NEGATIVE_INFINITY : isoMs(detail.endTime));
 
-  // Local time, as the runner's alarm is scheduled.
-  if (ctx.now < endMs - PREFLIGHT_LEAD_MS - PREFLIGHT_EARLY_SLACK_MS) {
+  const clock = assessClock(ctx.clockOffset);
+  const serverNow = clock.ok ? ctx.now + clock.offsetMs : ctx.now;
+
+  // T-128: on SGW's clock (the end is SGW's), as the runner schedules it
+  // (end - offset): judged on our clock, SGW more than 2 min ahead made
+  // every run "not due" at the very time the runner ran it again.
+  if (serverNow < endMs - PREFLIGHT_LEAD_MS - PREFLIGHT_EARLY_SLACK_MS) {
     return {
       ok: false,
       reason: 'not-due',
-      detail: `Preflight is not due yet: it runs 15 min before the end, and the end is ${relative(endMs, ctx.now)}.`,
+      detail: `Preflight is not due yet: it runs 15 min before the end, and the end is ${relative(endMs, serverNow)}.`,
       effects: [],
     };
   }
-
-  const clock = assessClock(ctx.clockOffset);
-  const serverNow = clock.ok ? ctx.now + clock.offsetMs : ctx.now;
   const failures: PreflightFailure[] = [];
   const warnings: string[] = [];
 
