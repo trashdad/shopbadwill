@@ -110,6 +110,21 @@ export const MAX_CONSECUTIVE_READ_ERRORS = 3;
 export const RECOVER_PERIOD_MINUTES = 1;
 /** A wait shorter than this keeps the window (KeepAlive) held; a longer one goes to an alarm. */
 export const WINDOW_HOLD_MAX_WAIT_MS = 60 * SEC;
+/**
+ * T-127: an armed snipe wakes (and preflights) when it is due within this
+ * long. Waking up to 30 s early is harmless (the wake is 5 min before the
+ * fire, and the clock samples are planned from the moment it wakes); waking
+ * late, or not at all, is not. It absorbs an alarm that fires a little before
+ * the local wake, and an offset that moved the wake a little later since the
+ * alarm was set.
+ */
+export const WAKE_SLACK_MS = 30 * SEC;
+/**
+ * T-127: an armed wait at most this long also gets a timer, exact while the
+ * worker lives (Chrome alarms are not reliable below ~30 s). The alarm stays
+ * as the backstop.
+ */
+export const ARMED_TIMER_MAX_WAIT_MS = 60 * SEC;
 /** The outcome read waits until this long after the end (server time), so it can be final. */
 export const POST_READ_AFTER_END_MS = 5 * SEC;
 /**
@@ -961,7 +976,9 @@ export class SnipeRunner {
           else await this.releaseAwake(s.id);
           break;
         case 'scheduleWake':
-          await this.ctx.alarms.create(snipeAlarmName(s.id, 'wake'), { when: eff.at });
+          // T-127: `at` is the reducer's plan in SGW time; the alarm runs on the local clock.
+          // Never later than the local wake (the armed step keeps it there as the offset moves).
+          await this.ctx.alarms.create(snipeAlarmName(s.id, 'wake'), { when: Math.min(eff.at, this.wakeAtLocal(s)) });
           break;
       }
     } catch (e) {
@@ -1070,21 +1087,57 @@ export class SnipeRunner {
 
   // ── States ────────────────────────────────────────────────────────────
 
+  /**
+   * T-127: the wake and the preflight are judged against the offset as it is
+   * now, which moves as SGW answers re-measure the clock (and is 0 until the
+   * first sample), so their alarms, set earlier, can fire a little before
+   * them. Both run when due within WAKE_SLACK_MS, and every wait leaves an
+   * alarm at or before the next one (plus a timer when it is close), so an
+   * armed snipe never sits with nothing pending.
+   */
   private async armedStep(s: Snipe, entry: Entry): Promise<StepResult> {
     await this.ensureArmedAlarms(s);
     await this.holdAwake(s);
     await this.alarmCompanionWake(s);
     const now = this.ctx.clock.now();
-    if (now >= this.wakeAtLocal(s)) {
+    const wakeAt = this.wakeAtLocal(s);
+    if (now >= wakeAt - WAKE_SLACK_MS) {
       await this.commit(s.id, { type: 'wake', now }, { expectVersion: s.history.length });
       return 'continue';
     }
+    // preflight() itself accepts a run up to 2 min early (PREFLIGHT_EARLY_SLACK_MS).
     const preflightAt = Math.max(this.endLocal(s) - PREFLIGHT_LEAD_MS, entry.preflightNotBefore ?? 0);
-    if (entry.preflightAt === undefined && now >= preflightAt) {
+    const preflightDue = entry.preflightAt === undefined;
+    if (preflightDue && now >= preflightAt - WAKE_SLACK_MS) {
       await this.runPreflight(s);
       return 'continue';
     }
+    await this.pendArmed(s.id, now, wakeAt, preflightDue ? preflightAt : null);
     return 'wait';
+  }
+
+  /**
+   * T-127: what an armed wait leaves pending. The `wake` alarm (and, before
+   * the preflight ran, the `preflight` alarm) at or before its time as
+   * computed now: one that already fired (or is past due), or one set later
+   * than that, is created again. A wait of ARMED_TIMER_MAX_WAIT_MS or less
+   * also gets a timer, as Chrome delays an alarm due in under 30 s; it is set
+   * first, so a failing Alarms call still leaves it.
+   */
+  private async pendArmed(id: string, now: EpochMs, wakeAt: EpochMs, preflightAt: EpochMs | null): Promise<void> {
+    const next = preflightAt === null ? wakeAt : Math.min(wakeAt, preflightAt);
+    if (next - now <= ARMED_TIMER_MAX_WAIT_MS) this.setTimer(id, next);
+    await this.safely('armed alarms', async () => {
+      const pending = new Map((await this.ctx.alarms.getAll()).map((a) => [a.name, a.scheduledTime]));
+      const plan: Array<[SnipeAlarmKind, EpochMs]> = [['wake', wakeAt]];
+      if (preflightAt !== null) plan.push(['preflight', preflightAt]);
+      for (const [kind, at] of plan) {
+        const name = snipeAlarmName(id, kind);
+        const when = pending.get(name);
+        if (when !== undefined && when > now && when <= at) continue;
+        await this.ctx.alarms.create(name, { when: Math.max(at, now) });
+      }
+    });
   }
 
   private async wakingStep(s: Snipe): Promise<StepResult> {
