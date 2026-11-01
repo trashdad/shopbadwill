@@ -860,7 +860,7 @@ function crashOn(state: Snipe['state']): CrashPredicate {
 }
 
 interface RunnerRecordView {
-  entries: Record<string, { outbox: Array<{ kind: string }>; atRisk?: string } | undefined>;
+  entries: Record<string, { outbox: Array<{ kind: string }>; atRisk?: string; preflightNotBefore?: number } | undefined>;
 }
 
 function runnerRecord(shared: Shared): RunnerRecordView {
@@ -3601,5 +3601,121 @@ describe('T-127: an armed snipe never loses its wake', () => {
     expect(wake).toBeGreaterThanOrEqual(wakeLocal(skew) - 30 * SEC);
     expect(wake).toBeLessThanOrEqual(wakeLocal(skew) + 1000);
     expectOneDryRunFire(shared, skew);
+  });
+});
+
+// ── T-128: a "not due" preflight never loops SGW reads ─────────────────────
+//
+// preflight() judged "due" on our clock while the runner judged it on SGW's
+// (end - offset): with SGW more than 2 min ahead, preflight() answered "not
+// due" at the very moment the runner re-ran it, and one step() looped its
+// background ItemDetail read up to 100 times. Be a considerate guest: one read
+// per attempt, and never two attempts within 60 s.
+
+/** The time of every SGW request from now on (the fake's own log has no times). */
+function logSgwRequests(shared: Shared): number[] {
+  const at: number[] = [];
+  const send = shared.http.send.bind(shared.http);
+  shared.http.send = (req) => {
+    at.push(shared.clock.now());
+    return send(req);
+  };
+  return at;
+}
+
+/**
+ * The preflight attempts behind `reads` (requests less than 1 s apart are one
+ * attempt): 1 to `max` of them, at least 60 s apart, each one ItemDetail read
+ * plus, when the clock is unknown (a restarted worker), its one clock sample.
+ */
+function expectSpacedReads(reads: readonly number[], max: number): void {
+  const attempts: number[][] = [];
+  for (const at of reads) {
+    const last = attempts.at(-1);
+    if (last !== undefined && at - (last.at(-1) ?? 0) < SEC) last.push(at);
+    else attempts.push([at]);
+  }
+  expect(attempts.length).toBeGreaterThanOrEqual(1);
+  expect(attempts.length).toBeLessThanOrEqual(max);
+  for (const a of attempts) expect(a.length).toBeLessThanOrEqual(2);
+  for (let i = 1; i < attempts.length; i++) expect((attempts[i]?.[0] ?? 0) - (attempts[i - 1]?.at(-1) ?? 0)).toBeGreaterThanOrEqual(60 * SEC);
+}
+
+describe('T-128: a "not due" preflight never loops SGW reads', () => {
+  it.each([
+    ['3 min ahead of', 3 * MIN],
+    ['3 min behind', -3 * MIN],
+  ])('SGW %s our clock: one read per preflight attempt, at least 60 s apart; the preflight runs once and the dry run wakes and fires on time', async (_label, skew) => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const { w, ctx } = await boot(shared);
+    // Measured at arm, so the :preflight alarm lands at END - skew - 15 min.
+    await remeasure(shared, ctx, skew);
+    await arm(w);
+    await flush(8);
+    const preflightLocal = END - skew - 15 * MIN;
+    const alarm = (await snipeAlarms(shared)).find((a) => a.name === snipeAlarmName('s1', 'preflight'));
+    expect(alarm?.scheduledTime).toBe(preflightLocal);
+    // A fresh sample 5 min before that alarm (another read refreshed the clock): the step judges on it.
+    // (5 min, so the background lane's 2 min spacing does not delay the preflight's own read.)
+    await runTo(shared, preflightLocal - 5 * MIN);
+    await remeasure(shared, ctx, skew);
+    const reads = logSgwRequests(shared);
+    await runTo(shared, wakeLocal(skew) - SEC);
+
+    expect(stored(shared).state).toBe('armed');
+    // The clock is known here, so the attempt is its ItemDetail read alone.
+    expect(reads).toHaveLength(1);
+    expectSpacedReads(reads, 1);
+    const pre = audits(shared).filter((a) => a.kind === 'snipe.preflight');
+    expect(pre).toHaveLength(1);
+    expect(pre[0]?.at).toBeGreaterThanOrEqual(preflightLocal - 30 * SEC);
+    expect(pre[0]?.at).toBeLessThanOrEqual(preflightLocal + 1000);
+
+    await runTo(shared, END + 5 * MIN);
+    const wake = stored(shared).history.find((h) => h.to === 'waking')?.at ?? Infinity;
+    expect(wake).toBeGreaterThanOrEqual(wakeLocal(skew) - 30 * SEC);
+    expect(wake).toBeLessThanOrEqual(wakeLocal(skew) + 1000);
+    expectOneDryRunFire(shared, skew);
+  });
+
+  it('a "not due" answer (the end moved an hour later) stores when to try again, and a restarted worker reads nothing before it', async () => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const first = await boot(shared);
+    await arm(first.w);
+    shared.sgw.item.endMs = END + HOUR;
+    await runTo(shared, END - 15 * MIN - 2 * MIN);
+    const reads = logSgwRequests(shared);
+    await runTo(shared, END - 15 * MIN + MIN);
+    expectSpacedReads(reads, 1);
+    expect(kinds(shared)).not.toContain('snipe.preflight');
+    const notBefore = runnerRecord(shared).entries.s1?.preflightNotBefore ?? 0;
+    expect(notBefore).toBeGreaterThanOrEqual(END + HOUR - 15 * MIN - 2 * SEC);
+    first.w.kill();
+
+    // A new worker over the same storage: its armed step honours the stored time.
+    await boot(shared);
+    await runTo(shared, wakeLocal() - SEC);
+    expectSpacedReads(reads, 1);
+    expect(stored(shared).state).toBe('armed');
+  });
+
+  it('a lost runner record before the preflight: the preflight still reads once and runs once', async () => {
+    const shared = t1DryRunShared();
+    await shared.permissions.request({ permissions: ['power'] });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - 20 * MIN);
+    // Unreadable: the runner fails closed to an empty record, so the armed snipe has no entry.
+    shared.areas.local.seed({ [RUNNER_KEY]: { version: 1, entries: { s1: { outbox: 'not-an-array' } } } });
+    const reads = logSgwRequests(shared);
+    await runTo(shared, wakeLocal() - SEC);
+
+    expectSpacedReads(reads, 1);
+    expect(kinds(shared).filter((k) => k === 'snipe.preflight')).toHaveLength(1);
+    expect(stored(shared).state).toBe('armed');
+    await runTo(shared, END + 5 * MIN);
+    expectOneDryRunFire(shared, SKEW);
   });
 });

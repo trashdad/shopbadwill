@@ -290,6 +290,17 @@ describe('not due yet: a preflight that runs early is a no-op', () => {
     expect(early).toMatchObject({ ok: false, reason: 'not-due', effects: [] });
   });
 
+  it("judged on SGW's clock, as the runner schedules it (T-128): 3 min ahead is due 3 min sooner on ours, 3 min behind 3 min later", () => {
+    const ahead = { offsetMs: 3 * 60_000, rttMs: 150, confidence: 'low' as const };
+    const behind = { offsetMs: -3 * 60_000, rttMs: 150, confidence: 'low' as const };
+    // SGW at end - 15 min while our clock reads end - 18 min: due (it used to be "not due" here, forever).
+    expect(preflight(snipe(), ctx({ now: END_MS - 18 * 60_000, clockOffset: ahead })).ok).toBe(true);
+    expect(preflight(snipe(), ctx({ now: END_MS - 20 * 60_000 - 1, clockOffset: ahead }))).toMatchObject({ reason: 'not-due' });
+    // SGW at end - 19 min while our clock reads end - 16 min: not due yet.
+    expect(preflight(snipe(), ctx({ now: END_MS - 16 * 60_000, clockOffset: behind }))).toMatchObject({ reason: 'not-due' });
+    expect(preflight(snipe(), ctx({ now: END_MS - 14 * 60_000, clockOffset: behind })).ok).toBe(true);
+  });
+
   it('measured from the later of the armed end and the fresh detail end', () => {
     const d = detail({ endTime: iso(END_MS + 60 * 60_000) });
     expect(preflight(snipe(), ctx({ detail: d })).ok).toBe(false);
