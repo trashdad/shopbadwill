@@ -6,7 +6,10 @@
 //     reconnect T-54's dashboard uses (connectResilient);
 //   - disarm through snipe.disarm;
 //   - the outcome list (R6) with each outcome's own classifier copy (a
-//     non-final win shows "Leading").
+//     non-final win shows "Leading"). T-129: a finished snipe (resolved or
+//     stopped) is not an armed one: it sits in a collapsed "Past snipes"
+//     disclosure under the armed list, newest first, at most PAST_SHOWN.
+//     The records stay in storage (the dry-run count must not change).
 //
 // The "Snipe…" deep link arrives as a re-send of ui.openSnipe from the
 // background (src/background/handlers/open-snipe.ts): the section listens with
@@ -46,6 +49,12 @@ const STATE_TEXT: Readonly<Record<SnipeState, string>> = {
   resolved: 'Finished',
   killed: 'Stopped',
 };
+
+/** T-129: the most finished snipes "Past snipes" shows. */
+export const PAST_SHOWN = 20;
+
+/** When a finished snipe settled: its last state change (else when it was armed). */
+const settledAt = (s: Snipe): number => s.history.at(-1)?.at ?? s.armedAt;
 
 const itemUrl = (id: ItemId): string => `https://shopgoodwill.com/item/${String(id)}`;
 
@@ -114,7 +123,10 @@ function OutcomeRow(props: { snipe: Snipe; tz: string }): VNode {
   if (o === null) {
     return (
       <li class="sbw-watch">
-        <p class="sbw-muted">Finished.</p>
+        <p>
+          <strong>{snipe.title === '' ? `Item ${String(snipe.itemId)}` : snipe.title}</strong>
+        </p>
+        <p class="sbw-muted">{STATE_TEXT[snipe.state]}.</p>
       </li>
     );
   }
@@ -187,7 +199,10 @@ export function SnipesSection(props: SnipesSectionProps): VNode {
   const s = settings.kind === 'ok' ? settings.value : null;
   const list = snipes.kind === 'ok' ? snipes.value : [];
   const open = list.filter((x) => !TERMINAL.has(x.state));
-  const closed = list.filter((x) => TERMINAL.has(x.state));
+  const closed = list
+    .filter((x) => TERMINAL.has(x.state))
+    .sort((a, b) => settledAt(b) - settledAt(a))
+    .slice(0, PAST_SHOWN);
 
   const disarm = (x: Snipe): void => {
     if (disarming !== null) return;
@@ -257,14 +272,15 @@ export function SnipesSection(props: SnipesSectionProps): VNode {
         </ul>
       ) : null}
 
-      <h3>Outcomes</h3>
-      {snipes.kind === 'ok' && closed.length === 0 ? <p class="sbw-muted">No finished snipes.</p> : null}
       {closed.length > 0 ? (
-        <ul class="sbw-list" aria-label="Snipe outcomes">
-          {closed.map((x) => (
-            <OutcomeRow key={x.id} snipe={x} tz={props.userTz} />
-          ))}
-        </ul>
+        <details class="sbw-past">
+          <summary>Past snipes</summary>
+          <ul class="sbw-list" aria-label="Past snipes">
+            {closed.map((x) => (
+              <OutcomeRow key={x.id} snipe={x} tz={props.userTz} />
+            ))}
+          </ul>
+        </details>
       ) : null}
       <ErrorAlert message={disarmError} />
     </div>

@@ -890,3 +890,52 @@ describe('T-118 F4: the arm flow warns when notifications are off', () => {
     expect(screen.queryByText(WARN)).toBeNull();
   });
 });
+
+describe('T-129: a finished snipe leaves the armed list for "Past snipes"', () => {
+  const finished = (id: string, at: number, over: Partial<Snipe> = {}): Snipe =>
+    snipe({
+      id,
+      title: `Bowl ${id}`,
+      state: 'resolved',
+      outcome: 'dry-run',
+      outcomeDetail: 'Dry run: no bid was placed.',
+      history: [{ at, from: 'firing', to: 'resolved', why: 'post-read' }],
+      ...over,
+    });
+
+  it('lists only open snipes as armed; finished ones sit in a collapsed "Past snipes", newest first, with their outcome text', async () => {
+    const armed = snipe({ id: 'open1', title: 'Open bowl' });
+    const older = finished('old', NOW - 3_600_000);
+    const newer = finished('new', NOW - 60_000);
+    const stopped = finished('stop', NOW - 600_000, { state: 'killed', outcome: 'killed', outcomeDetail: 'You disarmed it.' });
+    setup({ snipes: [older, armed, newer, stopped] });
+    const armedList = await screen.findByRole('list', { name: 'Armed snipes' });
+    expect(within(armedList).getByText('Open bowl')).toBeTruthy();
+    for (const t of ['Bowl old', 'Bowl new', 'Bowl stop']) expect(within(armedList).queryByText(new RegExp(t))).toBeNull();
+
+    const past = screen.getByRole('list', { name: 'Past snipes' });
+    const details = past.closest('details') as HTMLDetailsElement;
+    expect(details).not.toBeNull();
+    expect(details.open).toBe(false);
+    expect(within(details).getByText('Past snipes').tagName).toBe('SUMMARY');
+    const rows = within(past).getAllByRole('listitem');
+    expect(rows.map((r) => /Bowl ([a-z0-9]+)/.exec(r.textContent)?.[1])).toEqual(['new', 'stop', 'old']);
+    expect(rows[2]?.textContent).toMatch(/Dry run: no bid was placed\./);
+    expect(rows[1]?.textContent).toMatch(/You disarmed it\./);
+  });
+
+  it('shows at most 20 past snipes', async () => {
+    setup({ snipes: Array.from({ length: 25 }, (_, i) => finished(`p${String(i)}`, NOW - i * 60_000)) });
+    const past = await screen.findByRole('list', { name: 'Past snipes' });
+    const rows = within(past).getAllByRole('listitem');
+    expect(rows).toHaveLength(20);
+    const ids = rows.map((r) => /Bowl ([a-z0-9]+)/.exec(r.textContent)?.[1]);
+    expect(ids).toEqual(Array.from({ length: 20 }, (_, i) => `p${String(i)}`));
+  });
+
+  it('with no finished snipe there is no "Past snipes"', async () => {
+    setup({ snipes: [snipe({ id: 'open1', title: 'Open bowl' })] });
+    await screen.findByRole('list', { name: 'Armed snipes' });
+    expect(screen.queryByText('Past snipes')).toBeNull();
+  });
+});

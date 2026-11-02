@@ -25,6 +25,11 @@
 // CalendarSink, which obeys writesAllowed('calendar') and is not gated by the
 // SGW session (R7). Spent-today stays T-82's accumulation: nothing here adds
 // spending (R5).
+//
+// T-129: every tick ends with a prune pass (tracked-prune.ts), so an item
+// whose outcome was just recorded leaves `sbw:tracked`. The tick, that prune
+// and the deferred outcome notification share one queue (withOutcomeLock): a
+// prune never lands between an outcome being recorded and its notification.
 import type { AuditLog } from '../../domain/audit/types';
 import type { CalendarLink } from '../../domain/calendar/types';
 import { settledAsMissed } from '../../domain/snipe/outcome';
@@ -36,6 +41,7 @@ import { errorText, type BackgroundContext } from '../context';
 import { syncFor } from './calendar-sync';
 import { snipeSeams } from './snipe-runner';
 import postEnd from './steps/post-end';
+import { inOutcomeScope, pruneTracked, withOutcomeLock } from './tracked-prune';
 import { OUTCOME_NOTIFY_PREFIX, onOutcomeAlarm, notifyOutcome, recordOutcome, stampedOutcome, type OutcomeKind } from './steps/post-end';
 
 /** The outcome notification alarm / id prefix and the alarm handler (wired in register). */
@@ -181,7 +187,7 @@ export function planOutcomeWork(
     const itemSnipes = byItem.get(t.itemId) ?? [];
     const link = links[t.itemId];
     // R2: only tracked items with a snipe or a calendar event.
-    if (itemSnipes.length === 0 && !t.calendar && (link === undefined || link.status === 'deleted')) continue;
+    if (!inOutcomeScope(t, itemSnipes, link)) continue;
     // A send may be out: the T-84 runner owns the outcome.
     if (itemSnipes.some((s) => MID_FLIGHT.has(s.state))) continue;
     const h = history.get(t.itemId);
@@ -242,7 +248,16 @@ export async function outcomesTick(ctx: BackgroundContext): Promise<void> {
   if (RUNNING.has(ctx)) return;
   RUNNING.add(ctx);
   try {
-    await runOutcomesTick(ctx);
+    await withOutcomeLock(ctx, async () => {
+      try {
+        await runOutcomesTick(ctx);
+      } finally {
+        // T-129: what this tick recorded (or what aged out) leaves sbw:tracked.
+        await pruneTracked(ctx).catch((e: unknown) => {
+          console.error('[ShopBadwill] tracked prune: a pass failed', e);
+        });
+      }
+    });
   } finally {
     RUNNING.delete(ctx);
   }
@@ -290,7 +305,8 @@ export function register(ctx: BackgroundContext): void {
     if (!alarm.name.startsWith(OUTCOME_NOTIFY_PREFIX)) return;
     const itemId = Number(alarm.name.slice(OUTCOME_NOTIFY_PREFIX.length));
     if (Number.isSafeInteger(itemId) && itemId > 0) {
-      void onOutcomeAlarm(ctx, itemId).catch(() => undefined);
+      // T-129: queued with the tick and its prune, so the item is still there to notify about.
+      void withOutcomeLock(ctx, () => onOutcomeAlarm(ctx, itemId)).catch(() => undefined);
     }
   });
   ctx.ticks.onTick(() =>

@@ -1,6 +1,10 @@
 // T-120's tracked-item list with the audited "Stop tracking" (a confirm step,
 // then `tracked.remove`), shared by Matches/Favorites and T-122's "Other
 // tracked items". The copy names the calendar only for an item that is on it.
+// T-129: an ended auction (its end passed on the local clock, or an outcome is
+// recorded) is not listed, and a row leaves when its end passes while the page
+// is open (one timer to the next end, ./ended). The background prunes it from
+// storage later (src/background/jobs/tracked-prune.ts).
 import type { VNode } from 'preact';
 import { useState } from 'preact/hooks';
 
@@ -8,6 +12,7 @@ import type { TrackedItem } from '../../domain/types';
 import type { MessagingClient } from '../../ports/messaging';
 import { describeError } from '../components/describeError';
 import { PacificTime } from '../time';
+import { auctionEnded, useEndClock } from './ended';
 
 const SHOWN = 20;
 
@@ -15,6 +20,8 @@ const SHOWN = 20;
 export const endMs = (t: TrackedItem): number => new Date(t.endTime).getTime();
 /** Site-derived title, shown as a text node only. */
 export const titleOf = (t: TrackedItem): string => (t.title === '' ? `Item ${String(t.itemId)}` : t.title);
+/** T-129: the auction is over: its end has passed at `now`, or it has a recorded outcome. */
+export const trackedEnded = (t: TrackedItem, now: number): boolean => t.outcome !== undefined || auctionEnded(endMs(t), now);
 
 export interface StopTracking {
   busy: boolean;
@@ -77,10 +84,13 @@ export function ItemList(props: {
   blocked?: (t: TrackedItem) => string | null;
 }): VNode {
   const { stop } = props;
-  if (props.items.length === 0) return <p class="sbw-muted">{props.empty}</p>;
+  // T-129: an ended auction leaves the list at once, also when its end passes while the page is open.
+  const now = useEndClock(props.items.map(endMs));
+  const items = props.items.filter((t) => !trackedEnded(t, now));
+  if (items.length === 0) return <p class="sbw-muted">{props.empty}</p>;
   return (
     <ul class="sbw-list" aria-label={props.label}>
-      {props.items.slice(0, SHOWN).map((t) => {
+      {items.slice(0, SHOWN).map((t) => {
         const blocked = props.blocked?.(t) ?? null;
         return (
           <li key={t.itemId}>
@@ -126,7 +136,7 @@ export function ItemList(props: {
           </li>
         );
       })}
-      {props.items.length > SHOWN ? <li class="sbw-muted">and {props.items.length - SHOWN} more</li> : null}
+      {items.length > SHOWN ? <li class="sbw-muted">and {items.length - SHOWN} more</li> : null}
     </ul>
   );
 }

@@ -21,6 +21,13 @@
 //
 // Persisted bookkeeping the frozen CalendarLink has no room for (retries,
 // cooldown, the once-a-day notice) lives in `sbw:calendarSync` (SyncStateStore).
+//
+// T-129: `forget` drops a pruned item's local bookkeeping (its link, retries,
+// reminder-sink and dry-run records) and never its Google event: a past event
+// is harmless history. The item is remembered in `pruned` for PRUNED_KEEP_MS,
+// and every run, queuePending and the reminder feed skip a remembered item, so
+// a sync that read the item before the prune can neither touch its event nor
+// re-create it.
 import { z } from 'zod';
 
 import type { AuditLog } from '../../domain/audit/types';
@@ -101,6 +108,9 @@ export const MIN_REQUEST_INTERVAL_MS = 1000;
 export const COOLDOWN_BASE_MS = 60_000;
 export const COOLDOWN_CAP_MS = 60 * 60_000;
 export const SYNC_STATE_KEY = 'sbw:calendarSync';
+
+/** T-129: how long a pruned item is remembered (its links stay ignored meanwhile). */
+export const PRUNED_KEEP_MS = 30 * 24 * 60 * 60_000;
 /** Event title prefixes once the outcome is known. */
 export const OUTCOME_LABEL: Readonly<Record<Outcome, string>> = { won: 'WON', lost: 'LOST', 'ended-early': 'ENDED EARLY', missed: 'MISSED' };
 const MAX_BUMPS = 3;
@@ -188,6 +198,8 @@ const SyncStateSchema = z.object({
   sinkHashes: z.record(z.string(), z.string()).default({}),
   /** Dry-run audit dedupe: item id -> "op:hash" last audited. */
   dryRunSeen: z.record(z.string(), z.string()).default({}),
+  /** T-129: item id -> when it was pruned (forget). Runs leave these items alone. */
+  pruned: z.record(z.string(), z.number()).default({}),
 });
 export type SyncState = z.infer<typeof SyncStateSchema>;
 
@@ -428,6 +440,40 @@ export class GoogleCalendarSink implements CalendarSink {
     });
   }
 
+  /**
+   * T-129: forgets pruned items. Their links and their retry, reminder-sink and
+   * dry-run records are dropped, and each is remembered in `pruned` so a run
+   * leaves it alone. Their Google events are not deleted or touched. Runs in
+   * the sink's queue, after any run already under way (whose link writes it
+   * then drops). Local only: no Google call. Remembered items older than
+   * PRUNED_KEEP_MS are let go, and any link of theirs dropped with them.
+   */
+  async forget(itemIds: readonly ItemId[]): Promise<void> {
+    if (itemIds.length === 0) return;
+    await this.exclusive(async () => {
+      const now = this.deps.clock.now();
+      const keys = new Set(itemIds.map(String));
+      const expired: string[] = [];
+      const without = <T>(r: Readonly<Record<string, T>>): Record<string, T> =>
+        Object.fromEntries(Object.entries(r).filter(([k]) => !keys.has(k)));
+      await this.state.update((cur) => {
+        const pruned: Record<string, number> = {};
+        for (const [k, at] of Object.entries(cur.pruned)) {
+          if (now - at < PRUNED_KEEP_MS) pruned[k] = at;
+          else expired.push(k);
+        }
+        for (const k of keys) pruned[k] = now;
+        return { ...cur, pruned, retries: without(cur.retries), sinkHashes: without(cur.sinkHashes), dryRunSeen: without(cur.dryRunSeen) };
+      });
+      const drop = new Set([...keys, ...expired.filter((k) => !keys.has(k))]);
+      await this.deps.store.update((cur) =>
+        Object.keys(cur.links).some((k) => drop.has(k))
+          ? { ...cur, links: Object.fromEntries(Object.entries(cur.links).filter(([k]) => !drop.has(k))) }
+          : cur,
+      );
+    });
+  }
+
   async reconcile(desired: DesiredEvent[], links: CalendarLink[]): Promise<SinkResult[]> {
     return (await this.run(desired, links)).results;
   }
@@ -484,12 +530,14 @@ export class GoogleCalendarSink implements CalendarSink {
    * only: makes no Google call. Returns the number of items waiting.
    */
   async queuePending(desired: readonly DesiredEvent[]): Promise<number> {
+    const { pruned } = await this.state.read();
     const state = await this.deps.store.load();
     const calendarId = state.calendarId ?? PENDING_CALENDAR_ID;
     const adds: CalendarLink[] = [];
     let waiting = 0;
     for (const d of desired) {
       if (d.privateProps.sbwState !== 'open') continue; // already decided: nothing to put on a calendar
+      if (pruned[String(d.itemId)] !== undefined) continue; // T-129: pruned, its event is left alone
       const link = state.links[d.itemId];
       if (link === undefined) {
         adds.push({
@@ -527,7 +575,7 @@ export class GoogleCalendarSink implements CalendarSink {
     return next;
   }
 
-  private async runInner(desired: readonly DesiredEvent[], links: readonly CalendarLink[]): Promise<SinkRun> {
+  private async runInner(allDesired: readonly DesiredEvent[], allLinks: readonly CalendarLink[]): Promise<SinkRun> {
     const { store, clock } = this.deps;
     const verdict = await this.deps.switches.writesAllowed('calendar');
     const dry = !verdict.ok && (await store.dryRun());
@@ -536,6 +584,10 @@ export class GoogleCalendarSink implements CalendarSink {
     const stored = await store.load();
     let calendarId = stored.calendarId ?? PENDING_CALENDAR_ID;
     const sync0 = await this.state.read();
+    // T-129: a pruned item is never planned: no write, no delete, no re-create.
+    const kept = (itemId: ItemId): boolean => sync0.pruned[String(itemId)] === undefined;
+    const desired = allDesired.filter((d) => kept(d.itemId));
+    const links = allLinks.filter((l) => kept(l.itemId));
     const plan = (id: string, s: SyncState, from: readonly CalendarLink[] = links) =>
       this.deps.kit.reconcile(desired, rehome(from, id), clock.now(), {
         calendarId: id,

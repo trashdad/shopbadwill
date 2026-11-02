@@ -27,7 +27,11 @@ const tracked = (itemId: number, calendar: boolean): TrackedItem => ({
 });
 
 const blobs: Blob[] = [];
+/** T-129: the fixtures end in Oct 2026, so the list is read before then (an ended auction is not listed). */
+const NOW = Date.UTC(2026, 9, 7, 12, 0, 0);
+
 beforeEach(() => {
+  vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
   blobs.length = 0;
   vi.spyOn(URL, 'createObjectURL').mockImplementation((b: Blob | MediaSource) => {
     blobs.push(b as Blob);
@@ -39,6 +43,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 const mount = (m: FakeMessaging) =>
