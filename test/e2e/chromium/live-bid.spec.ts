@@ -758,6 +758,7 @@ async function openTheGate(): Promise<GatedTemplate> {
         onTimeRate: 0.8,
         maxBid: 5000,
         perDayMax: 10000,
+        skippedDryRuns: 0,
       });
       expectNoUnexpectedHosts(r);
     });
