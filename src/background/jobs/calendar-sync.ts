@@ -230,6 +230,7 @@ export class CalendarSync {
       this.sink.setTimeZone(settings.locale.timeZone);
       const [tracked, calendar] = await Promise.all([repo.get(STORAGE_KEYS.tracked), repo.get(STORAGE_KEYS.calendar)]);
       const now = repo.now();
+      await this.sink.release(tracked); // T-131: a re-tracked item gets its calendar event again
       const desired = buildDesired(tracked, calendar.links, settings, now);
       await this.feedSinks(desired, settings);
 

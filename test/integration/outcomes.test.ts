@@ -1382,6 +1382,29 @@ describe('T-129: a tracked item is pruned once its outcome is recorded, or 6 h a
     expect((await eventOf(r, 80))?.summary).toBe('Pyrex bowl 80');
   });
 
+  it('T-131: an item tracked again after its prune gets its calendar event again', async () => {
+    const r = await rig();
+    await track(r, 84);
+    await seedEvent(r, 84, 'Pyrex bowl 84');
+    r.api.details.set(84, closedDetail(84, { isHighBidder: false, currentPrice: 2500 }));
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([]);
+    expect(Object.keys((await syncFor(r.ctx).sink.state.read()).pruned)).toEqual(['84']);
+
+    // Tracked again, after the prune, for an end still ahead.
+    r.clock.advance(MIN);
+    await track(r, 84, { endTime: new Date(r.clock.now() + 2 * HOUR).toISOString(), addedAt: r.clock.now(), updatedAt: r.clock.now() });
+    r.google.connected = true;
+    const sync = syncFor(r.ctx).syncNow('re-tracked');
+    await settle(r.clock);
+    await sync;
+
+    expect((await syncFor(r.ctx).sink.state.read()).pruned).toEqual({});
+    expect((await r.repo.get(STORAGE_KEYS.calendar)).links[84]).toMatchObject({ status: 'synced' });
+    expect((await eventOf(r, 84))?.summary).toBe('Pyrex bowl 84');
+    expect(r.calendarApi.calls.filter((c) => c.method === 'eventsDelete')).toHaveLength(0);
+  });
+
   it('drops the item ntfy and reminder bookkeeping locally, and waits while a reminder is still to fire', async () => {
     const r = await rig();
     await track(r, 81, { calendar: false, outcome: 'won' });

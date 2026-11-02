@@ -34,7 +34,7 @@ import type { AuditLog } from '../../domain/audit/types';
 import type { CalendarLink, DesiredEvent, EventIdFor, GcalEvent, GcalEventBody } from '../../domain/calendar/types';
 import { formatMoney } from '../../domain/money';
 import type { CalendarState } from '../../domain/storage/schema';
-import type { Cents, EpochMs, IsoUtc, ItemId } from '../../domain/types';
+import type { Cents, EpochMs, IsoUtc, ItemId, TrackedItem } from '../../domain/types';
 import type { CalendarApi, CalendarSink } from '../../ports/calendar';
 import type { Clock } from '../../ports/clock';
 import { CalendarApiError } from '../../ports/errors';
@@ -471,6 +471,27 @@ export class GoogleCalendarSink implements CalendarSink {
           ? { ...cur, links: Object.fromEntries(Object.entries(cur.links).filter(([k]) => !drop.has(k))) }
           : cur,
       );
+    });
+  }
+
+  /**
+   * T-131: a pruned item that was tracked again (its `addedAt` is after the
+   * prune) is let go from `pruned`, so it gets a calendar event again. An item
+   * a sync read before the prune keeps its older `addedAt` and stays skipped.
+   * Local only: no Google call. Writes only on change.
+   */
+  async release(tracked: Readonly<Record<number, Pick<TrackedItem, 'addedAt'>>>): Promise<void> {
+    const { pruned } = await this.state.read();
+    const back = (k: string, at: number): boolean => {
+      const t = tracked[Number(k)];
+      return t !== undefined && t.addedAt > at;
+    };
+    if (!Object.entries(pruned).some(([k, at]) => back(k, at))) return;
+    await this.exclusive(async () => {
+      await this.state.update((cur) => {
+        const kept = Object.fromEntries(Object.entries(cur.pruned).filter(([k, at]) => !back(k, at)));
+        return Object.keys(kept).length === Object.keys(cur.pruned).length ? cur : { ...cur, pruned: kept };
+      });
     });
   }
 
