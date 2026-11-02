@@ -104,7 +104,8 @@ export function ExposureSection(props: ExposureSectionProps): JSX.Element {
           .filter((t) => t !== '')
           .join(' · ');
   const left = Math.max(0, s.snipe.requiredDryRuns - s.snipe.completedDryRuns);
-  const needsTyped = soak.onTimeRate < ON_TIME_RATE_MIN;
+  // T-130: skipping the remaining dry runs also needs the typed confirmation.
+  const needsTyped = soak.onTimeRate < ON_TIME_RATE_MIN || left > 0;
 
   /** Sends the typed confirmation over the gate's port and waits for its ok. */
   const sendConfirmation = (typed: string): Promise<boolean> => {
@@ -205,12 +206,14 @@ export function ExposureSection(props: ExposureSectionProps): JSX.Element {
       </p>
 
       {s.dryRun.bidding ? (
-        left > 0 ? (
-          <p class="hint">
-            Complete {String(left)} more dry-run {left === 1 ? 'snipe' : 'snipes'} before going live.
-          </p>
-        ) : confirming ? (
+        confirming ? (
           <div class="exposure-confirm" role="group" aria-label="Confirm going live">
+            {left > 0 ? (
+              <p class="exposure-skip" data-testid="exposure-skip">
+                You are skipping {String(left)} of {String(s.snipe.requiredDryRuns)} dry-run snipes. Timing is not
+                proven yet: a live snipe could fire late or miss.
+              </p>
+            ) : null}
             <p>
               Live bids are real money: at most <Money cents={s.snipe.caps.perItemMax} /> for one item and{' '}
               <Money cents={s.snipe.caps.perDayMax} /> per day. ShopGoodwill's terms may forbid automated bidding.
@@ -253,16 +256,23 @@ export function ExposureSection(props: ExposureSectionProps): JSX.Element {
             </div>
           </div>
         ) : (
-          <button
-            type="button"
-            class="exposure-go"
-            onClick={() => {
-              setError('');
-              setConfirming(true);
-            }}
-          >
-            Go live…
-          </button>
+          <>
+            {left > 0 ? (
+              <p class="hint">
+                Complete {String(left)} more dry-run {left === 1 ? 'snipe' : 'snipes'} before going live. You can skip them at your own risk.
+              </p>
+            ) : null}
+            <button
+              type="button"
+              class="exposure-go"
+              onClick={() => {
+                setError('');
+                setConfirming(true);
+              }}
+            >
+              Go live…
+            </button>
+          </>
         )
       ) : (
         <button type="button" class="exposure-go" onClick={dryRunAgain}>

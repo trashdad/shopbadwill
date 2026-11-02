@@ -175,6 +175,17 @@ describe('liveGateVerdict (pure)', () => {
     }
   });
 
+  it('T-130: a fresh typed confirmation skips the missing dry runs, audited as confirmed with the skipped count', () => {
+    const verdict = liveGateVerdict(off(settingsWith(2, 5)), [fired('a'), fired('b')], { at: NOW - 1000 }, NOW);
+    expect(verdict).toMatchObject({ ok: true, audit: { confirmed: true, completedDryRuns: 2, requiredDryRuns: 5, skippedDryRuns: 3 } });
+  });
+
+  it('T-130: a stale confirmation does not skip the missing dry runs', () => {
+    const verdict = liveGateVerdict(off(settingsWith(2, 5)), [fired('a'), fired('b')], { at: NOW - CONFIRM_TTL_MS - 1 }, NOW);
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.veto).toContain('type GO LIVE');
+  });
+
   it('the boundary: completed === required is not refused, one below is', () => {
     expect(liveGateVerdict(off(settingsWith(4, 5)), [], null, NOW).ok).toBe(false);
     // 5 of 5 completed with no fires at all: the on-time rate is 0, so the typed
@@ -417,7 +428,7 @@ describe('review fixes (Opus)', () => {
     const snipes = Object.values(ON_TIME_RECORD);
     const v = liveGateVerdict(off(settingsWith(4, 0)), snipes, null, NOW);
     expect(v.ok).toBe(false);
-    if (!v.ok) expect(v.veto).toBe('Complete 1 dry-run snipe before bidding live.');
+    if (!v.ok) expect(v.veto).toBe("Complete 1 dry-run snipe before bidding live, or type GO LIVE in the popup's Live bidding section to skip it.");
     expect(liveGateVerdict(off(settingsWith(5, 0)), snipes, null, NOW).ok).toBe(true);
   });
 
@@ -465,7 +476,7 @@ describe('the real background stack: router -> settings handler (T-36/T-90) -> t
     const before = await readSettings(h.repo);
 
     const claim = await h.send('settings.set', { dryRun: { ...before.dryRun, bidding: false }, snipe: { ...before.snipe, completedDryRuns: 99 } });
-    expect(claim).toMatchObject({ ok: false, error: { message: 'Complete 2 dry-run snipes before bidding live.' } });
+    expect(claim).toMatchObject({ ok: false, error: { message: expect.stringContaining('Complete 2 dry-run snipes before bidding live') as unknown } });
     expect(await readSettings(h.repo)).toEqual(before);
 
     // The claim on its own is written without the count (T-90 keeps the stored one): it is no back door.
@@ -522,6 +533,7 @@ describe('the real background stack: router -> settings handler (T-36/T-90) -> t
       confirmed: true,
       completedDryRuns: 5,
       requiredDryRuns: 5,
+      skippedDryRuns: 0,
       firesAttempted: 5,
       onTimeRate: 0.8,
       maxBid: 5000,

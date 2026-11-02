@@ -115,11 +115,27 @@ describe('popup exposure section', () => {
     expect(screen.getByRole('progressbar', { name: 'Exposure against the daily cap' })).toBeTruthy();
   });
 
-  it('is locked below requiredDryRuns: no go-live control, a plain statement', async () => {
-    setupPopup({ settings: settingsWith(3, 5) });
+  it('T-130: below requiredDryRuns it recommends finishing them, and skipping needs the typed GO LIVE with a warning', async () => {
+    const { m, ports } = setupPopup({ settings: settingsWith(3, 5), snipes: AT_100 });
     await screen.findByTestId('exposure-section');
-    expect(screen.queryByRole('button', { name: /go live/i })).toBeNull();
     expect(screen.getByText(/2 more dry-run snipes before going live/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /go live…/i }));
+    expect((await screen.findByTestId('exposure-skip')).textContent).toContain('skipping 2 of 5 dry-run snipes');
+
+    // Without the typed text nothing is sent.
+    fireEvent.click(screen.getByRole('button', { name: /^go live$/i }));
+    expect(ports.calls).toHaveLength(0);
+    expect(m.sent.filter((s) => s.type === 'settings.set')).toHaveLength(0);
+
+    fireEvent.input(screen.getByLabelText(/type go live to confirm/i), { target: { value: 'GO LIVE' } });
+    fireEvent.click(screen.getByRole('button', { name: /^go live$/i }));
+    await waitFor(() => {
+      expect(ports.calls).toHaveLength(1);
+    });
+    expect(ports.calls[0]?.messages).toEqual([{ confirmation: 'GO LIVE' }]);
+    await waitFor(() => {
+      expect(m.sent.filter((s) => s.type === 'settings.set')).toHaveLength(1);
+    });
   });
 
   it('go live shows the honest copy and the checklist link (R5)', async () => {

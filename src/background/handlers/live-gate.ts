@@ -5,7 +5,8 @@
 // The gate:
 //   - refuses turning `dryRun.bidding` OFF while
 //     completedDryRuns < requiredDryRuns (R2), judging the KEPT count in
-//     `next` (T-90 keeps it; a crafted patch can never raise it — R3);
+//     `next` (T-90 keeps it; a crafted patch can never raise it — R3),
+//     unless the user typed the confirmation to skip them (T-130, audited);
 //   - when the soak's on-time rate is below 95% (src/domain/snipe/soak.ts),
 //     requires a typed confirmation (R2, I-25) and audits every override;
 //   - refuses any `requiredDryRuns` decrease through settings.set (R3);
@@ -54,10 +55,12 @@ export interface LiveGateConfirmation {
 
 /** What the audit entry records when bidding goes live. */
 export interface BiddingOffAudit {
-  /** True when the user typed the confirmation (the <95% override); false at ≥95%. */
+  /** True when the user typed the confirmation (the <95% override or the T-130 dry-run skip). */
   confirmed: boolean;
   completedDryRuns: number;
   requiredDryRuns: number;
+  /** Dry runs still missing when bidding went live (T-130: the typed skip); 0 normally. */
+  skippedDryRuns: number;
   firesAttempted: number;
   onTimeRate: number;
   maxBid: Cents;
@@ -104,30 +107,37 @@ export function liveGateVerdict(
   // against at least the schema default.
   const completed = next.snipe.completedDryRuns;
   const required = Math.max(REQUIRED_DRY_RUNS_FLOOR, next.snipe.requiredDryRuns);
-  if (completed < required) {
-    const left = required - completed;
-    return {
-      ok: false,
-      veto: `Complete ${String(left)} dry-run ${left === 1 ? 'snipe' : 'snipes'} before bidding live.`,
-    };
-  }
-
+  const fresh = confirmation !== null && now - confirmation.at <= CONFIRM_TTL_MS;
   const soak = soakSummary(snipes);
   const audit: BiddingOffAudit = {
     confirmed: false,
     completedDryRuns: completed,
     requiredDryRuns: required,
+    skippedDryRuns: Math.max(0, required - completed),
     firesAttempted: soak.firesAttempted,
     onTimeRate: soak.onTimeRate,
     maxBid: next.snipe.caps.perItemMax,
     perDayMax: next.snipe.caps.perDayMax,
   };
 
+  // T-130: the user may skip the remaining dry runs, but only with the typed
+  // confirmation through the port (never by a bare settings.set), and the
+  // audit records how many were skipped.
+  if (completed < required) {
+    const left = required - completed;
+    if (fresh) return { ok: true, audit: { ...audit, confirmed: true } };
+    return {
+      ok: false,
+      veto:
+        `Complete ${String(left)} dry-run ${left === 1 ? 'snipe' : 'snipes'} before bidding live, ` +
+        `or type ${GO_LIVE_CONFIRMATION} in the popup's Live bidding section to skip ${left === 1 ? 'it' : 'them'}.`,
+    };
+  }
+
   // R2: at >= 95% no confirmation is asked.
   if (soak.onTimeRate >= ON_TIME_RATE_MIN) return { ok: true, audit };
 
   // Below 95%: the warning the user overrides with the typed confirmation.
-  const fresh = confirmation !== null && now - confirmation.at <= CONFIRM_TTL_MS;
   if (fresh) return { ok: true, audit: { ...audit, confirmed: true } };
 
   // R5 honest copy: real money, the max bid, the daily cap, the terms warning,
@@ -206,6 +216,7 @@ export class LiveGate {
         confirmed: verdict.audit.confirmed,
         completedDryRuns: verdict.audit.completedDryRuns,
         requiredDryRuns: verdict.audit.requiredDryRuns,
+        skippedDryRuns: verdict.audit.skippedDryRuns,
         firesAttempted: verdict.audit.firesAttempted,
         onTimeRate: verdict.audit.onTimeRate,
         maxBid: verdict.audit.maxBid,

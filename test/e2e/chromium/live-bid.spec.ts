@@ -690,12 +690,12 @@ async function openTheGate(): Promise<GatedTemplate> {
     });
 
     await test.step('the gate refuses at 0 dry runs; a crafted count is refused and never sticks', async () => {
-      await expectGateRefuses(r, /Complete 5 dry-run snipes before bidding live\./);
+      await expectGateRefuses(r, /Complete 5 dry-run snipes before bidding live/);
       const s = await settingsOf(r);
       // A patch that claims the dry runs: the gate judges the KEPT count (T-90), so it is refused...
       await expect(
         sendMsg(r.options, 'settings.set', { snipe: { ...s.snipe, completedDryRuns: REQUIRED_DRY_RUNS }, dryRun: { ...s.dryRun, bidding: false } }),
-      ).rejects.toThrow(/Complete 5 dry-run snipes before bidding live\./);
+      ).rejects.toThrow(/Complete 5 dry-run snipes before bidding live/);
       // ...and on its own it never changes the count.
       await sendMsg(r.options, 'settings.set', { snipe: { ...s.snipe, completedDryRuns: REQUIRED_DRY_RUNS } });
       expect((await settingsOf(r)).snipe.completedDryRuns).toBe(0);
@@ -705,7 +705,8 @@ async function openTheGate(): Promise<GatedTemplate> {
         await expect(section.getByTestId('bidding-state')).toHaveAttribute('data-state', 'dry');
         await expect(section).toContainText('0 of 5 dry-run snipes completed');
         await expect(section).toContainText('Complete 5 more dry-run snipes before going live.');
-        await expect(section.getByRole('button', { name: 'Go live…' })).toHaveCount(0);
+        // T-130: the skip is offered, behind the typed confirmation.
+        await expect(section.getByRole('button', { name: 'Go live…' })).toHaveCount(1);
       } finally {
         await popup.close();
       }
@@ -715,7 +716,7 @@ async function openTheGate(): Promise<GatedTemplate> {
       const late = n === REQUIRED_DRY_RUNS;
       await test.step(`dry run ${String(n)} of ${String(REQUIRED_DRY_RUNS)} against the fake${late ? `, fired ${String(LATE_FIRE_MS)} ms late` : ''}`, async () => {
         await dryRun(r, n, late ? LATE_FIRE_MS : 0);
-        if (n === REQUIRED_DRY_RUNS - 1) await expectGateRefuses(r, /Complete 1 dry-run snipe before bidding live\./);
+        if (n === REQUIRED_DRY_RUNS - 1) await expectGateRefuses(r, /Complete 1 dry-run snipe before bidding live/);
       });
     }
 

@@ -82,3 +82,7 @@
   color: var(--danger);
   font-weight: 600;
 }
+.exposure-skip {
+  color: var(--danger);
+  font-weight: 600;
+}
