@@ -14,8 +14,8 @@
 //   that may have been won gets a confirming read of its item after the end
 //   (`checking`): T-87's classifier must say `won` and `final` (the domain's
 //   judgeWin). Bounded retries. The lane (confirmLane): the snipe lane (the
-//   session's bearer: SGW says who leads; until the PlaceBid codes are
-//   catalogued that is the ONLY read that can confirm a live win) whenever no
+//   session's bearer: SGW says who leads; for a reply not in the PlaceBid
+//   catalogue that is the ONLY read that can confirm a live win) whenever no
 //   other snipe needs it soon (snipeLaneFree: a 429/5xx backs off the lane it
 //   came on, and must never make another snipe's verify, fire or outcome read
 //   wait), else the interactive lane (fast attempts) or the background lane

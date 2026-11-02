@@ -998,6 +998,27 @@ describe('result: SGW replies', () => {
     expect(r.effects[0]).toEqual({ kind: 'readDetail', snipeId: 's1', purpose: 'post-read' });
   });
 
+  it("T-132: the bid.result audit carries SGW's boolean status flag (null when the reply has none)", () => {
+    const live = bid('accepted', { statusFlag: true, rawStatus: null, rawResult: 1, messageText: 'Bid Received!' });
+    const r = reduce(inState('sent'), E.result(live), CAPS_OK, CTX);
+    expect(ofKind(r.effects, 'audit')[0]?.entry.details).toMatchObject({ resultKind: 'accepted', statusFlag: true, rawStatus: null, rawResult: 1 });
+    expect(r.next.attempt.reply?.statusFlag).toBe(true);
+    const legacy = reduce(inState('sent'), E.result(bid('rejected-unknown')), CAPS_OK, CTX);
+    expect(ofKind(legacy.effects, 'audit')[0]?.entry.details).toMatchObject({ statusFlag: null, rawStatus: 200 });
+  });
+
+  it("T-132: an 'accepted' reply only waits for the outcome read: no second send, no outcome yet", () => {
+    const live = bid('accepted', { statusFlag: true, rawStatus: null, rawResult: 1, isHighBidder: null });
+    const r = reduce(inState('sent'), E.result(live), CAPS_OK, CTX);
+    expect(r.next.state).toBe('sent');
+    expect(r.next.outcome).toBeUndefined();
+    expect(r.effects.filter((e) => e.kind !== 'audit')).toEqual([{ kind: 'readDetail', snipeId: 's1', purpose: 'post-read' }]);
+    // A second reply or an ambiguous after it is refused: the attempt has its one answer.
+    const again = reduce(r.next, E.result(live), CAPS_OK, CTX);
+    expect(again.rejection?.reason).toBe('duplicate');
+    expect(again.effects).toEqual([]);
+  });
+
   it('the bid.result audit carries the raw codes and the reply text', () => {
     const r = reduce(inState('sent'), E.result(bid('rejected-unknown', { rawStatus: 200, rawResult: 7, messageText: 'odd' })), CAPS_OK, CTX);
     expect(ofKind(r.effects, 'audit')[0]?.entry.details).toMatchObject({ resultKind: 'rejected-unknown', rawStatus: 200, rawResult: 7, message: 'odd' });

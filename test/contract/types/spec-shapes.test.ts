@@ -133,6 +133,8 @@ type SpecBidResultKind =
   | 'rejected-unknown';
 interface SpecBidResult {
   kind: SpecBidResultKind;
+  /** T-132 (additive): SGW's boolean `status`; null when it sent a number; absent on replies stored before T-132. */
+  statusFlag?: boolean | null;
   rawStatus: number | null;
   rawResult: number | null;
   messageText: string;

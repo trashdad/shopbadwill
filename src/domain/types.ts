@@ -113,6 +113,12 @@ export type BidResultKind = z.infer<typeof BidResultKindSchema>;
 
 export const BidResultSchema = z.object({
   kind: BidResultKindSchema,
+  /**
+   * T-132 (additive, optional): SGW's boolean `status` as sent; null when it sent a
+   * number (then in `rawStatus`) or none. Evidence only: it never decides `kind` on its
+   * own. Replies stored before T-132, and our own proof-read inference, have none.
+   */
+  statusFlag: z.boolean().nullable().optional(),
   rawStatus: z.number().int().nullable(),
   rawResult: z.number().int().nullable(),
   /** HTML stripped to text at the adapter edge. */

@@ -758,6 +758,7 @@ async function openTheGate(): Promise<GatedTemplate> {
         onTimeRate: 0.8,
         maxBid: 5000,
         perDayMax: 10000,
+        skippedDryRuns: 0,
       });
       expectNoUnexpectedHosts(r);
     });
@@ -1036,8 +1037,8 @@ test('win: one PlaceBid at exactly the max; the proxy price is the runner-up plu
   const sent = await test.step('the fire: ShowBidModal, then PlaceBid $20.00; SGW accepts and we lead', async () => {
     const s = await sendAnswered(r, r.snipe.id);
     expect(s.state).toBe('sent');
-    // Stage 1 (no P5 catalogue): every reply is 'rejected-unknown'; the outcome read decides (T-100).
-    expect(s.attempt.reply).toMatchObject({ kind: 'rejected-unknown', rawStatus: null, rawResult: 0 });
+    // Stage 2 (T-132): (status true, result 1) is catalogued 'accepted' = received; the outcome read decides.
+    expect(s.attempt.reply).toMatchObject({ kind: 'accepted', statusFlag: true, rawStatus: null, rawResult: 1 });
     expect(await fakeAuction(PYREX)).toMatchObject({ holder: 'me', price: 17.5, numBids: 4 });
     return s;
   });
@@ -1046,13 +1047,8 @@ test('win: one PlaceBid at exactly the max; the proxy price is the runner-up plu
     const done = await outcomeRead(r, sent);
     expect(done).toMatchObject({ state: 'resolved', outcome: 'won' });
     expect(done.outcomeDetail).toContain('Won; reported by SGW.');
-    expect(done.outcomeDetail).toContain('Unrecognised reply (status null, result 0)');
-    await expectNotification(
-      r,
-      done.id,
-      `Won: ${PYREX_TITLE}`,
-      `Won at $17.50 (your max $20.00). ShopGoodwill's reply was not recognised; this comes from re-reading the item. ${ended(r, r.endMs)}`,
-    );
+    expect(done.outcomeDetail).not.toContain('Unrecognised reply');
+    await expectNotification(r, done.id, `Won: ${PYREX_TITLE}`, `Won at $17.50 (your max $20.00). ${ended(r, r.endMs)}`);
     await expectNotificationSequence(r, [`Won: ${PYREX_TITLE}`]);
   });
 
@@ -1082,7 +1078,8 @@ test('outbid by a higher hidden max: one PlaceBid at the max; Lost, short by $1.
   const sent = await test.step('PlaceBid $20.00 meets a hidden $25.00 max: SGW reports us outbid at once', async () => {
     const s = await sendAnswered(r, r.snipe.id);
     expect(s.state).toBe('sent');
-    expect(s.attempt.reply).toMatchObject({ kind: 'rejected-unknown', rawStatus: null, rawResult: 1 });
+    // T-132: outbid at once shares result 1 with the lead; 'accepted' means received, never leading.
+    expect(s.attempt.reply).toMatchObject({ kind: 'accepted', statusFlag: true, rawStatus: null, rawResult: 1 });
     // Proxy semantics: the competitor's hidden max answers ours plus one increment.
     expect(await fakeAuction(PYREX)).toMatchObject({ holder: 'other', price: 21, numBids: 4 });
     return s;
@@ -1096,7 +1093,7 @@ test('outbid by a higher hidden max: one PlaceBid at the max; Lost, short by $1.
       r,
       done.id,
       `Lost: ${PYREX_TITLE}`,
-      `Lost: outbid at $21.00 (your max $20.00), short by $1.00. ShopGoodwill's reply was not recognised; this comes from re-reading the item. ${ended(r, r.endMs)}`,
+      `Lost: outbid at $21.00 (your max $20.00), short by $1.00. ${ended(r, r.endMs)}`,
     );
     await expectNotificationSequence(r, [`Lost: ${PYREX_TITLE}`]);
   });
@@ -1127,15 +1124,21 @@ test('below the minimum at the fire: the price passed the max after the verify; 
   const sent = await test.step('the one PlaceBid at the max; SGW answers "too low" (-4); nothing registers', async () => {
     const s = await sendAnswered(r, r.snipe.id);
     expect(s.state).toBe('sent');
-    expect(s.attempt.reply).toMatchObject({ kind: 'rejected-unknown', rawStatus: null, rawResult: -4, messageText: 'Your bid must be at least $25.00.' });
+    expect(s.attempt.reply).toMatchObject({
+      kind: 'rejected-unknown',
+      statusFlag: false,
+      rawStatus: null,
+      rawResult: -4,
+      messageText: 'Your bid must be at least $25.00.',
+    });
     expect(await fakeAuction(PYREX)).toMatchObject({ holder: 'other', price: 24, numBids: 5 });
     return s;
   });
 
-  await test.step('the outcome read: Lost with the margin (stage 1 has no catalogue entry for -4, so not yet "below-minimum")', async () => {
+  await test.step('the outcome read: Lost with the margin (no catalogue entry for -4 yet, so not "below-minimum")', async () => {
     const done = await outcomeRead(r, sent);
     expect(done).toMatchObject({ state: 'resolved', outcome: 'outbid' });
-    expect(done.outcomeDetail).toContain('Unrecognised reply (status null, result -4): Your bid must be at least $25.00.');
+    expect(done.outcomeDetail).toContain('Unrecognised reply (status false, result -4): Your bid must be at least $25.00.');
     await expectNotification(
       r,
       done.id,
@@ -1244,7 +1247,7 @@ test('cookie: with a Bid cookie in the browser and SGW setting one, no request c
       `${PLACE_BID} 200 cookie=null`,
     ]);
   });
-  expect(sent.attempt.reply).toMatchObject({ kind: 'rejected-unknown', rawStatus: null, rawResult: 0 });
+  expect(sent.attempt.reply).toMatchObject({ kind: 'accepted', statusFlag: true, rawStatus: null, rawResult: 1 });
   const done = await outcomeRead(r, sent);
 
   await test.step('the bid went through (a cookie would have been 403): Won', async () => {
@@ -1253,7 +1256,7 @@ test('cookie: with a Bid cookie in the browser and SGW setting one, no request c
       r,
       done.id,
       `Won: ${PYREX_TITLE}`,
-      `Won at $17.50 (your max $20.00). ShopGoodwill's reply was not recognised; this comes from re-reading the item. ${ended(r, r.endMs)}`,
+      `Won at $17.50 (your max $20.00). ${ended(r, r.endMs)}`,
     );
     await expectNotificationSequence(r, [`Won: ${PYREX_TITLE}`]);
   });
@@ -1293,7 +1296,7 @@ test('ambiguous, ≥ 2 s left: PlaceBid stalls past its timeout; the proof read 
     const s = await sendAnswered(r, r.snipe.id, 60_000);
     expect(s.state).toBe('sent');
     expect(s.attempt.ambiguous, 'the resend answered: not ambiguous').toBeUndefined();
-    expect(s.attempt.reply).toMatchObject({ kind: 'rejected-unknown', rawStatus: null, rawResult: 0 });
+    expect(s.attempt.reply).toMatchObject({ kind: 'accepted', statusFlag: true, rawStatus: null, rawResult: 1 });
     expect(await fakeAuction(HOT_WHEELS)).toMatchObject({ holder: 'me', price: 4, numBids: 1 });
     return s;
   });
@@ -1326,7 +1329,7 @@ test('ambiguous, ≥ 2 s left: PlaceBid stalls past its timeout; the proof read 
       r,
       done.id,
       `Won: ${HOT_WHEELS_TITLE}`,
-      `Won at $4.00 (your max $10.00). ShopGoodwill's reply was not recognised; this comes from re-reading the item. ${ended(r, r.endMs)}`,
+      `Won at $4.00 (your max $10.00). ${ended(r, r.endMs)}`,
     );
     await expectNotificationSequence(r, [`Won: ${HOT_WHEELS_TITLE}`]);
     await expectMoneyWire(r, { itemId: HOT_WHEELS, maxBid: 1000, placeBids: 2, endMs: r.endMs });

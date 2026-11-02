@@ -1,10 +1,12 @@
 // T-100: the live PlaceBid path (src/adapters/sgw/bid.ts) and its result-code
 // map, PLAN §6 T-100.
 //
-// STAGE 1: every PlaceBid reply in this file is SYNTHETIC and written inline.
-// The real replies (test/fixtures/sgw/json/placebid-*.json, USER STEP P5)
-// land in stage 2; the "every catalogue fixture" test picks them up from
-// manifest.json on its own.
+// STAGE 2 (T-132): the first real reply is catalogued, from the live audit of
+// the first real bid: (status true, result 1) → 'accepted', fixture
+// test/fixtures/sgw/json/placebid-accepted-high-bidder.json (reconstructed, no
+// raw capture). Every other reply in this file is SYNTHETIC and written inline.
+// Later P5 replies (placebid-*.json) are picked up from manifest.json by the
+// "every catalogue fixture" test on their own.
 //
 // No live network (R7): replies come from FakeHttp on a FakeClock, through the
 // real T-25 scheduler and T-26 adapter. MSW (test/setup) fails any request that
@@ -205,7 +207,7 @@ function fakeContext(reply: unknown, modal: { sellerId: number; minimumBid: numb
 const REQ = { itemId: ITEM, sellerId: SELLER, bidAmount: 7000, quantity: 1 as const };
 const OPTS = { idempotencyKey: KEY, timeoutMs: 20 * S };
 
-/** A synthetic catalogue (stage 1 has no real one): one success code, one outbid code, one rejection. */
+/** A synthetic catalogue (the real one has a single code): one success code, one outbid code, one rejection. */
 const SYNTHETIC_CATALOGUE: readonly PlaceBidCode[] = [
   { status: true, result: 7, kind: 'accepted', evidence: 'catalogue', source: 'placebid-synthetic-accepted.json' },
   { status: true, result: 8, kind: 'outbid', evidence: 'catalogue', source: 'placebid-synthetic-outbid.json' },
@@ -256,7 +258,7 @@ describe('R1: classification fails safe (synthetic replies)', () => {
     expect(BidResultSchema.parse(r)).toEqual(r);
   });
 
-  it('stage 1: the PLAN placeholder codes (-3, -4, -5, -110) are inert until the catalogue confirms them', () => {
+  it('the PLAN placeholder codes (-3, -4, -5, -110) stay inert until the catalogue confirms them', () => {
     const placeholders = PLACE_BID_RESULT_CODES.filter((c) => c.evidence === 'placeholder');
     expect(placeholders.map((c) => c.result).sort((a, b) => a - b)).toEqual([-110, -5, -4, -3]);
     for (const c of placeholders) {
@@ -264,24 +266,55 @@ describe('R1: classification fails safe (synthetic replies)', () => {
     }
   });
 
-  it("stage 1: no code is known yet, so no live reply is ever 'accepted' or 'outbid'", () => {
-    expect(PLACE_BID_RESULT_CODES.filter((c) => c.evidence === 'catalogue')).toEqual([]);
+  it("stage 2 (T-132): the only catalogue code is (status true, result 1) → 'accepted', citing the live reply", () => {
+    expect(PLACE_BID_RESULT_CODES.filter((c) => c.evidence === 'catalogue')).toEqual([
+      { status: true, result: 1, kind: 'accepted', evidence: 'catalogue', source: 'placebid-accepted-high-bidder.json' },
+    ]);
+  });
+
+  it("stage 2: a live reply is 'accepted' ONLY for a boolean status true with result 1, and never 'outbid'", () => {
     fc.assert(
       fc.property(replyArb(), (reply) => {
         const kind = classifyPlaceBid(reply, T0).kind;
-        expect(kind).not.toBe('accepted');
         expect(kind).not.toBe('outbid');
+        if (kind === 'accepted') {
+          expect(reply.status).toBe(true);
+          expect(reply.result).toBe(1);
+          expect(reply.isUnauthorized).not.toBe(true);
+        }
       }),
       { numRuns: 500 },
     );
   });
 
-  it("the fake server's UNVERIFIED codes (T-88) are never 'accepted' or 'outbid' here", () => {
+  it.each([
+    ['status false, result 1 (the inferred flag was wrong: fails safe)', { status: false, result: 1, message: 'Bid Received!' }],
+    ['numeric status 1, result 1', { status: 1, result: 1, message: 'Bid Received!' }],
+    ['numeric status 0, result 1', { status: 0, result: 1 }],
+    ['status true, no result, the same message', { status: true, message: 'Bid Received!\nYou are currently the high bidder for this auction.' }],
+    ['status true, result 0', { status: true, result: 0, message: 'Bid Received!' }],
+  ])("%s → 'rejected-unknown' (never classified by message text)", (_name, reply) => {
+    expect(classifyPlaceBid(reply, T0).kind).toBe('rejected-unknown');
+  });
+
+  it("isUnauthorized next to (true, 1) is still 'auth'", () => {
+    expect(classifyPlaceBid({ status: true, result: 1, isUnauthorized: true }, T0).kind).toBe('auth');
+  });
+
+  it("the fake server's codes (T-88): UNVERIFIED ones are 'accepted' only where they share the catalogued (true, 1), and never 'outbid'", () => {
     for (const [name, c] of Object.entries(BID_RESULT)) {
-      if (!c.unverified) continue;
       const kind = classifyPlaceBid({ status: c.status, result: c.result, message: name }, T0).kind;
-      expect(['accepted', 'outbid'], name).not.toContain(kind);
+      expect(kind, name).not.toBe('outbid');
+      if (c.unverified) {
+        const catalogued = PLACE_BID_RESULT_CODES.some((x) => x.evidence === 'catalogue' && x.status === c.status && x.result === c.result);
+        expect(kind === 'accepted', name).toBe(catalogued);
+      }
     }
+    // The verified accepted code is the catalogued one; the immediately-outbid variant shares it,
+    // so 'accepted' means "received" and the outcome read decides won or lost.
+    expect(BID_RESULT.ACCEPTED_HIGH).toEqual({ status: true, result: 1, unverified: false });
+    expect(classifyPlaceBid({ ...BID_RESULT.ACCEPTED_HIGH, message: 'x' }, T0).kind).toBe('accepted');
+    expect(classifyPlaceBid({ ...BID_RESULT.ACCEPTED_OUTBID, message: 'x' }, T0).kind).toBe('accepted');
   });
 
   it("a catalogue success code is 'accepted', but only with its own status flag", () => {
@@ -335,7 +368,38 @@ describe('R1: classification fails safe (synthetic replies)', () => {
 
   it('copies SGW’s raw signals and the observation time', () => {
     const r = classifyPlaceBid({ status: 3, result: -42, message: 'm', isHighBidder: false }, T0 + 5);
-    expect(r).toEqual({ kind: 'rejected-unknown', rawStatus: 3, rawResult: -42, messageText: 'm', isHighBidder: false, observedAt: T0 + 5 });
+    expect(r).toEqual({
+      kind: 'rejected-unknown',
+      statusFlag: null,
+      rawStatus: 3,
+      rawResult: -42,
+      messageText: 'm',
+      isHighBidder: false,
+      observedAt: T0 + 5,
+    });
+  });
+
+  it('T-132: records SGW’s boolean status flag (statusFlag), so every reply carries it as evidence', () => {
+    expect(classifyPlaceBid({ status: true, result: 12345 }, T0)).toMatchObject({ kind: 'rejected-unknown', statusFlag: true, rawStatus: null });
+    expect(classifyPlaceBid({ status: false, result: -999 }, T0)).toMatchObject({ kind: 'rejected-unknown', statusFlag: false, rawStatus: null });
+    expect(classifyPlaceBid({ status: 2, result: 1 }, T0)).toMatchObject({ statusFlag: null, rawStatus: 2 });
+    expect(classifyPlaceBid({ status: true, isUnauthorized: true }, T0)).toMatchObject({ kind: 'auth', statusFlag: true });
+    for (const r of [classifyPlaceBid({ status: false }, T0), classifyPlaceBid({ status: 0 }, T0)]) expect(BidResultSchema.parse(r)).toEqual(r);
+  });
+
+  it("T-132: the first live reply (placebid-accepted-high-bidder.json) is 'accepted', with its signals kept as sent", () => {
+    const raw = loadFixture<{ status: boolean; result: number; message: string }>('placebid-accepted-high-bidder');
+    const r = classifyPlaceBid(raw, T0);
+    expect(r).toEqual({
+      kind: 'accepted',
+      statusFlag: true,
+      rawStatus: null,
+      rawResult: 1,
+      messageText: raw.message,
+      isHighBidder: null,
+      observedAt: T0,
+    });
+    expect(BidResultSchema.parse(r)).toEqual(r);
   });
 });
 
@@ -539,7 +603,15 @@ describe('R3/R4: ShowBidModal first, then one PlaceBid through the guarded send'
     expect(sends).toEqual([
       { endpoint: 'placeBid', body: { itemId: ITEM, bidAmount: '70.00', sellerId: SELLER, quantity: 1 }, timeoutMs: 20_000 },
     ]);
-    expect(r).toEqual({ kind: 'rejected-unknown', rawStatus: null, rawResult: -999, messageText: 'No', isHighBidder: null, observedAt: T0 + 42 });
+    expect(r).toEqual({
+      kind: 'rejected-unknown',
+      statusFlag: false,
+      rawStatus: null,
+      rawResult: -999,
+      messageText: 'No',
+      isHighBidder: null,
+      observedAt: T0 + 42,
+    });
   });
 
   it('BidContext has no scheduler, and bid.ts never reaches for one, prepare(), fetch or run()', () => {
@@ -738,12 +810,23 @@ describe('R1: definitive replies resolve with a BidResult', () => {
     await advance(t.clock, 1 * S, 50);
     expect(valueOf(await p)).toEqual({
       kind: 'rejected-unknown',
+      statusFlag: true,
       rawStatus: null,
       rawResult: 31337,
       messageText: 'Thanks, bid placed & ok',
       isHighBidder: null,
       observedAt: T0 + 150,
     });
+  });
+
+  it("T-132: the first live reply (status true, result 1) resolves 'accepted', sent exactly once", async () => {
+    const t = setup();
+    t.http.on(MODAL, MODAL_OK);
+    t.http.on(PLACE_BID, json(loadFixture('placebid-accepted-high-bidder'), 200, 150));
+    const p = bid(t);
+    await advance(t.clock, 1 * S, 50);
+    expect(valueOf(await p)).toMatchObject({ kind: 'accepted', statusFlag: true, rawStatus: null, rawResult: 1, isHighBidder: null, observedAt: T0 + 150 });
+    expect(placeBidRequests(t)).toHaveLength(1);
   });
 
   it("isUnauthorized in a 200 reply: 'auth'", async () => {

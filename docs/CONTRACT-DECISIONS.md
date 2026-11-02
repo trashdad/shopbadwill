@@ -827,3 +827,17 @@ Source: T-129 (ended auctions fall off the extension). Additive: `sbw:meta.schem
 **Tests.** `test/unit/background/tracked-prune.test.ts`; the T-129 block in `test/integration/outcomes.test.ts`.
 
 **T-131 amendment.** An item tracked again after its prune (its `addedAt` is later than the `pruned` stamp) is released from `pruned` at the start of each calendar sync and gets its calendar event again (an existing event with the same id is adopted through the 409 path, never duplicated). An item a sync read before the prune keeps its older `addedAt` and stays skipped.
+
+## T-132 contract change: `BidResult.statusFlag` (optional), and the first PlaceBid catalogue code
+
+Source: T-132 (stage 2 of PlaceBid classification, from the first live reply). Additive: `sbw:meta.schemaVersion` stays 1 and nothing migrates.
+
+**Change.** `BidResult` (`src/domain/types.ts`) gains `statusFlag?: boolean | null`: SGW's boolean `status` exactly as sent, `null` when SGW sent a number (that stays in `rawStatus`) or none. `classifyPlaceBid` always sets it. Our own inference in `snipe-send.ts` (`acceptedFromProof`) and replies stored before T-132 have none. Because `Snipe.attempt.reply` is a `BidResult`, the stored attempt reply carries it too; the `bid.result` audit details gain `statusFlag` (`null` when absent).
+
+**Why.** The first live reply was audited with `rawStatus: null`, which only proves the status was a boolean; the flag itself was lost. The catalogue matches on (status flag, result), so every future reply must carry the flag as evidence. It is evidence only: it never decides `kind` on its own (`status: true` alone is never success).
+
+**Catalogue.** `PLACE_BID_RESULT_CODES` gains its first `'catalogue'` entry, `{ status: true, result: 1, kind: 'accepted', source: 'placebid-accepted-high-bidder.json' }`. The fixture is reconstructed from the audit (manifest `method: 'audit-reconstruction'`, no raw capture). Ruling: `status: true` is inferred from "Bid Received!"; if SGW sends `false` the entry does not match and the reply stays `rejected-unknown` (fail safe). `'accepted'` means received, not leading: result 1 may also be the immediately-outbid reply (the fake server's `ACCEPTED_OUTBID` keeps it), so the outcome read decides won or lost, and the reducer still only waits for that read; no resend (T-101 unchanged). Message text is never classified. An unrecognised reply's outcome detail now names the boolean flag when present ("status true/false"), else `rawStatus`.
+
+**Tests.** `test/contract/types/spec-shapes.test.ts` (`SpecBidResult.statusFlag?`); `test/contract/sgw/bid.test.ts` (the catalogue entry, the fixture, fail-safe variants, `statusFlag` capture); `test/unit/domain/snipe/state-machine.test.ts` (audit details, no second send); `test/unit/domain/snipe/outcome.test.ts` (copy); `test/unit/scripts/fixtures-manifest.test.ts` (the `audit-reconstruction` method).
+
+**Follow-up for the next PLAN edit.** Add `statusFlag?: boolean | null` to `BidResult` in PLAN §3 and contracts.md.

@@ -88,9 +88,10 @@ export function snipeLaneFree(selfId: string, snipes: readonly Snipe[], now: Epo
  * snipeLaneFree with SNIPE_LANE_GUARD_FIRST_MS for attempt 0, with
  * SNIPE_LANE_GUARD_RETRY_MS for the others.
  * - The snipe lane whenever it is free: it carries the session's bearer, so
- *   SGW says who is the high bidder. Until SGW's PlaceBid result codes are
- *   catalogued (P5), every reply is `rejected-unknown` and T-87 trusts only
- *   that flag: a live win can be confirmed ONLY by such a read.
+ *   SGW says who is the high bidder. Only one PlaceBid code is catalogued so
+ *   far (T-132: (true, 1) 'accepted'); every other reply is `rejected-unknown`
+ *   and T-87 trusts only that flag: for such a reply a live win can be
+ *   confirmed ONLY by such a read.
  * - Otherwise the interactive lane for the fast attempts (its own backoff) and
  *   the background lane for the slow ones. Anonymous: they confirm a dry run,
  *   or a live win whose reply T-87 recognises, never a live win otherwise.
