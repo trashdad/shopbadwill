@@ -1,8 +1,10 @@
 // PlaceBid `result` codes for the fake server.
 //
-// PLACEHOLDERS: only -3 (closed) is verified against the real site. Every other value
-// marked UNVERIFIED is a guess so the snipe engine has distinct branches to test. T-100
-// replaces this file with the real Phase 5 catalogue (I-19); keep the export names stable.
+// PLACEHOLDERS: -3 (closed) and, since T-132, (true, 1) "Bid Received! You are currently
+// the high bidder" are verified against the real site (src/adapters/sgw/bid.ts catalogue,
+// test/fixtures/sgw/json/placebid-accepted-high-bidder.json). Every other value marked
+// UNVERIFIED is a guess so the snipe engine has distinct branches to test. Keep the export
+// names stable.
 
 export interface BidResultCode {
   /** The `status` boolean in the PlaceBid response. */
@@ -14,9 +16,17 @@ export interface BidResultCode {
 }
 
 export const BID_RESULT = {
-  /** Bid accepted and you are the high bidder. UNVERIFIED. */
-  ACCEPTED_HIGH: { status: true, result: 0, unverified: true },
-  /** Bid accepted but a higher hidden max already held the lead (you were outbid at once). UNVERIFIED. */
+  /**
+   * Bid accepted and you are the high bidder. VERIFIED (T-132): the first live bid's reply was
+   * result 1 with "Bid Received! You are currently the high bidder". Its boolean status was not
+   * logged; true is inferred from "Bid Received!" (orchestrator ruling).
+   */
+  ACCEPTED_HIGH: { status: true, result: 1, unverified: false },
+  /**
+   * Bid accepted but a higher hidden max already held the lead (you were outbid at once).
+   * UNVERIFIED: assumed to share result 1 with ACCEPTED_HIGH, so the extension classifies it
+   * 'accepted' ("received") and only the outcome read says won or lost. Only the message differs.
+   */
   ACCEPTED_OUTBID: { status: true, result: 1, unverified: true },
   /** Auction closed. VERIFIED. */
   CLOSED: { status: false, result: -3, unverified: false },

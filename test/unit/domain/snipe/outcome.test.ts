@@ -706,3 +706,45 @@ describe('T-121: settledAsMissed reads the reducer history', () => {
     expect(settledAsMissed({ outcome: 'skipped', history: [] })).toBe(false);
   });
 });
+
+// T-132: the first live PlaceBid reply, (status true, result 1) "Bid Received!", is the
+// first catalogued code. 'accepted' means "received": only the outcome read says won or lost.
+describe('T-132: the catalogued live reply (status true, result 1)', () => {
+  const LIVE_TEXT =
+    'Bid Received!\nYou are currently the high bidder for this auction.\nThis item ends at 11/1/2026 7:53:00 PM PT, check back then for results.';
+  const live = (over: Partial<BidResult> = {}) =>
+    bid('accepted', { statusFlag: true, rawStatus: null, rawResult: 1, isHighBidder: null, messageText: LIVE_TEXT, ...over });
+
+  it('a won post-read is Won, and the copy never says "Unrecognised reply" or "not recognised"', () => {
+    const r = classifyOutcome(snipe(), live(), detail({ isHighBidder: true, currentPrice: 1800 }));
+    expect(r.outcome).toBe('won');
+    expect(r.final).toBe(true);
+    for (const text of [r.detail, r.notify.title, r.notify.message]) {
+      expect(text).not.toContain('Unrecognised');
+      expect(text).not.toContain('not recognised');
+    }
+  });
+
+  it('the outbid-at-once variant shares the code: the post-read says Lost', () => {
+    const r = classifyOutcome(snipe(), live(), detail({ isHighBidder: false, currentPrice: 2350 }));
+    expect(r.outcome).toBe('outbid');
+    expect(r.notify.title).toMatch(/^Lost:/);
+  });
+
+  it('with no read at all it is Unconfirmed: the reply alone never claims the lead', () => {
+    const r = classifyOutcome(snipe(), live(), null);
+    expect(r.outcome).toBe('network');
+    expect(r.final).toBe(false);
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+  });
+
+  it('an unrecognised reply names the boolean status flag when SGW sent one', () => {
+    const r = classifyOutcome(snipe(), bid('rejected-unknown', { statusFlag: true, rawStatus: null, rawResult: 12, messageText: 'odd' }), detail({ isHighBidder: true }));
+    expect(r.detail).toContain('Unrecognised reply (status true, result 12): odd');
+  });
+
+  it('an unrecognised reply stored before T-132 (no statusFlag) still names its raw status', () => {
+    const r = classifyOutcome(snipe(), bid('rejected-unknown', { rawStatus: null, rawResult: 12, messageText: 'odd' }), detail({ isHighBidder: true }));
+    expect(r.detail).toContain('Unrecognised reply (status null, result 12): odd');
+  });
+});

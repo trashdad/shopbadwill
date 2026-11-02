@@ -429,7 +429,7 @@ export function classifyOutcome(
           : '';
     const stillOpen = unread ? '' : 'auction still open; ';
     const rawNote = unknown
-      ? ` Unrecognised reply (status ${String(unknown.rawStatus)}, result ${String(unknown.rawResult)}): ${unknown.messageText}`
+      ? ` Unrecognised reply (status ${String(unknown.statusFlag ?? unknown.rawStatus)}, result ${String(unknown.rawResult)}): ${unknown.messageText}`
       : '';
     const at = price !== undefined ? ` at ${formatMoney(price)}` : '';
     if (v.outcome === 'won') {

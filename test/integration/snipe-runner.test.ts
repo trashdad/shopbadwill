@@ -2618,7 +2618,7 @@ describe('T-84b: the 7-day give-up settles a sent snipe (post-read-failed)', () 
   it('an accepted, leading reply makes both alerts say "Leading", never "Won" or "Not bid"', async () => {
     const shared = makeShared();
     const strategy: SendStrategy = {
-      // T-101's seam: the accepted, leading reply (the fake SGW has no catalogue entry for it).
+      // T-101's seam: an accepted reply that also says it leads (isHighBidder true; the real catalogued reply has none).
       send: (_req, deps) =>
         Promise.resolve({
           kind: 'result',

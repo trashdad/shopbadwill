@@ -40,7 +40,8 @@ const ManifestEntry = z
     layout: z.enum(['grid', 'list']).optional(),
     loggedIn: z.boolean(),
     source: z.enum(['anonymous', 'user']),
-    method: z.enum(['capture-fixtures:api', 'capture-fixtures:render', 'capture-fixtures:page-xhr', 'user-devtools']),
+    // 'audit-reconstruction' (T-132): rebuilt from the extension's own audit of a live reply; no raw capture exists.
+    method: z.enum(['capture-fixtures:api', 'capture-fixtures:render', 'capture-fixtures:page-xhr', 'user-devtools', 'audit-reconstruction']),
     urlPattern: z.string().regex(/^(GET|POST) https:\/\/(shopgoodwill\.com|buyerapi\.shopgoodwill\.com)\//),
     requestBody: z.unknown().optional(),
     status: z.number().int(),
@@ -92,9 +93,11 @@ describe('fixtures manifest', () => {
         expect(e.requestLogSeq, e.file).not.toBeNull();
         expect(e.method, e.file).not.toBe('user-devtools');
       } else {
-        expect(e.method, e.file).toBe('user-devtools');
+        expect(['user-devtools', 'audit-reconstruction'], e.file).toContain(e.method);
         expect(e.requestLogSeq, e.file).toBeNull();
       }
+      // A reconstruction must say so in its notes: it is not a raw capture.
+      if (e.method === 'audit-reconstruction') expect(e.notes, e.file).toMatch(/RECONSTRUCTED/);
       if (e.kind === 'json') expect(e.endpoint, e.file).toBeDefined();
       if (e.kind === 'html') expect(e.page, e.file).toBeDefined();
     }

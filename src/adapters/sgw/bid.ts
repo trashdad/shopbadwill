@@ -95,13 +95,22 @@ export const PLACE_BID_UNKNOWN_KIND = 'rejected-unknown' satisfies BidResultKind
 /**
  * The PlaceBid result codes.
  *
- * STAGE 1: no real reply has been captured yet, so there is no 'catalogue'
- * entry, and every live reply classifies as 'rejected-unknown' (or 'auth').
- * Stage 2 adds the codes from the P5 catalogue (placebid-*.json) and confirms
- * or drops these placeholders. The fake server's codes
- * (test/fakes/fake-sgw-server/bidding/result-codes.ts) are reconciled then.
+ * STAGE 2 (T-132): one 'catalogue' code, from the first live bid's reply
+ * (2026-11-01; the item was won): result 1 with "Bid Received! You are
+ * currently the high bidder for this auction." Its boolean status was not
+ * logged then; `true` is inferred from "Bid Received!" (orchestrator ruling).
+ * If SGW in fact sends `false`, the entry does not match and the reply stays
+ * 'rejected-unknown', which fails safe. 'accepted' means RECEIVED, not leading:
+ * result 1 may also come back when a proxy is outbid at once (the fake server's
+ * ACCEPTED_OUTBID shares it), so the runner never assumes the lead from it and
+ * the outcome read decides won or lost. It never triggers a second send (the
+ * T-101 one-send rule is unchanged). The message text is never classified.
+ *
+ * Every other live reply is still 'rejected-unknown' (or 'auth'). Further P5
+ * replies (placebid-*.json) confirm or drop the placeholders below.
  */
 export const PLACE_BID_RESULT_CODES: readonly PlaceBidCode[] = [
+  { status: true, result: 1, kind: 'accepted', evidence: 'catalogue', source: 'placebid-accepted-high-bidder.json' },
   { status: false, result: -3, kind: 'closed', evidence: 'placeholder', source: 'PLAN §6 T-88: -3 closed (unverified)' },
   { status: false, result: -4, kind: 'below-minimum', evidence: 'placeholder', source: 'PLAN §6 T-88: -4/-5 too low (unverified)' },
   { status: false, result: -5, kind: 'below-minimum', evidence: 'placeholder', source: 'PLAN §6 T-88: -4/-5 too low (unverified)' },
@@ -116,12 +125,19 @@ export const PLACE_BID_RESULT_CODES: readonly PlaceBidCode[] = [
  *   a numeric status, a code seen with the other status flag, and a placeholder.
  *
  * `messageText` is SGW's HTML message as plain text (T-24's htmlToText); render
- * it as text only. Throws SgwApiError('schema') when the reply fails the
+ * it as text only. `statusFlag` records SGW's boolean status as evidence (T-132). Throws SgwApiError('schema') when the reply fails the
  * PlaceBid schema.
  */
 export function classifyPlaceBid(raw: unknown, observedAt: EpochMs, codes: readonly PlaceBidCode[] = PLACE_BID_RESULT_CODES): BidResult {
   const p = normalizePlaceBidRaw(raw);
-  const signals = { rawStatus: p.rawStatus, rawResult: p.rawResult, messageText: p.messageText, isHighBidder: p.isHighBidder, observedAt };
+  const signals = {
+    statusFlag: p.statusFlag,
+    rawStatus: p.rawStatus,
+    rawResult: p.rawResult,
+    messageText: p.messageText,
+    isHighBidder: p.isHighBidder,
+    observedAt,
+  };
   if (p.isUnauthorized) return { kind: 'auth', ...signals };
   const known = codes.find((c) => c.evidence === 'catalogue' && c.status === p.statusFlag && c.result === p.rawResult);
   return { kind: known?.kind ?? PLACE_BID_UNKNOWN_KIND, ...signals };

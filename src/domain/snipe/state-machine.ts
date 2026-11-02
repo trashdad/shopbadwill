@@ -675,6 +675,8 @@ function onResult(s: Snipe, e: Extract<SnipeEvent, { type: 'result' }>, ctx: Red
   };
   const details: Details = {
     resultKind: r.kind,
+    // T-132: SGW's boolean status flag, so each live reply carries the evidence for the catalogue.
+    statusFlag: r.statusFlag ?? null,
     rawStatus: r.rawStatus,
     rawResult: r.rawResult,
     isHighBidder: r.isHighBidder,

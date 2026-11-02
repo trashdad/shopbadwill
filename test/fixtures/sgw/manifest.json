@@ -263,6 +263,21 @@
       "notes": "Open pickup-only auction (pickupOnly true) with 6 bids, about 10 min before its end; found through a searchPickupOnly ItemListing."
     },
     {
+      "file": "json/placebid-accepted-high-bidder.json",
+      "fixture": "placebid-accepted-high-bidder",
+      "kind": "json",
+      "endpoint": "placeBid",
+      "loggedIn": true,
+      "source": "user",
+      "method": "audit-reconstruction",
+      "urlPattern": "POST https://buyerapi.shopgoodwill.com/api/ItemBid/PlaceBid",
+      "status": 200,
+      "capturedAt": "2026-11-01T20:00:00.000Z",
+      "requestLogSeq": null,
+      "sanitizerVersion": "1.6.0",
+      "notes": "T-132: RECONSTRUCTED from the extension's own bid.result audit of the first live bid (2026-11-01, an early-proxy fallback bid; the item was won). There is NO raw capture and sources.json has no entry for it (scripts/sanitize-fixtures.ts would call it stale). The audit recorded rawResult 1, rawStatus null (so SGW's status was a boolean, not logged), isHighBidder absent, and this message verbatim. status true is inferred from \"Bid Received!\" (orchestrator ruling); if SGW in fact sends false the catalogue entry does not match and the reply stays rejected-unknown. The date is from the audit; the time of day and the HTTP status (200: the reply was parsed) are not recorded."
+    },
+    {
       "file": "json/saved-searches.json",
       "fixture": "saved-searches",
       "kind": "json",
