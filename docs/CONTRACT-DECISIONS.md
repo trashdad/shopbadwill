@@ -815,3 +815,13 @@ Source: T-124 (big action panel on SGW item pages). Additive for storage: `sbw:m
 **Tests.** `test/contract/types/messages.test.ts` and `examples/Msg/tracked.add.{valid,invalid}.json`; `test/integration/background-main.test.ts` (held detail, refusal without one or with another tab's, existing items, content `tracked.remove`, zero SGW requests, UI refused); `test/dom/overlay.test.ts` and `test/dom/dom-adapter.test.ts` (the panel).
 
 **Follow-up for the next PLAN edit.** Add `tracked.add` to §3.12 and contracts.md, and move `tracked.remove` to the content group there.
+
+## T-129 storage change: ended tracked items are pruned; `sbw:calendarSync.pruned`
+
+Source: T-129 (ended auctions fall off the extension). Additive: `sbw:meta.schemaVersion` stays 1, no message changes, nothing migrates.
+
+**Pruning `sbw:tracked`.** A background pass (`src/background/jobs/tracked-prune.ts`) deletes a tracked item once its outcome is recorded, or 6 h after its `endTime` when it has none, at the end of every outcomes tick and at browser start. It never deletes an item with a snipe in any state but `resolved`/`killed`, one the outcome scan still owes a read (a snipe, the calendar flag or a live link, and no outcome yet), one whose snipe still has runner outbox effects, one with a deferred outcome notification (`sbw:deferredAlarms`), or one with an ntfy reminder still scheduled to fire. One audit row per pass: actor `system`, kind `tracked.prune`, `details: { count }`. No SGW, Google or ntfy request.
+
+**`sbw:calendarSync` gains `pruned: Record<itemId, prunedAt>`** (default `{}`; the record's schema is adapter-private, `src/adapters/google/calendar-sink.ts`). `GoogleCalendarSink.forget(ids)` drops a pruned item's link from `sbw:calendar` and its `retries`, `sinkHashes` and `dryRunSeen` entries, and remembers it in `pruned` for 30 days. Runs, `queuePending` and the reminder-sink feed skip remembered items, so the item's Google event is never deleted, patched or re-created (a past event is harmless history). The item's `sbw:ntfy` record is dropped locally, without a cancel request. Ruling: unlike `tracked.remove` (the user's Stop tracking, which still deletes our event at the next sync), a prune keeps the event.
+
+**Tests.** `test/unit/background/tracked-prune.test.ts`; the T-129 block in `test/integration/outcomes.test.ts`.

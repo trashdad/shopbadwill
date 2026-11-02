@@ -18,7 +18,7 @@ import {
   createTickHub,
   type BackgroundContext,
 } from '../../src/background/context';
-import { syncFor } from '../../src/background/jobs/calendar-sync';
+import { buildDesired, syncFor } from '../../src/background/jobs/calendar-sync';
 import {
   MAX_POST_END_READS,
   OUTCOME_NOTIFY_ALARM_PREFIX,
@@ -27,7 +27,9 @@ import {
   register as registerOutcomes,
   stampedOutcome,
 } from '../../src/background/jobs/outcomes';
+import { register as registerDeferredAlarms } from '../../src/background/jobs/deferred-alarms';
 import { register as registerSnipeRunner } from '../../src/background/jobs/snipe-runner';
+import { PRUNE_AFTER_END_MS, PRUNE_AUDIT_KIND, register as registerPrune } from '../../src/background/jobs/tracked-prune';
 import { eventIdFor } from '../../src/domain/calendar/event-id';
 import { spentToday } from '../../src/domain/snipe/caps';
 import { defaultSettings } from '../../src/domain/settings/defaults';
@@ -285,7 +287,19 @@ async function seedSnipe(r: Rig, over: Partial<Snipe> = {}): Promise<string> {
 
 const reads = (r: Rig): Array<{ method: string; args: unknown[] }> => r.api.calls.filter((c) => c.method === 'itemDetail');
 const eventOf = (r: Rig, itemId: number) => r.calendarApi.eventsGet(CALENDAR_ID, eventIdFor(itemId, 0));
-const outcomes = (r: Rig) => r.repo.get(STORAGE_KEYS.tracked).then((t) => Object.fromEntries(Object.entries(t).map(([k, v]) => [k, v.outcome])));
+/**
+ * Each item's recorded outcome. T-129 prunes an item from `sbw:tracked` once
+ * its outcome is recorded, so a pruned item's outcome is the one its first
+ * `outcome.recorded` row audited; a tracked item's is the one it carries.
+ */
+async function outcomes(r: Rig): Promise<Record<string, TrackedItem['outcome']>> {
+  const out: Record<string, TrackedItem['outcome']> = {};
+  for (const e of await r.audit.list({ limit: 1000, kinds: ['outcome.recorded'] })) {
+    if (e.itemId !== undefined) out[String(e.itemId)] = e.details.outcome as TrackedItem['outcome'];
+  }
+  for (const [k, v] of Object.entries(await r.repo.get(STORAGE_KEYS.tracked))) out[k] = v.outcome ?? out[k];
+  return out;
+}
 
 // ── Pure classification helpers ──────────────────────────────────────────────
 
@@ -1201,5 +1215,195 @@ describe('T-121: a snipe that never woke for an on-time close is MISSED, never E
       expect((await r.repo.get(STORAGE_KEYS.snipes))[snipeId]?.state).toBe('armed');
       expect(r.notifier.sent.map((n) => n.notification.title)).toEqual([`${label}: Pyrex bowl ${String(itemId)}`]);
     }
+  });
+});
+
+// ── T-129: ended items fall off sbw:tracked ─────────────────────────────────
+
+describe('T-129: a tracked item is pruned once its outcome is recorded, or 6 h after its end', () => {
+  const HOUR = 60 * MIN;
+  const pruneRows = (r: Rig) => r.audit.list({ limit: 1000, kinds: [PRUNE_AUDIT_KIND] });
+  const trackedIds = async (r: Rig): Promise<number[]> => Object.keys(await r.repo.get(STORAGE_KEYS.tracked)).map(Number);
+  const writes = (r: Rig) =>
+    r.calendarApi.calls.filter((c) => c.method === 'eventsDelete' || c.method === 'eventsInsert' || c.method === 'eventsPatch');
+
+  it('a recorded outcome prunes the item on the same tick; its calendar event stays and no later sync touches it', async () => {
+    const r = await rig();
+    await track(r, 70);
+    await seedEvent(r, 70, 'Pyrex bowl 70');
+    r.api.details.set(70, closedDetail(70, { isHighBidder: false, currentPrice: 2500 }));
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 70: 'lost' });
+    expect(await trackedIds(r)).toEqual([]);
+    // The stamped event is left on the calendar: a past event is harmless history.
+    const ev = await eventOf(r, 70);
+    expect(ev?.summary).toBe('LOST: Pyrex bowl 70');
+    expect(ev?.status).not.toBe('cancelled');
+    // Its local bookkeeping is gone, so no sync can delete or re-create it.
+    expect((await r.repo.get(STORAGE_KEYS.calendar)).links[70]).toBeUndefined();
+    const rows = await pruneRows(r);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ actor: 'system', kind: PRUNE_AUDIT_KIND, details: { count: 1 } });
+    expect(rows[0]?.itemId).toBeUndefined();
+
+    r.google.connected = true;
+    const before = writes(r).length;
+    const sync = syncFor(r.ctx).syncNow('after-prune');
+    await settle(r.clock);
+    await sync;
+    expect(writes(r).length).toBe(before);
+    expect(r.calendarApi.calls.filter((c) => c.method === 'eventsDelete')).toHaveLength(0);
+    expect((await eventOf(r, 70))?.summary).toBe('LOST: Pyrex bowl 70');
+    // Later ticks neither read it again nor prune again.
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+    expect(await pruneRows(r)).toHaveLength(1);
+  });
+
+  it('without an outcome (nothing to read), an item is kept until 6 h after its end, then pruned', async () => {
+    const r = await rig();
+    await track(r, 71, { calendar: false });
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([71]);
+
+    // track() ended it 5 minutes ago.
+    r.clock.advance(PRUNE_AFTER_END_MS - 5 * MIN - 1);
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([71]);
+    expect(await pruneRows(r)).toHaveLength(0);
+
+    r.clock.advance(1);
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([]);
+    expect(await pruneRows(r)).toHaveLength(1);
+    // Local only: no SGW read, no Google call.
+    expect(reads(r)).toHaveLength(0);
+    expect(r.calendarApi.calls).toHaveLength(0);
+  });
+
+  it('an outcome read still owed keeps the item past 6 h; it goes once the read records the outcome', async () => {
+    const r = await rig();
+    await track(r, 72);
+    await seedEvent(r, 72, 'Pyrex bowl 72');
+    r.api.details.set(72, closedDetail(72, { isHighBidder: true }));
+    await r.repo.update(STORAGE_KEYS.settings, (s) => ({ ...s, killSwitch: true }));
+    r.clock.advance(7 * HOUR);
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([72]);
+    expect(reads(r)).toHaveLength(0);
+
+    await r.repo.update(STORAGE_KEYS.settings, (s) => ({ ...s, killSwitch: false }));
+    await r.tick();
+    expect(reads(r)).toHaveLength(1);
+    expect(await outcomes(r)).toMatchObject({ 72: 'won' });
+    expect(await trackedIds(r)).toEqual([]);
+  });
+
+  it('a snipe that is not finished blocks the prune, whatever the outcome and the time', async () => {
+    const r = await rig({ runner: false });
+    await track(r, 73, { calendar: false, outcome: 'won', reasons: [{ kind: 'snipe' }] });
+    const id = await seedSnipe(r, { itemId: 73, state: 'armed' });
+    r.clock.advance(7 * HOUR);
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([73]);
+
+    await r.repo.update(STORAGE_KEYS.snipes, (cur) => ({ ...cur, [id]: { ...(cur[id] as Snipe), state: 'resolved', outcome: 'won' } }));
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([]);
+  });
+
+  it('writes one audit row per pass, with the count, never one per item', async () => {
+    const r = await rig();
+    for (const id of [74, 75, 76]) await track(r, id, { calendar: false });
+    await track(r, 77, { calendar: false, endTime: new Date(r.clock.now() + HOUR).toISOString() });
+    r.clock.advance(PRUNE_AFTER_END_MS);
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([77]);
+    const rows = await pruneRows(r);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.details).toEqual({ count: 3 });
+    expect(await r.audit.list({ limit: 1000, kinds: ['tracked.remove'] })).toHaveLength(0);
+  });
+
+  it('a deferred outcome notification keeps the item until it is sent, with the item title', async () => {
+    const r = await rig({ now: T0_QUIET, quiet: { from: '22:00', to: '06:00' } });
+    registerDeferredAlarms(r.ctx);
+    await track(r, 78);
+    await seedEvent(r, 78, 'Pyrex bowl 78');
+    r.api.details.set(78, closedDetail(78, { isHighBidder: true, endTime: new Date(T0_QUIET - 5 * MIN).toISOString() }));
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 78: 'won' });
+    expect(await trackedIds(r)).toEqual([78]);
+
+    // Quiet hours end at 06:00 EDT = 10:00 UTC; the alarm fires and sends.
+    r.clock.advance(6 * HOUR + 10 * MIN);
+    await settle(r.clock);
+    expect(r.notifier.sent.map((n) => n.notification.title)).toEqual(['WON: Pyrex bowl 78']);
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([]);
+  });
+
+  it('runs at browser start too', async () => {
+    const r = await rig();
+    await track(r, 79, { calendar: false, endTime: new Date(r.clock.now() - 7 * HOUR).toISOString() });
+    const starts: Array<() => void> = [];
+    const onStartup = (cb: () => void): (() => void) => {
+      starts.push(cb);
+      return () => undefined;
+    };
+    registerPrune({ ...r.ctx, lifecycle: { onStartup } } as unknown as BackgroundContext);
+    expect(starts).toHaveLength(1);
+    starts[0]?.();
+    await settle(r.clock);
+    expect(await trackedIds(r)).toEqual([]);
+    expect(await pruneRows(r)).toHaveLength(1);
+  });
+
+  it('a sync that read the item before the prune neither touches nor re-creates its event', async () => {
+    const r = await rig();
+    r.google.connected = true;
+    await track(r, 80, { outcome: 'unknown' });
+    await seedEvent(r, 80, 'Pyrex bowl 80');
+    const settings = await r.repo.get(STORAGE_KEYS.settings);
+    const staleTracked = await r.repo.get(STORAGE_KEYS.tracked);
+    const staleLinks = (await r.repo.get(STORAGE_KEYS.calendar)).links;
+    const staleDesired = buildDesired(staleTracked, staleLinks, settings, r.clock.now());
+    expect(staleDesired.map((d) => d.itemId)).toEqual([80]);
+
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([]);
+    const before = r.calendarApi.calls.length;
+    const run = syncFor(r.ctx).sink.run(staleDesired, Object.values(staleLinks));
+    await settle(r.clock);
+    await run;
+    expect(r.calendarApi.calls.length).toBe(before);
+    expect((await r.repo.get(STORAGE_KEYS.calendar)).links[80]).toBeUndefined();
+    expect((await eventOf(r, 80))?.summary).toBe('Pyrex bowl 80');
+  });
+
+  it('drops the item ntfy and reminder bookkeeping locally, and waits while a reminder is still to fire', async () => {
+    const r = await rig();
+    await track(r, 81, { calendar: false, outcome: 'won' });
+    await track(r, 82, { calendar: false, outcome: 'won' });
+    const entry = (seq: string, fireAt: number) => ({ seq, leadMin: 5, fireAt, status: 'scheduled' as const });
+    await r.repo.set(STORAGE_KEYS.ntfy, {
+      items: {
+        81: { fingerprint: 'f81', entries: [entry('sbw-81-5-0', r.clock.now() - 10 * MIN)] },
+        82: { fingerprint: 'f82', entries: [entry('sbw-82-5-0', r.clock.now() + 10 * MIN)] },
+      },
+    });
+    await syncFor(r.ctx).sink.state.update((s) => ({ ...s, sinkHashes: { 81: 'h81', 82: 'h82' } }));
+
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([82]);
+    expect(Object.keys((await r.repo.find(STORAGE_KEYS.ntfy))?.items ?? {})).toEqual(['82']);
+    const state = await syncFor(r.ctx).sink.state.read();
+    expect(state.sinkHashes).toEqual({ 82: 'h82' });
+    expect(Object.keys(state.pruned)).toEqual(['81']);
+
+    r.clock.advance(10 * MIN);
+    await r.tick();
+    expect(await trackedIds(r)).toEqual([]);
   });
 });

@@ -350,8 +350,9 @@ export class CalendarSync {
     if (settings.killSwitch || settings.dryRun.calendar) return;
     const verdict = await this.deps.switches.writesAllowed('calendar');
     if (!verdict.ok) return;
-    const open = desired.filter((d) => d.privateProps.sbwState === 'open');
     const state = await this.sink.state.read();
+    // T-129: a pruned item gets no reminder (a sync that read it before the prune must not re-offer it).
+    const open = desired.filter((d) => d.privateProps.sbwState === 'open' && state.pruned[String(d.itemId)] === undefined);
     const next = new Map<string, string>();
     for (const e of open) {
       const key = String(e.itemId);
