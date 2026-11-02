@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Rule } from '../../src/domain/rules/schema';
 import type { JobRun, Watch } from '../../src/domain/watches/schema';
@@ -233,6 +233,11 @@ describe('dashboard sections', () => {
 });
 
 describe('dashboard matches and health', () => {
+  // T-129: the fixtures end in Oct 2026, so the lists are read at NOW (an ended auction is not listed).
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+  });
+
   it('lists matches and favorites as text only and syncs favorites', async () => {
     const m = new FakeMessaging();
     const base = { sellerId: 3, reasons: [{ kind: 'watch' as const, id: 'w1' }], calendar: false, addedAt: NOW, updatedAt: NOW };

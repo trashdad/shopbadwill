@@ -6,6 +6,9 @@
 // 2 minutes before the next end; the background enforces it, this only says so.
 // Every rule comes from src/domain/snipe/groups.ts (groupView), the same one
 // the background applies.
+// T-129: an item whose auction ended (its end passed, or its snipe resolved)
+// leaves the group's item list at once, also when its end passes while the
+// page is open. The wins line still counts it.
 import type { VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
@@ -18,6 +21,7 @@ import { describeError } from '../../../components/describeError';
 import { Field } from '../../../components/Field';
 import { Status } from '../../../components/Status';
 import { ErrorAlert, LoadNotice, useLoad } from '../../parts';
+import { auctionEnded, useEndClock } from '../../ended';
 import type { SectionDef, SectionProps } from '../../registry';
 import { DRY_RUN_LABEL } from '../snipes/arm-form';
 import { formatEndDual } from '../snipes/end-time';
@@ -134,6 +138,9 @@ function GroupCard(props: {
 }): VNode {
   const { view: v, group: g } = props;
   const idp = `grp-${g.id}`;
+  const endNow = useEndClock(v.items.map((i) => i.endMs));
+  const resolved = new Set(props.snipes.filter((s) => s.state === 'resolved').map((s) => s.id));
+  const items = v.items.filter((i) => !resolved.has(i.snipeId) && !auctionEnded(i.endMs, endNow));
   const [n, setN] = useState(String(g.maxWins));
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -212,9 +219,9 @@ function GroupCard(props: {
       )}
       {v.items.length === 0 ? (
         <p class="sbw-muted">No items yet. Add one below.</p>
-      ) : (
+      ) : items.length === 0 ? null : (
         <ul class="sbw-list" aria-label={`Items in ${g.name}`}>
-          {v.items.map((i) => (
+          {items.map((i) => (
             <li key={i.snipeId} data-snipe-id={i.snipeId}>
               {i.title}: {i.status}. Ends {formatEndDual(i.endMs, props.userTz)}.
             </li>

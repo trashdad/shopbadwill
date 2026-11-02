@@ -9,6 +9,8 @@
 // step says the event leaves our dedicated calendar; Yes sends the existing
 // `tracked.remove` (the background audits it; the sync then deletes our event
 // and audits that). There is no undo: re-tracking has no audit undo kind.
+// T-129: an ended auction (its end passed, or an outcome is recorded) leaves
+// the list at once, also when its end passes while the page is open.
 import type { VNode } from 'preact';
 import { useState } from 'preact/hooks';
 
@@ -17,8 +19,10 @@ import type { TrackedItem } from '../../../../domain/types';
 import { calendarSyncMessage } from '../../../calendar-sync-message';
 import { describeError } from '../../../components/describeError';
 import { PacificTime } from '../../../time';
+import { useEndClock } from '../../ended';
 import { ErrorAlert, LoadNotice, useLoad } from '../../parts';
 import type { SectionDef, SectionProps } from '../../registry';
+import { endMs, trackedEnded } from '../../tracked-list';
 
 export function describeStatus(s: AuthStatus): string {
   if (!s.configured && !s.connected) return 'Google Calendar is not set up. Add your OAuth client in the options page first.';
@@ -53,7 +57,9 @@ export function CalendarSection(props: SectionProps): VNode {
   /** The item whose "Stop tracking" awaits confirmation. */
   const [confirming, setConfirming] = useState<TrackedItem | null>(null);
   const connected = status.kind === 'ok' && status.value.connected;
-  const onCalendar = tracked.kind === 'ok' ? tracked.value.filter((t) => t.calendar) : [];
+  const wanted = tracked.kind === 'ok' ? tracked.value.filter((t) => t.calendar) : [];
+  const now = useEndClock(wanted.map(endMs));
+  const onCalendar = wanted.filter((t) => !trackedEnded(t, now));
 
   const act = async (label: string, fn: () => Promise<void>): Promise<void> => {
     setBusy(true);
@@ -167,7 +173,7 @@ export function CalendarSection(props: SectionProps): VNode {
             <li key={t.itemId}>
               <span>{titleOf(t)}</span>
               <div class="sbw-meta">
-                Ends <PacificTime ms={new Date(t.endTime).getTime()} userTz={props.userTz} />{' '}
+                Ends <PacificTime ms={endMs(t)} userTz={props.userTz} />{' '}
                 <button
                   type="button"
                   disabled={busy}

@@ -5,7 +5,7 @@
 // (spacing, freeze, mode) is shown as it comes.
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
@@ -18,6 +18,7 @@ import { FakeMessaging } from '../fakes/ports/fake-messaging';
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
 });
 
 const TZ = 'America/New_York';
@@ -130,7 +131,8 @@ describe('Bid groups section', () => {
     expect(within(c).getByText(/Win at most 2\. Wins so far: 1 of at most 2\./)).toBeTruthy();
     expect(within(c).getByText(/^Next end: .*"Lamp B"\.$/)).toBeTruthy();
     const items = within(c).getByRole('list', { name: 'Items in Lamps' });
-    expect(within(items).getByText(/^Lamp A: Won \(confirmed\)\. Ends /)).toBeTruthy();
+    // T-129: the won (resolved, ended) item left the item list; the wins line still counts it.
+    expect(within(items).queryByText(/Lamp A/)).toBeNull();
     expect(within(items).getByText(/^Lamp B: Armed\. Ends /)).toBeTruthy();
   });
 
@@ -237,7 +239,9 @@ describe('Bid groups section', () => {
     });
     const c = await card('Lamps');
     expect(within(c).getByText(DRY_RUN)).toBeTruthy();
-    expect(within(c).getByText(/Lamp A: Would have won \(dry run, confirmed at the close\)\./)).toBeTruthy();
+    // T-129: the finished item is not listed; the wins line says what it would have won.
+    expect(within(c).getByText(/Wins so far: 1 of at most 2 \(dry run: would have won\)\./)).toBeTruthy();
+    expect(within(c).queryByText(/Lamp A: Would have won/)).toBeNull();
     fireEvent.click(within(c).getByRole('button', { name: 'Add an item' }));
     fireEvent.input(within(c).getByLabelText('Item id'), { target: { value: '4242' } });
     fireEvent.click(within(c).getByRole('button', { name: 'Prepare' }));
@@ -246,5 +250,22 @@ describe('Bid groups section', () => {
     expect(box.checked).toBe(true);
     expect(box.disabled).toBe(true);
     expect(within(c).getAllByText(DRY_RUN).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('T-129: an ended item leaves the group list', () => {
+  it('hides an item once its end passes while the page is open; the group card stays', async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ now, toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    const a = snipe('a', now + 5 * MIN, { state: 'sent', attempt: { sentAt: 1 } });
+    const b = snipe('b', now + 60 * MIN);
+    setup({ groups: [group({ maxWins: 2 })], snipes: [a, b] });
+    await vi.advanceTimersByTimeAsync(0);
+    const items = (): HTMLElement => screen.getByRole('list', { name: 'Items in Lamps' });
+    expect(within(items()).getByText(/^Lamp A: /)).toBeTruthy();
+    await vi.advanceTimersByTimeAsync(5 * MIN);
+    expect(within(items()).queryByText(/^Lamp A: /)).toBeNull();
+    expect(within(items()).getByText(/^Lamp B: Armed\. Ends /)).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Lamps' })).toBeTruthy();
   });
 });

@@ -4,7 +4,7 @@
 // with an open snipe cannot be stopped here: the snipe must be cancelled first.
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { h } from 'preact';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Snipe } from '../../src/domain/snipe/types';
 import type { TrackedItem } from '../../src/domain/types';
@@ -16,9 +16,15 @@ import { FakeMessaging } from '../fakes/ports/fake-messaging';
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
 });
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0, 0);
+
+// T-129: the fixtures end in Oct 2026, so the list is read at NOW (an ended auction is not listed).
+beforeEach(() => {
+  vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+});
 
 const item = (itemId: number, title: string, over: Partial<TrackedItem> = {}): TrackedItem => ({
   itemId,
@@ -172,5 +178,56 @@ describe('T-122: Other tracked items', () => {
     fireEvent.click(within(list()).getByRole('button', { name: 'Yes, stop tracking' }));
     expect((await screen.findByRole('alert')).textContent).toMatch(/Could not stop tracking Manual lamp/);
     expect(within(list()).getByText('Manual lamp')).toBeTruthy();
+  });
+});
+
+describe('T-129: an ended auction drops off the list', () => {
+  const MIN = 60_000;
+
+  it('hides an item whose end has passed, and one with a recorded outcome', async () => {
+    const m = fake({
+      items: [
+        item(1, 'Manual lamp'),
+        item(11, 'Ended kettle', { endTime: new Date(NOW - MIN).toISOString() }),
+        item(12, 'Decided radio', { outcome: 'won' }),
+        item(13, 'Unknown vase', { endTime: new Date(NOW - 2 * MIN).toISOString(), outcome: 'unknown' }),
+      ],
+    });
+    mount(m);
+    await screen.findByRole('list', { name: 'Other tracked items' });
+    expect(within(list()).getByText('Manual lamp')).toBeTruthy();
+    for (const title of ['Ended kettle', 'Decided radio', 'Unknown vase']) expect(screen.queryByText(title)).toBeNull();
+  });
+
+  it('says the empty state when every item has ended', async () => {
+    const m = fake({ items: [item(11, 'Ended kettle', { endTime: new Date(NOW - MIN).toISOString() })] });
+    mount(m);
+    expect(await screen.findByText(/No other tracked items/)).toBeTruthy();
+    expect(screen.queryByText('Ended kettle')).toBeNull();
+  });
+
+  it('drops an item when its end passes while the page is open, on one timer (no polling)', async () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const m = fake({
+      items: [item(1, 'Manual lamp'), item(14, 'Soon clock', { endTime: new Date(NOW + 5 * MIN).toISOString() })],
+    });
+    const timeouts = vi.spyOn(globalThis, 'setTimeout');
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    mount(m);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(within(list()).getByText('Soon clock')).toBeTruthy();
+    // One timer, to the soonest end: nothing ticks every second (Preact's own
+    // 100 ms after-paint fallback is not ours).
+    const ours = (): unknown[] => timeouts.mock.calls.map((c) => c[1]).filter((ms) => typeof ms === 'number' && ms > 100);
+    expect(ours()).toEqual([5 * MIN]);
+    expect(intervals).not.toHaveBeenCalled();
+    const sent = m.sent.length;
+    await vi.advanceTimersByTimeAsync(5 * MIN - 1);
+    expect(within(list()).getByText('Soon clock')).toBeTruthy();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(screen.queryByText('Soon clock')).toBeNull();
+    expect(within(list()).getByText('Manual lamp')).toBeTruthy();
+    // Leaving the list is local: no message was sent for it.
+    expect(m.sent.length).toBe(sent);
   });
 });
