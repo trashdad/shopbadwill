@@ -3851,6 +3851,43 @@ describe('R-2: the send chain and the re-measured verify read', () => {
     expect(s.history.some((h) => h.to === 'firing')).toBe(false);
   });
 
+  it('fix 1: a re-read is budgeted by the last read: 12 s then 19 s, no third read, and the early proxy goes with 25 s left', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, VERIFY_LOCAL - 10);
+    shared.sgw.detailLatencies.push(12_000, 19_000, 19_000);
+    await runTo(shared, END + 10 * MIN);
+
+    expect(verifyReads(shared)).toHaveLength(2);
+    const disarms = audits(shared).filter((a) => a.kind === 'snipe.disarm');
+    expect(disarms).toHaveLength(1);
+    expect(String(disarms[0]?.details.why)).toMatch(/^latency: SGW took 12000 ms \(best of 2 reads\)/);
+    expect(audits(shared).filter((a) => a.kind === 'snipe.fallback')[0]?.details).toMatchObject({ reason: 'anomaly', applied: 'early-proxy' });
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(END - (shared.sgw.placeBids[0]?.at ?? END)).toBeGreaterThanOrEqual(25 * SEC);
+  });
+
+  it('fix 1: a re-read that times out budgets the next one at the request timeout: 2 reads, judged on the 12 s one', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, VERIFY_LOCAL - 10);
+    shared.sgw.detailLatencies.push(12_000);
+    await runTo(shared, VERIFY_LOCAL + 100);
+    shared.sgw.detailFaults.push({ hang: true });
+    await runTo(shared, END + 10 * MIN);
+
+    expect(verifyReads(shared)).toHaveLength(2);
+    const disarms = audits(shared).filter((a) => a.kind === 'snipe.disarm');
+    expect(disarms).toHaveLength(1);
+    expect(String(disarms[0]?.details.why)).toMatch(/^latency: SGW took 12000 ms \(best of 1 read\)/);
+    const disarmAt = stored(shared).history.find((h) => h.to === 'fallback-applied')?.at ?? END;
+    expect(END - disarmAt).toBeGreaterThanOrEqual(25 * SEC);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(END - (shared.sgw.placeBids[0]?.at ?? END)).toBeGreaterThanOrEqual(25 * SEC);
+  });
+
   it('under 25 s left after the first slow read: no re-read, and the rule is judged on that one read', async () => {
     const shared = makeShared({ settings: settingsWith() });
     const first = await boot(shared);

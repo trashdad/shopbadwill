@@ -60,6 +60,7 @@
 // adapters/browser/snipe-host.ts, keyed by the S-7 verdict (T-116 adds the
 // runner page). The `sbw:snipe-countdown` port is served here (§3.12).
 import { createSnipeHost, type SelectedSnipeHost } from '../../adapters/browser/snipe-host';
+import { REQUEST_TIMEOUT_MS } from '../../adapters/sgw/api-adapter';
 import { bidMayHaveBeenSent, PLACE_BID_TIMEOUT_MS } from '../../adapters/sgw/bid';
 import { SgwClockAdapter } from '../../adapters/sgw/clock-adapter';
 import { checkCaps, confirmsAmount, spentToday, typoCheck } from '../../domain/snipe/caps';
@@ -118,7 +119,11 @@ export const VERIFY_ATTEMPTS = 2;
  * more window reads (in series, through the lane's gap) before latency is judged.
  */
 export const VERIFY_REMEASURE_ATTEMPTS = 2;
-/** R-2: no re-measure read starts with less than this left before the end (local clock). */
+/**
+ * R-2: no re-measure read starts unless it can finish (taking as long as the
+ * last read, or the request timeout after a failure) with at least this long
+ * left before the end (local clock).
+ */
 export const VERIFY_REMEASURE_MIN_LEFT_MS = 25_000;
 /** Failed window reads in a row that count as an anomaly ("repeated errors"). */
 export const MAX_CONSECUTIVE_READ_ERRORS = 3;
@@ -1241,20 +1246,27 @@ export class SnipeRunner {
     // after the lane's gap (waited here, so the queue wait is not counted as rtt).
     let reads = 1;
     let rttMin = rttMs;
+    // How long the next read may take: as long as the last one, or the request timeout after a failure.
+    let lastMs = rttMs;
     for (let extra = 0; extra < VERIFY_REMEASURE_ATTEMPTS && rttMs > MAX_RTT_MS; extra++) {
       const startAt = this.ctx.clock.now() + gapMs;
-      if (this.endLocal(s) - startAt < VERIFY_REMEASURE_MIN_LEFT_MS) break;
+      if (this.endLocal(s) - (startAt + lastMs) < VERIFY_REMEASURE_MIN_LEFT_MS) break;
       await this.pause(gapMs);
+      if (this.disposed) return;
       const read = await this.windowRead(s, sess);
       if (read.anomaly !== undefined) {
         await this.commit(s.id, { type: 'disarm', now: this.ctx.clock.now(), by: 'anomaly', why: read.anomaly }, { consume });
         return;
       }
-      // A failed re-read counts against the attempts and changes nothing.
-      if (read.detail === undefined) continue;
+      // A failed re-read counts against the attempts and changes nothing but the next read's budget.
+      if (read.detail === undefined) {
+        lastMs = REQUEST_TIMEOUT_MS;
+        continue;
+      }
       reads += 1;
       detail = read.detail;
       rttMs = read.rttMs ?? 0;
+      lastMs = rttMs;
       rttMin = Math.min(rttMin, rttMs);
     }
     const now = this.ctx.clock.now();

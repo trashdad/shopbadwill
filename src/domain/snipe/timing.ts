@@ -6,7 +6,7 @@ import type { ComputeFireAt } from './types';
 /** Clock samples taken at wake: 3, 20 s apart; the lowest-RTT one wins (SgwClock.offset()). */
 export const CLOCK_SAMPLE_COUNT = 3;
 export const CLOCK_SAMPLE_SPACING_MS = 20_000;
-/** Abort when rtt is strictly above this. */
+/** Clock-sample quality only (assessClock): a sample whose rtt is strictly above this is not usable. */
 export const MAX_RTT_MS = 2000;
 /** Abort when |offset| is strictly above this (5 min). */
 export const MAX_CLOCK_OFFSET_MS = 300_000;
