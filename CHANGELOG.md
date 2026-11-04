@@ -9,6 +9,16 @@ extension is reliable enough to run unattended every day. Bump with `pnpm releas
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-04
+
+### Added
+
+- Problem alerts reach your phone at once through ntfy, quiet hours or not: snipe at risk, no bid sent, unconfirmed, missed, sign-in and calendar-reconnect warnings, and "ShopBadwill paused". New setting "Phone alerts" (Options, Notifications; on by default). They also reach the phone when browser notifications are off (R-3).
+
+### Changed
+
+- The calendar reconnect notice and won/lost notices are priority 2 (R-3).
+
 ## [0.3.0] - 2026-11-04
 
 ### Added
