@@ -13,12 +13,16 @@ you can turn down further.
    |---|---|---|---|
    | interactive | things you click: Run now, badges while you scroll | 1 s (+ up to 0.3 s) | 300 |
    | background | the daily job, outcome reads, preflights | **120 s** (+ up to 15 s) | 120 |
-   | snipe | the final minutes of one armed snipe | 1 s | 80 |
+   | snipe | the final minutes of one armed snipe | 1 s | 240 (about 30 snipes; counted, not enforced) |
    | canary | the CI drift check (not in your browser) | 120 s | 4 |
 
    - Each lane sends one request at a time.
    - Budgets reset at local midnight.
    - A spent lane refuses until then. It does not queue the requests up.
+   - The one exception is the snipe lane: its budget is counted and warned
+     on, never enforced. Only armed snipes use that lane, so its traffic is
+     bounded by the number of snipes, and refusing a read in the last minutes
+     would cost you the auction.
 
    The 120 s background gap honours the `Crawl-delay` in SGW's robots.txt.
 
@@ -31,6 +35,12 @@ you can turn down further.
 
    You get a notification either way. A longer `Retry-After` from SGW always
    wins.
+
+   The bid itself is not held back by a 429 pause or by a 429/5xx backoff on
+   the snipe lane: a slow-down asked for elsewhere must not cost you an
+   auction. A 403 (backoff or pause) and a manual or health pause still stop
+   it. The 24 h and 1 h checks before a snipe warn when the snipe lane is
+   running low or SGW has asked ShopBadwill to slow down.
 
 3. **Honours robots.txt.** It never automates a page load of the paths that
    robots.txt disallows:

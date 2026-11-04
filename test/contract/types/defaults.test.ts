@@ -126,7 +126,7 @@ describe('DEFAULT_LANES', () => {
     expect(DEFAULT_LANES).toEqual({
       interactive: { minIntervalMs: 1000, jitterMs: 300, maxConcurrent: 1, dailyBudget: 300 },
       background: { minIntervalMs: 120000, jitterMs: 15000, maxConcurrent: 1, dailyBudget: 120 },
-      snipe: { minIntervalMs: 1000, jitterMs: 0, maxConcurrent: 1, dailyBudget: 80 },
+      snipe: { minIntervalMs: 1000, jitterMs: 0, maxConcurrent: 1, dailyBudget: 240 },
       canary: { minIntervalMs: 120000, jitterMs: 0, maxConcurrent: 1, dailyBudget: 4 },
     });
   });

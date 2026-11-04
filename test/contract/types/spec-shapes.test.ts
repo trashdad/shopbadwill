@@ -197,10 +197,20 @@ interface SpecLaneConfig {
   dailyBudget: number;
 }
 interface SpecSchedulerStats {
-  lanes: Record<SpecLane, { usedToday: number; budget: number; nextAllowedAt: EpochMs; backoffUntil?: EpochMs }>;
+  /** R-1 (additive): backoffKind, present with backoffUntil. */
+  lanes: Record<
+    SpecLane,
+    {
+      usedToday: number;
+      budget: number;
+      nextAllowedAt: EpochMs;
+      backoffUntil?: EpochMs;
+      backoffKind?: 'rate-limited' | 'blocked' | 'server';
+    }
+  >;
   cacheHits: number;
-  /** Contract change (T-25): present while every lane is paused; until null = open-ended. */
-  paused?: { until: EpochMs | null; reason: string };
+  /** Contract change (T-25): present while every lane is paused; until null = open-ended. R-1 (additive): cause. */
+  paused?: { until: EpochMs | null; reason: string; cause?: 'manual' | 'blocked' | 'rate-limited' };
 }
 
 // ── §3.5 ────────────────────────────────────────────────────────────────────

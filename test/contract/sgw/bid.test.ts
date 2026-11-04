@@ -161,7 +161,7 @@ function setup(opts: SetupOpts = {}) {
     },
     sgwClock: new SgwClockAdapter(clock),
   });
-  return { clock, http, runs, audit, switches, failures, api };
+  return { clock, http, runs, audit, switches, failures, api, inner };
 }
 type Setup = ReturnType<typeof setup>;
 
@@ -789,15 +789,26 @@ describe('R1: a failure after PlaceBid may have left is distinguishable from "ne
     expect(t.http.requests).toHaveLength(0);
   });
 
-  it('the snipe lane is out of budget: BidNotSentError(budget), zero PlaceBid', async () => {
-    const tight: LaneConfig = { minIntervalMs: 0, jitterMs: 0, maxConcurrent: 1, dailyBudget: 1 };
-    const t = setup({ lanes: { ...FAST_LANES, snipe: tight } });
+  it('R-1: a spent snipe-lane budget does not stop the bid: ShowBidModal and PlaceBid are critical', async () => {
+    const spent: LaneConfig = { minIntervalMs: 0, jitterMs: 0, maxConcurrent: 1, dailyBudget: 0 };
+    const t = setup({ lanes: { ...FAST_LANES, snipe: spent } });
     t.http.on(MODAL, MODAL_OK);
     t.http.on(PLACE_BID, json({ status: true, result: 7 }));
+    const r = await bid(t);
+    expect(r.ok).toBe(true);
+    expect(placeBidRequests(t)).toHaveLength(1);
+  });
+
+  it('a manual/health pause still refuses the bid: BidNotSentError(paused), zero HTTP', async () => {
+    const t = setup();
+    t.http.on(MODAL, MODAL_OK);
+    t.http.on(PLACE_BID, json({ status: true, result: 7 }));
+    t.inner.pause('health check failed');
     const err = errorOf(await bid(t));
     expect(err).toBeInstanceOf(BidNotSentError);
-    expect(err.kind).toBe('budget');
-    expect(placeBidRequests(t)).toHaveLength(0);
+    expect(err.kind).toBe('paused');
+    expect(bidMayHaveBeenSent(err)).toBe(false);
+    expect(t.http.requests).toHaveLength(0);
   });
 });
 

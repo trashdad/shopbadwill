@@ -33,7 +33,7 @@ function health() {
       lanes: {
         interactive: { usedToday: 0, budget: 300, nextAllowedAt: 0 },
         background: { usedToday: 0, budget: 120, nextAllowedAt: 0 },
-        snipe: { usedToday: 0, budget: 80, nextAllowedAt: 0 },
+        snipe: { usedToday: 0, budget: 240, nextAllowedAt: 0 },
         canary: { usedToday: 0, budget: 4, nextAllowedAt: 0 },
       },
       cacheHits: 0,

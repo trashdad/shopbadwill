@@ -18,7 +18,8 @@
 // Everything else is `ok: true` plus a warning notification from THIS module
 // (the runner acts only on `ok: false`): a session expiring soon but after the
 // end, Google disconnected (or needing interaction) only when the calendar is
-// on, a failing health report, keep-awake unavailable. Keep-awake readiness
+// on, a failing health report, keep-awake unavailable, and (R-1) a snipe lane
+// running dry or SGW asking to slow down. Keep-awake readiness
 // matches the runner: tier T1 and the `power` permission, not `background`.
 // R4: one notification per snipe per check, deduped
 // across restarts through the audit log (`snipe.auth-warn`, ref = snipe id,
@@ -27,6 +28,10 @@
 // delivery is an alarm (`sbw:authhealth:<id>:<which>`) that re-checks, so a
 // session that died during the night surfaces through the same copy the
 // runner's at-risk notification uses.
+//
+// R-1: the snipe-lane figures come from `scheduler.stats()`, the scheduler's
+// in-memory state (no request). Fewer than SNIPE_LANE_LOW_WATER requests left
+// today, or an active pause or snipe-lane backoff, is a warning, never ok:false.
 import { browser } from 'wxt/browser';
 
 import type { AuthStatus } from '../../domain/calendar/types';
@@ -38,13 +43,14 @@ import { isoMs, SESSION_MARGIN_AFTER_END_MS } from '../../domain/snipe/preflight
 import type { Snipe } from '../../domain/snipe/types';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
 import { formatDual } from '../../domain/time/pacific';
-import type { EpochMs, HealthReport, SgwSessionState } from '../../domain/types';
+import type { EpochMs, HealthReport, RequestSchedulerStats, SgwSessionState } from '../../domain/types';
 import type { Alarms } from '../../ports/alarms';
 import type { Clock } from '../../ports/clock';
 import type { GoogleAuthProvider } from '../../ports/google-auth';
 import type { KeepAwake } from '../../ports/keep-awake';
 import type { Notifier } from '../../ports/notifier';
 import type { Permissions } from '../../ports/permissions';
+import type { RequestScheduler } from '../../ports/request-scheduler';
 import type { SgwHealth } from '../../ports/sgw-health';
 import type { SgwSession } from '../../ports/sgw-session';
 import type { BackgroundContext } from '../context';
@@ -63,6 +69,9 @@ export const AUTH_WARN_ID_PREFIX = 'sbw:snipe:';
 const SIGN_IN = 'Sign in to ShopGoodwill in this browser';
 const RECONNECT_GOOGLE = 'Reconnect Google';
 const TURN_ON_KEEP_AWAKE = 'Turn on Keep awake';
+
+/** R-1: warn when the snipe lane has fewer requests than this left today (two snipes of about 8). */
+export const SNIPE_LANE_LOW_WATER = 16;
 
 export function authWarnAlarmName(id: string, which: AuthHealthCheck): string {
   return `${AUTH_WARN_ALARM_PREFIX}${id}:${which}`;
@@ -113,6 +122,34 @@ export interface AuthHealthSnapshot {
   powerGranted: boolean;
   tier: Settings['snipe']['tier'];
   timeZone: string;
+  /**
+   * R-1: the snipe lane today, from the scheduler's cached stats; null when
+   * they could not be read. `paused`: an all-lane pause is active;
+   * `backingOff`: the snipe lane is backing off; `blocked`: that pause or
+   * backoff would refuse the bid too (a 403, or a manual/health pause);
+   * `until`: when the longest of them ends (null = until resumed).
+   */
+  snipeLane: { left: number; paused: boolean; backingOff: boolean; blocked: boolean; until: EpochMs | null } | null;
+}
+
+/** R-1: the snapshot's snipe-lane figures from the scheduler stats. */
+export function snipeLaneOf(stats: RequestSchedulerStats): NonNullable<AuthHealthSnapshot['snipeLane']> {
+  const snipe = stats.lanes.snipe;
+  const pause = stats.paused;
+  const backingOff = snipe.backoffUntil !== undefined;
+  const paused = pause !== undefined;
+  // A pause of unknown cause (an older scheduler) counts as one that refuses the bid.
+  const blocked = (paused && pause.cause !== 'rate-limited') || (backingOff && snipe.backoffKind === 'blocked');
+  let until: EpochMs | null = 0;
+  if (paused) until = pause.until === null ? null : Math.max(until, pause.until);
+  if (backingOff && until !== null) until = Math.max(until, snipe.backoffUntil ?? 0);
+  return {
+    left: Math.max(0, snipe.budget - snipe.usedToday),
+    paused,
+    backingOff,
+    blocked,
+    until: paused || backingOff ? until : null,
+  };
 }
 
 const HEALTH_WARN_NAMES_LIMIT = 3;
@@ -212,6 +249,23 @@ export function assessAuthHealth(
     }
   }
 
+  const lane = snap.snipeLane;
+  if (lane !== null) {
+    if (lane.left < SNIPE_LANE_LOW_WATER) {
+      warnings.push(
+        `The snipe lane has only ${String(lane.left)} SGW requests left today (a snipe needs about 8). Fewer snipes today, or turn off considerate mode.`,
+      );
+    }
+    if (lane.paused || lane.backingOff) {
+      const until = lane.until === null ? 'resumed' : formatDual(lane.until, snap.timeZone);
+      warnings.push(
+        lane.blocked
+          ? `ShopBadwill's SGW requests are paused (until ${until}), so the bid will not go unless the pause ends first. See the health section in options.`
+          : `SGW asked ShopBadwill to slow down (until ${until}); the bid itself will still go, but the checks before it may not.`,
+      );
+    }
+  }
+
   return { result: { ok: true }, warnings };
 }
 
@@ -237,6 +291,8 @@ export interface AuthHealthDeps {
   getSnipe(id: string): Promise<Snipe | undefined>;
   /** T-118 (L6): records the deferral alarm in `sbw:deferredAlarms`. */
   repo?: Pick<Repo, 'update'>;
+  /** R-1: the scheduler's cached stats only (no request is ever made through it here). */
+  scheduler: Pick<RequestScheduler, 'stats'>;
   log?(message: string, error?: unknown): void;
 }
 
@@ -286,6 +342,12 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
     // R2: a usable state whose token could not be read is unknown (a warning),
     // never "no login saved" (a failure). Logged-out/expired need no token.
     const sessionState = tokenRead === null && (state === 'ok' || state === 'expiring') ? null : state;
+    let snipeLane: AuthHealthSnapshot['snipeLane'];
+    try {
+      snipeLane = snipeLaneOf(deps.scheduler.stats());
+    } catch {
+      snipeLane = null; // unreadable: no snipe-lane warning (a warning never disarms anyway)
+    }
     return {
       now: deps.clock.now(),
       sessionState,
@@ -298,6 +360,7 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
       powerGranted,
       tier: settings.snipe.tier,
       timeZone: settings.locale.timeZone,
+      snipeLane,
       quiet: settings.notifications.quietHours,
     };
   };
@@ -433,6 +496,7 @@ export function register(ctx: BackgroundContext): AuthHealth {
       ),
     getSnipe: async (id) => (await ctx.repo.get(STORAGE_KEYS.snipes))[id],
     repo: ctx.repo,
+    scheduler: ctx.scheduler,
   });
   snipeSeams(ctx).setAuthHealth(impl);
   return impl;
