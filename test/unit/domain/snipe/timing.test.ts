@@ -3,17 +3,48 @@ import { describe, expect, it } from 'vitest';
 import {
   CLOCK_SAMPLE_COUNT,
   CLOCK_SAMPLE_SPACING_MS,
+  FIRE_MIN_AHEAD_MS,
+  LATENCY_ABORT_RTT_MS,
   MAX_CLOCK_OFFSET_MS,
   MAX_RTT_MS,
   assessClock,
   clockSanity,
   computeFireAt,
   planClockSamples,
+  sendChainMs,
   toLocalFireAt,
 } from '../../../../src/domain/snipe/timing';
 import type { ComputeFireAt } from '../../../../src/domain/snipe/types';
 
 const END = 1_800_000_000_000;
+
+describe('sendChainMs (R-2)', () => {
+  it('is the modal round trip + the lane gap + PlaceBid one way', () => {
+    expect(sendChainMs(250, 1000)).toBe(1375);
+    expect(sendChainMs(6400, 1000)).toBe(10600);
+    expect(sendChainMs(1500, 2000)).toBe(4250);
+  });
+
+  it('rejects negative or non-finite inputs with RangeError', () => {
+    expect(() => sendChainMs(-1, 1000)).toThrow(RangeError);
+    expect(() => sendChainMs(250, -1)).toThrow(RangeError);
+    expect(() => sendChainMs(Number.NaN, 1000)).toThrow(RangeError);
+    expect(() => sendChainMs(250, Number.NaN)).toThrow(RangeError);
+    expect(() => sendChainMs(Number.POSITIVE_INFINITY, 1000)).toThrow(RangeError);
+  });
+
+  it('the latency bounds are 8 s and 2 s', () => {
+    expect(LATENCY_ABORT_RTT_MS).toBe(8000);
+    expect(FIRE_MIN_AHEAD_MS).toBe(2000);
+    expect(MAX_RTT_MS).toBe(2000);
+  });
+
+  it('with the chain, the fire is end - lead - chain (the report table)', () => {
+    expect(computeFireAt(END, 8000, sendChainMs(250, 1000))).toBe(END - 9375);
+    expect(computeFireAt(END, 8000, 1375)).toBe(END - 9375);
+    expect(computeFireAt(END, 3000, sendChainMs(1500, 1000))).toBe(END - 6250);
+  });
+});
 
 describe('computeFireAt', () => {
   it('is end - lead - oneWay (rtt/2)', () => {

@@ -29,6 +29,7 @@ import {
 } from '../../src/adapters/browser/snipe-host';
 import type { BackgroundContext, BackgroundModule, RuntimePort } from '../../src/background/context';
 import { HANDLER_MODULES } from '../../src/background/handlers/index';
+import { companionWakeAt } from '../../src/background/companion-wake';
 import { COMPANION_WAKE_MARGIN_MS } from '../../src/background/jobs/companion-sync';
 import { JOB_MODULES } from '../../src/background/jobs/index';
 import {
@@ -54,6 +55,8 @@ import { defaultSettings } from '../../src/domain/settings/defaults';
 import type { Settings } from '../../src/domain/settings/schema';
 import { exposure } from '../../src/domain/snipe/caps';
 import { settledAsMissed } from '../../src/domain/snipe/outcome';
+import { WAKE_BEFORE_FIRE_MS } from '../../src/domain/snipe/state-machine';
+import { sendChainMs } from '../../src/domain/snipe/timing';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import { formatPacificNaive } from '../../src/domain/time/pacific';
 import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
@@ -98,8 +101,10 @@ const ITEM = 702801256;
 const SELLER = 955353;
 const LEAD = 8000;
 const MAX = 2000;
-/** The planned fire, server time: end - lead - rtt/2 (T-81). */
-const FIRE_SERVER = END - LEAD - LATENCY / 2;
+/** The snipe lane's gap between ShowBidModal and PlaceBid. */
+const GAP = 1000;
+/** The planned fire, server time: end - lead - send chain (R-2: modal rtt + lane gap + PlaceBid one way). */
+const FIRE_SERVER = END - LEAD - (LATENCY + GAP + LATENCY / 2);
 const FIRE_LOCAL = FIRE_SERVER - SKEW;
 const ALARM_DELAY = 45 * SEC;
 /** "No bid was placed" style copy: never allowed once a bid may have gone out. */
@@ -155,6 +160,8 @@ class FakeSgw {
   latency = LATENCY;
   /** Replaces the next ItemDetail replies, in order. */
   readonly detailFaults: HttpStep[] = [];
+  /** R-2: the latency of the next ItemDetail replies, in order (then `latency`). */
+  readonly detailLatencies: number[] = [];
   /** Replaces every ItemDetail reply while set. */
   detailDown: HttpStep | undefined;
   placeBidStep: HttpStep | undefined;
@@ -207,14 +214,15 @@ class FakeSgw {
     this.details.push({ at: this.clock.now(), auth: req.headers?.Authorization !== undefined });
     const fault = this.detailFaults.shift() ?? this.detailDown;
     if (fault) return fault;
-    return { status: 200, bodyText: JSON.stringify(this.raw()), latencyMs: this.latency };
+    const latency = this.detailLatencies.shift() ?? this.latency;
+    return { status: 200, bodyText: JSON.stringify(this.raw(latency)), latencyMs: latency };
   }
 
   /** The ItemDetail reply SGW would send now. */
-  raw(): Record<string, unknown> {
+  raw(latency = this.latency): Record<string, unknown> {
     const raw = structuredClone(loadFixture<Record<string, unknown>>('item-detail-open'));
     // SGW stamps serverTime mid-flight: the offset estimate is then exact.
-    const server = this.serverNow() + this.latency / 2;
+    const server = this.serverNow() + latency / 2;
     const i = this.item;
     const closed = i.closed || server >= i.endMs;
     raw.itemId = ITEM;
@@ -2504,12 +2512,12 @@ describe('R4: the runner model as a property of the real runner', () => {
 });
 
 describe('auto-kill on anomalies (clock, latency, schema drift)', () => {
-  it('latency: a 60-second check slower than 2 s is an anomaly, and the fallback applies', async () => {
+  it('latency: a 60-second check SGW answers too slowly for a bid to be timed (best read > 8 s) is an anomaly, and the fallback applies', async () => {
     const shared = makeShared();
     const { w } = await boot(shared);
     await arm(w);
-    await runTo(shared, wakeLocal() + ALARM_DELAY - SEC);
-    shared.sgw.latency = 2500;
+    await runTo(shared, END - SKEW - 60 * SEC - 10);
+    shared.sgw.latency = 9000;
     await runTo(shared, END + 10 * MIN);
     const fb = audits(shared).find((a) => a.kind === 'snipe.fallback');
     expect(fb?.details).toMatchObject({ reason: 'anomaly', applied: 'early-proxy' });
@@ -3717,5 +3725,182 @@ describe('T-128: a "not due" preflight never loops SGW reads', () => {
     expect(stored(shared).state).toBe('armed');
     await runTo(shared, END + 5 * MIN);
     expectOneDryRunFire(shared, SKEW);
+  });
+});
+
+// ── R-2: the fire counts the real send chain; a slow verify read is re-measured ──
+
+describe('R-2: the send chain and the re-measured verify read', () => {
+  /** The verify read, on the local clock. */
+  const VERIFY_LOCAL = END - SKEW - 60 * SEC;
+
+  /** ItemDetail reads the verify made (from the verify, up to the fire or 40 s on). */
+  function verifyReads(shared: Shared): number[] {
+    const s = stored(shared);
+    const fired = s.history.find((h) => h.to === 'firing')?.at ?? Infinity;
+    return shared.sgw.details.map((d) => d.at).filter((at) => at >= VERIFY_LOCAL - 5 && at < Math.min(fired - 5, VERIFY_LOCAL + 40 * SEC));
+  }
+
+  function verifiedDetails(shared: Shared): Record<string, unknown> | undefined {
+    return audits(shared).find((a) => a.kind === 'snipe.verified')?.details;
+  }
+
+  /** The dry run fired once at `fireAt` (server), and nothing went on the wire. */
+  function expectDryRunFiredAt(shared: Shared, fireAt: number): void {
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'dry-run', dryRun: true });
+    expect(transitions(s)).toContain('waking>verified');
+    expect(s.fireAt).toBe(fireAt);
+    expect(Math.abs((s.history.find((h) => h.to === 'firing')?.at ?? 0) - (fireAt - SKEW))).toBeLessThanOrEqual(5);
+    expect(audits(shared).some((a) => a.kind === 'snipe.disarm')).toBe(false);
+    expect(audits(shared).some((a) => a.kind === 'snipe.fallback')).toBe(false);
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+  }
+
+  it('a normal verify plans the fire from the whole chain: end - lead - (rtt + 1 s gap + rtt/2)', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END + 2 * MIN);
+    expectDryRunFiredAt(shared, END - LEAD - sendChainMs(LATENCY, GAP));
+    expect(verifyReads(shared)).toHaveLength(1);
+    expect(verifiedDetails(shared)).toMatchObject({ sendRttMs: LATENCY, sendChainMs: sendChainMs(LATENCY, GAP) });
+  });
+
+  it('a 6.4 s verify read is re-measured: a 300 ms re-read is no anomaly, and the fire is planned from it', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, VERIFY_LOCAL - 10);
+    shared.sgw.detailLatencies.push(6400, 300, 300);
+    await runTo(shared, END + 2 * MIN);
+
+    expectDryRunFiredAt(shared, END - LEAD - sendChainMs(300, GAP));
+    // R4 stops at the first read back under 2 s: 2 reads, the second a full gap after the first answered.
+    const reads = verifyReads(shared);
+    expect(reads).toHaveLength(2);
+    expect((reads[1] ?? 0) - (reads[0] ?? 0)).toBeGreaterThanOrEqual(6400 + GAP);
+    expect(verifiedDetails(shared)).toMatchObject({ sendRttMs: 300, sendChainMs: 1450 });
+  });
+
+  it('two slow reads then a 300 ms one: exactly 3 verify reads, in series, each a full gap after the last answered', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, VERIFY_LOCAL - 10);
+    shared.sgw.detailLatencies.push(6400, 6400, 300);
+    await runTo(shared, END + 2 * MIN);
+
+    expectDryRunFiredAt(shared, END - LEAD - sendChainMs(300, GAP));
+    const reads = verifyReads(shared);
+    expect(reads).toHaveLength(3);
+    expect((reads[1] ?? 0) - (reads[0] ?? 0)).toBeGreaterThanOrEqual(6400 + GAP);
+    expect((reads[2] ?? 0) - (reads[1] ?? 0)).toBeGreaterThanOrEqual(6400 + GAP);
+  });
+
+  it('three 6.4 s reads with lead 8 s and 60 s left: the fire can still be timed, so it proceeds and fires (no early proxy)', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, VERIFY_LOCAL - 10);
+    shared.sgw.detailLatencies.push(6400, 6400, 6400);
+    await runTo(shared, END + 2 * MIN);
+
+    expectDryRunFiredAt(shared, END - LEAD - 10_600);
+    expect(verifyReads(shared)).toHaveLength(3);
+    expect(verifiedDetails(shared)).toMatchObject({ sendRttMs: 6400, sendChainMs: 10_600 });
+  });
+
+  it('three 6.4 s reads with lead 30 s: the fire would be in the past, so the anomaly disarm runs once with the early proxy', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w, { leadMs: 30_000 });
+    await runTo(shared, VERIFY_LOCAL - 10);
+    shared.sgw.detailLatencies.push(6400, 6400, 6400);
+    await runTo(shared, END + 10 * MIN);
+
+    const s = stored(shared);
+    expect(transitions(s)).toContain('waking>fallback-applied');
+    expect(s.history.some((h) => h.to === 'verified' || h.to === 'firing')).toBe(false);
+    const disarms = audits(shared).filter((a) => a.kind === 'snipe.disarm');
+    expect(disarms).toHaveLength(1);
+    expect(String(disarms[0]?.details.why)).toMatch(/^latency: SGW took 6400 ms \(best of 3 reads\); the bid needs 10600 ms to land and \d+ ms remain$/);
+    const fallbacks = audits(shared).filter((a) => a.kind === 'snipe.fallback');
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0]?.details).toMatchObject({ reason: 'anomaly', applied: 'early-proxy' });
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+
+  it('a best read over 8 s (after two slower ones) is an anomaly: early proxy, one money effect only', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, VERIFY_LOCAL - 10);
+    shared.sgw.detailLatencies.push(12_000, 10_000, 9000);
+    await runTo(shared, END + 10 * MIN);
+
+    const s = stored(shared);
+    expect(transitions(s)).toContain('waking>fallback-applied');
+    expect(verifyReads(shared)).toHaveLength(3);
+    const disarms = audits(shared).filter((a) => a.kind === 'snipe.disarm');
+    expect(disarms).toHaveLength(1);
+    expect(String(disarms[0]?.details.why)).toMatch(/^latency: SGW took 9000 ms \(best of 3 reads\)/);
+    expect(audits(shared).filter((a) => a.kind === 'snipe.fallback')).toHaveLength(1);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(s.history.some((h) => h.to === 'firing')).toBe(false);
+  });
+
+  it('under 25 s left after the first slow read: no re-read, and the rule is judged on that one read', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const first = await boot(shared);
+    await arm(first.w);
+    await runTo(shared, VERIFY_LOCAL - SEC);
+    expect(stored(shared).state).toBe('waking');
+    // The worker dies before the verify; a new one starts 31 s before the end and verifies at once.
+    // (It keeps a good clock sample, as a worker that took one would: this test is about the verify read.)
+    first.w.kill();
+    shared.clock.advance(END - SKEW - 31 * SEC - shared.clock.now());
+    shared.sgw.detailLatencies.push(6400, 300);
+    const t = shared.clock.now();
+    await boot(shared, {
+      jobModules: probe((ctx) => {
+        ctx.sgwClock.addSample({ serverMs: t + SKEW + LATENCY / 2, sentAt: t, receivedAt: t + LATENCY, rttMs: LATENCY, source: 'itemDetail' });
+      }),
+    });
+    await runTo(shared, END + 2 * MIN);
+
+    // One 6.4 s read, ~24.6 s left: judged on it. The chain (10.6 s) still fits, so it proceeds.
+    expectDryRunFiredAt(shared, END - LEAD - 10_600);
+    const fireLocal = END - LEAD - 10_600 - SKEW;
+    expect(shared.sgw.details.map((d) => d.at).filter((at) => at >= END - SKEW - 31 * SEC && at < fireLocal - 5)).toHaveLength(1);
+    expect(verifiedDetails(shared)).toMatchObject({ sendRttMs: 6400 });
+  });
+
+  it("considerateMode 'tight' doubles the gap in the fire time", async () => {
+    const settings = settingsWith();
+    settings.considerateMode = 'tight';
+    const shared = makeShared({ settings });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END + 2 * MIN);
+    expectDryRunFiredAt(shared, END - LEAD - sendChainMs(LATENCY, 2 * GAP));
+    expect(verifiedDetails(shared)).toMatchObject({ sendChainMs: LATENCY + 2 * GAP + LATENCY / 2 });
+  });
+
+  it('the wake alarm is still 5 min before the planned fire, and the companion wake follows the new fireAt', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, wakeLocal() - 20 * SEC);
+    const pending = (await snipeAlarms(shared)).find((a) => a.name === snipeAlarmName('s1', 'wake'));
+    expect(pending?.scheduledTime).toBeLessThanOrEqual(wakeLocal());
+    await runTo(shared, VERIFY_LOCAL + 5 * SEC);
+    const s = stored(shared);
+    expect(s.state).toBe('verified');
+    expect(s.fireAt).toBe(FIRE_SERVER);
+    // The chain moves the fire only ~1.2 s earlier than the plan the wake was set from.
+    expect(FIRE_SERVER - SKEW - (pending?.scheduledTime ?? 0)).toBeGreaterThanOrEqual(WAKE_BEFORE_FIRE_MS - sendChainMs(LATENCY, GAP));
+    expect(companionWakeAt(s, SKEW)).toBe(FIRE_SERVER - SKEW - WAKE_BEFORE_FIRE_MS - COMPANION_WAKE_MARGIN_MS);
   });
 });

@@ -66,11 +66,20 @@ import { checkCaps, confirmsAmount, spentToday, typoCheck } from '../../domain/s
 import { classifyOutcome } from '../../domain/snipe/outcome';
 import { isoMs, preflight, PREFLIGHT_LEAD_MS, type PreflightContext, type PreflightReason } from '../../domain/snipe/preflight';
 import { capsForEvent, reduce, WAKE_BEFORE_FIRE_MS, type ReduceContext, type Rejection } from '../../domain/snipe/state-machine';
-import { assessClock, computeFireAt, MAX_RTT_MS, planClockSamples, toLocalFireAt } from '../../domain/snipe/timing';
+import {
+  assessClock,
+  computeFireAt,
+  FIRE_MIN_AHEAD_MS,
+  LATENCY_ABORT_RTT_MS,
+  MAX_RTT_MS,
+  planClockSamples,
+  sendChainMs,
+  toLocalFireAt,
+} from '../../domain/snipe/timing';
 import { type CapsResult, type Effect, type Snipe, type SnipeEvent } from '../../domain/snipe/types';
 import { formatDual } from '../../domain/time/pacific';
 import { SnipeRunnerRecordSchema, STORAGE_KEYS, STORAGE_RECORDS, type SnipeRunnerRecord } from '../../domain/storage/schema';
-import { BidResultSchema, type BidResult, type Cents, type EpochMs, type ItemDetail, type ItemId, type Lane } from '../../domain/types';
+import { BidResultSchema, DEFAULT_LANES, type BidResult, type Cents, type EpochMs, type ItemDetail, type ItemId, type Lane } from '../../domain/types';
 import type { Settings } from '../../domain/settings/schema';
 import { PORT_NAMES, SnipeCountdownTickSchema } from '../../messaging/protocol';
 import type { Clock } from '../../ports/clock';
@@ -104,6 +113,13 @@ export const HEALTH1_BEFORE_END_MS = HOUR;
 export const VERIFY_BEFORE_END_MS = 60 * SEC;
 /** Verify read attempts (the snipe lane spaces them 1 s apart). */
 export const VERIFY_ATTEMPTS = 2;
+/**
+ * R-2: a verify read slower than MAX_RTT_MS is re-measured with up to this many
+ * more window reads (in series, through the lane's gap) before latency is judged.
+ */
+export const VERIFY_REMEASURE_ATTEMPTS = 2;
+/** R-2: no re-measure read starts with less than this left before the end (local clock). */
+export const VERIFY_REMEASURE_MIN_LEFT_MS = 25_000;
 /** Failed window reads in a row that count as an anomaly ("repeated errors"). */
 export const MAX_CONSECUTIVE_READ_ERRORS = 3;
 /** The window's recovery alarm: revives a worker that died in the window (S-7, fire + 100 s in the spike). */
@@ -439,6 +455,8 @@ interface CommitOptions {
   external?: 'dispatch' | 'ended-early';
   /** T-87e: a preflight hook's failure detail, for the reducer's copy (ReduceContext.preflightDetail). */
   preflightDetail?: string;
+  /** R-2: for `verified`, the verify's best rtt and the lane gap the fire is planned from (ReduceContext.send). */
+  send?: { rttMs: number; gapMs: number };
 }
 
 type StepResult = 'continue' | 'wait';
@@ -784,7 +802,7 @@ export class SnipeRunner {
         ...(detail === undefined ? {} : { detail }),
       });
       const endedRead = isEndedEvent(e) ? opts.detail : undefined;
-      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable, opts.preflightDetail, endedRead));
+      const red = reduce(s, e, caps, this.reduceContext(s, settings, sessionUsable, opts.preflightDetail, endedRead, opts.send));
       if (red.rejection !== null) {
         if (outbox !== entry.outbox) {
           rec.entries[id] = { ...entry, outbox };
@@ -812,7 +830,14 @@ export class SnipeRunner {
     return r;
   }
 
-  private reduceContext(s: Snipe, settings: Settings, sessionUsable: boolean, preflightDetail?: string, endedRead?: ItemDetail): ReduceContext {
+  private reduceContext(
+    s: Snipe,
+    settings: Settings,
+    sessionUsable: boolean,
+    preflightDetail?: string,
+    endedRead?: ItemDetail,
+    send?: { rttMs: number; gapMs: number },
+  ): ReduceContext {
     return {
       timeZone: settings.locale.timeZone,
       sessionUsable,
@@ -820,6 +845,7 @@ export class SnipeRunner {
       writesAllowed: this.biddingVerdict(s).ok,
       ...(preflightDetail === undefined ? {} : { preflightDetail }),
       ...(endedRead === undefined ? {} : { endedRead }),
+      ...(send === undefined ? {} : { send }),
     };
   }
 
@@ -1205,11 +1231,33 @@ export class SnipeRunner {
         failure = read.kind ?? 'network';
       }
     }
-    const now = this.ctx.clock.now();
     if (detail === undefined) {
-      await this.commit(s.id, { type: 'verify-failed', now, reason: failure === 'auth' ? 'auth' : 'network' }, { consume });
+      await this.commit(s.id, { type: 'verify-failed', now: this.ctx.clock.now(), reason: failure === 'auth' ? 'auth' : 'network' }, { consume });
       return;
     }
+    const settings = await this.settings();
+    const gapMs = DEFAULT_LANES.snipe.minIntervalMs * (settings.considerateMode === 'tight' ? 2 : 1);
+    // R-2 (R4): one slow read is re-measured before it is judged. In series, each
+    // after the lane's gap (waited here, so the queue wait is not counted as rtt).
+    let reads = 1;
+    let rttMin = rttMs;
+    for (let extra = 0; extra < VERIFY_REMEASURE_ATTEMPTS && rttMs > MAX_RTT_MS; extra++) {
+      const startAt = this.ctx.clock.now() + gapMs;
+      if (this.endLocal(s) - startAt < VERIFY_REMEASURE_MIN_LEFT_MS) break;
+      await this.pause(gapMs);
+      const read = await this.windowRead(s, sess);
+      if (read.anomaly !== undefined) {
+        await this.commit(s.id, { type: 'disarm', now: this.ctx.clock.now(), by: 'anomaly', why: read.anomaly }, { consume });
+        return;
+      }
+      // A failed re-read counts against the attempts and changes nothing.
+      if (read.detail === undefined) continue;
+      reads += 1;
+      detail = read.detail;
+      rttMs = read.rttMs ?? 0;
+      rttMin = Math.min(rttMin, rttMs);
+    }
+    const now = this.ctx.clock.now();
     const sessionUsable = usableSession(await this.ctx.session.state());
     const ev = this.verifyEvent(s, detail, now, sessionUsable);
     // T-84b: when the verify read returned a body, the content exits (ended,
@@ -1221,13 +1269,25 @@ export class SnipeRunner {
     const over = detail.isClosed || isoMs(detail.serverTime) >= endMs;
     const later = endMs > isoMs(s.endTime);
     const proceed = ev.type === 'verified' && !over && !later;
-    // Latency: SGW is too slow right now for a bid to land on time (an older fast sample would hide it).
-    if (proceed && rttMs > MAX_RTT_MS) {
-      const why = `latency: SGW took ${String(Math.round(rttMs))} ms to answer the 60-second check (over ${String(MAX_RTT_MS)} ms)`;
+    // R-2 (R3): latency is an anomaly only when the bid cannot be timed.
+    const chain = sendChainMs(rttMin, gapMs);
+    const fireAt = computeFireAt(endMs, s.leadMs, chain);
+    const serverNow = now + this.offsetFor(s);
+    if (proceed && (rttMin > LATENCY_ABORT_RTT_MS || fireAt < serverNow + FIRE_MIN_AHEAD_MS)) {
+      const why =
+        `latency: SGW took ${String(Math.round(rttMin))} ms (best of ${String(reads)} ${reads === 1 ? 'read' : 'reads'}); ` +
+        `the bid needs ${String(Math.round(chain))} ms to land and ${String(Math.max(0, Math.round(endMs - serverNow)))} ms remain`;
       await this.commit(s.id, { type: 'disarm', now, by: 'anomaly', why }, { consume, detail });
       return;
     }
-    await this.commit(s.id, ev, { consume, detail, expectVersion: s.history.length });
+    await this.commit(s.id, ev, { consume, detail, expectVersion: s.history.length, send: { rttMs: rttMin, gapMs } });
+  }
+
+  /** Waits `ms` on the worker's clock (a dead worker never resumes). */
+  private pause(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.ctx.clock.setTimeout(resolve, ms);
+    });
   }
 
   /** Maps the verify read to `verified` / `verify-failed`; the reducer judges ended, extended, clock and caps. */

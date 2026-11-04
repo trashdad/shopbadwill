@@ -404,7 +404,10 @@ test('on-time dry-run fire: the tight timer fires on time, the measured error is
     expect(rtt, 'the round trip carries the injected 150 ms').toBeGreaterThanOrEqual(LATENCY_MS);
     // The midpoint estimate is within rtt/2 of the true offset (plus the stamp-to-send gap).
     expect(Math.abs(offset - SKEW_MS)).toBeLessThanOrEqual(rtt / 2 + 50);
-    expect(verified.fireAt).toBe(r.endMs - LEAD_S * SEC - rtt / 2);
+    // R-2: fireAt = end − lead − send chain (verify rtt + the 1 s snipe-lane gap + rtt/2).
+    const sendRtt = (r.endMs - LEAD_S * SEC - (verified.fireAt as number) - 1000) / 1.5;
+    expect(sendRtt, 'the chain carries the verify read’s injected 150 ms').toBeGreaterThanOrEqual(LATENCY_MS);
+    expect(sendRtt).toBeLessThanOrEqual(2000);
   });
 
   await test.step('the last 3 s run on real time; the dry run fires and resolves', async () => {
