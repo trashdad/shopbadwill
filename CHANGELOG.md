@@ -9,6 +9,12 @@ extension is reliable enough to run unattended every day. Bump with `pnpm releas
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-04
+
+### Fixed
+
+- On tier T0 (nothing keeps the computer awake), the 24 h and 1 h checks warn when the computer is usually asleep at the auction's end, or the end falls in quiet hours (R-6).
+
 ## [0.2.2] - 2026-11-04
 
 ### Fixed
