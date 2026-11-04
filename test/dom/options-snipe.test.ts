@@ -194,6 +194,19 @@ describe('SnipeSection', () => {
     expect(saved[0]).toMatchObject({ snipe: { defaultFallback: 'skip' } });
   });
 
+  it('R-4: saves "still raise my max" and shows an absent setting as on', async () => {
+    const legacy = defaultSettings();
+    delete (legacy.snipe as Partial<Settings['snipe']>).raiseOwnProxy;
+    const { saved } = app({ settings: legacy });
+    const box = await screen.findByLabelText('When I am already the high bidder, still raise my max at the end');
+    expect((box as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(box);
+    await waitFor(() => {
+      expect(saved).toHaveLength(1);
+    });
+    expect(saved[0]).toMatchObject({ snipe: { raiseOwnProxy: false, enabled: false, tier: 'T0' } });
+  });
+
   it('saves the tier from the radio group', async () => {
     const { saved } = app({ settings: defaultSettings() });
     fireEvent.click(await screen.findByRole('radio', { name: /T2 · Wake the computer/ }));

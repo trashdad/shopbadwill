@@ -253,6 +253,15 @@ export function SnipeSection(props: SnipeSectionProps): VNode {
             saveSnipe((s) => ({ ...s, enabled: v }), 'sniping');
           }}
         />
+        <Switch
+          id="snipe-raise-own-proxy"
+          label="When I am already the high bidder, still raise my max at the end"
+          hint="If you lead at a price below the snipe's max (an earlier bid of yours), the snipe still bids its max once in the final seconds, so a late bidder must beat the higher max. Off: no bid is placed while you lead."
+          checked={sn.raiseOwnProxy !== false}
+          onChange={(v) => {
+            saveSnipe((s) => ({ ...s, raiseOwnProxy: v }), 'raise my max when already the high bidder');
+          }}
+        />
         {sn.enabled && settings.dryRun.bidding ? (
           <p class="sbw-hint">
             Sniping is on, but bidding is still in dry-run mode: snipes do not place real bids. This page never turns

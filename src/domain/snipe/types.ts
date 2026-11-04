@@ -132,7 +132,8 @@ export const SnipeEventSchema = z.discriminatedUnion('type', [
     now,
     reason: z.enum(['ended', 'extended', 'price-over-max', 'already-high', 'auth', 'network', 'clock', 'cap']),
   }),
-  z.object({ type: z.literal('fire'), now }),
+  /** R-4: `wasHighBidder` marks a fire that raises the user's own proxy (the verify read showed the lead). */
+  z.object({ type: z.literal('fire'), now, wasHighBidder: z.literal(true).optional() }),
   z.object({ type: z.literal('sent'), now, key: z.string().min(1) }),
   z.object({ type: z.literal('result'), now, result: BidResultSchema }),
   z.object({ type: z.literal('ambiguous'), now }),

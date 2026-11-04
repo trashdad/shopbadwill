@@ -47,6 +47,15 @@ describe('Settings defaults', () => {
     expect(DEFAULT_SETTINGS.snipe.enabled).toBe(false);
   });
 
+  it('R-4: raise the own proxy by default, and still parse a record saved before the field existed', () => {
+    expect(DEFAULT_SETTINGS.snipe.raiseOwnProxy).toBe(true);
+    const old = defaultSettings();
+    delete (old.snipe as Partial<Settings['snipe']>).raiseOwnProxy;
+    const parsed = SettingsSchema.parse(old);
+    expect(parsed.snipe).not.toHaveProperty('raiseOwnProxy');
+    expect(SettingsSchema.safeParse({ ...old, snipe: { ...old.snipe, raiseOwnProxy: 'yes' } }).success).toBe(false);
+  });
+
   it('use the §3.8 reminders [60, 15, 5] on a dedicated calendar', () => {
     expect(DEFAULT_SETTINGS.calendar.reminders).toEqual([60, 15, 5]);
     expect(DEFAULT_SETTINGS.calendar.mode).toBe('dedicated');

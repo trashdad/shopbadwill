@@ -644,7 +644,8 @@ function onFire(s: Snipe, e: Extract<SnipeEvent, { type: 'fire' }>, caps: CapsRe
   // The money transition re-checks the precomputed caps too.
   if (!caps.ok) return capBlocked(s, e, ctx, caps, 'fire: cap');
   const next = step(s, e, 'firing', 'fire', { measured: { ...s.measured, firedAt } });
-  const details = { amount: s.maxBid, fireAt: plannedAt, firedAt };
+  // R-4: a fire that raises the user's own proxy says so (the P5 catalogue looks for its reply).
+  const details = { amount: s.maxBid, fireAt: plannedAt, firedAt, ...(e.wasHighBidder === true ? { wasHighBidder: true } : {}) };
   if (s.dryRun) {
     // C4: the same path; a harmless read at fire time measures real latency in place of PlaceBid.
     return { next, effects: [{ kind: 'readDetail', snipeId: s.id, purpose: 'measure' }], details, auditKind: 'bid.dry-run' };
