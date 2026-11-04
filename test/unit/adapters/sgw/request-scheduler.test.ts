@@ -495,7 +495,7 @@ describe('RequestScheduler: backoff and blocks', () => {
       reason: 'SGW is refusing requests; automation paused',
       until,
     });
-    expect(h.sched.stats().paused).toEqual({ reason: 'SGW is refusing requests; automation paused', until });
+    expect(h.sched.stats().paused).toEqual({ cause: 'blocked', reason: 'SGW is refusing requests; automation paused', until });
     expect(h.notifier.sent).toHaveLength(1);
     expect(h.notifier.sent[0]?.id).toBe(PAUSE_NOTIFICATION_ID);
     expect(h.notifier.sent[0]?.notification).toMatchObject({ id: PAUSE_NOTIFICATION_ID, message: 'SGW is refusing requests; automation paused' });
@@ -535,7 +535,7 @@ describe('RequestScheduler: backoff and blocks', () => {
       expect((await failure(h.sched.run(req(lane)))).kind).toBe('rate-limited');
     }
     const until = T0 + 30 * S;
-    expect(h.sched.stats().paused).toEqual({ reason: 'SGW is rate-limiting requests', until });
+    expect(h.sched.stats().paused).toEqual({ cause: 'rate-limited', reason: 'SGW is rate-limiting requests', until });
     expect(h.events).toContainEqual(expect.objectContaining({ type: 'paused', cause: 'rate-limited', until }));
     expect(h.notifier.sent).toHaveLength(1);
 
@@ -569,7 +569,7 @@ describe('RequestScheduler: pause and resume', () => {
     const err = await failure(h.sched.run(req('interactive')));
     expect(err.kind).toBe('paused');
     expect(err.message).toContain('health check failed');
-    expect(h.sched.stats().paused).toEqual({ reason: 'health check failed', until: null });
+    expect(h.sched.stats().paused).toEqual({ cause: 'manual', reason: 'health check failed', until: null });
     expect(h.events).toContainEqual({ type: 'paused', cause: 'manual', reason: 'health check failed', until: null });
 
     await h.advance(10 * HOUR, HOUR);
@@ -598,7 +598,7 @@ describe('RequestScheduler: pause and resume', () => {
     const h = setup();
     h.sched.pause('considerate mode', T0 + MIN);
     expect((await failure(h.sched.run(req('interactive')))).retryAfterMs).toBe(MIN);
-    expect(h.sched.stats().paused).toEqual({ reason: 'considerate mode', until: T0 + MIN });
+    expect(h.sched.stats().paused).toEqual({ cause: 'manual', reason: 'considerate mode', until: T0 + MIN });
     expect(h.sched.stats().lanes.interactive.nextAllowedAt).toBe(T0 + MIN);
     expect(h.sched.stats().lanes.interactive.backoffUntil).toBeUndefined();
     await h.advance(MIN);
@@ -610,10 +610,10 @@ describe('RequestScheduler: pause and resume', () => {
     h.sched.pause('blocked for a while', T0 + HOUR);
     h.sched.pause('brief', T0 + MIN);
     await h.advance(MIN);
-    expect(h.sched.stats().paused).toEqual({ reason: 'blocked for a while', until: T0 + HOUR });
+    expect(h.sched.stats().paused).toEqual({ cause: 'manual', reason: 'blocked for a while', until: T0 + HOUR });
     h.sched.pause('until resumed');
     h.sched.pause('brief again', T0 + 2 * HOUR);
-    expect(h.sched.stats().paused).toEqual({ reason: 'until resumed', until: null });
+    expect(h.sched.stats().paused).toEqual({ cause: 'manual', reason: 'until resumed', until: null });
   });
 
   it('resume() keeps per-lane backoffs that SGW asked for', async () => {
@@ -873,7 +873,7 @@ describe('RequestScheduler: persisted state (sbw:requestSchedulerState)', () => 
     const err = await failure(b.sched.run(req('canary')));
     expect(err.kind).toBe('paused');
     expect(err.retryAfterMs).toBe(6 * HOUR - 10 * MIN);
-    expect(b.sched.stats().paused).toEqual({ reason: 'SGW is refusing requests; automation paused', until: T0 + 6 * HOUR });
+    expect(b.sched.stats().paused).toEqual({ cause: 'blocked', reason: 'SGW is refusing requests; automation paused', until: T0 + 6 * HOUR });
     expect(b.sent).toHaveLength(0);
     expect(b.notifier.sent).toHaveLength(0);
 
@@ -913,7 +913,7 @@ describe('RequestScheduler: persisted state (sbw:requestSchedulerState)', () => 
     storage.seed({ [KEY]: state({ pause: { cause: 'manual', reason: 'health check failed', until: null } }) });
     const h = setup({ storage });
     await flush();
-    expect(h.sched.stats().paused).toEqual({ reason: 'health check failed', until: null });
+    expect(h.sched.stats().paused).toEqual({ cause: 'manual', reason: 'health check failed', until: null });
   });
 
   it('a new instance keeps the background gap', async () => {
@@ -1118,7 +1118,7 @@ describe('RequestScheduler: hardening (review fix round 1)', () => {
     expect(stored(storage).pause).toEqual(BLOCK);
 
     // B follows A's write and refuses.
-    expect(b.sched.stats().paused).toEqual({ reason: BLOCK.reason, until: BLOCK.until });
+    expect(b.sched.stats().paused).toEqual({ cause: 'blocked', reason: BLOCK.reason, until: BLOCK.until });
     expect((await failure(b.sched.run(req('canary')))).kind).toBe('paused');
 
     // B's in-flight request settles and B writes its state: A's pause survives.
@@ -1258,7 +1258,7 @@ describe('RequestScheduler: hardening (review fix round 1)', () => {
     const h = setup({ storage });
     await h.sched.load();
     expect(MAX_RESTORED_WAIT_MS).toBe(24 * HOUR);
-    expect(h.sched.stats().paused).toEqual({ reason: 'far future', until: T0 + 24 * HOUR });
+    expect(h.sched.stats().paused).toEqual({ cause: 'manual', reason: 'far future', until: T0 + 24 * HOUR });
     expect(h.sched.stats().lanes.interactive.backoffUntil).toBe(T0 + 24 * HOUR);
 
     h.sched.resume();
@@ -1383,5 +1383,119 @@ describe('RequestScheduler: T-36 hardening (read timeout, dispose)', () => {
     await h.advance(10 * MIN, MIN);
     expect(h.sent).toHaveLength(1);
     expect(h.clock.pendingTimers).toBe(0);
+  });
+});
+
+// ── R-1: the bid itself is never refused by a budget or a 429/5xx ───────────
+
+describe('RequestScheduler: critical requests (R-1)', () => {
+  const ZERO_GAP_LANES = (snipeBudget: number): Record<Lane, LaneConfig> => ({
+    ...DEFAULT_LANES,
+    snipe: { minIntervalMs: 0, jitterMs: 0, maxConcurrent: 1, dailyBudget: snipeBudget },
+  });
+
+  it('the default snipe budget is 240; tight mode 120', () => {
+    expect(DEFAULT_LANES.snipe.dailyBudget).toBe(240);
+    expect(setup().sched.stats().lanes.snipe.budget).toBe(240);
+    expect(setup({ considerateMode: 'tight' }).sched.stats().lanes.snipe.budget).toBe(120);
+  });
+
+  it('a spent snipe budget refuses an ordinary snipe-lane read with `budget`; a critical request runs', async () => {
+    const h = setup({ lanes: ZERO_GAP_LANES(2) });
+    await h.sched.run(req('snipe'));
+    await h.sched.run(req('snipe'));
+    expect((await failure(h.sched.run(req('snipe')))).kind).toBe('budget');
+    expect(h.sent).toHaveLength(2);
+    await expect(h.sched.run(req('snipe', { critical: true }))).resolves.toBe('ok');
+    expect(h.sent).toHaveLength(3);
+    // It is still counted.
+    expect(h.sched.stats().lanes.snipe.usedToday).toBe(3);
+  });
+
+  it('after a 429 burst pause: ordinary requests refused `paused` on every lane; a critical snipe request runs', async () => {
+    const h = setup();
+    h.reply({ status: 429 });
+    for (const lane of ['interactive', 'background', 'canary'] as const) {
+      expect((await failure(h.sched.run(req(lane)))).kind).toBe('rate-limited');
+    }
+    expect(h.sched.stats().paused).toMatchObject({ cause: 'rate-limited' });
+    h.reply({ status: 200, bodyText: 'ok' });
+    for (const lane of LANES) expect((await failure(h.sched.run(req(lane)))).kind).toBe('paused');
+    expect(h.sent).toHaveLength(3);
+    await expect(h.sched.run(req('snipe', { critical: true }))).resolves.toBe('ok');
+    expect(h.sent).toHaveLength(4);
+  });
+
+  it('after a 403 burst pause the critical request is refused too', async () => {
+    const h = setup();
+    h.reply({ status: 403 });
+    for (const lane of ['interactive', 'background', 'canary'] as const) {
+      expect((await failure(h.sched.run(req(lane)))).kind).toBe('blocked');
+    }
+    expect(h.sched.stats().paused).toMatchObject({ cause: 'blocked' });
+    h.reply({ status: 200, bodyText: 'ok' });
+    expect((await failure(h.sched.run(req('snipe', { critical: true })))).kind).toBe('paused');
+    expect(h.sent).toHaveLength(3);
+  });
+
+  it('a manual (health) pause refuses the critical request too', async () => {
+    const h = setup();
+    h.sched.pause('health check failed');
+    expect(h.sched.stats().paused).toMatchObject({ cause: 'manual' });
+    expect((await failure(h.sched.run(req('snipe', { critical: true })))).kind).toBe('paused');
+    expect(h.sent).toHaveLength(0);
+  });
+
+  it('a snipe-lane 5xx or 429 backoff refuses ordinary requests; a critical one runs', async () => {
+    const h = setup();
+    h.reply({ status: 503 }, { status: 200, bodyText: 'ok' });
+    expect((await failure(h.sched.run(req('snipe')))).kind).toBe('server');
+    expect(h.sched.stats().lanes.snipe).toMatchObject({ backoffKind: 'server' });
+    await h.advance(2 * S);
+    expect((await failure(h.sched.run(req('snipe')))).kind).toBe('server');
+    await expect(h.sched.run(req('snipe', { critical: true }))).resolves.toBe('ok');
+
+    const r = setup();
+    r.reply({ status: 429 }, { status: 200, bodyText: 'ok' });
+    expect((await failure(r.sched.run(req('snipe')))).kind).toBe('rate-limited');
+    await r.advance(2 * S);
+    expect((await failure(r.sched.run(req('snipe')))).kind).toBe('rate-limited');
+    await expect(r.sched.run(req('snipe', { critical: true }))).resolves.toBe('ok');
+  });
+
+  it('a `blocked` (403) snipe-lane backoff refuses the critical request', async () => {
+    const h = setup();
+    h.reply({ status: 403 }, { status: 200, bodyText: 'ok' });
+    expect((await failure(h.sched.run(req('snipe')))).kind).toBe('blocked');
+    expect(h.sched.stats().lanes.snipe).toMatchObject({ backoffKind: 'blocked' });
+    await h.advance(2 * S);
+    expect((await failure(h.sched.run(req('snipe', { critical: true })))).kind).toBe('blocked');
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('the lane gap still applies to a critical request', async () => {
+    const h = setup();
+    await h.sched.run(req('snipe'));
+    const t = track(h.sched.run(req('snipe', { critical: true })));
+    await flush();
+    expect(h.sent).toHaveLength(1);
+    await h.advance(DEFAULT_LANES.snipe.minIntervalMs - 1);
+    expect(h.sent).toHaveLength(1);
+    await h.advance(1);
+    expect(h.sent).toHaveLength(2);
+    expect(h.sent[1]?.at).toBe(T0 + DEFAULT_LANES.snipe.minIntervalMs);
+    await flush();
+    expect(t.value).toBe('ok');
+  });
+
+  it('a critical request on a spent lane waits its turn behind one in flight (one in flight)', async () => {
+    const h = setup({ lanes: ZERO_GAP_LANES(1) });
+    h.reply({ hang: true });
+    const first = track(h.sched.run(req('snipe')));
+    const second = track(h.sched.run(req('snipe', { critical: true })));
+    await flush();
+    expect(h.sent).toHaveLength(1);
+    expect(first.done).toBe(false);
+    expect(second.done).toBe(false);
   });
 });

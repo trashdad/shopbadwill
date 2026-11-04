@@ -281,6 +281,8 @@ interface DetailRead {
 
 interface RunOptions {
   priority?: number;
+  /** R-1: the bid itself (ShowBidModal, PlaceBid); see ScheduledRequest.critical. */
+  critical?: boolean;
   /** Runs inside build(), right before the request leaves; may throw to stop it (nothing is sent). */
   beforeSend?: () => void;
   /** Called from build() once the request is committed to leave, with the bearer it carries (if any). */
@@ -388,7 +390,8 @@ export class SgwApiAdapter implements SgwApi {
   async showBidModal(itemId: ItemId): Promise<{ sellerId: number; minimumBid: Cents }> {
     assertItemId('showBidModal', itemId);
     const request = await this.prepare('showBidModal', { query: { itemId } });
-    return this.run('showBidModal', BID_MODAL_LANE, request, (_res, raw) => normalizeShowBidModal(raw));
+    // R-1: part of the bid itself, so a spent budget or a 429/5xx slow-down cannot refuse it.
+    return this.run('showBidModal', BID_MODAL_LANE, request, (_res, raw) => normalizeShowBidModal(raw), { critical: true });
   }
 
   /**
@@ -477,9 +480,19 @@ export class SgwApiAdapter implements SgwApi {
       showBidModal: (itemId) => this.showBidModal(itemId),
       prepare: (endpoint, init) => this.prepare(endpoint, init),
       sendWrite: (endpoint, init, parse) =>
-        this.guardedRun('bidding', 'bid.place', target, endpoint, 'snipe', init, parse, (bearer) => {
-          sentBearer = bearer;
-        }),
+        this.guardedRun(
+          'bidding',
+          'bid.place',
+          target,
+          endpoint,
+          'snipe',
+          init,
+          parse,
+          (bearer) => {
+            sentBearer = bearer;
+          },
+          true, // R-1: PlaceBid is critical
+        ),
       flagSchemaFailure: (endpoint, error) => {
         this.flagSchemaFailure(endpoint, error);
       },
@@ -511,6 +524,7 @@ export class SgwApiAdapter implements SgwApi {
     init: SgwRequestInit,
     parse: (res: HttpResponse, raw: unknown) => T,
     onSent?: (bearer: string | undefined) => void,
+    critical = false,
   ): Promise<T> {
     const { clock } = this.deps;
     let verdict = await this.ask(feature); // when the write is requested
@@ -543,6 +557,7 @@ export class SgwApiAdapter implements SgwApi {
               if (clock.monotonic() - verdict.at > WRITE_GATE_MAX_AGE_MS) throw new StaleWriteGate();
             },
             ...(onSent === undefined ? {} : { onSent }),
+            ...(critical ? { critical: true } : {}),
           });
         } catch (e) {
           if (e instanceof RefusedWrite) throw await this.refuse(kind, target, e.why);
@@ -752,6 +767,7 @@ export class SgwApiAdapter implements SgwApi {
       parse: (res) => parse(res, decode(endpoint, res)),
     };
     if (opts.priority !== undefined) scheduled.priority = opts.priority;
+    if (opts.critical === true) scheduled.critical = true;
     try {
       const value = await this.deps.scheduler.run(scheduled);
       this.schemaOk(endpoint);

@@ -565,7 +565,7 @@ describe('register(ctx): the live kill switch and read-gate probes', () => {
       lanes: {
         interactive: { ...lane },
         background: { ...lane, budget: 120 },
-        snipe: { ...lane, budget: 80 },
+        snipe: { ...lane, budget: 240 },
         canary: { ...lane, budget: 4 },
         ...over,
       },

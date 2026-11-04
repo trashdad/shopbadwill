@@ -25,6 +25,11 @@
 // - Requests go out exactly as `build()` made them: no header, user-agent or
 //   credential changes, ever.
 // - considerateMode 'tight' halves every budget and doubles every interval.
+// - R-1: a `critical` request (ShowBidModal and PlaceBid, the bid itself)
+//   ignores the daily budget (it is still counted), a 429-burst pause and its
+//   lane's 429/5xx backoff. A 403 backoff or pause, a manual/health pause, the
+//   one-in-flight rule and the lane gap still apply: a 429 or 5xx elsewhere
+//   must not cost the user an auction, but a 403 means SGW is refusing us.
 //
 // Persistence (contract change, T-25). Pause, backoff and spacing state lives
 // in `sbw:requestSchedulerState`, the budget in `sbw:requestBudget`. Both are
@@ -380,12 +385,14 @@ export class SgwRequestScheduler implements RequestScheduler {
       let nextAllowedAt = Math.max(this.gapEndsAt(lane, now), backoffUntil ?? 0);
       if (pause !== undefined && pause.until !== null) nextAllowedAt = Math.max(nextAllowedAt, pause.until);
       if (usedToday >= budget) nextAllowedAt = Math.max(nextAllowedAt, this.budgetResetsAt(now));
-      return backoffUntil === undefined ? { usedToday, budget, nextAllowedAt } : { usedToday, budget, nextAllowedAt, backoffUntil };
+      return backoffUntil === undefined
+        ? { usedToday, budget, nextAllowedAt }
+        : { usedToday, budget, nextAllowedAt, backoffUntil, backoffKind: ls.backoffKind ?? 'rate-limited' };
     };
     const lanes = { interactive: one('interactive'), background: one('background'), snipe: one('snipe'), canary: one('canary') };
     return pause === undefined
       ? { lanes, cacheHits: this.cacheHits }
-      : { lanes, cacheHits: this.cacheHits, paused: { until: pause.until, reason: pause.reason } };
+      : { lanes, cacheHits: this.cacheHits, paused: { until: pause.until, reason: pause.reason, cause: pause.cause } };
   }
 
   /** Pauses every lane until `untilMs`, or until resume(). A pause never shortens a longer one. */
@@ -482,7 +489,7 @@ export class SgwRequestScheduler implements RequestScheduler {
   // ── Queue ───────────────────────────────────────────────────────────────
 
   private enqueue<T>(r: ScheduledRequest<T>): Promise<T> {
-    const refusal = this.refusal(r.lane);
+    const refusal = this.refusal(r.lane, r.critical === true);
     if (refusal !== undefined) return Promise.reject(refusal);
     return new Promise<T>((resolve, reject) => {
       const queue = this.lanes[r.lane].queue;
@@ -500,7 +507,7 @@ export class SgwRequestScheduler implements RequestScheduler {
     const ls = this.lanes[lane];
     if (ls.inFlight || ls.timer !== undefined) return;
     for (let head = ls.queue[0]; head !== undefined; head = ls.queue[0]) {
-      const refusal = this.refusal(lane);
+      const refusal = this.refusal(lane, head.req.critical === true);
       if (refusal !== undefined) {
         ls.queue.shift();
         head.reject(refusal);
@@ -532,12 +539,17 @@ export class SgwRequestScheduler implements RequestScheduler {
     }
   }
 
-  /** Why the lane may not send at all right now (pause, backoff, budget), as the error to throw. */
-  private refusal(lane: Lane): SgwApiError | undefined {
+  /**
+   * Why the lane may not send at all right now (pause, backoff, budget), as
+   * the error to throw. R-1: a `critical` request (the bid itself) is not
+   * refused by the daily budget, a 429-burst pause or a 429/5xx backoff; a
+   * 403 (`blocked`) backoff or pause and a manual/health pause still refuse it.
+   */
+  private refusal(lane: Lane, critical = false): SgwApiError | undefined {
     if (this.disposed) return disposedError();
     const now = this.clock.now();
     const pause = this.activePause(now);
-    if (pause !== undefined) {
+    if (pause !== undefined && !(critical && pause.cause === 'rate-limited')) {
       return new SgwApiError(
         'paused',
         `SGW requests are paused: ${pause.reason}`,
@@ -545,13 +557,13 @@ export class SgwRequestScheduler implements RequestScheduler {
       );
     }
     const ls = this.lanes[lane];
-    if (ls.backoffUntil !== undefined && ls.backoffUntil > now) {
+    if (ls.backoffUntil !== undefined && ls.backoffUntil > now && !(critical && ls.backoffKind !== 'blocked')) {
       return new SgwApiError(ls.backoffKind ?? 'rate-limited', `${lane} lane is backing off`, {
         retryAfterMs: ls.backoffUntil - now,
       });
     }
     const budget = this.config(lane).dailyBudget;
-    if (this.usedToday(lane, now) >= budget) {
+    if (!critical && this.usedToday(lane, now) >= budget) {
       return new SgwApiError('budget', `${lane} lane has used its daily budget of ${String(budget)} requests`, {
         retryAfterMs: this.budgetResetsAt(now) - now,
       });

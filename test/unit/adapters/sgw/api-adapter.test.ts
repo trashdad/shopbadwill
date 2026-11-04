@@ -108,10 +108,10 @@ class DelayedSwitches extends FakeSwitches {
 
 /** Wraps the real scheduler and records every ScheduledRequest it is given. */
 class RecordingScheduler implements RequestScheduler {
-  readonly runs: Array<{ lane: Lane; endpoint: string; priority: number | undefined }> = [];
+  readonly runs: Array<{ lane: Lane; endpoint: string; priority: number | undefined; critical: boolean | undefined }> = [];
   constructor(private readonly inner: SgwRequestScheduler) {}
   run<T>(r: ScheduledRequest<T>): Promise<T> {
-    this.runs.push({ lane: r.lane, endpoint: r.endpoint, priority: r.priority });
+    this.runs.push({ lane: r.lane, endpoint: r.endpoint, priority: r.priority, critical: r.critical });
     return this.inner.run(r);
   }
   stats(): ReturnType<RequestScheduler['stats']> {
@@ -1003,6 +1003,27 @@ describe('I2: ctx.sendWrite is the same guarded send, on the snipe lane, for bid
     expect(err).toBeInstanceOf(SgwApiError);
     expect((err as SgwApiError).kind).toBe('paused');
     expect(t.http.requests.map((r) => r.url)).toEqual([`${BASE}ItemBid/ShowBidModal?itemId=${String(ITEM)}`]);
+  });
+
+  it('R-1: ShowBidModal and PlaceBid are scheduled critical; nothing else is (a snipe-lane itemDetail included)', async () => {
+    const t = setup();
+    scriptAll(t.http);
+    t.http.on(PLACE_BID, json({ status: true, result: 0, message: 'ok' }));
+    const ctx = await stubContext(t);
+    await t.api.itemDetail(ITEM, 'snipe');
+    await t.api.showBidModal(ITEM);
+    await ctx.showBidModal(ITEM);
+    await ctx.sendWrite('placeBid', { body: BID_BODY }, (_res, r) => r);
+    await t.api.addFavorite(ITEM);
+    await t.api.serverTimeSample();
+    expect(t.scheduler.runs.map((r) => `${r.endpoint}@${r.lane}:${String(r.critical === true)}`)).toEqual([
+      'itemDetail@snipe:false',
+      'showBidModal@snipe:true',
+      'showBidModal@snipe:true',
+      'placeBid@snipe:true',
+      'addFavorite@background:false',
+      'itemDetail@interactive:false',
+    ]);
   });
 });
 

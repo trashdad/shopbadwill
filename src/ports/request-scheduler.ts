@@ -17,6 +17,13 @@ export interface ScheduledRequest<T> {
   key?: string;
   cacheTtlMs?: number;
   priority?: number;
+  /**
+   * R-1: the bid itself (ShowBidModal, PlaceBid). A critical request ignores
+   * the lane's daily budget, an all-lane pause caused by a 429 burst, and the
+   * lane's own 429/5xx backoff. It still honours a 403 (`blocked`) backoff or
+   * pause, a manual/health pause, the one-in-flight rule and the lane gap.
+   */
+  critical?: boolean;
   build(): HttpRequest;
   /** Runs zod; throws SgwApiError('schema'). */
   parse(res: HttpResponse): T;
