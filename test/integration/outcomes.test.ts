@@ -14,10 +14,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   Channel,
   EventGate,
+  NotifyMirrorList,
   createPortRegistry,
   createTickHub,
   type BackgroundContext,
 } from '../../src/background/context';
+import type { Notification } from '../../src/ports/notifier';
 import { buildDesired, syncFor } from '../../src/background/jobs/calendar-sync';
 import {
   MAX_POST_END_READS,
@@ -100,6 +102,9 @@ interface Rig {
   repo: Repo;
   audit: FakeAuditLog;
   notifier: FakeNotifier;
+  permissions: FakePermissions;
+  /** R-3: what reached ctx.notifyMirrors directly (the ntfy-only path). */
+  mirrored: Notification[];
   switches: TestSwitches;
   api: FakeSgwApi;
   calendarApi: FakeCalendarApi;
@@ -133,12 +138,19 @@ async function rig(opts: { now?: number; quiet?: { from: string; to: string }; r
   const ports = createPortRegistry(new Channel(gate));
   const sessionState: Rig['sessionState'] = { value: 'ok' };
   const google: Rig['google'] = { connected: false, needsInteraction: false };
+  const mirrored: Notification[] = [];
+  const notifyMirrors = new NotifyMirrorList(() => undefined);
+  notifyMirrors.add((n) => {
+    mirrored.push(structuredClone(n));
+    return Promise.resolve();
+  });
   const ctx = {
     clock,
     storage: areas,
     repo,
     audit,
     notifier,
+    notifyMirrors,
     permissions,
     alarms,
     keepAlive,
@@ -175,6 +187,8 @@ async function rig(opts: { now?: number; quiet?: { from: string; to: string }; r
     repo,
     audit,
     notifier,
+    permissions,
+    mirrored,
     switches,
     api,
     calendarApi,
@@ -643,7 +657,40 @@ describe('post-end outcome detection', () => {
     expect((await eventOf(r, 27))?.summary).toBe('WON: Pyrex bowl 27');
     expect(await outcomes(r)).toMatchObject({ 27: 'won' });
     expect(r.notifier.sent).toHaveLength(0);
-    expect(r.audit.kinds).not.toContain('notify.outcome');
+    // R-3 fix 1: the browser stays silent, but the phone still hears it, once.
+    const marker = r.audit.entries.filter((e) => e.kind === 'notify.outcome');
+    expect(marker).toHaveLength(1);
+    expect(marker[0]?.details).toEqual({ outcome: 'won', channel: 'ntfy-only' });
+    expect(r.mirrored).toHaveLength(1);
+    expect(r.mirrored[0]).toMatchObject({ title: 'WON: Pyrex bowl 27', priority: 2 });
+    await r.tick();
+    expect(r.mirrored).toHaveLength(1);
+  });
+
+  it('R-3 fix 1: notifications permission missing: notify.skipped, the marker, one ntfy-only mirror, and never twice', async () => {
+    const r = await rig();
+    await track(r, 29);
+    await seedEvent(r, 29, 'Pyrex bowl 29');
+    r.api.details.set(29, closedDetail(29, { isHighBidder: false }));
+    r.permissions.revoke({ permissions: ['notifications'] });
+
+    await r.tick();
+    expect(await outcomes(r)).toMatchObject({ 29: 'lost' });
+    expect(r.notifier.sent).toHaveLength(0);
+    expect(r.audit.kinds).toContain('notify.skipped');
+    const marker = r.audit.entries.filter((e) => e.kind === 'notify.outcome');
+    expect(marker).toHaveLength(1);
+    expect(marker[0]?.details).toEqual({ outcome: 'lost', channel: 'ntfy-only' });
+    expect(r.mirrored).toHaveLength(1);
+    expect(r.mirrored[0]?.title).toMatch(/Pyrex bowl 29/);
+    expect(r.mirrored[0]?.priority).toBe(2);
+
+    // A later grant and another scan send nothing (no browser notice, no second mirror).
+    await r.permissions.request({ permissions: ['notifications'] });
+    await r.tick();
+    await onOutcomeAlarm(r.ctx, 29);
+    expect(r.notifier.sent).toHaveLength(0);
+    expect(r.mirrored).toHaveLength(1);
   });
 
   it('quiet hours: the outcome notification is deferred to the quiet end and sent exactly once', async () => {

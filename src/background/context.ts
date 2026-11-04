@@ -57,7 +57,7 @@ export interface BackgroundContext {
    * notification was attempted (ntfy-alerts.ts mirrors to the phone). Best
    * effort: a mirror that throws or rejects is logged and never fails `notify`.
    */
-  readonly notifyMirrors: InterceptorList<NotifyMirror>;
+  readonly notifyMirrors: NotifyMirrorList;
   /** `onRemoved` is served from the top-level listener. */
   readonly permissions: Permissions;
   readonly keepAwake: KeepAwake;
@@ -403,6 +403,9 @@ export type NotifyMirror = (n: Notification) => Promise<void>;
 export class NotifyMirrorList implements InterceptorList<NotifyMirror> {
   private readonly list: NotifyMirror[] = [];
 
+  /** `log`: where a failing mirror is reported (main.ts passes the background log). */
+  constructor(private readonly log: (message: string, error: unknown) => void = () => undefined) {}
+
   add(fn: NotifyMirror): () => void {
     this.list.push(fn);
     return () => {
@@ -411,8 +414,13 @@ export class NotifyMirrorList implements InterceptorList<NotifyMirror> {
     };
   }
 
-  /** Starts every mirror without waiting; each failure (sync throw or rejection) is logged once. */
-  fire(n: Notification, log: (message: string, error: unknown) => void): void {
+  /**
+   * Starts every mirror without waiting; each failure (sync throw or rejection)
+   * is logged once. Also called directly (R-3 fix 1) by a caller whose browser
+   * notification is closed off (notifications disabled or not permitted), so a
+   * priority-2 notice still reaches the phone.
+   */
+  fire(n: Notification, log: (message: string, error: unknown) => void = this.log): void {
     for (const fn of [...this.list]) {
       void (async () => {
         try {

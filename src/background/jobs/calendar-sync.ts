@@ -30,7 +30,7 @@ import type { CalendarApi } from '../../ports/calendar';
 import type { Clock } from '../../ports/clock';
 import type { GlobalSwitches } from '../../ports/global-switches';
 import type { GoogleAuthProvider } from '../../ports/google-auth';
-import type { Notifier } from '../../ports/notifier';
+import type { Notification, Notifier } from '../../ports/notifier';
 import type { Permissions } from '../../ports/permissions';
 import type { Alarms } from '../../ports/alarms';
 import type { Storage } from '../../ports/storage';
@@ -153,6 +153,11 @@ export interface CalendarSyncDeps {
   permissions: Pick<Permissions, 'contains'>;
   /** The badge owner (T-86 subscribes to the flag). */
   badge: { set(on: boolean): void };
+  /**
+   * R-3 fix 1: sends a priority-2 notice to the phone (ctx.notifyMirrors)
+   * when browser notifications are off or not permitted. Never throws.
+   */
+  mirror?: (n: Notification) => void;
   strategy?: RecreateStrategy;
   /** 0 in tests; production uses the 1 s default. */
   minIntervalMs?: number;
@@ -298,14 +303,19 @@ export class CalendarSync {
     await this.sink.state.update((s) => ({ ...s, noticeDay: day }));
     const details: Record<string, string> = why === undefined ? { day } : { day, why: why.slice(0, 200) };
     await this.deps.audit.append({ actor: 'calendar', kind: 'calendar.needs-reconnect', details });
-    if (!(await this.canNotify(settings))) return;
+    const notice: Notification = {
+      id: 'sbw:calendar:reconnect',
+      title: 'Reconnect Google Calendar',
+      message: 'ShopBadwill cannot update your auction calendar until you reconnect Google in the options page.',
+      priority: 2, // R-3: mirrored to ntfy
+    };
+    if (!(await this.canNotify(settings))) {
+      // R-3 fix 1: no browser notification, but the phone still hears it (once a day, as above).
+      this.deps.mirror?.(notice);
+      return;
+    }
     try {
-      await this.deps.notifier.notify({
-        id: 'sbw:calendar:reconnect',
-        title: 'Reconnect Google Calendar',
-        message: 'ShopBadwill cannot update your auction calendar until you reconnect Google in the options page.',
-        priority: 2, // R-3: mirrored to ntfy
-      });
+      await this.deps.notifier.notify(notice);
     } catch {
       // Audited above; a failed notification must not fail the sync.
     }
@@ -402,6 +412,9 @@ export function syncFor(ctx: BackgroundContext): CalendarSync {
       notifier: ctx.notifier,
       permissions: ctx.permissions,
       badge: ctx.googleNeedsInteraction,
+      mirror: (n) => {
+        ctx.notifyMirrors.fire(n);
+      },
     });
     instances.set(ctx, sync);
   }

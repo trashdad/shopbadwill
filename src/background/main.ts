@@ -242,7 +242,7 @@ export function startBackground(opts: StartBackgroundOptions): BackgroundHandle 
     getAll: () => ports.alarms.getAll(),
     onAlarm: (cb) => alarmEvents.on(cb),
   };
-  const notifyMirrors = new NotifyMirrorList();
+  const notifyMirrors = new NotifyMirrorList(log);
   const notifier: Notifier = {
     get supportsActions() {
       return ports.notifier.supportsActions;
