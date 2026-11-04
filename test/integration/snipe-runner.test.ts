@@ -47,6 +47,7 @@ import { SWITCHES_LOAD_TIMEOUT_MS } from '../../src/background/switches';
 import { startBackground, type BackgroundBrowser } from '../../src/background/main';
 import type { MessageResponse, RouterSender } from '../../src/background/router';
 import { BidNotSentError } from '../../src/adapters/sgw/bid';
+import { localDay } from '../../src/adapters/sgw/request-scheduler';
 import { normalizeItemDetail } from '../../src/adapters/sgw/normalize';
 import type { AuditEntry } from '../../src/domain/audit/types';
 import { bidAmount } from '../../src/domain/money';
@@ -57,7 +58,7 @@ import { settledAsMissed } from '../../src/domain/snipe/outcome';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import { formatPacificNaive } from '../../src/domain/time/pacific';
 import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
-import type { HealthReport, SgwSessionRecord } from '../../src/domain/types';
+import { DEFAULT_LANES, type HealthReport, type SgwSessionRecord } from '../../src/domain/types';
 import type { AlarmInfo, Alarms } from '../../src/ports/alarms';
 import type { Clock } from '../../src/ports/clock';
 import { HttpNetworkError } from '../../src/ports/errors';
@@ -1147,9 +1148,9 @@ describe('money safety carries', () => {
     await runTo(shared, END + 10 * MIN);
     expect(shared.sgw.placeBids).toHaveLength(0);
     // ShowBidModal's 500 is a BidNotSentError, so the idempotent strategy retries
-    // once. That 500 puts the snipe lane in backoff, and the retry's ShowBidModal
-    // is refused before a request is built. One modal read on the wire, no PlaceBid.
-    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(1);
+    // once. R-1: ShowBidModal is critical, so the snipe lane's 5xx backoff no longer
+    // refuses the retry: two modal reads on the wire (both 500), still no PlaceBid.
+    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(2);
     expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
     const s = stored(shared);
     expect(s.state).toBe('resolved');
@@ -3290,8 +3291,9 @@ describe('T-84b final check: a failed not-sent write', () => {
 
     await runTo(shared, END + 10 * MIN);
     const s = stored(shared);
-    // Nothing was ever resent: one modal read, no PlaceBid byte.
-    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(1);
+    // Nothing was ever resent: no PlaceBid byte. R-1: the strategy's one retry reads
+    // ShowBidModal again (critical: the 5xx backoff does not refuse it), so two modal reads.
+    expect(shared.http.requests.filter((r) => r.url.startsWith(MODAL_URL))).toHaveLength(2);
     expect(shared.http.requests.filter((r) => r.url.startsWith(PLACE_URL))).toHaveLength(0);
     expect(s.history.filter((h) => h.to === 'sent' && h.from !== 'sent')).toHaveLength(1);
     // The worker still knows the bid provably never left: not-sent, never the ambiguous read.
@@ -3717,5 +3719,47 @@ describe('T-128: a "not due" preflight never loops SGW reads', () => {
     expect(stored(shared).state).toBe('armed');
     await runTo(shared, END + 5 * MIN);
     expectOneDryRunFire(shared, SKEW);
+  });
+});
+
+// ── R-1: a spent snipe-lane budget never refuses the bid itself ─────────────
+
+describe('R-1: the snipe lane budget spent before the fire', () => {
+  /** Spends the snipe lane's whole day through storage (the scheduler follows it, higher count wins). */
+  async function spendSnipeBudget(shared: Shared): Promise<void> {
+    await shared.areas.local.set({
+      [STORAGE_KEYS.requestBudget]: { day: localDay(shared.clock.now()), used: { snipe: DEFAULT_LANES.snipe.dailyBudget } },
+    });
+    await flush();
+  }
+
+  it('a live snipe still sends PlaceBid once', async () => {
+    const shared = makeShared();
+    const { ctx, w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 20 * SEC);
+    expect(stored(shared).state).toBe('verified');
+    await spendSnipeBudget(shared);
+    expect(ctx.scheduler.stats().lanes.snipe.usedToday).toBeGreaterThanOrEqual(DEFAULT_LANES.snipe.dailyBudget);
+    await runTo(shared, END + 2 * MIN);
+
+    expect(shared.sgw.modals).toHaveLength(1);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(transitions(stored(shared))).toContain('verified>firing');
+    expect(kinds(shared)).toContain('bid.sent');
+  });
+
+  it('a dry-run snipe still reaches firing', async () => {
+    const shared = makeShared({ settings: settingsWith() });
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 20 * SEC);
+    expect(stored(shared).state).toBe('verified');
+    await spendSnipeBudget(shared);
+    await runTo(shared, END + 2 * MIN);
+
+    expect(transitions(stored(shared))).toContain('verified>firing');
+    expect(shared.sgw.modals).toHaveLength(0);
+    expect(shared.sgw.placeBids).toHaveLength(0);
   });
 });
