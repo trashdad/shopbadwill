@@ -204,8 +204,8 @@ export function judgeWin(s: Snipe, post: ItemDetail | null, userTz?: string): Wi
   const reply = s.attempt.ambiguous === true ? null : (s.attempt.reply ?? null);
   const c = classifyOutcome(s, reply, post, ctx);
   if (c.outcome === 'won' && c.final) {
-    // T-87 trusts the bid reply's high-bidder flag when the read is anonymous;
-    // a closing price above the max proves that flag stale.
+    // R-5: classifyOutcome no longer trusts the bid reply's high-bidder flag; this
+    // guard stays as a backstop: a closing price above the max is never a win.
     if (post.currentPrice > s.maxBid) {
       return { verdict: 'unconfirmed', why: `it closed at ${formatMoney(post.currentPrice)}, above your max: check the item`, retry: false };
     }

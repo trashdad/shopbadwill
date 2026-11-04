@@ -592,7 +592,7 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
       expect(row.textContent).not.toMatch(/Unconfirmed|may have been placed/);
     });
 
-    it('a kill disarm (T-86) and a reply-only win (post-read failed: Leading) repeat their own copy', async () => {
+    it('a kill disarm (T-86) and an accepted reply flagged high, never read (R-5: Unconfirmed), repeat their own copy', async () => {
       const killed = settle(snipe({ id: 'k1', title: 'Killed bowl', dryRun: false }), {
         type: 'disarm',
         now: NOW,
@@ -602,7 +602,7 @@ describe('dashboard snipes: prepare, arm, countdown, disarm, outcomes', () => {
       const leading = settle(sentLive('Leading bowl', { reply: accepted(true) }), { type: 'post-read-failed', now: END_MS + 7 * 86_400_000 });
       const unconfirmed = settle(sentLive('Ambiguous bowl', { ambiguous: true }), { type: 'post-read-failed', now: END_MS + 7 * 86_400_000 });
       expect(killed.title).toBe('Stopped: Killed bowl');
-      expect(leading.title).toBe('Leading: Leading bowl');
+      expect(leading.title).toBe('Unconfirmed: Leading bowl'); // R-5: the reply's flag never says Leading
       expect(unconfirmed.title).toBe('Unconfirmed: Ambiguous bowl');
       setup({ snipes: [killed.stored, leading.stored, unconfirmed.stored] });
       for (const x of [killed, leading, unconfirmed]) {

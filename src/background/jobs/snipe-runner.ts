@@ -51,7 +51,8 @@
 //
 // Lanes (I-39): `:health24` / `:health1` call the AuthHealth port only (0 SGW
 // requests); `:preflight` reads on lane `background`; the lane `snipe` is used
-// only from the T-5 min wake onward.
+// only from the T-5 min wake onward, through the fast outcome reads (R-5); the
+// slow outcome retries read on lane `background`.
 //
 // Seams (I-12), so later cards add files and never edit this one:
 // `snipeSeams(ctx)` takes the SendStrategy (T-101), the AuthHealth port
@@ -1411,7 +1412,9 @@ export class SnipeRunner {
       }
       return 'wait';
     }
-    const lane: Lane = failures === 0 ? 'snipe' : 'background';
+    // R-5: the fast attempts (3 within 30 min) stay authenticated on lane snipe, so
+    // `isHighBidder` is known; only the slow 6-hourly retries go anonymous.
+    const lane: Lane = failures < POST_READ_FAST_ATTEMPTS ? 'snipe' : 'background';
     let detail: ItemDetail | undefined;
     try {
       detail = await this.readItem(s, lane, false);
