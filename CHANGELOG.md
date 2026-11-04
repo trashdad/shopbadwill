@@ -9,6 +9,13 @@ extension is reliable enough to run unattended every day. Bump with `pnpm releas
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
+### Changed
+
+- Snipes time the fire from the whole send chain (the bid form, the site's pacing gap and the bid itself), so a bid lands on time even when ShopGoodwill is slow (R-2).
+- One slow read at T-60 s no longer triggers the early bid: the speed is re-measured first, and only a site that stays slow gets the early fallback (R-2).
+
 ## [0.1.0] - 2026-11-04
 
 ### Added
