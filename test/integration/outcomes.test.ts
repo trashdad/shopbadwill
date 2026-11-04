@@ -371,6 +371,7 @@ describe('post-end outcome detection', () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.id).toBe('sbw:notify:outcome:11');
     expect(sent[0]?.notification.title).toBe('WON: Pyrex bowl 11');
+    expect(sent[0]?.notification.priority).toBe(2); // R-3: mirrored to ntfy
     expect(sent[0]?.notification.message).toContain('You won this auction');
     expect(sent[0]?.notification.id?.startsWith('sbw:notify:digest:')).toBe(false);
     expect(sent[0]?.notification.openUrlOnClick).toBe('https://shopgoodwill.com/item/11');
@@ -625,6 +626,7 @@ describe('post-end outcome detection', () => {
     // price fact, never "you did not win".
     expect(r.notifier.sent).toHaveLength(1);
     expect(r.notifier.sent[0]?.notification.title).toBe('Over your max: Pyrex bowl 26');
+    expect(r.notifier.sent[0]?.notification.priority).toBe(2); // R-3
     expect(r.notifier.sent[0]?.notification.message).toBe(
       'The final price, $12.99, was above your max of $10.00. https://shopgoodwill.com/item/26',
     );
@@ -1076,6 +1078,7 @@ describe('T-121: a snipe that never woke for an on-time close is MISSED, never E
     expect(reads(r)).toHaveLength(1);
     expect(r.notifier.sent).toHaveLength(1);
     expect(r.notifier.sent[0]?.notification.title).toBe('Missed: Pyrex bowl 60');
+    expect(r.notifier.sent[0]?.notification.priority).toBe(2); // R-3
     expect(r.notifier.sent[0]?.notification.message).toMatch(/^The browser was not awake when the auction ended/);
     expect(r.notifier.sent[0]?.notification.title).not.toMatch(/ended early/i);
     expect(r.audit.entries.some((e) => e.kind === 'outcome.recorded' && e.itemId === 60 && e.details.outcome === 'missed')).toBe(true);

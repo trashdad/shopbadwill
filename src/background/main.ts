@@ -62,6 +62,8 @@ import {
   createTickHub,
   errorText,
   EventGate,
+  mirroredNotify,
+  NotifyMirrorList,
   PageStore,
   SettingsSetInterceptors,
   toDiscoveryReport,
@@ -240,11 +242,13 @@ export function startBackground(opts: StartBackgroundOptions): BackgroundHandle 
     getAll: () => ports.alarms.getAll(),
     onAlarm: (cb) => alarmEvents.on(cb),
   };
+  const notifyMirrors = new NotifyMirrorList();
   const notifier: Notifier = {
     get supportsActions() {
       return ports.notifier.supportsActions;
     },
-    notify: (n) => ports.notifier.notify(n),
+    // R-3: priority-2 notifications are mirrored (ntfy-alerts.ts) after the browser one.
+    notify: mirroredNotify(ports.notifier, notifyMirrors, log),
     onAction: (cb) => actions.on(cb),
   };
   const permissions: Permissions = {
@@ -353,6 +357,7 @@ export function startBackground(opts: StartBackgroundOptions): BackgroundHandle 
       http,
       alarms,
       notifier,
+      notifyMirrors,
       permissions,
       keepAwake: ports.keepAwake,
       keepAlive: ports.keepAlive,

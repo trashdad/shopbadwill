@@ -119,7 +119,7 @@ export function outcomeNotification(t: TrackedItem, outcome: OutcomeKind, overMa
       id: OUTCOME_NOTIFY_PREFIX + String(t.itemId),
       title: `Over your max: ${title}`,
       message: `${price} above your max of ${formatMoney(overMax.maxBid)}. ${url}`,
-      priority: 1,
+      priority: 2, // R-3: mirrored to ntfy
       openUrlOnClick: url,
     };
   }
@@ -127,7 +127,7 @@ export function outcomeNotification(t: TrackedItem, outcome: OutcomeKind, overMa
     id: OUTCOME_NOTIFY_PREFIX + String(t.itemId),
     title: `${OUTCOME_HEADING[outcome]}: ${title}`,
     message: `${OUTCOME_MESSAGE[outcome]} ${url}`,
-    priority: 1,
+    priority: 2, // R-3: mirrored to ntfy
     openUrlOnClick: url,
   };
 }

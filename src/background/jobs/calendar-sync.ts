@@ -304,7 +304,7 @@ export class CalendarSync {
         id: 'sbw:calendar:reconnect',
         title: 'Reconnect Google Calendar',
         message: 'ShopBadwill cannot update your auction calendar until you reconnect Google in the options page.',
-        priority: 1,
+        priority: 2, // R-3: mirrored to ntfy
       });
     } catch {
       // Audited above; a failed notification must not fail the sync.

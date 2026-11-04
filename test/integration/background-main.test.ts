@@ -371,6 +371,31 @@ describe('T-36 brief', () => {
     expect((await h.send('audit.list', { limit: 5 })).ok).toBe(true);
   });
 
+  it('R-3: ctx.notifier.notify runs the mirrors after the browser notification, only for priority 2, and a throwing mirror never rejects it', async () => {
+    const seen: Array<{ id: string | undefined; sentBefore: number }> = [];
+    let sentCount = (): number => -1;
+    const job = (ctx: BackgroundContext): void => {
+      ctx.notifyMirrors.add((n) => {
+        seen.push({ id: n.id, sentBefore: sentCount() });
+        return Promise.resolve();
+      });
+      ctx.notifyMirrors.add(() => {
+        throw new Error('sync boom');
+      });
+      ctx.notifyMirrors.add(() => Promise.reject(new Error('async boom')));
+    };
+    const h = boot({ jobModules: { './mirror-probe.ts': { register: job } } });
+    sentCount = () => h.notifier.sent.length;
+    const ctx = await h.handle.ready;
+    await expect(ctx.notifier.notify({ id: 'a', title: 't', message: 'm', priority: 2 })).resolves.toBe('a');
+    await expect(ctx.notifier.notify({ id: 'b', title: 't', message: 'm', priority: 1 })).resolves.toBe('b');
+    await expect(ctx.notifier.notify({ id: 'c', title: 't', message: 'm' })).resolves.toBe('c');
+    await flush();
+    expect(seen).toEqual([{ id: 'a', sentBefore: 1 }]);
+    expect(h.notifier.sent.map((s) => s.id)).toEqual(['a', 'b', 'c']);
+    expect(h.log).toHaveBeenCalledWith('background: a notification mirror failed', expect.any(Error));
+  });
+
   it('a module without register(ctx), or one that throws, is reported and the rest still register', async () => {
     const good = vi.fn();
     const h = boot({

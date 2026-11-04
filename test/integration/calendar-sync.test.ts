@@ -635,6 +635,8 @@ describe('invalid_grant', () => {
     expect(first.status).toBe('needs-reconnect');
     expect(calendarRequests(r)).toBe(0);
     expect(r.notifier.sent.filter((n) => n.id === 'sbw:calendar:reconnect')).toHaveLength(1);
+    // R-3: priority 2, so it is mirrored to ntfy.
+    expect(r.notifier.sent.find((n) => n.id === 'sbw:calendar:reconnect')?.notification.priority).toBe(2);
     expect(r.badge).toContain(true);
     expect(Object.values(await links(r)).map((l) => l.status)).toEqual(['pending', 'pending', 'pending']);
 

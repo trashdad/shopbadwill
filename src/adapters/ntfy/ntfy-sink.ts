@@ -97,6 +97,13 @@ export interface NtfyMessage {
   fireAt: EpochMs;
 }
 
+/** R-3: an immediate alert (a priority-2 notification mirrored to the phone). */
+export interface NtfyAlertMessage {
+  title: string;
+  body: string;
+  clickUrl?: string | undefined;
+}
+
 /**
  * The ONE place that knows ntfy's wire shape. PROVISIONAL — the shapes below
  * come from the ntfy documentation and MUST BE CHECKED LIVE against the real
@@ -106,6 +113,9 @@ export interface NtfyMessage {
  *            headers: X-Title, X-Click, X-Tags: hourglass,
  *                     X-Delay: <unix seconds>, X-Sequence-ID: <seq>
  *   cancel:  DELETE <server>/<topic>/<seq>
+ *   alert:   POST   <server>/<topic>   body = plain text (R-3: immediate)
+ *            headers: X-Title, X-Click (when there is a URL), X-Priority: 5,
+ *                     X-Tags: rotating_light; no X-Delay, no X-Sequence-ID
  *   both:    Authorization: Bearer <token>, only when a token is set (T-123)
  *
  * `<server>` must be a normalized https origin (`isAllowedServer`); anything
@@ -119,12 +129,36 @@ export interface NtfyMessage {
  */
 export function ntfyRequest(kind: 'publish', target: NtfyTarget, message: NtfyMessage): HttpRequest;
 export function ntfyRequest(kind: 'cancel', target: NtfyTarget, message: Pick<NtfyMessage, 'seq'>): HttpRequest;
-export function ntfyRequest(kind: 'publish' | 'cancel', target: NtfyTarget, message: NtfyMessage | Pick<NtfyMessage, 'seq'>): HttpRequest {
+export function ntfyRequest(kind: 'alert', target: NtfyTarget, message: NtfyAlertMessage): HttpRequest;
+export function ntfyRequest(
+  kind: 'publish' | 'cancel' | 'alert',
+  target: NtfyTarget,
+  message: NtfyMessage | Pick<NtfyMessage, 'seq'> | NtfyAlertMessage,
+): HttpRequest {
   const base = topicUrl(target);
   const auth = authHeaders(target.token);
-  if (kind === 'cancel' || !('title' in message)) {
+  if (kind === 'alert') {
+    // R-3: an immediate alert. No X-Delay (ntfy rejects a delay in the past) and no sequence id.
+    const alert = message as NtfyAlertMessage;
     return {
-      url: `${base}/${message.seq}`,
+      url: base,
+      method: 'POST',
+      headers: {
+        ...auth,
+        'X-Title': headerText(alert.title),
+        ...(alert.clickUrl === undefined || alert.clickUrl === '' ? {} : { 'X-Click': alert.clickUrl }),
+        'X-Priority': '5',
+        'X-Tags': 'rotating_light',
+      },
+      body: alert.body,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      credentials: 'omit',
+    };
+  }
+  const scheduled = message as NtfyMessage | Pick<NtfyMessage, 'seq'>;
+  if (kind === 'cancel' || !('title' in scheduled)) {
+    return {
+      url: `${base}/${scheduled.seq}`,
       method: 'DELETE',
       ...(Object.keys(auth).length === 0 ? {} : { headers: auth }),
       timeoutMs: REQUEST_TIMEOUT_MS,
@@ -136,13 +170,13 @@ export function ntfyRequest(kind: 'publish' | 'cancel', target: NtfyTarget, mess
     method: 'POST',
     headers: {
       ...auth,
-      'X-Title': headerText(message.title),
-      'X-Click': message.clickUrl,
+      'X-Title': headerText(scheduled.title),
+      'X-Click': scheduled.clickUrl,
       'X-Tags': 'hourglass',
-      'X-Delay': String(Math.floor(message.fireAt / 1000)),
-      'X-Sequence-ID': message.seq,
+      'X-Delay': String(Math.floor(scheduled.fireAt / 1000)),
+      'X-Sequence-ID': scheduled.seq,
     },
-    body: message.body,
+    body: scheduled.body,
     timeoutMs: REQUEST_TIMEOUT_MS,
     credentials: 'omit',
   };
@@ -245,8 +279,8 @@ interface Lead {
 
 type RequestResult = 'ok' | 'rate-limited' | 'failed';
 
-/** Serializes sends and starts each at least `minIntervalMs` after the previous one ENDED (R8). */
-class Pacer {
+/** Serializes sends and starts each at least `minIntervalMs` after the previous one ENDED (R8). Also R-3's alert pacer. */
+export class Pacer {
   private tail: Promise<unknown> = Promise.resolve();
   private lastDone = Number.NEGATIVE_INFINITY;
 
