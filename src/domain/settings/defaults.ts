@@ -40,6 +40,12 @@ export const DEFAULT_WATCH_FAVORITE_MODE = 'sgw' satisfies FavoriteMode;
 /** `Watch.favoriteWithinHours` when `favoriteMode` is 'sgw-late' and the field is absent (§1.8). */
 export const DEFAULT_FAVORITE_WITHIN_HOURS = 6;
 
+/**
+ * R-3: `ntfy.alerts` when absent. The ntfy group itself stays undefined by
+ * default (ntfy off, §15 Q10), so this default lives here, not in DEFAULT_SETTINGS.
+ */
+export const DEFAULT_NTFY_ALERTS = true;
+
 export const DEFAULT_SETTINGS: DeepReadonly<Settings> = freezeDeep<Settings>({
   schemaVersion: 1,
   // §15 Q7. The composition root may replace it with the detected zone.

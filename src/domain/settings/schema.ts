@@ -41,7 +41,19 @@ export const SettingsSchema = z.object({
     digest: z.boolean(),
     quietHours: z.object({ from: LocalTimeSchema, to: LocalTimeSchema }).optional(),
   }),
-  ntfy: z.object({ enabled: z.boolean(), server: z.string(), topic: z.string() }).optional(),
+  ntfy: z
+    .object({
+      enabled: z.boolean(),
+      server: z.string(),
+      topic: z.string(),
+      /**
+       * R-3 (additive, optional): also send priority-2 snipe alerts (won, lost,
+       * not sent, at risk, reconnect) to this topic at once. Absent means on,
+       * the default (DEFAULT_NTFY_ALERTS).
+       */
+      alerts: z.boolean().optional(),
+    })
+    .optional(),
   snipe: z.object({
     enabled: z.boolean(),
     defaultLeadMs: LeadMsSchema,

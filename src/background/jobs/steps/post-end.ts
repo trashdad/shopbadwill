@@ -119,7 +119,7 @@ export function outcomeNotification(t: TrackedItem, outcome: OutcomeKind, overMa
       id: OUTCOME_NOTIFY_PREFIX + String(t.itemId),
       title: `Over your max: ${title}`,
       message: `${price} above your max of ${formatMoney(overMax.maxBid)}. ${url}`,
-      priority: 1,
+      priority: 2, // R-3: mirrored to ntfy
       openUrlOnClick: url,
     };
   }
@@ -127,7 +127,7 @@ export function outcomeNotification(t: TrackedItem, outcome: OutcomeKind, overMa
     id: OUTCOME_NOTIFY_PREFIX + String(t.itemId),
     title: `${OUTCOME_HEADING[outcome]}: ${title}`,
     message: `${OUTCOME_MESSAGE[outcome]} ${url}`,
-    priority: 1,
+    priority: 2, // R-3: mirrored to ntfy
     openUrlOnClick: url,
   };
 }
@@ -191,6 +191,8 @@ async function alreadyNotified(audit: Pick<AuditLog, 'list'>, itemId: ItemId): P
  * hours (deferred by an alarm that carries the item id; the handler rebuilds
  * the copy from the persisted tracked outcome). The `notify.outcome` marker
  * row is written BEFORE the send, so a restart can never send it twice (R6).
+ * R-3 fix 1: with notifications off or not permitted, the notification goes
+ * only to ctx.notifyMirrors (ntfy), at once, under a `channel: 'ntfy-only'` marker.
  */
 export async function notifyOutcome(
   ctx: BackgroundContext,
@@ -199,20 +201,30 @@ export async function notifyOutcome(
 ): Promise<'sent' | 'deferred' | 'skipped' | 'failed'> {
   const { repo, audit, notifier, permissions, alarms, clock } = ctx;
   const settings = await repo.get(STORAGE_KEYS.settings);
-  if (!settings.notifications.enabled) return 'skipped';
   if (await alreadyNotified(audit, itemId)) return 'skipped';
-  let ok: boolean;
-  try {
-    ok = await permissions.contains({ permissions: ['notifications'] });
-  } catch {
-    ok = false;
-  }
-  if (!ok) {
-    await audit.append({ actor: 'daily-job', kind: 'notify.skipped', itemId, details: { why: 'notifications permission not granted' } });
-    return 'skipped';
-  }
   const tracked = await repo.get(STORAGE_KEYS.tracked);
   const t = tracked[itemId];
+  let ok = settings.notifications.enabled;
+  if (ok) {
+    try {
+      ok = await permissions.contains({ permissions: ['notifications'] });
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      await audit.append({ actor: 'daily-job', kind: 'notify.skipped', itemId, details: { why: 'notifications permission not granted' } });
+    }
+  }
+  if (!ok) {
+    // R-3 fix 1: no browser notification, but the phone still hears it, at
+    // once (quiet hours do not hold an ntfy alert). The marker is written first,
+    // so a later permission grant or a restart never sends it again.
+    if (t === undefined) return 'skipped';
+    const overMax = outcome === 'lost' ? await lossBasis(ctx, itemId) : undefined;
+    await audit.append({ actor: 'daily-job', kind: NOTIFY_OUTCOME_KIND, itemId, details: { outcome, channel: 'ntfy-only' } });
+    ctx.notifyMirrors.fire(outcomeNotification(t, outcome, overMax));
+    return 'skipped';
+  }
   if (t === undefined) return 'skipped';
   const until = quietHoursEnd(clock.now(), settings.notifications.quietHours, settings.locale.timeZone);
   if (until !== null) {

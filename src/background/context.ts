@@ -32,7 +32,7 @@ import type { Clock } from '../ports/clock';
 import type { Http } from '../ports/http';
 import type { KeepAlive } from '../ports/keep-alive';
 import type { KeepAwake } from '../ports/keep-awake';
-import type { Notifier } from '../ports/notifier';
+import type { Notification, Notifier } from '../ports/notifier';
 import type { Permissions } from '../ports/permissions';
 import type { SgwClock } from '../ports/sgw-clock';
 import type { SgwHealth } from '../ports/sgw-health';
@@ -52,6 +52,12 @@ export interface BackgroundContext {
   readonly alarms: Alarms;
   /** `onAction` is served from the top-level listener; actions before ready are replayed. */
   readonly notifier: Notifier;
+  /**
+   * R-3: functions run after every priority-2 notification, once the browser
+   * notification was attempted (ntfy-alerts.ts mirrors to the phone). Best
+   * effort: a mirror that throws or rejects is logged and never fails `notify`.
+   */
+  readonly notifyMirrors: NotifyMirrorList;
   /** `onRemoved` is served from the top-level listener. */
   readonly permissions: Permissions;
   readonly keepAwake: KeepAwake;
@@ -387,6 +393,64 @@ export class SettingsSetInterceptors implements InterceptorList<SettingsSetInter
       if (verdict !== undefined) throw new SettingsVetoError(verdict.veto);
     }
   }
+}
+
+// ── Notification mirrors (R-3) ──────────────────────────────────────────────
+
+/** Runs after a priority-2 notification. Must not rely on being awaited. */
+export type NotifyMirror = (n: Notification) => Promise<void>;
+
+export class NotifyMirrorList implements InterceptorList<NotifyMirror> {
+  private readonly list: NotifyMirror[] = [];
+
+  /** `log`: where a failing mirror is reported (main.ts passes the background log). */
+  constructor(private readonly log: (message: string, error: unknown) => void = () => undefined) {}
+
+  add(fn: NotifyMirror): () => void {
+    this.list.push(fn);
+    return () => {
+      const i = this.list.indexOf(fn);
+      if (i >= 0) this.list.splice(i, 1);
+    };
+  }
+
+  /**
+   * Starts every mirror without waiting; each failure (sync throw or rejection)
+   * is logged once. Also called directly (R-3 fix 1) by a caller whose browser
+   * notification is closed off (notifications disabled or not permitted), so a
+   * priority-2 notice still reaches the phone.
+   */
+  fire(n: Notification, log: (message: string, error: unknown) => void = this.log): void {
+    for (const fn of [...this.list]) {
+      void (async () => {
+        try {
+          await fn(n);
+        } catch (e) {
+          log('background: a notification mirror failed', e);
+        }
+      })();
+    }
+  }
+}
+
+/**
+ * R-3: `notify` that sends the browser notification first, then (priority 2
+ * only) starts the mirrors. They also run when the browser notification fails
+ * (e.g. the optional `notifications` permission is missing): the phone may be
+ * the only channel left. The caller sees exactly the browser outcome.
+ */
+export function mirroredNotify(
+  base: Pick<Notifier, 'notify'>,
+  mirrors: NotifyMirrorList,
+  log: (message: string, error: unknown) => void,
+): (n: Notification) => Promise<string> {
+  return async (n) => {
+    try {
+      return await base.notify(n);
+    } finally {
+      if (n.priority === 2) mirrors.fire(n, log);
+    }
+  };
 }
 
 // ── Page store ──────────────────────────────────────────────────────────────

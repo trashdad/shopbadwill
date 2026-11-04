@@ -435,6 +435,19 @@ export function NtfySection(props: NtfySectionProps): VNode {
             applyChange(ntfy, { ...ntfy, enabled: false }, 'phone push', false, true);
           }}
         />
+        {ntfy.enabled ? (
+          <Switch
+            id="ntfy-alerts"
+            label="Also send snipe alerts (won, lost, not sent, at risk, reconnect) to this topic"
+            hint="Sent at once, even during quiet hours, so an alert reaches your phone while you sleep."
+            checked={ntfy.alerts !== false}
+            disabled={busy}
+            onChange={(v) => {
+              if (retiring.current) return;
+              void save({ ...ntfy, alerts: v }, 'snipe alerts');
+            }}
+          />
+        ) : null}
         <p class="sbw-hint">Auction titles and end times are sent to {host}.</p>
         {firefox ? (
           <p class="sbw-hint">

@@ -195,7 +195,8 @@ describe('storage schema v1', () => {
     expect(parseNtfyAuth({ token: 7 })).toBeUndefined();
     expect(parseNtfyAuth(undefined)).toBeUndefined();
     // Settings (and so settings.get, which every page reads) never carry the token.
-    expect(Object.keys(SettingsSchema.shape.ntfy.unwrap().shape).sort()).toEqual(['enabled', 'server', 'topic']);
+    // R-3: `alerts` is a flag, not a secret.
+    expect(Object.keys(SettingsSchema.shape.ntfy.unwrap().shape).sort()).toEqual(['alerts', 'enabled', 'server', 'topic']);
   });
 
   it('keys ItemId records by positive integer ids', () => {

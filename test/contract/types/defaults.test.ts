@@ -4,6 +4,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   DEFAULT_CAPS,
   DEFAULT_FAVORITE_WITHIN_HOURS,
+  DEFAULT_NTFY_ALERTS,
   DEFAULT_SETTINGS,
   DEFAULT_WATCH_FAVORITE_MODE,
   defaultSettings,
@@ -63,6 +64,15 @@ describe('Settings defaults', () => {
 
   it('leave ntfy off (§15 Q10)', () => {
     expect(DEFAULT_SETTINGS.ntfy).toBeUndefined();
+  });
+
+  it('R-3: ntfy snipe alerts default on, and a ntfy group saved before the field existed still parses', () => {
+    expect(DEFAULT_NTFY_ALERTS).toBe(true);
+    const old = defaultSettings();
+    old.ntfy = { enabled: true, server: 'https://ntfy.example.com', topic: 'sbw-abcdefghijklmnopqrstuvwxyz' };
+    expect(SettingsSchema.parse(old).ntfy).not.toHaveProperty('alerts');
+    expect(SettingsSchema.parse({ ...old, ntfy: { ...old.ntfy, alerts: false } }).ntfy?.alerts).toBe(false);
+    expect(SettingsSchema.safeParse({ ...old, ntfy: { ...old.ntfy, alerts: 'yes' } }).success).toBe(false);
   });
 
   it('are deeply frozen and deeply readonly, so no consumer can change the shared constant', () => {

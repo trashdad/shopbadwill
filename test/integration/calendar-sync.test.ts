@@ -32,6 +32,7 @@ import type { Settings } from '../../src/domain/settings/schema';
 import { Repo } from '../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../src/domain/storage/schema';
 import type { CalendarApi } from '../../src/ports/calendar';
+import type { Notification } from '../../src/ports/notifier';
 import { startFakeGoogle, type FakeGoogle, type Scenario } from '../fakes/fake-google-server/server';
 import { FakeAuditLog } from '../fakes/ports/fake-audit-log';
 import { FakeClock } from '../fakes/ports/fake-clock';
@@ -93,6 +94,8 @@ interface Rig {
   switches: FakeSwitches;
   notifier: FakeNotifier;
   permissions: FakePermissions;
+  /** R-3: notices that went to the ntfy mirror directly (browser notifications closed). */
+  mirrored: Notification[];
   badge: boolean[];
   provider: PkceRefreshProvider;
   api: CalendarApi;
@@ -117,6 +120,7 @@ async function rig(opts: { connect?: boolean; scenario?: Scenario } = {}): Promi
   const notifier = new FakeNotifier();
   const permissions = new FakePermissions({ permissions: ['notifications'] });
   const badge: boolean[] = [];
+  const mirrored: Notification[] = [];
   const http = new BrowserHttp({ isOnline: () => true });
   const base = fake.url;
   const provider = new PkceRefreshProvider({
@@ -148,6 +152,7 @@ async function rig(opts: { connect?: boolean; scenario?: Scenario } = {}): Promi
       notifier,
       permissions,
       badge: { set: (on) => void badge.push(on) },
+      mirror: (n) => void mirrored.push(structuredClone(n)),
       minIntervalMs: 0,
     });
   const r: Rig = {
@@ -158,6 +163,7 @@ async function rig(opts: { connect?: boolean; scenario?: Scenario } = {}): Promi
     switches,
     notifier,
     permissions,
+    mirrored,
     badge,
     provider,
     api,
@@ -635,6 +641,8 @@ describe('invalid_grant', () => {
     expect(first.status).toBe('needs-reconnect');
     expect(calendarRequests(r)).toBe(0);
     expect(r.notifier.sent.filter((n) => n.id === 'sbw:calendar:reconnect')).toHaveLength(1);
+    // R-3: priority 2, so it is mirrored to ntfy.
+    expect(r.notifier.sent.find((n) => n.id === 'sbw:calendar:reconnect')?.notification.priority).toBe(2);
     expect(r.badge).toContain(true);
     expect(Object.values(await links(r)).map((l) => l.status)).toEqual(['pending', 'pending', 'pending']);
 
@@ -648,6 +656,39 @@ describe('invalid_grant', () => {
     await r.sync.syncNow('four');
     await r.sync.syncNow('five');
     expect(r.notifier.sent.filter((n) => n.id === 'sbw:calendar:reconnect')).toHaveLength(2);
+  });
+});
+
+describe('R-3 fix 1: reconnect notice with browser notifications off', () => {
+  it('goes to the ntfy mirror only, at priority 2, once per local day', async () => {
+    const r = await rig();
+    await r.settings((s) => {
+      s.notifications.enabled = false;
+    });
+    await r.track();
+    r.fake.setScenario({ invalidGrant: true });
+    r.clock.offset += 2 * HOUR;
+    r.fake.advanceClock(2 * HOUR);
+
+    expect((await r.sync.syncNow('one')).status).toBe('needs-reconnect');
+    expect(r.notifier.sent).toHaveLength(0);
+    expect(r.mirrored).toHaveLength(1);
+    expect(r.mirrored[0]).toMatchObject({ id: 'sbw:calendar:reconnect', title: 'Reconnect Google Calendar', priority: 2 });
+
+    await r.sync.syncNow('two');
+    expect(r.mirrored).toHaveLength(1);
+    expect(r.notifier.sent).toHaveLength(0);
+  });
+
+  it('is not mirrored directly when the browser notification goes out (main.ts mirrors that one)', async () => {
+    const r = await rig();
+    await r.track();
+    r.fake.setScenario({ invalidGrant: true });
+    r.clock.offset += 2 * HOUR;
+    r.fake.advanceClock(2 * HOUR);
+    await r.sync.syncNow('one');
+    expect(r.notifier.sent.filter((n) => n.id === 'sbw:calendar:reconnect')).toHaveLength(1);
+    expect(r.mirrored).toHaveLength(0);
   });
 });
 

@@ -155,6 +155,23 @@ describe('NtfySection', () => {
     expect(saved[0]).toEqual({ ntfy: { enabled: true, server: NTFY_SERVER, topic: '' } });
   });
 
+  it('R-3: the snipe alerts checkbox shows checked when absent and saves alerts: false when cleared', async () => {
+    const { saved } = app({ settings: ntfyOn() });
+    const box = await screen.findByLabelText<HTMLInputElement>('Also send snipe alerts (won, lost, not sent, at risk, reconnect) to this topic');
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    await waitFor(() => {
+      expect(saved).toHaveLength(1);
+    });
+    expect(saved[0]).toEqual({ ntfy: { enabled: true, server: NTFY_SERVER, topic: TOPIC, alerts: false } });
+  });
+
+  it('R-3: the snipe alerts checkbox is hidden while phone push is off', async () => {
+    app();
+    await screen.findByLabelText('Phone push (ntfy)');
+    expect(screen.queryByLabelText('Also send snipe alerts (won, lost, not sent, at risk, reconnect) to this topic')).toBeNull();
+  });
+
   it('generates a topic on click, saves it, shows it in the field and only its last 4 characters elsewhere', async () => {
     const { saved } = app({ settings: ntfyOn(''), generate: () => TOPIC });
     fireEvent.click(await screen.findByRole('button', { name: 'Generate topic' }));

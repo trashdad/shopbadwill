@@ -503,7 +503,7 @@ interface SpecSettings {
   features: { landedCost: boolean; comps: boolean; countdownRefresh: boolean; relistDetector: boolean };
   calendar: { enabled: boolean; mode: 'dedicated' | 'primary'; reminders: number[]; icsFallback: boolean };
   notifications: { enabled: boolean; digest: boolean; quietHours?: { from: string; to: string } };
-  ntfy?: { enabled: boolean; server: string; topic: string };
+  ntfy?: { enabled: boolean; server: string; topic: string; alerts?: boolean };
   snipe: {
     enabled: boolean;
     defaultLeadMs: number;
