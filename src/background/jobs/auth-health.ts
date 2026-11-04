@@ -32,6 +32,11 @@
 // R-1: the snipe-lane figures come from `scheduler.stats()`, the scheduler's
 // in-memory state (no request). Fewer than SNIPE_LANE_LOW_WATER requests left
 // today, or an active pause or snipe-lane backoff, is a warning, never ok:false.
+//
+// R-6: on tier T0 nothing keeps the computer awake, so both checks warn when
+// the awake history (`sbw:awake`, read from the Repo) shows the browser ran in
+// the end's local hour on under half of at least 3 observed days, or when the
+// end falls inside quiet hours. A warning, never ok:false.
 import { browser } from 'wxt/browser';
 
 import type { AuthStatus } from '../../domain/calendar/types';
@@ -39,6 +44,7 @@ import type { AuditLog } from '../../domain/audit/types';
 import type { Repo } from '../../domain/storage/repo';
 import { defaultSettings } from '../../domain/settings/defaults';
 import type { Settings } from '../../domain/settings/schema';
+import { awakeAdvice } from '../../domain/snipe/awake-history';
 import { isoMs, SESSION_MARGIN_AFTER_END_MS } from '../../domain/snipe/preflight';
 import type { Snipe } from '../../domain/snipe/types';
 import { STORAGE_KEYS } from '../../domain/storage/schema';
@@ -72,6 +78,10 @@ const TURN_ON_KEEP_AWAKE = 'Turn on Keep awake';
 
 /** R-1: warn when the snipe lane has fewer requests than this left today (two snipes of about 8). */
 export const SNIPE_LANE_LOW_WATER = 16;
+
+/** R-6: the awake rule needs at least this many observed days, and warns below this likelihood. */
+export const T0_AWAKE_MIN_DAYS = 3;
+export const T0_AWAKE_MIN_LIKELIHOOD = 0.5;
 
 export function authWarnAlarmName(id: string, which: AuthHealthCheck): string {
   return `${AUTH_WARN_ALARM_PREFIX}${id}:${which}`;
@@ -130,6 +140,12 @@ export interface AuthHealthSnapshot {
    * `until`: when the longest of them ends (null = until resumed).
    */
   snipeLane: { left: number; paused: boolean; backingOff: boolean; blocked: boolean; until: EpochMs | null } | null;
+  /** R-6: the `sbw:awake` heartbeat history; null when it could not be read (no awake-history warning). */
+  awakeHistory: readonly EpochMs[] | null;
+  /** R-6: `sbw:meta.installedAt` (when recording began); null when unknown (`since` is omitted). */
+  installedAt: EpochMs | null;
+  /** The user's quiet hours (also used for the R4 deferral). */
+  quiet: Settings['notifications']['quietHours'];
 }
 
 /** R-1: the snapshot's snipe-lane figures from the scheduler stats. */
@@ -153,6 +169,33 @@ export function snipeLaneOf(stats: RequestSchedulerStats): NonNullable<AuthHealt
 }
 
 const HEALTH_WARN_NAMES_LIMIT = 3;
+
+/** R-6 R1/R2: the tier-T0 "usually asleep at the end" warning, or null. */
+function t0AwakeWarning(now: EpochMs, endMs: EpochMs, snap: AuthHealthSnapshot): string | null {
+  if (snap.tier !== 'T0') return null;
+  const lead = 'Tier T0 does nothing to keep this computer awake, and';
+  const fix = 'or set up tier T1 or T2 in the snipe settings.';
+  const time = formatDual(endMs, snap.timeZone);
+  let advice: ReturnType<typeof awakeAdvice> | null = null;
+  if (snap.awakeHistory !== null) {
+    try {
+      advice = awakeAdvice(endMs, snap.awakeHistory, {
+        now,
+        timeZone: snap.timeZone,
+        ...(snap.installedAt === null ? {} : { since: snap.installedAt }),
+      });
+    } catch {
+      advice = null; // an unusable zone: no awake-history warning
+    }
+  }
+  if (advice !== null && advice.observed >= T0_AWAKE_MIN_DAYS && advice.likelihood < T0_AWAKE_MIN_LIKELIHOOD) {
+    return `${lead} ${advice.text}. Keep the computer awake and the browser open for the end at ${time}, ${fix}`;
+  }
+  if (quietHoursEnd(endMs, snap.quiet, snap.timeZone) !== null) {
+    return `${lead} the auction ends inside your quiet hours (${time}). Keep the computer awake and the browser open, ${fix}`;
+  }
+  return null;
+}
 
 function sessionFailure(
   now: EpochMs,
@@ -249,6 +292,9 @@ export function assessAuthHealth(
     }
   }
 
+  const asleep = t0AwakeWarning(now, endMs, snap);
+  if (asleep !== null) warnings.push(asleep);
+
   const lane = snap.snipeLane;
   if (lane !== null) {
     if (lane.left < SNIPE_LANE_LOW_WATER) {
@@ -293,6 +339,10 @@ export interface AuthHealthDeps {
   repo?: Pick<Repo, 'update'>;
   /** R-1: the scheduler's cached stats only (no request is ever made through it here). */
   scheduler: Pick<RequestScheduler, 'stats'>;
+  /** R-6: the stored `sbw:awake` heartbeat history (no request). */
+  awakeHistory(): Promise<readonly EpochMs[]>;
+  /** R-6: `sbw:meta.installedAt`, or null when there is no meta record. */
+  installedAt(): Promise<EpochMs | null>;
   log?(message: string, error?: unknown): void;
 }
 
@@ -328,9 +378,9 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
     }
   };
 
-  const gather = async (): Promise<AuthHealthSnapshot & { now: EpochMs; quiet: Settings['notifications']['quietHours'] }> => {
+  const gather = async (): Promise<AuthHealthSnapshot & { now: EpochMs }> => {
     const settings = deps.settings();
-    const [state, tokenRead, record, google, healthReport, powerGranted] = await Promise.all([
+    const [state, tokenRead, record, google, healthReport, powerGranted, awakeHistory, installedAt] = await Promise.all([
       safe(() => deps.session.state(), null),
       // `{ token }` when read (token may be null: no login); null when the read failed.
       safe(async () => ({ token: await deps.session.current() }), null),
@@ -338,6 +388,8 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
       safe(() => deps.google.status(), null),
       safe(() => deps.health.last(), null),
       safe(() => deps.permissions.contains({ permissions: ['power'] }), false),
+      safe<readonly EpochMs[] | null>(() => deps.awakeHistory(), null),
+      safe(() => deps.installedAt(), null),
     ]);
     // R2: a usable state whose token could not be read is unknown (a warning),
     // never "no login saved" (a failure). Logged-out/expired need no token.
@@ -361,6 +413,8 @@ export function createAuthHealth(deps: AuthHealthDeps): AuthHealth {
       tier: settings.snipe.tier,
       timeZone: settings.locale.timeZone,
       snipeLane,
+      awakeHistory,
+      installedAt,
       quiet: settings.notifications.quietHours,
     };
   };
@@ -497,6 +551,8 @@ export function register(ctx: BackgroundContext): AuthHealth {
     getSnipe: async (id) => (await ctx.repo.get(STORAGE_KEYS.snipes))[id],
     repo: ctx.repo,
     scheduler: ctx.scheduler,
+    awakeHistory: () => ctx.repo.get(STORAGE_KEYS.awake),
+    installedAt: async () => (await ctx.repo.find(STORAGE_KEYS.meta))?.installedAt ?? null,
   });
   snipeSeams(ctx).setAuthHealth(impl);
   return impl;
