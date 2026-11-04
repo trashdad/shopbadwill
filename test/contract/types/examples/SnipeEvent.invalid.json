@@ -1,0 +1,12 @@
+{
+  "invalidBecause": "a disarm comes from the user, the kill switch or an anomaly",
+  "path": [
+    "by"
+  ],
+  "value": {
+    "type": "disarm",
+    "now": 1791400000000,
+    "by": "timer",
+    "why": "expired"
+  }
+}

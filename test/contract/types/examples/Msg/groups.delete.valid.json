@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-82",
+  "type": "groups.delete",
+  "payload": {
+    "id": "grp-lamps-1"
+  }
+}

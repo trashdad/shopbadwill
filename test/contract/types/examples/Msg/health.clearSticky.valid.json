@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-38",
+  "type": "health.clearSticky",
+  "payload": {
+    "endpoint": "placeBid"
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "invalidBecause": "the daily run time is \"HH:MM\", 24-hour",
+  "path": [
+    "dailyRun",
+    "localTime"
+  ],
+  "value": {
+    "schemaVersion": 1,
+    "homeZip": "14201",
+    "locale": {
+      "timeZone": "America/New_York"
+    },
+    "dailyRun": {
+      "enabled": true,
+      "localTime": "7am",
+      "catchUp": true
+    },
+    "overlay": {
+      "enabled": true,
+      "hideStyle": "collapse",
+      "quickFavorite": false,
+      "landedCostBadges": true,
+      "countdown": true
+    },
+    "dryRun": {
+      "favorites": true,
+      "calendar": true,
+      "bidding": true
+    },
+    "considerateMode": "normal",
+    "features": {
+      "landedCost": true,
+      "comps": false,
+      "countdownRefresh": false,
+      "relistDetector": false
+    },
+    "calendar": {
+      "enabled": true,
+      "mode": "dedicated",
+      "reminders": [
+        60,
+        15,
+        5
+      ],
+      "icsFallback": true
+    },
+    "notifications": {
+      "enabled": true,
+      "digest": true,
+      "quietHours": {
+        "from": "22:00",
+        "to": "07:00"
+      }
+    },
+    "ntfy": {
+      "enabled": false,
+      "server": "https://ntfy.sh",
+      "topic": "sbw-3q7kd0x2v9n4m8r1t6y5c0b2"
+    },
+    "snipe": {
+      "enabled": false,
+      "defaultLeadMs": 8000,
+      "defaultFallback": "early-proxy",
+      "caps": {
+        "perItemMax": 5000,
+        "perDayMax": 10000,
+        "openExposureMax": 20000,
+        "typoMultiplier": 3,
+        "typoAbsolute": 2500
+      },
+      "keepAlive": true,
+      "requiredDryRuns": 5,
+      "completedDryRuns": 0,
+      "tier": "T0"
+    },
+    "killSwitch": false
+  }
+}

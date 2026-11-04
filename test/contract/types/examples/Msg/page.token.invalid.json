@@ -1,0 +1,16 @@
+{
+  "invalidBecause": "tap data is untrusted (I-27): only JWT-shaped tokens",
+  "path": [
+    "payload",
+    "bearer"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-3",
+    "type": "page.token",
+    "payload": {
+      "bearer": "not-a-jwt",
+      "capturedAt": 1791400000000
+    }
+  }
+}

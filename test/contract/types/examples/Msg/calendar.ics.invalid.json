@@ -1,0 +1,18 @@
+{
+  "invalidBecause": "item ids are positive",
+  "path": [
+    "payload",
+    "itemIds",
+    0
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-31",
+    "type": "calendar.ics",
+    "payload": {
+      "itemIds": [
+        -1
+      ]
+    }
+  }
+}

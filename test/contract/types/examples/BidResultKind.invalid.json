@@ -1,0 +1,5 @@
+{
+  "invalidBecause": "'won' is a SnipeOutcome, not a BidResultKind",
+  "path": [],
+  "value": "won"
+}

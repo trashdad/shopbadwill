@@ -1,0 +1,32 @@
+{
+  "invalidBecause": "maxBid is integer cents",
+  "path": [
+    "payload",
+    "snipe",
+    "maxBid"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-33",
+    "type": "snipe.arm",
+    "payload": {
+      "snipe": {
+        "id": "snp-1",
+        "itemId": 279250057,
+        "title": "Vintage Pyrex Butterfly Gold Bowl 403",
+        "endTime": "2026-10-08T02:18:30.000Z",
+        "endTimeAtArm": "2026-10-08T02:18:30.000Z",
+        "sellerId": 123,
+        "maxBid": 35.5,
+        "allInMax": 4700,
+        "estShipping": 899,
+        "estHandling": 300,
+        "leadMs": 8000,
+        "fallback": "early-proxy",
+        "dryRun": true,
+        "attempt": {}
+      },
+      "typedConfirmation": "35.00"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "a group id is 1-64 letters, digits, '_' or '-'",
+  "path": [
+    "payload",
+    "id"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-82",
+    "type": "groups.delete",
+    "payload": {
+      "id": "grp lamps/1"
+    }
+  }
+}

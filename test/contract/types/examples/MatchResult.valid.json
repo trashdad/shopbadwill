@@ -1,0 +1,19 @@
+{
+  "itemId": 279250057,
+  "decision": "highlight",
+  "matched": [
+    {
+      "ruleId": "r-pyrex",
+      "action": "highlight",
+      "reasons": [
+        {
+          "ruleId": "r-pyrex",
+          "conditionIndex": 0,
+          "field": "title",
+          "detail": "title contains 'pyrex' (whole word)"
+        }
+      ]
+    }
+  ],
+  "unknownConditions": 0
+}

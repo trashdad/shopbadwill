@@ -1,0 +1,11 @@
+{
+  "invalidBecause": "envelope version is 1",
+  "path": [
+    "v"
+  ],
+  "value": {
+    "v": 0,
+    "reqId": "r-26",
+    "type": "favorites.sync"
+  }
+}

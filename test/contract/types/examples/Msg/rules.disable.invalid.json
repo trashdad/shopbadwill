@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "a rule id is never empty",
+  "path": [
+    "payload",
+    "ruleId"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-31",
+    "type": "rules.disable",
+    "payload": {
+      "ruleId": ""
+    }
+  }
+}

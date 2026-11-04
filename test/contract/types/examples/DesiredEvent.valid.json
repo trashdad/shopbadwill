@@ -1,0 +1,28 @@
+{
+  "itemId": 279250057,
+  "generation": 0,
+  "title": "SGW ends: Vintage Pyrex Butterfly Gold Bowl 403 ($12.99)",
+  "description": "https://shopgoodwill.com/item/279250057\nCurrent $12.99 · Bids 0 · Ends 7:18 PM PT · 10:18 PM ET\nShopBadwill watch: Pyrex",
+  "startUtc": "2026-10-08T02:18:30.000Z",
+  "durationMin": 15,
+  "sourceUrl": "https://shopgoodwill.com/item/279250057",
+  "reminders": [
+    {
+      "method": "popup",
+      "minutes": 60
+    },
+    {
+      "method": "popup",
+      "minutes": 15
+    },
+    {
+      "method": "popup",
+      "minutes": 5
+    }
+  ],
+  "privateProps": {
+    "sbwItemId": "279250057",
+    "sbwGen": "0",
+    "sbwState": "open"
+  }
+}

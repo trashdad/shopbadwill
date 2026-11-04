@@ -1,0 +1,18 @@
+{
+  "invalidBecause": "unknown provider",
+  "path": [
+    "provider"
+  ],
+  "value": {
+    "connected": true,
+    "provider": "oauth",
+    "account": "user@example.com",
+    "grantedScopes": [
+      "https://www.googleapis.com/auth/calendar.app.created"
+    ],
+    "refreshTokenAgeDays": 3,
+    "lastError": "rate_limited",
+    "needsInteraction": false,
+    "configured": true
+  }
+}

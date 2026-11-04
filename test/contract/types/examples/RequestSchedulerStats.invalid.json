@@ -1,0 +1,28 @@
+{
+  "invalidBecause": "stats cover every lane",
+  "path": [
+    "lanes",
+    "canary"
+  ],
+  "value": {
+    "lanes": {
+      "interactive": {
+        "usedToday": 12,
+        "budget": 300,
+        "nextAllowedAt": 1791400001000
+      },
+      "background": {
+        "usedToday": 20,
+        "budget": 120,
+        "nextAllowedAt": 1791400120000,
+        "backoffUntil": 1791400060000
+      },
+      "snipe": {
+        "usedToday": 0,
+        "budget": 80,
+        "nextAllowedAt": 1791400000000
+      }
+    },
+    "cacheHits": 7
+  }
+}

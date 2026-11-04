@@ -1,0 +1,57 @@
+{
+  "invalidBecause": "tabId is a number",
+  "path": [
+    "payload",
+    "tabId"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-17",
+    "type": "rules.preview",
+    "payload": {
+      "rule": {
+        "id": "r-pyrex",
+        "name": "Pyrex under $40",
+        "enabled": true,
+        "action": "highlight",
+        "tone": "green",
+        "all": [
+          {
+            "kind": "keyword",
+            "mode": "any",
+            "terms": [
+              "pyrex",
+              "fire-king"
+            ],
+            "wholeWord": true,
+            "regex": false,
+            "fields": [
+              "title"
+            ]
+          },
+          {
+            "kind": "price",
+            "max": 4000
+          }
+        ],
+        "any": [
+          {
+            "kind": "pickupOnly",
+            "value": false
+          },
+          {
+            "kind": "location",
+            "mode": "include",
+            "states": [
+              "OH",
+              "PA"
+            ]
+          }
+        ],
+        "createdAt": 1790795200000,
+        "updatedAt": 1791313600000
+      },
+      "tabId": "42"
+    }
+  }
+}

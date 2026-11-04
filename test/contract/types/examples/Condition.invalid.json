@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "unknown condition kind",
+  "path": [
+    "kind"
+  ],
+  "value": {
+    "kind": "distance",
+    "maxMiles": 50
+  }
+}

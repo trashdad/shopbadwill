@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SBW S-8 probe</title>
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 12px; width: 560px; }
+  button { margin: 2px 4px 2px 0; }
+  pre { background: #f4f4f4; padding: 6px; max-height: 260px; overflow: auto; }
+  @media (prefers-color-scheme: dark) { body { background: #1c1c1c; color: #ddd; } pre { background: #2a2a2a; } }
+</style>
+</head>
+<body>
+<h3>S-8 probe (throwaway)</h3>
+<div>
+  <button id="bg">Request "background" permission</button>
+  <span id="bgState"></span>
+</div>
+<div>
+  <label><input type="checkbox" id="ka"> power.requestKeepAwake('system')</label>
+</div>
+<div>
+  <button id="refresh">Refresh</button>
+  <button id="mark">Add MARK</button>
+  <button id="export">Export JSON</button>
+  <button id="clear">Clear log</button>
+</div>
+<div id="summary"></div>
+<pre id="out">loading...</pre>
+<script src="probe.js"></script>
+</body>
+</html>

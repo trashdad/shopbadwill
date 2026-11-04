@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "the seller name labels the new rule",
+  "path": [
+    "payload",
+    "sellerName"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-8",
+    "type": "quick.hideSeller",
+    "payload": {
+      "sellerId": 123
+    }
+  }
+}

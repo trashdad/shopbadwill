@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "reqId": "r-4",
+  "type": "page.domHealth",
+  "payload": {
+    "url": "https://shopgoodwill.com/categories/listing?st=pyrex",
+    "configVersion": "2026.10.07-1",
+    "pageKind": "search",
+    "cardsFound": 40,
+    "fallbackUsed": false
+  }
+}

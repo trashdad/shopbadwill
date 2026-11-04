@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-34",
+  "type": "snipe.disarm",
+  "payload": {
+    "id": "snp-1"
+  }
+}

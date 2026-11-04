@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# WXT build output and generated types
+.output/
+.wxt/
+
+# Test and report output
+test-results/
+playwright-report/
+coverage/
+
+# Canary lock/budget state and the local result (CI artifacts; never commit)
+canary-state/
+canary-out/
+
+# Local environment (OAuth client ID, test flags). Only the example is committed.
+.env*
+!.env.example
+
+# Raw, unsanitized SGW captures must never be committed (sanitized fixtures live beside them)
+test/fixtures/sgw/raw/
+
+# The user's own spike results (S-2, S-4, ...): personal observations, never committed
+docs/USER-STEPS/*-results.txt
+
+# Local agent workspace
+.superpowers/
+
+# OS noise and logs
+.DS_Store
+Thumbs.db
+*.log
+
+# Local test-browser runner config (machine-specific paths)
+web-ext.config.ts

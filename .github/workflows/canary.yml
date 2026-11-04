@@ -1,0 +1,125 @@
+name: SGW canary
+
+# T-60: nightly, read-only drift check against shopgoodwill.com (SGW).
+# At most 3 anonymous requests per run (a search, an ItemDetail read, one rendered item page),
+# 120 s apart, plus at most 1 retry after a network/5xx failure (never more than 4 requests
+# in that run). The 12 h lock is the daily cap (at most two runs a day). There is no rolling
+# 24 h request budget. Never a search page or /shopgoodwill/* (robots.txt). See scripts/canary.ts.
+#
+# Scheduled workflows run only from the default branch (main); until dev is merged to main,
+# only workflow_dispatch from a branch that has this file works.
+on:
+  schedule:
+    # Off-peak US time (02:17 PDT / 01:17 PST), not on the hour.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Bypass the 12 h run lock (the 120 s spacing still applies; one run still makes at most 4 requests)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write # open or update the "SGW drift detected" issue
+  actions: read # find the previous run's lock artifact (read-only)
+
+# Never two canaries at once; never cancel one that is mid-spacing.
+concurrency:
+  group: sgw-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: canary (schemas and selectors)
+    runs-on: ubuntu-latest
+    # 3 requests with two 120 s waits, one possible 120 s retry wait, page load limits.
+    timeout-minutes: 25
+    env:
+      CI: 'true'
+      CANARY_FORCE: ${{ inputs.force && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Do not write the token into .git/config, where pnpm install scripts and later steps could read it.
+          persist-credentials: false
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0 - version comes from package.json "packageManager"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+
+      # The lock file lives in the previous run's `canary-state` artifact. `--find-state` lists the
+      # artifacts with gh and writes run_id (the newest unexpired one; empty only when the list
+      # succeeded and has none) to GITHUB_OUTPUT. The choice is selectStateRunId, unit-tested.
+      # Any gh error or unexpected reply exits non-zero, so the canary does not run without a lock.
+      # An expired artifact cannot be downloaded and is older than the 12 h lock, so it is not a lock.
+      - name: Find previous canary state
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pnpm exec tsx scripts/canary.ts --find-state
+      - name: Restore canary state
+        if: steps.prev.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: canary-state
+          path: canary-state
+          run-id: ${{ steps.prev.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      # run_id set but no state file means the restore failed or the artifact was empty.
+      # Skip the canary so this run makes no requests. Do not treat that as a first run.
+      - name: Skip when restored state is missing
+        id: gate
+        env:
+          PREV_RUN_ID: ${{ steps.prev.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PREV_RUN_ID" ] && ! printf '%s' "$PREV_RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error::canary: previous run id is not numeric; refusing to continue"
+            exit 1
+          fi
+          if [ -n "$PREV_RUN_ID" ] && [ ! -f canary-state/state.json ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Previous canary state (run ${PREV_RUN_ID}) did not restore canary-state/state.json; skipping this run so it makes no requests."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run canary
+        id: canary
+        if: steps.gate.outputs.skip == 'false'
+        # Exit 1 means drift (the issue step below handles it); 0 is pass, inconclusive or skipped.
+        continue-on-error: true
+        run: pnpm canary
+
+      # State is saved even when the canary fails or is skipped, so the lock carries over.
+      # A skipped restore uploads nothing (if-no-files-found: ignore), so the previous artifact stays.
+      - name: Save canary state
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: canary-state
+          path: canary-state/state.json
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Open or update the drift issue
+        if: steps.canary.outputs.status == 'drift'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pnpm exec tsx scripts/canary.ts --sync-issue
+
+      - name: Fail the job on drift
+        if: steps.canary.outputs.status == 'drift'
+        run: exit 1
+      # Drift exits 1 and is handled above; any other failure is a crash, even one after status= was written.
+      - name: Fail the job if the canary crashed
+        if: steps.canary.outcome == 'failure' && steps.canary.outputs.status != 'drift'
+        run: |
+          echo "::error::canary crashed (failed without a drift result); see the Run canary step log"
+          exit 1

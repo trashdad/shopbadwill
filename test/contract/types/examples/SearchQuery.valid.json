@@ -1,0 +1,21 @@
+{
+  "searchText": "pyrex butterfly",
+  "categoryIds": [
+    45
+  ],
+  "sellerIds": [],
+  "lowPrice": 500,
+  "highPrice": 5000,
+  "pickupOnly": false,
+  "excludePickupOnly": true,
+  "oneCentShippingOnly": false,
+  "searchDescriptions": false,
+  "closedAuctions": false,
+  "sortColumn": 1,
+  "sortDescending": false,
+  "page": 1,
+  "layout": "grid",
+  "extra": {
+    "utm_source": "email"
+  }
+}

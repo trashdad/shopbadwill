@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "itemIds is an array",
+  "path": [
+    "payload",
+    "itemIds"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-7",
+    "type": "landedCost.get",
+    "payload": {
+      "itemIds": "279250057"
+    }
+  }
+}

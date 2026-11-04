@@ -1,0 +1,26 @@
+{
+  "invalidBecause": "favoriteState has no 'pending' state",
+  "path": [
+    "favoriteState"
+  ],
+  "value": {
+    "itemId": 279250057,
+    "title": "Vintage Pyrex Butterfly Gold Bowl 403",
+    "endTime": "2026-10-08T02:18:30.000Z",
+    "sellerId": 123,
+    "reasons": [
+      {
+        "kind": "watch",
+        "id": "w-pyrex"
+      },
+      {
+        "kind": "manual"
+      }
+    ],
+    "favoriteState": "pending",
+    "calendar": true,
+    "outcome": "unknown",
+    "addedAt": 1791313600000,
+    "updatedAt": 1791400000000
+  }
+}

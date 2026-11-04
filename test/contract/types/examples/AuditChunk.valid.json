@@ -1,0 +1,29 @@
+[
+  {
+    "seq": 41,
+    "at": 1791400000000,
+    "actor": "daily-job",
+    "kind": "favorite.add",
+    "itemId": 279250057,
+    "ref": "w-pyrex",
+    "details": {
+      "watch": "Pyrex",
+      "price": 1299,
+      "dryRun": true,
+      "note": null
+    },
+    "undo": {
+      "kind": "unfavorite",
+      "ref": "279250057",
+      "done": false
+    },
+    "dryRun": true
+  },
+  {
+    "seq": 42,
+    "at": 1791400001000,
+    "actor": "user",
+    "kind": "kill.on",
+    "details": {}
+  }
+]

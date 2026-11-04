@@ -1,0 +1,10 @@
+{
+  "invalidBecause": "the request id is required",
+  "path": [
+    "reqId"
+  ],
+  "value": {
+    "v": 1,
+    "type": "groups.list"
+  }
+}

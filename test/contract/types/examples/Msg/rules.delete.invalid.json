@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "ids are non-empty",
+  "path": [
+    "payload",
+    "id"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-16",
+    "type": "rules.delete",
+    "payload": {
+      "id": ""
+    }
+  }
+}

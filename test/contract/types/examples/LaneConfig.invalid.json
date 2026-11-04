@@ -1,0 +1,12 @@
+{
+  "invalidBecause": "one request in flight per lane (maxConcurrent: 1)",
+  "path": [
+    "maxConcurrent"
+  ],
+  "value": {
+    "minIntervalMs": 120000,
+    "jitterMs": 15000,
+    "maxConcurrent": 2,
+    "dailyBudget": 120
+  }
+}

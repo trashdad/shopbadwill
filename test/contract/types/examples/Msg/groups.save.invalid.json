@@ -1,0 +1,17 @@
+{
+  "invalidBecause": "N (maxWins) is at least 1: a group that may win nothing would cancel every snipe",
+  "path": [
+    "payload",
+    "maxWins"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-81",
+    "type": "groups.save",
+    "payload": {
+      "id": "grp-lamps-1",
+      "name": "Table lamps",
+      "maxWins": 0
+    }
+  }
+}

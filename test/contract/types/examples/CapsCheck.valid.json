@@ -1,0 +1,7 @@
+{
+  "perItemMax": 5000,
+  "perDayMax": 10000,
+  "openExposureMax": 20000,
+  "typoMultiplier": 3,
+  "typoAbsolute": 2500
+}

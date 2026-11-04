@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "ids are strings",
+  "path": [
+    "payload",
+    "id"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-20",
+    "type": "watches.delete",
+    "payload": {
+      "id": 5
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "reqId": "r-22",
+  "type": "job.runNow",
+  "payload": {
+    "watchIds": [
+      "w-pyrex"
+    ]
+  }
+}

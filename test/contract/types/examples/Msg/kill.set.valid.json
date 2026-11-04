@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "reqId": "r-36",
+  "type": "kill.set",
+  "payload": {
+    "on": true
+  }
+}

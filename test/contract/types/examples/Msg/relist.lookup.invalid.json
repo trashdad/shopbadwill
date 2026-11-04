@@ -1,0 +1,15 @@
+{
+  "invalidBecause": "itemIds is an array",
+  "path": [
+    "payload",
+    "itemIds"
+  ],
+  "value": {
+    "v": 1,
+    "reqId": "r-7",
+    "type": "relist.lookup",
+    "payload": {
+      "itemIds": "279250057"
+    }
+  }
+}

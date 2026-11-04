@@ -1,0 +1,139 @@
+name: Release
+
+# Tag push (vX.Y.Z) -> build, lint, package, optionally sign Firefox, create a GitHub release.
+# EVERY release is created as a DRAFT; the maintainer publishes it manually.
+# Manual run (workflow_dispatch) with `draft` left at true -> same pipeline on a branch, and no tag
+# is created (a draft release does not create its tag until it is published).
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: 'Branch runs only: must stay true (a draft release, no tag created). Every release is a draft; publish it manually.'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: 'true'
+  # Public OAuth client id for the Chrome manifest's oauth2 block (set as a repo variable).
+  # Empty -> the key is omitted from the manifest.
+  SBW_GOOGLE_CLIENT_ID: ${{ vars.SBW_GOOGLE_CLIENT_ID }}
+
+jobs:
+  build:
+    name: build, lint, package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0 - version comes from package.json "packageManager"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 25
+          cache: pnpm
+
+      - name: Read version and check the tag matches package.json
+        id: meta
+        env:
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" != "tag" ] && [ "$DRAFT" != "true" ]; then
+            echo "A non-draft release must run on a tag; use the draft input from a branch." >&2
+            exit 1
+          fi
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm build:firefox
+      - run: pnpm lint:webext -- --self-hosted
+
+      - name: Package (Chrome zip, source zip, checksums)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p dist
+          # Chrome: "Load unpacked" from the extracted zip. -X drops extra file attributes.
+          (cd .output/chrome-mv3 && find . -type f | LC_ALL=C sort | zip -X -q "$GITHUB_WORKSPACE/dist/shopbadwill-${VERSION}-chrome.zip" -@)
+          # Source for AMO and for reproducing the Firefox build: tracked files at this commit only.
+          # git archive output depends only on the commit, so it is reproducible.
+          git archive --format=zip --prefix="shopbadwill-${VERSION}/" \
+            -o "dist/shopbadwill-${VERSION}-sources.zip" HEAD
+          ls -l dist
+
+      - name: Sign Firefox (unlisted); skipped without AMO secrets
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          pnpm sign:firefox "dist/shopbadwill-${VERSION}-sources.zip"
+          if compgen -G ".output/signed/*.xpi" > /dev/null; then
+            cp .output/signed/*.xpi dist/
+          fi
+
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes from CHANGELOG.md
+        run: pnpm --silent release notes > dist-notes.md
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-dist
+          path: |
+            dist/
+            dist-notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # only this job can create releases
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-dist
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # The tag already exists (it triggered this run); the release stays a draft.
+            gh release create "${GITHUB_REF_NAME}" dist/* --draft --verify-tag \
+              --title "ShopBadwill ${VERSION}" --notes-file dist-notes.md
+          else
+            # Branch dispatch: no tag is created. The name is unique per run so reruns never collide.
+            gh release create "v${VERSION}-draft.${GITHUB_RUN_ID}" dist/* \
+              --draft --target "${GITHUB_SHA}" \
+              --title "ShopBadwill ${VERSION} (draft)" --notes-file dist-notes.md
+          fi

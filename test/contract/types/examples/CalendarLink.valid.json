@@ -1,0 +1,9 @@
+{
+  "itemId": 279250057,
+  "eventId": "sbv279250057g0",
+  "generation": 0,
+  "calendarId": "example@group.calendar.google.com",
+  "lastSyncedHash": "h-3f9a1c",
+  "status": "error",
+  "lastError": "HTTP 429 rateLimitExceeded"
+}
