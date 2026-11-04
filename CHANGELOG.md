@@ -3,7 +3,13 @@
 All notable changes to ShopBadwill are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+Versioning: every change that ships in the extension gets a new version (test- or docs-only changes do not).
+PATCH (0.1.x) for fixes, MINOR (0.x.0) for new features or behaviour you would notice, and 1.0.0 once the
+extension is reliable enough to run unattended every day. Bump with `pnpm release patch|minor|major`.
+
 ## [Unreleased]
+
+## [0.1.0] - 2026-11-04
 
 ### Added
 
@@ -15,3 +21,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Continuous integration on pushes to `dev` and pull requests into `main`.
 - Release pipeline: tag-triggered GitHub release with a Chrome zip, a reproducible source zip, `SHA256SUMS`, and an unlisted self-signed Firefox `.xpi` when AMO keys are configured.
 - `pnpm release` version bump and `pnpm sign:firefox` signing scripts.
+- Search-page overlay that highlights or hides listings, big injected Track and Snipe buttons on item pages.
+- Saved watches that run daily and track new matches; hide rules (for example by brand).
+- Google Calendar sync of auction ends with 60/15/5-minute reminders, a toolbar Sync button, and ntfy push reminders.
+- Last-second sniping with a preset max: preflight, clock sampling, a T-60 s verify, one bid per snipe, and an outcome read.
+- Bid groups ("win at most N of these"), spending caps, an exposure meter, a kill switch and an audit log.
+- A live-bidding gate: dry runs first; typing GO LIVE can skip the remaining dry runs, and the skip is audited (T-130).
+
+### Changed
+
+- Ended auctions drop off every list at once and are pruned from storage 6 h after the end; resolved snipes move to "Past snipes" (T-129).
+
+### Fixed
+
+- An item tracked again after it was pruned gets its calendar event again (T-131).
+- ShopGoodwill's "Bid Received" reply to a bid is recognised; its status flag is logged (T-132).
