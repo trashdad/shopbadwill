@@ -1400,16 +1400,42 @@ describe('RequestScheduler: critical requests (R-1)', () => {
     expect(setup({ considerateMode: 'tight' }).sched.stats().lanes.snipe.budget).toBe(120);
   });
 
-  it('a spent snipe budget refuses an ordinary snipe-lane read with `budget`; a critical request runs', async () => {
+  it('fix 1: the snipe budget is a meter, never a brake: an ordinary snipe-lane read still runs and is counted', async () => {
     const h = setup({ lanes: ZERO_GAP_LANES(2) });
     await h.sched.run(req('snipe'));
     await h.sched.run(req('snipe'));
-    expect((await failure(h.sched.run(req('snipe')))).kind).toBe('budget');
-    expect(h.sent).toHaveLength(2);
+    await expect(h.sched.run(req('snipe', { endpoint: 'itemDetail' }))).resolves.toBe('ok');
     await expect(h.sched.run(req('snipe', { critical: true }))).resolves.toBe('ok');
-    expect(h.sent).toHaveLength(3);
-    // It is still counted.
-    expect(h.sched.stats().lanes.snipe.usedToday).toBe(3);
+    expect(h.sent).toHaveLength(4);
+    const snipe = h.sched.stats().lanes.snipe;
+    expect(snipe).toMatchObject({ usedToday: 4, budget: 2 });
+    // stats(): the spent snipe budget does not push nextAllowedAt to midnight.
+    expect(snipe.nextAllowedAt).toBeLessThan(nextLocalMidnight(h.clock.now()));
+  });
+
+  it('fix 1: a spent background budget still refuses with `budget`', async () => {
+    const h = setup({ lanes: { ...ZERO_GAP_LANES(240), background: { minIntervalMs: 0, jitterMs: 0, maxConcurrent: 1, dailyBudget: 1 } } });
+    await h.sched.run(req('background'));
+    expect((await failure(h.sched.run(req('background')))).kind).toBe('budget');
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('fix 1: a restored snipe backoff of unknown kind fails closed: critical refused `blocked`, stats say blocked', async () => {
+    const storage = new FakeStorage();
+    storage.seed({
+      [STORAGE_KEYS.requestSchedulerState]: {
+        version: 1,
+        pause: null,
+        consecutive403: 0,
+        consecutive429: 0,
+        lanes: { snipe: { gapJitterMs: 0, backoffUntil: T0 + 10 * MIN, failures: 0 } },
+      },
+    });
+    const h = setup({ storage });
+    await h.sched.load();
+    expect(h.sched.stats().lanes.snipe.backoffKind).toBe('blocked');
+    expect((await failure(h.sched.run(req('snipe', { critical: true })))).kind).toBe('blocked');
+    expect(h.sent).toHaveLength(0);
   });
 
   it('after a 429 burst pause: ordinary requests refused `paused` on every lane; a critical snipe request runs', async () => {

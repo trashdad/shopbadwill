@@ -29,7 +29,11 @@
 //   ignores the daily budget (it is still counted), a 429-burst pause and its
 //   lane's 429/5xx backoff. A 403 backoff or pause, a manual/health pause, the
 //   one-in-flight rule and the lane gap still apply: a 429 or 5xx elsewhere
-//   must not cost the user an auction, but a 403 means SGW is refusing us.
+//   must not cost the user an auction, but a 403 means SGW is refusing us. A
+//   backoff of unknown kind counts as a 403. The snipe lane's budget is
+//   counted and warned on, never enforced: the lane is runner-only and bounded
+//   by the number of snipes, and a refused clock sample or verify read would
+//   cost the auction just as surely as a refused bid.
 //
 // Persistence (contract change, T-25). Pause, backoff and spacing state lives
 // in `sbw:requestSchedulerState`, the budget in `sbw:requestBudget`. Both are
@@ -384,10 +388,11 @@ export class SgwRequestScheduler implements RequestScheduler {
       const backoffUntil = ls.backoffUntil !== undefined && ls.backoffUntil > now ? ls.backoffUntil : undefined;
       let nextAllowedAt = Math.max(this.gapEndsAt(lane, now), backoffUntil ?? 0);
       if (pause !== undefined && pause.until !== null) nextAllowedAt = Math.max(nextAllowedAt, pause.until);
-      if (usedToday >= budget) nextAllowedAt = Math.max(nextAllowedAt, this.budgetResetsAt(now));
+      // The snipe lane's budget is a meter, never a brake (R-1 fix 1).
+      if (usedToday >= budget && lane !== 'snipe') nextAllowedAt = Math.max(nextAllowedAt, this.budgetResetsAt(now));
       return backoffUntil === undefined
         ? { usedToday, budget, nextAllowedAt }
-        : { usedToday, budget, nextAllowedAt, backoffUntil, backoffKind: ls.backoffKind ?? 'rate-limited' };
+        : { usedToday, budget, nextAllowedAt, backoffUntil, backoffKind: ls.backoffKind ?? 'blocked' };
     };
     const lanes = { interactive: one('interactive'), background: one('background'), snipe: one('snipe'), canary: one('canary') };
     return pause === undefined
@@ -557,13 +562,17 @@ export class SgwRequestScheduler implements RequestScheduler {
       );
     }
     const ls = this.lanes[lane];
-    if (ls.backoffUntil !== undefined && ls.backoffUntil > now && !(critical && ls.backoffKind !== 'blocked')) {
-      return new SgwApiError(ls.backoffKind ?? 'rate-limited', `${lane} lane is backing off`, {
+    // A backoff of unknown kind (an older saved record) fails closed: treated as a 403.
+    const bypassBackoff = critical && ls.backoffKind !== undefined && ls.backoffKind !== 'blocked';
+    if (ls.backoffUntil !== undefined && ls.backoffUntil > now && !bypassBackoff) {
+      return new SgwApiError(ls.backoffKind ?? 'blocked', `${lane} lane is backing off`, {
         retryAfterMs: ls.backoffUntil - now,
       });
     }
     const budget = this.config(lane).dailyBudget;
-    if (!critical && this.usedToday(lane, now) >= budget) {
+    // The snipe lane is runner-only and bounded by the number of snipes: its
+    // budget is counted and warned on (auth-health), never enforced (R-1 fix 1).
+    if (!critical && lane !== 'snipe' && this.usedToday(lane, now) >= budget) {
       return new SgwApiError('budget', `${lane} lane has used its daily budget of ${String(budget)} requests`, {
         retryAfterMs: this.budgetResetsAt(now) - now,
       });

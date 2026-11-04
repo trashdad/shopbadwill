@@ -212,7 +212,8 @@ export type LaneConfig = z.infer<typeof LaneConfigSchema>;
 /**
  * §3.4 lane table. The snipe lane's 1 s interval is the exception justified in §9.
  * The snipe lane's 240 a day (R-1) is about 30 snipes (one costs 7–9 requests);
- * only the runner uses it, so its traffic is bounded by the number of snipes.
+ * only the runner uses it, so its traffic is bounded by the number of snipes. It is
+ * counted and warned on, never enforced (the scheduler skips it for this lane).
  */
 export const DEFAULT_LANES: Readonly<Record<Lane, Readonly<LaneConfig>>> = Object.freeze({
   interactive: Object.freeze({ minIntervalMs: 1000, jitterMs: 300, maxConcurrent: 1, dailyBudget: 300 }),

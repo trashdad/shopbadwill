@@ -13,15 +13,16 @@ you can turn down further.
    |---|---|---|---|
    | interactive | things you click: Run now, badges while you scroll | 1 s (+ up to 0.3 s) | 300 |
    | background | the daily job, outcome reads, preflights | **120 s** (+ up to 15 s) | 120 |
-   | snipe | the final minutes of one armed snipe | 1 s | 240 (about 30 snipes) |
+   | snipe | the final minutes of one armed snipe | 1 s | 240 (about 30 snipes; counted, not enforced) |
    | canary | the CI drift check (not in your browser) | 120 s | 4 |
 
    - Each lane sends one request at a time.
    - Budgets reset at local midnight.
    - A spent lane refuses until then. It does not queue the requests up.
-   - The one exception is the bid itself (the bid form read and the bid):
-     it still goes when the snipe lane's budget is spent. It is counted, and
-     only armed snipes use that lane, so it is bounded by the number of snipes.
+   - The one exception is the snipe lane: its budget is counted and warned
+     on, never enforced. Only armed snipes use that lane, so its traffic is
+     bounded by the number of snipes, and refusing a read in the last minutes
+     would cost you the auction.
 
    The 120 s background gap honours the `Crawl-delay` in SGW's robots.txt.
 

@@ -3749,7 +3749,26 @@ describe('R-1: the snipe lane budget spent before the fire', () => {
     expect(kinds(shared)).toContain('bid.sent');
   });
 
-  it('a dry-run snipe still reaches firing', async () => {
+  it('fix 1: spent before the wake (T−6 min): clock samples and verify succeed, no disarm or fallback, one PlaceBid', async () => {
+    const shared = makeShared();
+    const { w } = await boot(shared);
+    await arm(w);
+    await runTo(shared, END - SKEW - 6 * MIN);
+    expect(stored(shared).state).toBe('armed');
+    await spendSnipeBudget(shared);
+    const detailsBefore = shared.sgw.details.length;
+    await runTo(shared, END + 2 * MIN);
+
+    // The wake's clock samples and the verify read all went out and were answered.
+    expect(shared.sgw.details.length - detailsBefore).toBeGreaterThanOrEqual(4);
+    expect(kinds(shared)).not.toContain('snipe.disarm');
+    expect(kinds(shared)).not.toContain('snipe.fallback');
+    const s = stored(shared);
+    expect(transitions(s)).toContain('verified>firing');
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+
+    it('a dry-run snipe still reaches firing', async () => {
     const shared = makeShared({ settings: settingsWith() });
     const { w } = await boot(shared);
     await arm(w);
