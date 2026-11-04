@@ -9,6 +9,16 @@ extension is reliable enough to run unattended every day. Bump with `pnpm releas
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
+### Added
+
+- New setting "Raise my own bid" (Options, Sniping; on by default, also for existing installs): when you are already the high bidder below your snipe's max, the snipe still fires and raises your own proxy, still exactly one bid (R-4).
+
+### Changed
+
+- A raise whose send times out is recorded as unconfirmed, never "confirmed", and is never resent; the read after the close decides won or lost (R-4).
+
 ## [0.2.3] - 2026-11-04
 
 ### Fixed
