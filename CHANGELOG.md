@@ -9,6 +9,13 @@ extension is reliable enough to run unattended every day. Bump with `pnpm releas
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-04
+
+### Fixed
+
+- The quick result reads after a snipe stay logged in, so won or lost is confirmed sooner (R-5).
+- The bid reply's "high bidder" flag never decides won or lost: without a read after the close, the result shows Unconfirmed (R-5).
+
 ## [0.2.1] - 2026-11-04
 
 ### Fixed
