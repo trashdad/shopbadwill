@@ -51,6 +51,12 @@ export const SettingsSchema = z.object({
     requiredDryRuns: z.number().int().nonnegative(),
     completedDryRuns: z.number().int().nonnegative(),
     tier: z.enum(['T0', 'T1', 'T2']),
+    /**
+     * R-4 (additive, optional): when the T-60 s read shows the user already the
+     * high bidder at a price below the snipe's max, still fire (SGW raises the
+     * user's own proxy). Absent means on, the default.
+     */
+    raiseOwnProxy: z.boolean().optional(),
   }),
   /**
    * T-111 (additive, optional): the T2 wake companion. `profile` is the

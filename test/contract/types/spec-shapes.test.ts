@@ -441,7 +441,7 @@ type SpecSnipeEvent =
       now: EpochMs;
       reason: 'ended' | 'extended' | 'price-over-max' | 'already-high' | 'auth' | 'network' | 'clock' | 'cap';
     }
-  | { type: 'fire'; now: EpochMs }
+  | { type: 'fire'; now: EpochMs; wasHighBidder?: true }
   | { type: 'sent'; now: EpochMs; key: string }
   | { type: 'result'; now: EpochMs; result: SpecBidResult }
   | { type: 'ambiguous'; now: EpochMs }
@@ -513,6 +513,8 @@ interface SpecSettings {
     requiredDryRuns: number;
     completedDryRuns: number;
     tier: 'T0' | 'T1' | 'T2';
+    /** R-4 (additive): still fire when already the high bidder below the max. */
+    raiseOwnProxy?: boolean;
   };
   /** T-111 (additive): the T2 companion's browser profile. */
   companion?: { profile: string };

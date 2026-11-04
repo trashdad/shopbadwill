@@ -64,7 +64,7 @@ import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
 import { DEFAULT_LANES, type HealthReport, type SgwSessionRecord } from '../../src/domain/types';
 import type { AlarmInfo, Alarms } from '../../src/ports/alarms';
 import type { Clock } from '../../src/ports/clock';
-import { HttpNetworkError } from '../../src/ports/errors';
+import { HttpNetworkError, HttpTimeoutError } from '../../src/ports/errors';
 import type { Http, HttpRequest, HttpResponse } from '../../src/ports/http';
 import type { KeepAlive } from '../../src/ports/keep-alive';
 import type { Notification, Notifier } from '../../src/ports/notifier';
@@ -2622,10 +2622,109 @@ describe('auto-kill on anomalies (clock, latency, schema drift)', () => {
     const { w } = await boot(shared);
     await arm(w);
     await runTo(shared, END - SKEW - 2 * MIN);
-    shared.sgw.item.high = true;
+    // R-4: at a price that already reaches the max, raising the own proxy cannot help.
+    shared.sgw.item = { ...shared.sgw.item, high: true, price: MAX, minimumBid: MAX + 100 };
     await runTo(shared, END + 2 * MIN);
     expect(stored(shared)).toMatchObject({ state: 'resolved', outcome: 'skipped' });
     expect(shared.sgw.placeBids).toHaveLength(0);
+  });
+});
+
+// ── R-4: already the high bidder below the max raises the user's own proxy ────
+
+describe('R-4: already the high bidder below the max', () => {
+  const RAISE_MAX = 5000;
+
+  function settingsRaise(on: boolean): Settings {
+    const s = settingsWith({ live: true });
+    s.snipe.raiseOwnProxy = on;
+    return s;
+  }
+
+  async function armHigh(shared: Shared, opts: WorkerOptions = {}): Promise<void> {
+    const { w } = await boot(shared, opts);
+    shared.sgw.item = { ...shared.sgw.item, price: 2000, minimumBid: 2100 };
+    await arm(w, { maxBid: RAISE_MAX }, '50.00');
+    await runTo(shared, END - SKEW - 2 * MIN);
+    expect(stored(shared).state).toBe('waking');
+    shared.sgw.item.high = true;
+  }
+
+  function fireDetails(shared: Shared): Record<string, unknown> | undefined {
+    return audits(shared).find((a) => a.kind === 'bid.fire')?.details;
+  }
+
+  it('setting on, price below the max: verified, fires once at the max, and the fire records wasHighBidder', async () => {
+    const shared = makeShared({ settings: settingsRaise(true) });
+    await armHigh(shared);
+    await runTo(shared, FIRE_LOCAL - 2 * SEC);
+    expect(stored(shared).state).toBe('verified');
+    await runTo(shared, END + 2 * MIN);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+    expect(shared.sgw.placeBids[0]?.body.bidAmount).toBe(bidAmount(RAISE_MAX));
+    expect(fireDetails(shared)).toMatchObject({ amount: RAISE_MAX, wasHighBidder: true });
+  });
+
+  it('setting on, price at the max: resolved already-high, nothing sent', async () => {
+    const shared = makeShared({ settings: settingsRaise(true) });
+    await armHigh(shared);
+    shared.sgw.item = { ...shared.sgw.item, price: RAISE_MAX, minimumBid: RAISE_MAX + 100 };
+    await runTo(shared, END + 2 * MIN);
+    expect(stored(shared)).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(stored(shared).history.some((h) => h.why === 'verify-failed: already-high')).toBe(true);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+    expect(shared.sgw.modals).toHaveLength(0);
+  });
+
+  it("setting off, price below the max: resolved already-high, nothing sent (today's behaviour)", async () => {
+    const shared = makeShared({ settings: settingsRaise(false) });
+    await armHigh(shared);
+    await runTo(shared, END + 2 * MIN);
+    expect(stored(shared)).toMatchObject({ state: 'resolved', outcome: 'skipped' });
+    expect(stored(shared).history.some((h) => h.why === 'verify-failed: already-high')).toBe(true);
+    expect(shared.sgw.placeBids).toHaveLength(0);
+  });
+
+  it('a settings record without raiseOwnProxy raises (the default is on)', async () => {
+    const legacy = settingsWith({ live: true });
+    delete (legacy.snipe as Partial<Settings['snipe']>).raiseOwnProxy;
+    const shared = makeShared({ settings: legacy });
+    await armHigh(shared);
+    await runTo(shared, END + 2 * MIN);
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+
+  it('the uncatalogued reply is rejected-unknown; the post-read showing the lead settles won; no second send', async () => {
+    const shared = makeShared({ settings: settingsRaise(true) });
+    await armHigh(shared);
+    // An uncatalogued code: it classifies as rejected-unknown.
+    shared.sgw.placeBidStep = {
+      status: 200,
+      bodyText: JSON.stringify({ status: true, result: 0, message: 'Bid placed' }),
+      latencyMs: LATENCY,
+    };
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared)).toMatchObject({ state: 'sent', attempt: { reply: { kind: 'rejected-unknown' } } });
+    await runTo(shared, END + 2 * MIN);
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'won' });
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+
+  // Fix round 1: the standing lead is no proof the raise landed, so a timed-out raise is ambiguous.
+  it('a timed-out raise is ambiguous (never "confirmed"); outbid at the close settles outbid; one send', async () => {
+    const shared = makeShared({ settings: settingsRaise(true) });
+    await armHigh(shared);
+    shared.sgw.placeBidStep = { error: new HttpTimeoutError(20_000), latencyMs: LATENCY };
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared)).toMatchObject({ state: 'sent', attempt: { ambiguous: true } });
+    shared.sgw.item = { ...shared.sgw.item, high: false, price: 3500, minimumBid: 3600, closed: true };
+    await runTo(shared, END + 2 * MIN);
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'outbid', attempt: { ambiguous: true } });
+    expect(s.attempt.reply).toBeUndefined();
+    expect(JSON.stringify(audits(shared))).not.toMatch(/confirmed/i);
+    expect(shared.sgw.placeBids).toHaveLength(1);
   });
 });
 
@@ -2881,7 +2980,8 @@ describe('T-84b: content exits win over the latency anomaly at the verify', () =
     await runTo(shared, END - SKEW - 2 * MIN);
     expect(stored(shared).state).toBe('waking');
     shared.sgw.latency = 2500;
-    shared.sgw.item.high = true;
+    // R-4: already high at a price that reaches the max (below it, the snipe raises its own proxy).
+    shared.sgw.item = { ...shared.sgw.item, high: true, price: MAX, minimumBid: MAX + 100 };
     await runTo(shared, END + 2 * MIN);
 
     expect(stored(shared)).toMatchObject({ state: 'resolved', outcome: 'skipped' });

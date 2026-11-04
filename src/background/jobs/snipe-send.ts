@@ -18,6 +18,7 @@
 //     same max, the same key;
 //   - under 2 s left, or the read failed or is inconclusive → no resend,
 //     ambiguous. NEVER not-sent on this path.
+//   - On a raise (`req.raise`), the proof read proves nothing either way: ambiguous, never a resend.
 // - R3. Once any request of the attempt MAY have left, the strategy never
 //   returns `not-sent` for that attempt, even when a later retry throws
 //   `BidNotSentError` (it would mean the retry itself left nothing, but the
@@ -105,9 +106,9 @@ async function resolveAmbiguous(req: SendRequest, deps: SendDeps, error: unknown
     // The read failed: no resend, and never a not-sent claim (R3).
     return { kind: 'ambiguous', error };
   }
-  if (bidPresent(detail)) return { kind: 'result', result: acceptedFromProof(detail, deps) };
+  if (bidPresent(detail)) return req.raise === true ? { kind: 'ambiguous', error } : { kind: 'result', result: acceptedFromProof(detail, deps) };
   const endMs = isoMs(req.snipe.endTime);
-  if (nothingChanged(detail) && endMs - deps.serverNow() >= PROOF_RESEND_MIN_TIME_LEFT_MS) {
+  if (req.raise !== true && nothingChanged(detail) && endMs - deps.serverNow() >= PROOF_RESEND_MIN_TIME_LEFT_MS) {
     try {
       return { kind: 'result', result: await placeBid(req, deps) };
     } catch (retryError) {

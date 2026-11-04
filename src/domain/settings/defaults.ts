@@ -64,6 +64,8 @@ export const DEFAULT_SETTINGS: DeepReadonly<Settings> = freezeDeep<Settings>({
     requiredDryRuns: 5,
     completedDryRuns: 0,
     tier: 'T0',
+    // R-4: already the high bidder below the max still fires (raises the own proxy).
+    raiseOwnProxy: true,
   },
   killSwitch: false,
 });

@@ -203,6 +203,8 @@ export interface SendRequest {
   readonly idempotencyKey: string;
   /** PlaceBid's abort; bid.ts caps it at 20 s (T-100). */
   readonly timeoutMs: number;
+  /** R-4: the last read showed the user already the high bidder; the bid raises their own proxy, so a proof read cannot tell the raise from the standing lead. */
+  readonly raise?: true;
 }
 
 export interface SendDeps {
@@ -1089,7 +1091,15 @@ export class SnipeRunner {
     let outcome: SendOutcome;
     try {
       outcome = await this.seams.sendStrategy.send(
-        { snipe: sent.next, kind: eff.kind, amount: eff.amount, sellerId, idempotencyKey: key, timeoutMs: PLACE_BID_TIMEOUT_MS },
+        {
+          snipe: sent.next,
+          kind: eff.kind,
+          amount: eff.amount,
+          sellerId,
+          idempotencyKey: key,
+          timeoutMs: PLACE_BID_TIMEOUT_MS,
+          ...(this.details.get(id)?.isHighBidder === true ? { raise: true as const } : {}),
+        },
         { api: this.ctx.api, clock: this.ctx.clock, serverNow: () => this.ctx.clock.now() + this.offsetFor(sent.next) },
       );
     } catch (error) {
@@ -1272,7 +1282,7 @@ export class SnipeRunner {
     }
     const now = this.ctx.clock.now();
     const sessionUsable = usableSession(await this.ctx.session.state());
-    const ev = this.verifyEvent(s, detail, now, sessionUsable);
+    const ev = this.verifyEvent(s, detail, now, sessionUsable, settings.snipe.raiseOwnProxy !== false);
     // T-84b: when the verify read returned a body, the content exits (ended,
     // extended, already-high, price-over-max, auth, clock) take precedence over
     // the latency anomaly. The latency anomaly (with its fallback) applies only
@@ -1303,8 +1313,12 @@ export class SnipeRunner {
     });
   }
 
-  /** Maps the verify read to `verified` / `verify-failed`; the reducer judges ended, extended, clock and caps. */
-  private verifyEvent(s: Snipe, d: ItemDetail, now: EpochMs, sessionUsable: boolean): SnipeEvent {
+  /**
+   * Maps the verify read to `verified` / `verify-failed`; the reducer judges ended, extended, clock and caps.
+   * R-4: with `raiseOwnProxy` on, already leading is `already-high` only at a price that reaches the
+   * max; below it the checks go on and the snipe fires (SGW raises the user's own proxy: one bid).
+   */
+  private verifyEvent(s: Snipe, d: ItemDetail, now: EpochMs, sessionUsable: boolean, raiseOwnProxy: boolean): SnipeEvent {
     const offset = this.ctx.sgwClock.offset();
     const clockKnown = offset !== null && offset.confidence !== 'none';
     const endMs = isoMs(d.endTime);
@@ -1313,7 +1327,9 @@ export class SnipeRunner {
     if ((over || later) && clockKnown) return { type: 'verified', now, detail: d, offsetMs: offset.offsetMs, rttMs: offset.rttMs };
     if (over) return { type: 'verify-failed', now, reason: 'ended' };
     if (later) return { type: 'verify-failed', now, reason: 'extended' };
-    if (d.isHighBidder === true) return { type: 'verify-failed', now, reason: 'already-high' };
+    if (d.isHighBidder === true && (!raiseOwnProxy || d.currentPrice >= s.maxBid)) {
+      return { type: 'verify-failed', now, reason: 'already-high' };
+    }
     // `minimumBid` is the next acceptable bid (detail value).
     if (!(d.minimumBid <= s.maxBid)) return { type: 'verify-failed', now, reason: 'price-over-max' };
     if (!sessionUsable) return { type: 'verify-failed', now, reason: 'auth' };
@@ -1339,7 +1355,9 @@ export class SnipeRunner {
       this.setTimer(s.id, fireLocal);
       return 'wait';
     }
-    await this.commit(s.id, { type: 'fire', now }, { expectVersion: s.history.length });
+    // R-4: the verify read (or the restart's re-read) showed the user already leading below the max.
+    const fire: SnipeEvent = this.details.get(s.id)?.isHighBidder === true ? { type: 'fire', now, wasHighBidder: true } : { type: 'fire', now };
+    await this.commit(s.id, fire, { expectVersion: s.history.length });
     return 'continue';
   }
 
