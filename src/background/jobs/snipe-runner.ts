@@ -203,6 +203,8 @@ export interface SendRequest {
   readonly idempotencyKey: string;
   /** PlaceBid's abort; bid.ts caps it at 20 s (T-100). */
   readonly timeoutMs: number;
+  /** R-4: the last read showed the user already the high bidder; the bid raises their own proxy, so a proof read cannot tell the raise from the standing lead. */
+  readonly raise?: true;
 }
 
 export interface SendDeps {
@@ -1089,7 +1091,15 @@ export class SnipeRunner {
     let outcome: SendOutcome;
     try {
       outcome = await this.seams.sendStrategy.send(
-        { snipe: sent.next, kind: eff.kind, amount: eff.amount, sellerId, idempotencyKey: key, timeoutMs: PLACE_BID_TIMEOUT_MS },
+        {
+          snipe: sent.next,
+          kind: eff.kind,
+          amount: eff.amount,
+          sellerId,
+          idempotencyKey: key,
+          timeoutMs: PLACE_BID_TIMEOUT_MS,
+          ...(this.details.get(id)?.isHighBidder === true ? { raise: true as const } : {}),
+        },
         { api: this.ctx.api, clock: this.ctx.clock, serverNow: () => this.ctx.clock.now() + this.offsetFor(sent.next) },
       );
     } catch (error) {

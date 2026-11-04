@@ -788,6 +788,50 @@ function realStack(): { api: SgwApiAdapter; http: FakeHttp; clock: FakeClock; ki
   };
 }
 
+// ── R-4: a raise (already the high bidder) — the proof read proves nothing ──
+
+describe("R-4: a raise of the user's own proxy", () => {
+  it('timeout, proof read shows the lead → ambiguous (the standing lead is not proof of the raise), one wire send', async () => {
+    const clock = new FakeClock(T0);
+    const log: string[] = [];
+    const sends: WireSend[] = [];
+    const api = scriptedApi({ place: ['ambiguous', 'ok'], proof: 'present' }, log, sends, clock);
+    const deps = makeDeps(api, clock, () => END - 5 * SEC);
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest({ raise: true }), deps);
+
+    expect(outcome.kind).toBe('ambiguous');
+    expect(sends).toHaveLength(1);
+    expect(log.filter((x) => x === 'itemDetail')).toHaveLength(1);
+  });
+
+  it('timeout, proof read shows nothing changed with time left → still ambiguous, no resend', async () => {
+    const clock = new FakeClock(T0);
+    const log: string[] = [];
+    const sends: WireSend[] = [];
+    const api = scriptedApi({ place: ['ambiguous', 'ok'], proof: 'no-change' }, log, sends, clock);
+    const deps = makeDeps(api, clock, () => END - 10 * SEC);
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest({ raise: true }), deps);
+
+    expect(outcome.kind).toBe('ambiguous');
+    expect(sends).toHaveLength(1);
+    expect(log.filter((x) => x === 'placeBid')).toHaveLength(1);
+  });
+
+  it('not a raise: timeout, proof read shows the lead → accepted from the proof read (unchanged)', async () => {
+    const clock = new FakeClock(T0);
+    const sends: WireSend[] = [];
+    const api = scriptedApi({ place: ['ambiguous', 'ok'], proof: 'present' }, [], sends, clock);
+    const deps = makeDeps(api, clock, () => END - 5 * SEC);
+
+    const outcome = await IDEMPOTENT_SEND_STRATEGY.send(makeRequest(), deps);
+
+    expect(outcome).toMatchObject({ kind: 'result', result: { kind: 'accepted', messageText: 'Bid confirmed by the proof read (isHighBidder)' } });
+    expect(sends).toHaveLength(1);
+  });
+});
+
 describe('the proof read on the real adapter', () => {
   it('is a fresh authenticated snipe-lane read: a cached anonymous zero-bid detail cannot cause a resend', async () => {
     const live = realStack();

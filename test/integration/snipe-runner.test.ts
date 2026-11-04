@@ -64,7 +64,7 @@ import type { Snipe, SnipeEvent } from '../../src/domain/snipe/types';
 import { DEFAULT_LANES, type HealthReport, type SgwSessionRecord } from '../../src/domain/types';
 import type { AlarmInfo, Alarms } from '../../src/ports/alarms';
 import type { Clock } from '../../src/ports/clock';
-import { HttpNetworkError } from '../../src/ports/errors';
+import { HttpNetworkError, HttpTimeoutError } from '../../src/ports/errors';
 import type { Http, HttpRequest, HttpResponse } from '../../src/ports/http';
 import type { KeepAlive } from '../../src/ports/keep-alive';
 import type { Notification, Notifier } from '../../src/ports/notifier';
@@ -2708,6 +2708,22 @@ describe('R-4: already the high bidder below the max', () => {
     await runTo(shared, END + 2 * MIN);
     const s = stored(shared);
     expect(s).toMatchObject({ state: 'resolved', outcome: 'won' });
+    expect(shared.sgw.placeBids).toHaveLength(1);
+  });
+
+  // Fix round 1: the standing lead is no proof the raise landed, so a timed-out raise is ambiguous.
+  it('a timed-out raise is ambiguous (never "confirmed"); outbid at the close settles outbid; one send', async () => {
+    const shared = makeShared({ settings: settingsRaise(true) });
+    await armHigh(shared);
+    shared.sgw.placeBidStep = { error: new HttpTimeoutError(20_000), latencyMs: LATENCY };
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared)).toMatchObject({ state: 'sent', attempt: { ambiguous: true } });
+    shared.sgw.item = { ...shared.sgw.item, high: false, price: 3500, minimumBid: 3600, closed: true };
+    await runTo(shared, END + 2 * MIN);
+    const s = stored(shared);
+    expect(s).toMatchObject({ state: 'resolved', outcome: 'outbid', attempt: { ambiguous: true } });
+    expect(s.attempt.reply).toBeUndefined();
+    expect(JSON.stringify(audits(shared))).not.toMatch(/confirmed/i);
     expect(shared.sgw.placeBids).toHaveLength(1);
   });
 });
