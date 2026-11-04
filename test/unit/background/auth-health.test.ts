@@ -10,6 +10,7 @@ import { browser } from 'wxt/browser';
 
 import type { BackgroundContext } from '../../../src/background/context';
 import {
+  assessAuthHealth,
   authWarnAlarmName,
   authWarnDeferUntil,
   createAuthHealth,
@@ -18,6 +19,7 @@ import {
   AUTH_WARN_ALARM_PREFIX,
   AUTH_WARN_KIND,
   type AuthHealthDeps,
+  type AuthHealthSnapshot,
 } from '../../../src/background/jobs/auth-health';
 import type { AuthHealth } from '../../../src/background/jobs/snipe-runner';
 import { defaultSettings } from '../../../src/domain/settings/defaults';
@@ -26,7 +28,8 @@ import { SESSION_MARGIN_AFTER_END_MS } from '../../../src/domain/snipe/preflight
 import type { Snipe } from '../../../src/domain/snipe/types';
 import { Repo } from '../../../src/domain/storage/repo';
 import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
-import type { EpochMs, HealthReport, SgwSessionState } from '../../../src/domain/types';
+import { formatDual } from '../../../src/domain/time/pacific';
+import type { EpochMs, HealthReport, RequestSchedulerStats, SgwSessionState } from '../../../src/domain/types';
 import type { SgwSession } from '../../../src/ports/sgw-session';
 import { FakeAlarms } from '../../fakes/ports/fake-alarms';
 import { FakeAuditLog } from '../../fakes/ports/fake-audit-log';
@@ -81,6 +84,18 @@ let settings: Settings;
 let healthLast: HealthReport | null;
 let sessionRecord: { expiresAt: EpochMs } | null;
 let keepAwakeAvailable: boolean;
+let schedStats: RequestSchedulerStats;
+
+const lane = (over: Partial<RequestSchedulerStats['lanes']['snipe']> = {}): RequestSchedulerStats['lanes']['snipe'] => ({
+  usedToday: 0,
+  budget: 240,
+  nextAllowedAt: 0,
+  ...over,
+});
+const healthyStats = (): RequestSchedulerStats => ({
+  lanes: { interactive: lane({ budget: 300 }), background: lane({ budget: 120 }), snipe: lane(), canary: lane({ budget: 4 }) },
+  cacheHits: 0,
+});
 
 beforeEach(() => {
   clock = new FakeClock(NOW);
@@ -96,6 +111,7 @@ beforeEach(() => {
   healthLast = null;
   sessionRecord = { expiresAt: END + DAY };
   keepAwakeAvailable = true;
+  schedStats = healthyStats();
 });
 
 const snipe = (over: Partial<Snipe> = {}): Snipe => ({
@@ -139,6 +155,7 @@ const deps = (): AuthHealthDeps => ({
   openOptions: () => undefined,
   getSnipe: async (id: string) => (await repo.get(STORAGE_KEYS.snipes))[id],
   repo,
+  scheduler: { stats: () => schedStats },
 });
 
 const make = (): AuthHealth => createAuthHealth(deps());
@@ -603,13 +620,13 @@ describe('T-91 auth-health: alarm names and the register() seam', () => {
         repo,
         api: sgw,
         http: {},
-        scheduler: {},
+        scheduler: { stats: () => schedStats },
         calendarApi: {},
         sgwClock: {},
       } as unknown as BackgroundContext,
       {
         get(target, prop, receiver) {
-          if (prop === 'api' || prop === 'http' || prop === 'scheduler' || prop === 'calendarApi' || prop === 'sgwClock') {
+          if (prop === 'api' || prop === 'http' || prop === 'calendarApi' || prop === 'sgwClock') {
             touched.push(prop);
           }
           const value: unknown = Reflect.get(target, prop, receiver);
@@ -626,7 +643,7 @@ describe('T-91 auth-health: alarm names and the register() seam', () => {
       expect(notifier.sent).toHaveLength(1);
     });
     expect(notifier.sent[0]?.notification.message).toContain('Turn on Keep awake');
-    // R3 / I-39: the check never touches the SGW API, HTTP, or the scheduler.
+    // R3 / I-39: the check never touches the SGW API or HTTP; the scheduler only for stats() (R-1, cached).
     expect(sgw.calls).toEqual([]);
     expect(touched).toEqual([]);
   });
@@ -702,5 +719,100 @@ describe('T-91 auth-health: alarm names and the register() seam', () => {
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+});
+
+// ── R-1: the snipe lane running dry, or SGW asking to slow down ─────────────
+
+describe('R-1 auth-health: snipe-lane low water and slow-down warnings', () => {
+  const LOW = (n: number): string =>
+    `The snipe lane has only ${String(n)} SGW requests left today (a snipe needs about 8). Fewer snipes today, or turn off considerate mode.`;
+  const SLOW = (until: EpochMs): string =>
+    `SGW asked ShopBadwill to slow down (until ${formatDual(until, 'America/New_York')}); the bid itself will still go, but the checks before it may not.`;
+
+  const base = (snipeLane: AuthHealthSnapshot['snipeLane']): AuthHealthSnapshot => ({
+    sessionState: 'ok',
+    tokenExpiresAt: END + DAY,
+    sessionRecordExpiresAt: END + DAY,
+    google: null,
+    calendarEnabled: false,
+    healthReport: null,
+    keepAwakeAvailable: true,
+    powerGranted: true,
+    tier: 'T0',
+    timeZone: 'America/New_York',
+    snipeLane,
+  });
+  const lane0 = { left: 240, paused: false, backingOff: false, blocked: false, until: null };
+
+  it('15 left → the low-water warning (exact text); 16 → none', () => {
+    const low = assessAuthHealth(snipe(), NOW, base({ ...lane0, left: 15 }));
+    expect(low.result).toEqual({ ok: true });
+    expect(low.warnings).toEqual([LOW(15)]);
+    expect(assessAuthHealth(snipe(), NOW, base({ ...lane0, left: 16 })).warnings).toEqual([]);
+  });
+
+  it('a 429 pause or a snipe-lane 429/5xx backoff → the slow-down warning; never ok:false', () => {
+    const until = NOW + 30 * 60_000;
+    const paused = assessAuthHealth(snipe(), NOW, base({ ...lane0, paused: true, until }));
+    expect(paused).toEqual({ result: { ok: true }, warnings: [SLOW(until)] });
+    const backoff = assessAuthHealth(snipe(), NOW, base({ ...lane0, backingOff: true, until }));
+    expect(backoff.warnings).toEqual([SLOW(until)]);
+  });
+
+  it('a 403 (blocked) or manual pause does not claim the bid will still go', () => {
+    const until = NOW + 6 * HOUR;
+    const r = assessAuthHealth(snipe(), NOW, base({ ...lane0, paused: true, blocked: true, until }));
+    expect(r.result).toEqual({ ok: true });
+    expect(r.warnings).toEqual([
+      `ShopBadwill's SGW requests are paused (until ${formatDual(until, 'America/New_York')}), so the bid will not go unless the pause ends first. See the health section in options.`,
+    ]);
+    const open = assessAuthHealth(snipe(), NOW, base({ ...lane0, paused: true, blocked: true, until: null }));
+    expect(open.warnings).toEqual([
+      "ShopBadwill's SGW requests are paused (until resumed), so the bid will not go unless the pause ends first. See the health section in options.",
+    ]);
+  });
+
+  it('snipeLane: null → no warning', () => {
+    expect(assessAuthHealth(snipe(), NOW, base(null)).warnings).toEqual([]);
+  });
+
+  it('check(): reads the scheduler stats (left = budget − used; pause and backoff) and sends the warning', async () => {
+    const until = NOW + 10 * 60_000;
+    schedStats = {
+      ...healthyStats(),
+      lanes: { ...healthyStats().lanes, snipe: lane({ usedToday: 230, backoffUntil: until, backoffKind: 'server' }) },
+    };
+    settings.locale.timeZone = 'America/New_York';
+    const r = await make().check(snipe(), '24h');
+    expect(r).toEqual({ ok: true });
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(1);
+    });
+    const msg = notifier.sent[0]?.notification.message ?? '';
+    expect(msg).toContain(LOW(10));
+    expect(msg).toContain(SLOW(until));
+  });
+
+  it('check(): a 403 pause in the stats is reported as blocked; a throwing stats() is no snipe-lane warning', async () => {
+    schedStats = { ...healthyStats(), paused: { until: NOW + 6 * HOUR, reason: 'x', cause: 'blocked' } };
+    settings.locale.timeZone = 'America/New_York';
+    await make().check(snipe(), '24h');
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(1);
+    });
+    expect(notifier.sent[0]?.notification.message).toContain('so the bid will not go unless the pause ends first');
+
+    const quiet = createAuthHealth({
+      ...deps(),
+      scheduler: {
+        stats: () => {
+          throw new Error('not ready');
+        },
+      },
+    });
+    await expect(quiet.check(snipe({ id: 's2' }), '24h')).resolves.toEqual({ ok: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(notifier.sent).toHaveLength(1);
   });
 });
