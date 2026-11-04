@@ -189,8 +189,9 @@ interface Verdict {
 function judgeAccepted(s: Snipe, bid: BidResult | null, post: ItemDetail | null): Verdict {
   const accepted = bid?.kind === 'accepted';
   if (bid?.kind === 'outbid') return { outcome: 'outbid', how: 'reported by SGW' };
-  // An unrecognised reply's own flag is unverified: only the post-read may speak for it.
-  const high = bid?.kind === 'rejected-unknown' ? (post?.isHighBidder ?? null) : (post?.isHighBidder ?? bid?.isHighBidder ?? null);
+  // R-5: only the post-read may say who leads. A reply's own high-bidder flag dates from
+  // the send (seconds before the end) and is evidence in the audit, never the verdict.
+  const high = post?.isHighBidder ?? null;
   if (high === true) return { outcome: 'won', how: 'reported by SGW' };
   // T-87d: not leading at a price below the max. A registered max above the price
   // would lead, so the bid is not on record: at the close (with no accepted reply)

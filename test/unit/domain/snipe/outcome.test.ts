@@ -490,14 +490,14 @@ describe('T-80b: a sent snipe judged with no read at all', () => {
     expect(r.stamp).toBeNull();
   });
 
-  it('an accepted, leading reply: not final, no "auction still open", no re-read claimed', () => {
+  // R-5: the reply's own high-bidder flag no longer says "Leading"; with no read it is Unconfirmed.
+  it('an accepted reply flagged high: Unconfirmed, not final, no "auction still open", no re-read claimed', () => {
     const r = classifyOutcome(snipe(), bid('accepted', { isHighBidder: true }), null);
-    expect(r.outcome).toBe('won');
+    expect(r.outcome).toBe('network');
     expect(r.final).toBe(false);
     expect(r.stamp).toBeNull();
-    expect(r.notify.title).toMatch(/^Leading:/);
-    expect(r.notify.message).toMatch(/^Leading when the bid went in/);
-    expect(r.notify.message).not.toMatch(/^Won/);
+    expect(r.notify.title).toMatch(/^Unconfirmed:/);
+    expect(r.notify.message).not.toMatch(/^(Won|Leading)/);
     expect(r.notify.message).toContain('the item could not be read');
     expect(r.notify.message).not.toContain('still open');
     expect(r.notify.message).not.toContain('re-reading');
@@ -746,5 +746,31 @@ describe('T-132: the catalogued live reply (status true, result 1)', () => {
   it('an unrecognised reply stored before T-132 (no statusFlag) still names its raw status', () => {
     const r = classifyOutcome(snipe(), bid('rejected-unknown', { rawStatus: null, rawResult: 12, messageText: 'odd' }), detail({ isHighBidder: true }));
     expect(r.detail).toContain('Unrecognised reply (status null, result 12): odd');
+  });
+});
+
+describe("R-5: the bid reply's high-bidder flag never decides won/lost", () => {
+  const leadingReply = () => bid('accepted', { isHighBidder: true });
+
+  it('accepted reply flagged high + anonymous closed read above the max → outbid, never won', () => {
+    const r = classifyOutcome(snipe(), leadingReply(), detail({ isHighBidder: null, currentPrice: 2350 }));
+    expect(r.outcome).toBe('outbid');
+    expect(r.stamp?.outcome).toBe('lost');
+  });
+
+  it('accepted reply flagged high + anonymous closed read below the max → won, inferred from the price', () => {
+    const r = classifyOutcome(snipe(), leadingReply(), detail({ isHighBidder: null, currentPrice: 1800 }));
+    expect(r.outcome).toBe('won');
+    expect(r.detail).toContain('inferred from the price');
+  });
+
+  it('accepted reply flagged high + authenticated closed read not high above the max → outbid', () => {
+    const r = classifyOutcome(snipe(), leadingReply(), detail({ isHighBidder: false, currentPrice: 2350 }));
+    expect(r.outcome).toBe('outbid');
+  });
+
+  it('rejected-unknown reply + authenticated read high → won (unchanged)', () => {
+    const r = classifyOutcome(snipe(), bid('rejected-unknown', { rawStatus: null, rawResult: 12, messageText: 'odd' }), detail({ isHighBidder: true, currentPrice: 1800 }));
+    expect(r.outcome).toBe('won');
   });
 });

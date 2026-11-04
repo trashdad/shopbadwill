@@ -1013,6 +1013,58 @@ describe('money safety carries', () => {
     expect(runnerRecord(shared).entries.s1).toBeUndefined();
   });
 
+  it('R-5: a retried fast outcome read runs on lane snipe with the bearer', async () => {
+    const shared = makeShared();
+    const { w, ctx } = await boot(shared);
+    const lanes: string[] = [];
+    const orig = ctx.api.itemDetail.bind(ctx.api);
+    vi.spyOn(ctx.api, 'itemDetail').mockImplementation((...args: Parameters<typeof orig>) => {
+      lanes.push(args[1]);
+      return orig(...args);
+    });
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared).state).toBe('sent');
+    const lanesBefore = lanes.length;
+    const readsBefore = shared.sgw.details.length;
+
+    // The first outcome read fails, the second succeeds.
+    shared.sgw.detailFaults.push(net());
+    await runTo(shared, END + 10 * MIN);
+    expect(stored(shared).state).toBe('resolved');
+    const reads = shared.sgw.details.slice(readsBefore);
+    expect(reads).toHaveLength(2);
+    expect(lanes.slice(lanesBefore)).toEqual(['snipe', 'snipe']);
+    expect(reads.map((r) => r.auth)).toEqual([true, true]);
+  });
+
+  it('R-5: after the fast attempts fail, the next (slow) outcome read is on lane background', async () => {
+    const shared = makeShared();
+    const { w, ctx } = await boot(shared);
+    const lanes: string[] = [];
+    const orig = ctx.api.itemDetail.bind(ctx.api);
+    vi.spyOn(ctx.api, 'itemDetail').mockImplementation((...args: Parameters<typeof orig>) => {
+      lanes.push(args[1]);
+      return orig(...args);
+    });
+    await arm(w);
+    await runTo(shared, FIRE_LOCAL + 3 * SEC);
+    expect(stored(shared).state).toBe('sent');
+    const lanesBefore = lanes.length;
+    const readsBefore = shared.sgw.details.length;
+
+    shared.sgw.detailDown = net();
+    await runTo(shared, END + 45 * MIN);
+    expect(lanes.slice(lanesBefore)).toEqual(['snipe', 'snipe', 'snipe']);
+    expect(shared.sgw.details.slice(readsBefore).map((r) => r.auth)).toEqual([true, true, true]);
+
+    // The 4th attempt (6 h on) also fails; it ran anonymous, on lane background.
+    await runTo(shared, END + 7 * HOUR);
+    expect(lanes.slice(lanesBefore)).toEqual(['snipe', 'snipe', 'snipe', 'background']);
+    expect(shared.sgw.details.slice(readsBefore)[3]?.auth).toBe(false);
+    expect(stored(shared).state).toBe('sent');
+  });
+
   it('effects outbox: notifications and audit entries pending at a crash are delivered after the restart', async () => {
     const shared = makeShared();
     // Crash right after the post-read resolves the snipe: its outcome notice is still in the outbox.
@@ -2623,7 +2675,8 @@ describe('T-84b: the 7-day give-up settles a sent snipe (post-read-failed)', () 
     expect(snipeNotes[0]?.notification.message).not.toMatch(NO_BID_CLAIM);
   });
 
-  it('an accepted, leading reply makes both alerts say "Leading", never "Won" or "Not bid"', async () => {
+  // R-5: the reply's own high-bidder flag is evidence only; with no read it never says Leading or Won.
+  it('an accepted reply flagged high, never read: both alerts say "Unconfirmed", never "Leading", "Won" or "Not bid"', async () => {
     const shared = makeShared();
     const strategy: SendStrategy = {
       // T-101's seam: an accepted reply that also says it leads (isHighBidder true; the real catalogued reply has none).
@@ -2652,24 +2705,23 @@ describe('T-84b: the 7-day give-up settles a sent snipe (post-read-failed)', () 
 
     // The early heads-up alert after the fast retries: the SAME classification as the reducer's.
     await runTo(shared, END + 45 * MIN);
-    const early = shared.notifier.sent.find((n) => n.notification.title.startsWith('Leading'));
-    expect(early?.notification.title).toBe(`Leading: ${stored(shared).title}`);
-    expect(early?.notification.message).toMatch(/Leading when the bid went in/);
+    const early = shared.notifier.sent.find((n) => n.notification.title.startsWith('Unconfirmed'));
+    expect(early?.notification.title).toBe(`Unconfirmed: ${stored(shared).title}`);
     expect(early?.notification.message).toMatch(/after 3 tries/);
 
     // The final notification at the give-up: the reducer's, from its effects.
     await runTo(shared, END + 7 * DAY + 2 * HOUR);
     const s = stored(shared);
     expect(s.state).toBe('resolved');
-    expect(s.outcome).toBe('won');
+    expect(s.outcome).not.toBe('won');
     expect(kinds(shared)).toContain('snipe.post-read-failed');
     const finals = shared.notifier.sent.filter(
-      (n) => n.notification.title.startsWith('Leading') && !/tries/.test(n.notification.message),
+      (n) => n.notification.title.startsWith('Unconfirmed') && !/tries/.test(n.notification.message),
     );
     expect(finals).toHaveLength(1);
-    expect(finals[0]?.notification.message).toMatch(/Leading when the bid went in/);
+    expect(finals[0]?.notification.message).toMatch(/Check ShopGoodwill/i);
     for (const n of shared.notifier.sent) {
-      expect(n.notification.title).not.toMatch(/^Won/);
+      expect(n.notification.title).not.toMatch(/^(Won|Leading)/);
       expect(n.notification.title).not.toMatch(/^Not bid/);
     }
   });
