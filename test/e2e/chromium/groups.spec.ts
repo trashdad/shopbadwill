@@ -363,8 +363,9 @@ test('a confirmed win cancels the rest: A would have won at the close, so the gr
       const card = groupCard(section, GROUP);
       await expect(card.getByText(`Win at most 1. Wins so far: 1 of at most 1 (dry run: would have won).`)).toBeVisible();
       await expect(card.getByText('Done: the group won what it may win.')).toBeVisible();
+      // T-129: A's auction ended, so it leaves the list; B (stopped, its auction still open on the page's clock) stays.
       const items = card.getByRole('list', { name: `Items in ${GROUP}` });
-      await expect(items.getByText(/^Vintage Pyrex .*: Would have won \(dry run, confirmed at the close\)\. Ends /)).toBeVisible();
+      await expect(items.getByText(/^Vintage Pyrex /)).toHaveCount(0);
       await expect(items.getByText(/^Lot of 12 Hot Wheels Cars Assorted Loose: Stopped by the group \(it had won 1\)\. Ends /)).toBeVisible();
       await expect(card.getByRole('note')).toHaveCount(0);
     } finally {
@@ -419,8 +420,8 @@ test('an unconfirmed win does not cancel: A is still open when read (soft close)
       const risks = card.getByRole('note', { name: `Risks in ${GROUP}` });
       await expect(risks).toContainText('Could win more than 1:');
       await expect(risks).toContainText('is not confirmed yet (the auction was still open when read); still checking. Until it is, the group keeps bidding, so you could win more than 1.');
-      const items = card.getByRole('list', { name: `Items in ${GROUP}` });
-      await expect(items.getByText(/^Vintage Pyrex .*: Checking whether it would have won\. Ends /)).toBeVisible();
+      // T-129: A and B have both ended, so neither is listed; the risk note above still names A.
+      await expect(card.getByRole('list', { name: `Items in ${GROUP}` })).toHaveCount(0);
     } finally {
       await page.close();
     }
