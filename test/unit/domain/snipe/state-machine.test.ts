@@ -63,7 +63,8 @@ const RTT = 150;
 const ARM_AT = END_MS - 24 * HOUR;
 const WAKE_AT = END_MS - 8000 - 5 * MIN;
 const VERIFY_AT = END_MS - MIN;
-const FIRE_AT_SERVER = END_MS - 8000 - RTT / 2; // end - lead - rtt/2, written out
+/** R-2: end - lead - send chain (modal rtt + the 1 s lane gap + PlaceBid one way), written out. */
+const FIRE_AT_SERVER = END_MS - 8000 - (RTT + 1000 + RTT / 2);
 const FIRE_LOCAL = FIRE_AT_SERVER - OFFSET;
 const SENT_LOCAL = FIRE_LOCAL + 5;
 const RESULT_LOCAL = FIRE_LOCAL + 300;
@@ -518,7 +519,7 @@ describe('live path: draft → armed → waking → verified → firing → sent
     expect(audits(r.effects)).toEqual(['snipe.wake']);
   });
 
-  it('verified plans the fire in server time: end − lead − rtt/2 (T-81), and records offset and rtt', () => {
+  it('verified plans the fire in server time: end − lead − send chain (R-2), and records offset and rtt', () => {
     const r = reduce(inState('waking'), E.verified(), CAPS_OK, CTX);
     expect(r.next.state).toBe('verified');
     expect(r.next.fireAt).toBe(FIRE_AT_SERVER);
@@ -526,12 +527,33 @@ describe('live path: draft → armed → waking → verified → firing → sent
     expect(kinds(r.effects)).toEqual(['audit']);
   });
 
+  it('R-2: verified with ctx.send plans the fire from the verify rtt and gap, and audits them', () => {
+    const r = reduce(inState('waking'), E.verified(), CAPS_OK, { ...CTX, send: { rttMs: 250, gapMs: 1000 } });
+    expect(r.next.state).toBe('verified');
+    expect(r.next.fireAt).toBe(END_MS - 8000 - 1375);
+    // The clock sample's rtt is still what is stored as measured.
+    expect(r.next.measured).toEqual({ offsetMs: OFFSET, rttMs: RTT });
+    expect(audits(r.effects)).toEqual(['snipe.verified']);
+    expect(ofKind(r.effects, 'audit')[0]?.entry.details).toMatchObject({ fireAt: END_MS - 9375, sendRttMs: 250, sendChainMs: 1375 });
+  });
+
+  it('R-2: verified without ctx.send uses the event rtt and the default 1 s gap', () => {
+    const r = reduce(inState('waking'), E.verified(), CAPS_OK, CTX);
+    expect(r.next.fireAt).toBe(END_MS - 8000 - (RTT + 1000 + RTT / 2));
+    expect(ofKind(r.effects, 'audit')[0]?.entry.details).toMatchObject({ sendRttMs: RTT, sendChainMs: RTT + 1000 + RTT / 2 });
+  });
+
+  it('R-2: a doubled gap (considerate tight) moves the fire 1 s earlier', () => {
+    const r = reduce(inState('waking'), E.verified(), CAPS_OK, { ...CTX, send: { rttMs: 250, gapMs: 2000 } });
+    expect(r.next.fireAt).toBe(END_MS - 8000 - 2375);
+  });
+
   it('verified adopts an earlier end from the read and plans the fire from it', () => {
     const earlier = END_MS - 30_000;
     const r = reduce(inState('waking'), E.verified(detail({ endTime: iso(earlier) })), CAPS_OK, CTX);
     expect(r.next.state).toBe('verified');
     expect(r.next.endTime).toBe(iso(earlier));
-    expect(r.next.fireAt).toBe(earlier - 8000 - RTT / 2);
+    expect(r.next.fireAt).toBe(earlier - 8000 - (RTT + 1000 + RTT / 2));
     expect(r.next.endTimeAtArm).toBe(END);
   });
 

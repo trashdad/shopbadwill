@@ -47,11 +47,11 @@
 // object and no effects. The table and the handler switch are typed from the
 // contract's zod unions, so a new state or event fails to compile until it is
 // placed in the table.
-import type { BidResultKind, EpochMs, ItemDetail } from '../types';
+import { DEFAULT_LANES, type BidResultKind, type EpochMs, type ItemDetail } from '../types';
 import { checkCaps, DEFAULT_TIME_ZONE, spentToday } from './caps';
 import { classifyOutcome, MISSED_END_WHY, sleptThroughEnd, type AbortReason, type Classification, type OutcomeContext } from './outcome';
 import { fallbackDecision, isoMs, type Fallback, type FallbackReason, type PreflightReason } from './preflight';
-import { assessClock, computeFireAt, type ClockAbortReason } from './timing';
+import { assessClock, computeFireAt, sendChainMs, type ClockAbortReason } from './timing';
 import { LeadMsSchema, type CapsCheck, type CapsResult, type Effect, type Snipe, type SnipeEvent, type SnipeState } from './types';
 
 /**
@@ -165,6 +165,13 @@ export interface ReduceContext {
    * either way, and no other event reads it.
    */
   endedRead?: ItemDetail;
+  /**
+   * R-2: for `verified`, the verify read's best rtt and the snipe lane's gap
+   * (doubled in considerate 'tight' mode). The fire is planned from them:
+   * end - lead - sendChainMs(rttMs, gapMs). Without it, the event's rtt and the
+   * default lane gap.
+   */
+  send?: { rttMs: number; gapMs: number };
 }
 
 const accept =(...to: SnipeState[]): TransitionCell => Object.freeze({ to: Object.freeze(to) });
@@ -582,7 +589,9 @@ function onVerified(s: Snipe, e: Extract<SnipeEvent, { type: 'verified' }>, caps
   if (!clock.ok) return preFireFallback(s, e, 'clock', CLOCK_CAUSE[clock.reason], caps, ctx);
   // C1: the caller ran checkCaps with this read (capsForEvent).
   if (!caps.ok) return capBlocked(s, e, ctx, caps, 'verified: cap');
-  const fireAt = computeFireAt(endMs, s.leadMs, clock.oneWayMs);
+  const sendRttMs = ctx.send?.rttMs ?? e.rttMs;
+  const chain = sendChainMs(sendRttMs, ctx.send?.gapMs ?? DEFAULT_LANES.snipe.minIntervalMs);
+  const fireAt = computeFireAt(endMs, s.leadMs, chain);
   return {
     next: step(s, e, 'verified', 'verified', {
       endTime: d.endTime,
@@ -590,7 +599,7 @@ function onVerified(s: Snipe, e: Extract<SnipeEvent, { type: 'verified' }>, caps
       measured: { ...s.measured, offsetMs: e.offsetMs, rttMs: e.rttMs },
     }),
     effects: [],
-    details: { fireAt, offsetMs: e.offsetMs, rttMs: e.rttMs, endTime: d.endTime, minimumBid: d.minimumBid },
+    details: { fireAt, offsetMs: e.offsetMs, rttMs: e.rttMs, sendRttMs, sendChainMs: chain, endTime: d.endTime, minimumBid: d.minimumBid },
   };
 }
 

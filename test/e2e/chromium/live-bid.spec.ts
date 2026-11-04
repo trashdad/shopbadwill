@@ -1340,8 +1340,9 @@ test('ambiguous, ≥ 2 s left: PlaceBid stalls past its timeout; the proof read 
 
 test('ambiguous, < 2 s left: the stalled PlaceBid\'s proof read shows no change too late to resend; no resend; Unconfirmed', async () => {
   test.setTimeout(300_000);
-  // Lead 23 s: the browser gives up on PlaceBid ~1.8 s before the end; the proof read goes out under 1 s before it.
-  const r = await liveRig(hotWheels(23, { latencyMs: { [PLACE_BID]: PLACE_BID_STALL_MS } }));
+  // Lead 22 s (R-2: the fire also counts the ~1.2 s send chain, so this is the old lead-23 timing): the browser
+  // gives up on PlaceBid under 2 s before the end, and the proof read goes out about 1 s before it.
+  const r = await liveRig(hotWheels(22, { latencyMs: { [PLACE_BID]: PLACE_BID_STALL_MS } }));
   // After the close SGW's item page is down: from the outcome read on (the second read after PlaceBid), every read gets 503.
   r.wire.onLeave(async (d, departed) => {
     const firstBid = departed.findIndex((x) => x.endpoint === PLACE_BID);
