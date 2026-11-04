@@ -9,6 +9,13 @@ extension is reliable enough to run unattended every day. Bump with `pnpm releas
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-04
+
+### Fixed
+
+- The bid itself is never refused by the request budget, a "slow down" (429) pause or a lane backoff; a 403 still stops it. The snipe lane's daily budget (now 240) is counted and warned on, never enforced (R-1).
+- The 24 h and 1 h checks warn when the snipe lane runs low or ShopGoodwill has asked to slow down (R-1).
+
 ## [0.2.0] - 2026-11-04
 
 ### Changed
