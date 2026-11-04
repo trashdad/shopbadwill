@@ -27,7 +27,7 @@ import type { Settings } from '../../../src/domain/settings/schema';
 import { SESSION_MARGIN_AFTER_END_MS } from '../../../src/domain/snipe/preflight';
 import type { Snipe } from '../../../src/domain/snipe/types';
 import { Repo } from '../../../src/domain/storage/repo';
-import { STORAGE_KEYS } from '../../../src/domain/storage/schema';
+import { STORAGE_KEYS, STORAGE_SCHEMA_VERSION } from '../../../src/domain/storage/schema';
 import { formatDual } from '../../../src/domain/time/pacific';
 import type { EpochMs, HealthReport, RequestSchedulerStats, SgwSessionState } from '../../../src/domain/types';
 import type { SgwSession } from '../../../src/ports/sgw-session';
@@ -85,6 +85,8 @@ let healthLast: HealthReport | null;
 let sessionRecord: { expiresAt: EpochMs } | null;
 let keepAwakeAvailable: boolean;
 let schedStats: RequestSchedulerStats;
+let awakeHist: EpochMs[];
+let installedAt: EpochMs | null;
 
 const lane = (over: Partial<RequestSchedulerStats['lanes']['snipe']> = {}): RequestSchedulerStats['lanes']['snipe'] => ({
   usedToday: 0,
@@ -112,6 +114,9 @@ beforeEach(() => {
   sessionRecord = { expiresAt: END + DAY };
   keepAwakeAvailable = true;
   schedStats = healthyStats();
+  // R-6: no observed days by default (recording began now), so the T0 awake rule stays quiet.
+  awakeHist = [];
+  installedAt = NOW;
 });
 
 const snipe = (over: Partial<Snipe> = {}): Snipe => ({
@@ -156,6 +161,8 @@ const deps = (): AuthHealthDeps => ({
   getSnipe: async (id: string) => (await repo.get(STORAGE_KEYS.snipes))[id],
   repo,
   scheduler: { stats: () => schedStats },
+  awakeHistory: () => Promise.resolve(awakeHist),
+  installedAt: () => Promise.resolve(installedAt),
 });
 
 const make = (): AuthHealth => createAuthHealth(deps());
@@ -742,6 +749,9 @@ describe('R-1 auth-health: snipe-lane low water and slow-down warnings', () => {
     tier: 'T0',
     timeZone: 'America/New_York',
     snipeLane,
+    awakeHistory: [],
+    installedAt: NOW,
+    quiet: undefined,
   });
   const lane0 = { left: 240, paused: false, backingOff: false, blocked: false, until: null };
 
@@ -814,5 +824,141 @@ describe('R-1 auth-health: snipe-lane low water and slow-down warnings', () => {
     await expect(quiet.check(snipe({ id: 's2' }), '24h')).resolves.toEqual({ ok: true });
     await new Promise((r) => setTimeout(r, 0));
     expect(notifier.sent).toHaveLength(1);
+  });
+});
+
+describe('R-6 auth-health: tier T0 warns when the computer is usually asleep at the end', () => {
+  const NY = 'America/New_York';
+  // END is 15:00 NY on 2026-10-16; NOW is 15:00 NY on 2026-10-15, so the last 14 days are Oct 1..14.
+  const ndays = (n: number, utcHour: number, utcMinute = 0): EpochMs[] =>
+    Array.from({ length: n }, (_, i) => Date.UTC(2026, 9, 14 - i, utcHour, utcMinute));
+  // Heartbeats at 10:00 NY (14:00Z) every day: none inside the end's 15:00 hour.
+  const asleep = (): EpochMs[] => ndays(15, 14).reverse();
+  const ADVICE = (text: string, at: EpochMs): string =>
+    `Tier T0 does nothing to keep this computer awake, and ${text}. Keep the computer awake and the browser open for the end at ${formatDual(at, NY)}, or set up tier T1 or T2 in the snipe settings.`;
+  const QUIET = (at: EpochMs): string =>
+    `Tier T0 does nothing to keep this computer awake, and the auction ends inside your quiet hours (${formatDual(at, NY)}). Keep the computer awake and the browser open, or set up tier T1 or T2 in the snipe settings.`;
+  const quietNight = { from: '22:00', to: '07:00' };
+  // Recording began 2026-10-13 12:00 NY: the 15:00 and 23:00 hours are observed on Oct 13 and 14 only.
+  const RECENT = Date.UTC(2026, 9, 13, 16, 0, 0);
+
+  const snap = (over: Partial<AuthHealthSnapshot> = {}): AuthHealthSnapshot => ({
+    sessionState: 'ok',
+    tokenExpiresAt: END + 2 * DAY,
+    sessionRecordExpiresAt: END + 2 * DAY,
+    google: null,
+    calendarEnabled: false,
+    healthReport: null,
+    keepAwakeAvailable: true,
+    powerGranted: true,
+    tier: 'T0',
+    timeZone: NY,
+    snipeLane: null,
+    awakeHistory: [],
+    installedAt: null,
+    quiet: undefined,
+    ...over,
+  });
+
+  it('T0, 14 days of heartbeats none inside the end hour → the warning with "on 0 of the last 14 days"', () => {
+    const r = assessAuthHealth(snipe(), NOW, snap({ awakeHistory: asleep() }));
+    expect(r.result).toEqual({ ok: true });
+    expect(r.warnings).toEqual([ADVICE('your browser was running at 3:00 PM on 0 of the last 14 days', END)]);
+  });
+
+  it('T0, heartbeats on 10 of 14 days in that hour, end outside quiet hours → no warning', () => {
+    const hist = [...asleep(), ...ndays(10, 19, 30)].sort((a, b) => a - b); // 15:30 NY on Oct 5..14
+    expect(assessAuthHealth(snipe(), NOW, snap({ awakeHistory: hist, quiet: quietNight })).warnings).toEqual([]);
+  });
+
+  it('T0, 2 observed days (recent installedAt), end inside quiet hours → the quiet-hours copy', () => {
+    const s = snipe({ endTime: new Date(NIGHT).toISOString() });
+    const r = assessAuthHealth(s, NOW, snap({ installedAt: RECENT, quiet: quietNight }));
+    expect(r.warnings).toEqual([QUIET(NIGHT)]);
+  });
+
+  it('T0, 2 observed days, end outside quiet hours → no warning', () => {
+    expect(assessAuthHealth(snipe(), NOW, snap({ installedAt: RECENT, quiet: quietNight })).warnings).toEqual([]);
+  });
+
+  it('T1 with keep-awake granted and an asleep history → no T0 warning (the T1 rules are unchanged)', () => {
+    expect(assessAuthHealth(snipe(), NOW, snap({ tier: 'T1', awakeHistory: asleep(), quiet: quietNight })).warnings).toEqual([]);
+    const night = snipe({ endTime: new Date(NIGHT).toISOString() });
+    expect(assessAuthHealth(night, NOW, snap({ tier: 'T2', quiet: quietNight })).warnings).toEqual([]);
+  });
+
+  it('an unreadable awake history (null) leaves only the quiet-hours rule; a warning never fails the check', () => {
+    expect(assessAuthHealth(snipe(), NOW, snap({ awakeHistory: null })).warnings).toEqual([]);
+    const night = snipe({ endTime: new Date(NIGHT).toISOString() });
+    const r = assessAuthHealth(night, NOW, snap({ awakeHistory: null, quiet: quietNight }));
+    expect(r).toEqual({ result: { ok: true }, warnings: [QUIET(NIGHT)] });
+  });
+
+  it('check(): the T0 warning goes out at priority 2, one per snipe per check, deduped across restarts', async () => {
+    awakeHist = asleep();
+    installedAt = null;
+    const s = snipe();
+    await make().check(s, '24h');
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(1);
+    });
+    await make().check(s, '24h');
+    expect(notifier.sent).toHaveLength(1);
+    await make().check(s, '1h');
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(2);
+    });
+    await make().check(s, '1h');
+    expect(notifier.sent).toHaveLength(2);
+    expect(audit.kinds.filter((k) => k === AUTH_WARN_KIND)).toHaveLength(2);
+    expect(notifier.sent[0]?.notification).toMatchObject({ id: 'sbw:snipe:s1:auth-warn-24h', priority: 2 });
+    expect(notifier.sent[0]?.notification.message).toContain(
+      ADVICE('your browser was running at 3:00 PM on 0 of the last 14 days', END),
+    );
+  });
+
+  it('check(): an awake-history read that throws is no awake warning (never a false "asleep")', async () => {
+    const impl = createAuthHealth({
+      ...deps(),
+      installedAt: () => Promise.resolve(null),
+      awakeHistory: () => Promise.reject(new Error('down')),
+    });
+    await expect(impl.check(snipe(), '24h')).resolves.toEqual({ ok: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(notifier.sent).toHaveLength(0);
+  });
+
+  it('register() reads sbw:awake and sbw:meta.installedAt from the Repo, with zero SGW requests', async () => {
+    await repo.set(STORAGE_KEYS.awake, asleep());
+    const s = snipe();
+    await repo.set(STORAGE_KEYS.snipes, { [s.id]: s });
+    const ctx = {
+      clock,
+      session,
+      google,
+      health: { last: () => Promise.resolve(healthLast) },
+      keepAwake: { get available() { return keepAwakeAvailable; } },
+      permissions,
+      switches: { settings: () => settings },
+      audit,
+      notifier,
+      alarms,
+      repo,
+      api: sgw,
+      scheduler: { stats: () => schedStats },
+    } as unknown as BackgroundContext;
+    await register(ctx).check(s, '24h');
+    await vi.waitFor(() => {
+      expect(notifier.sent).toHaveLength(1);
+    });
+    expect(notifier.sent[0]?.notification.message).toContain('on 0 of the last 14 days');
+
+    // A recent install (sbw:meta) leaves fewer than 3 observed days: no awake warning.
+    notifier.sent.length = 0;
+    await repo.set(STORAGE_KEYS.meta, { schemaVersion: STORAGE_SCHEMA_VERSION, installedAt: RECENT, lastMigrationAt: RECENT });
+    await register(ctx).check(snipe({ id: 's-recent' }), '24h');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(notifier.sent).toHaveLength(0);
+    expect(sgw.calls).toEqual([]);
   });
 });
